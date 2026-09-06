@@ -20,7 +20,7 @@ use conseqa::confluence::{
 use conseqa::spec::{
     DeliverySemantics, DispatchRouting, DispatchSemantics, ExecutionSemantics, Id, Input,
     LaneConcurrency, MessageSelector, OperationBlock, OperationConcurrency, OperationStep,
-    Revision, SubscriptionInput,
+    Revision, SubscriptionInput, TransactionStep,
 };
 use uuid::Uuid;
 
@@ -639,4 +639,99 @@ async fn bundles_fall_back_to_interfaces_before_analysis_and_use_summaries_after
         bundle.dependency_summaries[0].operation,
         id("operation.create_order")
     );
+}
+
+fn create_order_program(engine: &ConfluenceEngine) -> OperationBlock {
+    engine
+        .head_snapshot()
+        .workspace
+        .operations
+        .get(&id("operation.create_order"))
+        .expect("create_order exists")
+        .program
+        .clone()
+        .expect("create_order has a program")
+}
+
+/// The draft gate rejects a structurally broken program at submit time —
+/// a fixable, in-session rejection, never a stale-context restart — and
+/// the very same task then commits the corrected program. This is the
+/// convergence fix: a dangling effect intent is caught before it commits,
+/// where the agent can still repair it, rather than committing and only
+/// failing whole-model validation asynchronously.
+#[tokio::test]
+async fn a_broken_program_is_rejected_in_session_then_repaired() {
+    let engine = ConfluenceEngine::in_memory(fixture_workspace()).expect("engine starts");
+
+    let valid = create_order_program(&engine);
+
+    // Drop the establishment, leaving the execution referring to an
+    // effect intent nothing produces.
+    let mut broken = valid.clone();
+
+    for step in &mut broken.steps {
+        if let OperationStep::Transaction(transaction) = step
+            && transaction.id == id("tx.create_order.new")
+        {
+            transaction
+                .steps
+                .retain(|inner| !matches!(inner, TransactionStep::EstablishEffectIntent(_)));
+        }
+    }
+
+    let synth = task(
+        &engine,
+        TaskKind::OperationSynthesis,
+        WriteScope::operation_synthesis(id("operation.create_order")),
+    );
+
+    // Observe the operation's shared symbols so read-before-reference is
+    // satisfied and the commit reaches draft validation.
+    engine
+        .context_bundle(
+            synth.id,
+            &BundleSpec {
+                operation: Some(id("operation.create_order")),
+                requirement: None,
+                include: Vec::new(),
+            },
+        )
+        .expect("the bundle builds");
+
+    let rejection = submit(
+        &engine,
+        &synth,
+        vec![Mutation::ReplaceOperationProgram {
+            operation: id("operation.create_order"),
+            program: broken,
+        }],
+    )
+    .await
+    .expect_err("a dangling effect intent is rejected");
+
+    match &rejection {
+        CommitRejection::DraftValidationFailed { diagnostics } => assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("effect intent")),
+            "expected a dangling-effect-intent diagnostic, got:\n{diagnostics:#?}"
+        ),
+
+        other => panic!("expected DraftValidationFailed, got {other:?}"),
+    }
+
+    // Not stale context: the task stays runnable, so the agent fixes the
+    // program and commits in the same session.
+    assert!(!rejection.is_stale_context());
+
+    submit(
+        &engine,
+        &synth,
+        vec![Mutation::ReplaceOperationProgram {
+            operation: id("operation.create_order"),
+            program: valid,
+        }],
+    )
+    .await
+    .expect("the corrected program commits in the same session");
 }
