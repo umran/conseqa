@@ -8,12 +8,12 @@ use conseqa::{
     analyzer::validation::{self, ProgramUse, ReferenceKind, ValidationError},
     parser::yaml,
     spec::{
-        Arm, Branch, Condition, Derivation, EstablishTransactionOutput, FieldPath, Id,
-        IdempotencyGuarantee, Input, Literal, MessageIdentity, MessageSelector, Model,
-        OperationBlock, OperationStep, RequestIdentity, ResultOutcome, ResultVariant, Return,
-        Schema, SchemaFragment, SelectorValue, StateTransition, StepHop, StepLocation,
-        TopicOrdering, Transaction, TransactionIsolation, TransactionStep, TransitionEffectIntent,
-        ValueRef, ValueSource,
+        Arm, Branch, Condition, Derivation, Effect, EstablishTransactionOutput, ExecuteEffect,
+        FieldPath, Id, IdempotencyGuarantee, Input, Literal, MessageIdentity, MessageSelector,
+        Model, OperationBlock, OperationStep, RequestEffect, RequestIdentity, RequestTarget,
+        ResultOutcome, ResultVariant, RetrySemantics, Return, Schema, SchemaFragment, SelectorValue,
+        StateTransition, StepHop, StepLocation, TopicOrdering, Transaction, TransactionIsolation,
+        TransactionStep, TransitionEffectIntent, ValueRef, ValueSource,
     },
 };
 
@@ -2467,4 +2467,150 @@ fn a_nested_match_keeps_the_enclosing_arms_variant_selection() {
     let errors = validation::validate(&model);
 
     assert!(errors.is_empty(), "expected no errors, got:\n{errors:#?}");
+}
+
+// The draft-commit gate's program-local check (`program_local_diagnostics`)
+// reuses these very passes, so it cannot drift from the authority. These
+// tests pin that contract: it stays silent on valid programs, reproduces
+// the validator's verdict verbatim for operation-local breakages, and
+// leaves external-reference errors — which the gate checks separately —
+// to the full validator.
+
+#[test]
+fn program_local_diagnostics_pass_a_valid_model() {
+    let model = load_flash_checkout();
+
+    for operation in model.operations.keys() {
+        let diagnostics = validation::program_local_diagnostics(&model, operation);
+
+        assert!(
+            diagnostics.is_empty(),
+            "`{operation}` is valid but the program-local check reported:\n{diagnostics:#?}"
+        );
+    }
+}
+
+#[test]
+fn program_local_diagnostics_reproduce_the_validator_verbatim() {
+    let mut model = load_flash_checkout();
+
+    // Executing the intent before the transaction that establishes it is
+    // a use-before-bind error — exactly one operation-local verdict.
+    program_mut(&mut model, "operation.create_order").steps.swap(0, 1);
+
+    let validator: Vec<String> = validation::validate(&model)
+        .into_iter()
+        .map(|error| conseqa::analyzer::Diagnostic::from(error).message)
+        .collect();
+
+    let gate: Vec<String> =
+        validation::program_local_diagnostics(&model, &id("operation.create_order"))
+            .into_iter()
+            .map(|diagnostic| diagnostic.message)
+            .collect();
+
+    assert_eq!(
+        gate, validator,
+        "the gate must reproduce the validator's operation-local verdict word for word"
+    );
+    assert!(!gate.is_empty(), "the mutation should produce a verdict");
+}
+
+#[test]
+fn program_local_diagnostics_flag_a_dangling_effect_intent() {
+    let mut model = load_flash_checkout();
+
+    // Remove the establishment, leaving the execution referring to an
+    // effect intent nothing produces — the reported "unknown effect
+    // intent" failure that used to commit and only fail asynchronously.
+    transaction_mut(&mut model, "operation.create_order", "tx.create_order.new")
+        .steps
+        .retain(|step| !matches!(step, TransactionStep::EstablishEffectIntent(_)));
+
+    let diagnostics = validation::program_local_diagnostics(&model, &id("operation.create_order"));
+
+    assert!(
+        diagnostics.iter().any(|diagnostic| {
+            diagnostic.message.contains("effect intent")
+                && diagnostic.message.contains("intent.create_order.publish_created")
+        }),
+        "expected a dangling-effect-intent diagnostic, got:\n{diagnostics:#?}"
+    );
+}
+
+#[test]
+fn program_local_diagnostics_leave_external_references_to_the_validator() {
+    let mut model = load_flash_checkout();
+
+    // A missing data model is an external-reference error: the full
+    // validator flags it, but the gate resolves shared references through
+    // its own checks, so the program-local pass stays silent on it rather
+    // than double-reporting or risking a false positive over a partial
+    // draft model.
+    transaction_mut(&mut model, "operation.create_order", "tx.create_order.new").data_model =
+        Some(id("data.missing"));
+
+    assert!(
+        !validation::validate(&model).is_empty(),
+        "the full validator should flag the missing data model"
+    );
+
+    let diagnostics = validation::program_local_diagnostics(&model, &id("operation.create_order"));
+
+    assert!(
+        diagnostics.is_empty(),
+        "the program-local pass should not surface an external-reference error:\n{diagnostics:#?}"
+    );
+}
+
+#[test]
+fn program_local_diagnostics_do_not_fault_a_request_to_an_absent_operation() {
+    let mut model = load_flash_checkout();
+
+    // A request effect names another operation and its input. When the
+    // gate validates one program against a probe that omits sibling
+    // operations, that cross-operation reference is legitimately absent —
+    // so it must not be faulted here. The gate resolves callee targets
+    // separately (`require_request_target` and read-before-reference).
+    // This exclusion is exactly what keeps the single-operation probe
+    // sound.
+    let request = OperationStep::ExecuteEffect(ExecuteEffect {
+        effect_id: id("effect.create_order.call_absent"),
+        effect: Effect::Request(RequestEffect {
+            target: RequestTarget {
+                operation: id("operation.absent"),
+                input: id("input.absent"),
+            },
+            schema: id("schema.CreateOrderRequest"),
+            retry: RetrySemantics::Unspecified,
+            idempotency_key_propagation: Vec::new(),
+        }),
+        values: Derivation::Unspecified,
+        bind: None,
+    });
+
+    program_mut(&mut model, "operation.create_order")
+        .steps
+        .insert(0, request);
+
+    // The full validator faults the absent operation.
+    assert!(
+        validation::validate(&model).iter().any(|error| matches!(
+            error,
+            ValidationError::UnknownReference { reference, .. }
+                if reference == &id("operation.absent")
+        )),
+        "the full validator should fault the absent operation"
+    );
+
+    // The program-local gate check does not — the reference is external.
+    let diagnostics = validation::program_local_diagnostics(&model, &id("operation.create_order"));
+
+    assert!(
+        diagnostics
+            .iter()
+            .all(|diagnostic| !diagnostic.message.contains("operation.absent")
+                && !diagnostic.message.contains("input.absent")),
+        "cross-operation references must be left to the gate's other checks:\n{diagnostics:#?}"
+    );
 }

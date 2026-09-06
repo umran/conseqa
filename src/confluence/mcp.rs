@@ -984,9 +984,9 @@ impl ConseqaMcp {
                        keys, graph queries, and patch mutations."
     )]
     async fn dsl_reference(&self) -> Result<CallToolResult, McpError> {
-        Ok(CallToolResult::success(vec![ContentBlock::text(
-            DSL_REFERENCE.to_string(),
-        )]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(format!(
+            "{DSL_REFERENCE}{PROGRAM_EXAMPLE_PREAMBLE}\n{PROGRAM_EXAMPLE_JSON}\n"
+        ))]))
     }
 }
 
@@ -1187,3 +1187,92 @@ Conseqa model YAML structure, as JSON. Value references:
   {"source":"input:input.x.request","path":"order_id"}
 Derivations: {"kind":"unspecified"} or {"kind":"deterministic","from":[<value ref>...]}.
 "#;
+
+/// The prose that introduces [`PROGRAM_EXAMPLE_JSON`] in the reference.
+const PROGRAM_EXAMPLE_PREAMBLE: &str = "
+WORKED EXAMPLE — a valid program (the body of a `replace_operation_program`
+patch). An effect intent must be established before it is executed, by the
+same binding id: executing an intent no transaction established is the
+`unknown effect intent` error the commit gate rejects. A transaction output
+is bound once and then consumed by the `return`.
+";
+
+/// A complete, valid operation program, appended to `dsl_reference` so an
+/// agent has a concrete template for the establish/execute-intent and
+/// output-binding wiring it most often gets wrong. Kept as pure JSON and
+/// checked by a test (`the_worked_example_is_a_valid_program`), so the
+/// reference cannot drift into an invalid shape.
+const PROGRAM_EXAMPLE_JSON: &str = r#"{"steps":[
+  {"kind":"transaction","id":"tx.example","data_model":null,
+   "isolation":"read_committed","idempotency":{"kind":"not_deduplicated"},
+   "steps":[
+     {"kind":"establish_effect_intent",
+      "bind":"intent.example.notify","effect_id":"effect.example.notify",
+      "effect":{"kind":"publication","topic":"topic.example",
+                "schema":"schema.Event","idempotency_key_propagation":[]},
+      "values":{"kind":"deterministic",
+                "from":[{"source":"input:input.example.request","path":"id"}]}},
+     {"kind":"establish_transaction_output",
+      "bind":"output.example","schema":"schema.Result",
+      "values":{"kind":"deterministic",
+                "from":[{"source":"input:input.example.request","path":"id"}]}}
+   ]},
+  {"kind":"execute_effect_intent","intent":"intent.example.notify"},
+  {"kind":"return","request":"input.example.request",
+   "outcome":{"kind":"ok","values":{"kind":"deterministic",
+              "from":[{"source":"transaction_output:output.example","path":"id"}]}}}
+]}"#;
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use crate::spec::{
+        ExecutionSemantics, Id, Model, Operation, OperationBlock, OperationConcurrency, Revision,
+    };
+
+    /// The worked example in `dsl_reference` must be a genuinely valid
+    /// program: it parses as an operation program and passes the same
+    /// program-local checks the commit gate applies, so the reference can
+    /// never teach a shape the gate would reject.
+    #[test]
+    fn the_worked_example_is_a_valid_program() {
+        let program: OperationBlock = serde_json::from_str(super::PROGRAM_EXAMPLE_JSON)
+            .expect("the worked example parses as an operation program");
+
+        let operation_id = Id("operation.example".to_string());
+
+        let operation = Operation {
+            service: Id("service.example".to_string()),
+            description: None,
+            inputs: BTreeMap::new(),
+            program,
+            requirements: Default::default(),
+            execution: ExecutionSemantics {
+                concurrency: OperationConcurrency::Unspecified,
+            },
+        };
+
+        let mut operations = BTreeMap::new();
+        operations.insert(operation_id.clone(), operation);
+
+        let model = Model {
+            revision: Revision(1),
+            services: BTreeMap::new(),
+            schemas: BTreeMap::new(),
+            data_models: BTreeMap::new(),
+            topics: BTreeMap::new(),
+            state_machines: BTreeMap::new(),
+            operations,
+        };
+
+        let diagnostics =
+            crate::analyzer::validation::program_local_diagnostics(&model, &operation_id);
+
+        assert!(
+            diagnostics.is_empty(),
+            "the worked example must be internally valid, but the program-local \
+             check reported:\n{diagnostics:#?}"
+        );
+    }
+}

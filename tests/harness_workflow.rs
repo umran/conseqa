@@ -413,6 +413,72 @@ fn incomplete_script() -> ScriptFn {
     })
 }
 
+/// A plan that builds a valid model with no requirements at all: the
+/// prompt states no explicit obligation, and discovery proposes nothing.
+/// The run should still converge — a requirement-free model is vacuously
+/// proven — and it must finalize promptly rather than re-running
+/// discovery every iteration until the budget is spent.
+fn no_requirements_script() -> ScriptFn {
+    Arc::new(|engine, invocation| {
+        Box::pin(async move {
+            match invocation.kind {
+                conseqa::confluence::TaskKind::Decompose => {
+                    commit(
+                        &engine,
+                        &invocation,
+                        vec![
+                            Mutation::PutService {
+                                id: id("service.api"),
+                                value: Service {
+                                    kind: ServiceKind::Backend,
+                                },
+                            },
+                            Mutation::PutSchema {
+                                id: id("schema.PingRequest"),
+                                value: canonical(&[("id", ScalarType::Uuid)]),
+                            },
+                            Mutation::PutSchema {
+                                id: id("schema.PingResponse"),
+                                value: canonical(&[("id", ScalarType::Uuid)]),
+                            },
+                            Mutation::PutSchema {
+                                id: id("schema.Rejected"),
+                                value: canonical(&[("reason", ScalarType::String)]),
+                            },
+                            Mutation::PutOperationInterface {
+                                operation: id("operation.ping"),
+                                value: ping_interface(),
+                            },
+                        ],
+                    )
+                    .await;
+                }
+
+                conseqa::confluence::TaskKind::OperationSynthesis => {
+                    commit(
+                        &engine,
+                        &invocation,
+                        vec![
+                            Mutation::ReplaceOperationProgram {
+                                operation: id("operation.ping"),
+                                program: ping_program(),
+                            },
+                            Mutation::ReplaceOperationExecution {
+                                operation: id("operation.ping"),
+                                execution: bounded_one(),
+                            },
+                        ],
+                    )
+                    .await;
+                }
+
+                // Discovery proposes nothing; repair has nothing to do.
+                _ => {}
+            }
+        })
+    })
+}
+
 fn workflow(
     out_dir: PathBuf,
     script: ScriptFn,
@@ -780,4 +846,33 @@ async fn operation_fanout_runs_agents_concurrently() {
     // All four commits landed through the one sequencer, at distinct
     // revisions.
     assert_eq!(engine.head_revision().0, OPERATIONS as u64);
+}
+
+#[tokio::test]
+async fn a_requirement_free_model_finalizes_without_spinning() {
+    let out_dir = std::env::temp_dir().join(format!("conseqa-wf-{}", Uuid::new_v4()));
+
+    // A generous iteration budget: if the fixpoint re-ran discovery every
+    // iteration (gating on tasks run rather than progress), it would spend
+    // the whole budget before finalizing.
+    let (workflow, _engine) = workflow(out_dir.clone(), no_requirements_script(), 8);
+
+    let report = workflow.run().await.expect("the workflow runs");
+
+    // A requirement-free model is vacuously proven, so the run succeeds.
+    assert!(
+        matches!(report.status, RunStatus::Success { .. }),
+        "{:?}",
+        report.status
+    );
+
+    // And it finalized promptly: discovery committed nothing, so the loop
+    // proceeded to verify and finalize instead of spinning to the bound.
+    assert!(
+        report.iterations <= 2,
+        "expected a prompt finalize, but the run took {} iterations",
+        report.iterations
+    );
+
+    std::fs::remove_dir_all(&out_dir).ok();
 }

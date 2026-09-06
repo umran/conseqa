@@ -310,6 +310,113 @@ pub fn validate(model: &Model) -> Vec<ValidationError> {
     errors
 }
 
+/// Operation-local structural diagnostics for one program, for the
+/// confluence draft-commit gate (§8.1, §29 step 11).
+///
+/// Runs the validator's own reference-resolution and definite-
+/// availability passes against `model` for `operation_id`, then keeps
+/// only the error classes fully determined by that operation's own
+/// program, inputs, and the shared symbols present — never a reference
+/// that could resolve to *another* operation, which the gate checks
+/// separately and which a partial draft model legitimately lacks. This
+/// lets a dangling effect intent, result binding, or transaction output,
+/// or a value that is not definitely available, be rejected at
+/// `submit_patch` and fixed in the same session, instead of committing
+/// and only failing whole-model validation asynchronously.
+///
+/// `model` need not be a complete, assemblable model: callers pass a
+/// probe of the shared symbols plus the single operation whose program
+/// was just written. The passes reused here are the same ones
+/// [`validate`] runs, so the gate cannot drift from the authority.
+pub fn program_local_diagnostics(
+    model: &Model,
+    operation_id: &Id,
+) -> Vec<crate::analyzer::Diagnostic> {
+    let Some(operation) = model.operations.get(operation_id) else {
+        return Vec::new();
+    };
+
+    let index = ReferenceIndex::build(model);
+
+    let mut errors = Vec::new();
+
+    validate_program_references(model, &index, operation_id, &operation.program, &mut errors);
+
+    let mut validator = ProgramValidator {
+        model,
+        operation_id,
+        errors: Vec::new(),
+        reported: BTreeSet::new(),
+    };
+
+    let fallthrough = validator.block(
+        &operation.program,
+        &StepLocation::root(),
+        None,
+        Availability::default(),
+    );
+
+    errors.extend(validator.errors);
+
+    if fallthrough.is_some() {
+        errors.push(ValidationError::ProgramNotTerminated {
+            operation: operation_id.clone(),
+        });
+    }
+
+    errors
+        .into_iter()
+        .filter(is_program_local_error)
+        .map(crate::analyzer::Diagnostic::from)
+        .collect()
+}
+
+/// Whether a validation error is fully determined by one operation's own
+/// program, inputs, and the shared symbols — so it is sound to surface
+/// from a probe model that omits sibling operations. Reference errors are
+/// kept only for kinds that can name nothing outside the program: an
+/// effect intent, a result binding, a transaction output, a transaction,
+/// or a transaction read are all established within the same program.
+/// `Input` is deliberately excluded — a request effect can name another
+/// operation's input, resolved separately by the gate — as are all
+/// external kinds (schema, topic, operation, and so on).
+fn is_program_local_error(error: &ValidationError) -> bool {
+    use ValidationError::*;
+
+    match error {
+        ProgramNotTerminated { .. }
+        | UnreachableProgramStep { .. }
+        | TransactionArtifactNotAvailable { .. }
+        | EffectResultNotBound { .. }
+        | EffectResultVariantOutOfScope { .. }
+        | EffectHasNoResult { .. }
+        | TransactionReadOutsideTransaction { .. }
+        | TransactionReadOutOfOrder { .. }
+        | TransactionReadFieldNotSelected { .. }
+        | ValueSourceOutOfScope { .. }
+        | InvalidReferenceOwner { .. } => true,
+
+        UnknownReference { expected, .. } | InvalidReferenceKind { expected, .. } => {
+            is_program_owned_kind(*expected)
+        }
+
+        _ => false,
+    }
+}
+
+/// The reference kinds that can only ever name a declaration established
+/// within the same operation program.
+fn is_program_owned_kind(kind: ReferenceKind) -> bool {
+    matches!(
+        kind,
+        ReferenceKind::EffectIntent
+            | ReferenceKind::EffectResult
+            | ReferenceKind::TransactionOutput
+            | ReferenceKind::Transaction
+            | ReferenceKind::TransactionRead
+    )
+}
+
 pub fn validate_global_id_uniqueness(model: &Model) -> Vec<ValidationError> {
     let mut seen: BTreeMap<&Id, IdDeclaration> = BTreeMap::new();
 
