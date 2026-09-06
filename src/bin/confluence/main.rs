@@ -271,7 +271,7 @@ async fn admin_analysis(
     Json(value)
 }
 
-fn open_persistence(database: &PathBuf) -> Result<Persistence, String> {
+fn open_persistence(database: &std::path::Path) -> Result<Persistence, String> {
     Persistence::open_file(database)
         .map_err(|error| format!("cannot open {}: {error}", database.display()))
 }
