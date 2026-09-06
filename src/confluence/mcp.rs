@@ -131,6 +131,14 @@ pub struct SubmitPatchParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct RequestDesignParams {
+    /// Optional extra guidance for the worker agents, layered on top of
+    /// the run's prompt.
+    #[serde(default)]
+    pub objective: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct DependencyRequestParams {
     /// The symbol that must change, in canonical serialized form.
     pub target: serde_json::Value,
@@ -146,14 +154,39 @@ pub struct DependencyRequestParams {
     pub evidence: Vec<String>,
 }
 
+/// Launches the concurrent multi-agent design workflow against the
+/// shared engine. Implemented by the orchestrating binary (which
+/// depends on the `harness` module) and injected here, so the MCP
+/// server can trigger a fanout without `confluence` depending on
+/// `harness`.
+pub trait DesignLauncher: Send + Sync {
+    /// Starts the workflow in the background and returns a description
+    /// of the launched run, or a reason it could not start (for
+    /// example, one is already running).
+    fn launch(&self, objective: Option<String>) -> Result<serde_json::Value, String>;
+}
+
 #[derive(Clone)]
 pub struct ConseqaMcp {
     engine: ConfluenceEngine,
+    launcher: Option<Arc<dyn DesignLauncher>>,
 }
 
 impl ConseqaMcp {
     pub fn new(engine: ConfluenceEngine) -> Self {
-        Self { engine }
+        Self {
+            engine,
+            launcher: None,
+        }
+    }
+
+    /// Builds an MCP server that can also launch the concurrent design
+    /// workflow through `launcher`.
+    pub fn with_launcher(engine: ConfluenceEngine, launcher: Arc<dyn DesignLauncher>) -> Self {
+        Self {
+            engine,
+            launcher: Some(launcher),
+        }
     }
 
     /// Resolves the request's bearer capability to its task (§43).
@@ -538,6 +571,42 @@ impl ConseqaMcp {
     }
 
     #[tool(
+        description = "Launch the concurrent multi-agent design workflow against this shared \
+                       model: independent coding-agent sessions fan out to synthesize and \
+                       repair operations in parallel, each committing through the same gate. \
+                       Use this to build out or complete an architecture faster than editing \
+                       one operation at a time. Returns immediately; the workers run in the \
+                       background — watch the head advance (task_context) and read the growing \
+                       model with the read tools. One workflow runs at a time."
+    )]
+    async fn request_design(
+        &self,
+        params: Parameters<RequestDesignParams>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        // Any valid session establishes that the caller is an
+        // authorized client of this engine.
+        let _task = self.authenticate(&context)?;
+
+        let Some(launcher) = &self.launcher else {
+            return json_error(serde_json::json!({
+                "launched": false,
+                "error": "concurrent design is not available on this server",
+                "guidance": "This confluence server has no orchestration backend. Run the \
+                             design workflow with the conseqa-harness CLI instead.",
+            }));
+        };
+
+        match launcher.launch(params.0.objective) {
+            Ok(value) => json_result(value),
+            Err(error) => json_error(serde_json::json!({
+                "launched": false,
+                "error": error,
+            })),
+        }
+    }
+
+    #[tool(
         description = "Compact reference for the JSON shapes these tools exchange: symbol \
                        keys, graph queries, and patch mutations."
     )]
@@ -582,11 +651,22 @@ impl McpServer {
 /// The axum router exposing `/mcp`, for embedding alongside other
 /// routes (the standalone daemon adds its admin surface).
 pub fn router(engine: ConfluenceEngine) -> axum::Router {
+    build_router(ConseqaMcp::new(engine))
+}
+
+/// The `/mcp` router with a design launcher wired in, so `request_design`
+/// can start the concurrent workflow.
+pub fn router_with_launcher(
+    engine: ConfluenceEngine,
+    launcher: Arc<dyn DesignLauncher>,
+) -> axum::Router {
+    build_router(ConseqaMcp::with_launcher(engine, launcher))
+}
+
+fn build_router(mcp: ConseqaMcp) -> axum::Router {
     use rmcp::transport::streamable_http_server::{
         StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
     };
-
-    let mcp = ConseqaMcp::new(engine);
 
     let mut config = StreamableHttpServerConfig::default();
 

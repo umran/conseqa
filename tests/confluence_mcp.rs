@@ -277,6 +277,96 @@ async fn shared_skeleton_put_service_commits_over_mcp() {
 }
 
 #[tokio::test]
+async fn request_design_invokes_the_injected_launcher() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    // A stand-in launcher records how many times the tool triggered it,
+    // proving the MCP tool reaches the injected orchestrator without
+    // confluence depending on the harness.
+    struct MockLauncher {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl mcp::DesignLauncher for MockLauncher {
+        fn launch(&self, _objective: Option<String>) -> Result<serde_json::Value, String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+
+            Ok(serde_json::json!({ "launched": true, "backend": "mock" }))
+        }
+    }
+
+    let engine = ConfluenceEngine::in_memory(WorkspaceState::empty(RunMetadata::new(RunId(
+        "design".to_string(),
+    ))))
+    .expect("engine starts");
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let launcher = Arc::new(MockLauncher {
+        calls: Arc::clone(&calls),
+    });
+
+    let router = mcp::router_with_launcher(engine.clone(), launcher);
+
+    let server = mcp::serve_router(router, "127.0.0.1:0".parse().expect("addr"))
+        .await
+        .expect("mcp server binds");
+
+    let url = format!("http://{}/mcp", server.local_addr);
+
+    let handle = engine
+        .create_session(WriteScope::shared_skeleton(), "ui")
+        .expect("session");
+
+    let mut client = McpClient::connect(&url, &handle.token.0).await;
+
+    let (result, is_error) = client.call("request_design", serde_json::json!({})).await;
+
+    assert!(!is_error, "{result}");
+    assert_eq!(result["launched"], true);
+    assert_eq!(result["backend"], "mock");
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn request_design_reports_when_no_launcher_is_configured() {
+    // A plain confluence server (no orchestration backend) reports the
+    // feature is unavailable rather than erroring at the protocol level.
+    let engine = ConfluenceEngine::in_memory(WorkspaceState::empty(RunMetadata::new(RunId(
+        "no-design".to_string(),
+    ))))
+    .expect("engine starts");
+
+    let server = mcp::serve(engine.clone(), "127.0.0.1:0".parse().expect("addr"))
+        .await
+        .expect("mcp server binds");
+
+    let url = format!("http://{}/mcp", server.local_addr);
+
+    let handle = engine
+        .create_session(WriteScope::shared_skeleton(), "ui")
+        .expect("session");
+
+    let mut client = McpClient::connect(&url, &handle.token.0).await;
+
+    let (result, is_error) = client.call("request_design", serde_json::json!({})).await;
+
+    assert!(is_error);
+    assert_eq!(result["launched"], false);
+    assert!(
+        result["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("not available"),
+        "{result}"
+    );
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
 async fn an_interactive_session_commits_repeatedly_under_one_bearer_token() {
     // The UI demo shape: one interactive session token, driven over MCP,
     // committing several patches in a row. The token rolls to a fresh

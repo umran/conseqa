@@ -10,16 +10,26 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use axum::extract::{Path, State};
 use axum::routing::{get, post};
 use axum::Json;
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
+use parking_lot::{Mutex, RwLock};
 use serde::Deserialize;
 
+use conseqa::confluence::mcp::{self, DesignLauncher};
 use conseqa::confluence::{
     AnalysisState, ConfluenceEngine, CreateTask, Persistence, PromptEvidence, RunId, RunMetadata,
-    TaskBudget, TaskId, TaskKind, WorkspaceState, WriteScope, mcp,
+    TaskBudget, TaskId, TaskKind, WorkspaceState, WriteScope,
+};
+use conseqa::harness::backend::InvocationBudget;
+use conseqa::harness::backends::{ClaudeCliBackend, CodexCliBackend};
+use conseqa::harness::{
+    AgentBackend, RunReport, Scheduler, SchedulerPolicy, Supervisor, Workflow, WorkflowConfig,
 };
 use conseqa::spec::Revision;
 
@@ -58,6 +68,22 @@ enum Command {
         /// The session can commit repeatedly under one token.
         #[arg(long)]
         session: bool,
+
+        /// Backend for the `request_design` concurrent workflow.
+        #[arg(long, value_enum, default_value_t = Backend::Claude)]
+        backend: Backend,
+
+        /// Path to the backend executable (non-default install).
+        #[arg(long)]
+        backend_program: Option<String>,
+
+        /// Maximum worker agents reasoning concurrently in a fanout.
+        #[arg(long, default_value_t = 4)]
+        max_agents: usize,
+
+        /// Where a triggered workflow writes its finalized artifacts.
+        #[arg(long, default_value = ".conseqa/design")]
+        design_out: PathBuf,
     },
 
     /// Print the persisted head, tasks, and commit count.
@@ -99,7 +125,24 @@ async fn main() -> ExitCode {
             model,
             prompt,
             session,
-        } => serve(database, bind, model, prompt, session).await,
+            backend,
+            backend_program,
+            max_agents,
+            design_out,
+        } => {
+            serve(ServeOptions {
+                database,
+                bind,
+                model,
+                prompt,
+                session,
+                backend,
+                backend_program,
+                max_agents,
+                design_out,
+            })
+            .await
+        }
         Command::Status { database } => status(database),
         Command::Export {
             database,
@@ -141,46 +184,79 @@ fn initial_workspace(
     }
 }
 
-async fn serve(
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum Backend {
+    Claude,
+    Codex,
+}
+
+struct ServeOptions {
     database: PathBuf,
     bind: SocketAddr,
     model: Option<PathBuf>,
     prompt: Option<String>,
     session: bool,
-) -> Result<(), String> {
-    let initial = initial_workspace(model, prompt)?;
+    backend: Backend,
+    backend_program: Option<String>,
+    max_agents: usize,
+    design_out: PathBuf,
+}
 
-    let engine = ConfluenceEngine::open(&database, initial)
-        .map_err(|error| format!("cannot open {}: {error}", database.display()))?;
+async fn serve(options: ServeOptions) -> Result<(), String> {
+    let initial = initial_workspace(options.model, options.prompt)?;
+
+    let engine = ConfluenceEngine::open(&options.database, initial)
+        .map_err(|error| format!("cannot open {}: {error}", options.database.display()))?;
+
+    // The workers connect back to this daemon's own MCP endpoint. The
+    // bound URL is known only after binding, so the launcher reads it
+    // from a shared cell filled in below.
+    let mcp_url = Arc::new(RwLock::new(String::new()));
+
+    let backend = build_backend(options.backend, options.backend_program);
+
+    let launcher: Arc<dyn DesignLauncher> = Arc::new(DaemonDesignLauncher {
+        engine: engine.clone(),
+        backend,
+        mcp_url: Arc::clone(&mcp_url),
+        out_dir: options.design_out,
+        max_agents: options.max_agents.max(1),
+        state: Arc::new(DesignState::default()),
+    });
 
     let admin = axum::Router::new()
         .route("/admin/status", get(admin_status))
         .route("/admin/tasks", post(admin_create_task))
         .route("/admin/session", post(admin_create_session))
+        .route("/admin/design", post(admin_create_design))
         .route("/admin/tasks/{task}/cancel", post(admin_cancel_task))
         .route("/admin/analysis/{revision}", get(admin_analysis))
-        .with_state(engine.clone());
+        .with_state(AdminState {
+            engine: engine.clone(),
+            launcher: Arc::clone(&launcher),
+        });
 
-    let router = mcp::router(engine.clone()).merge(admin);
+    let router = mcp::router_with_launcher(engine.clone(), Arc::clone(&launcher)).merge(admin);
 
-    let server = mcp::serve_router(router, bind)
+    let server = mcp::serve_router(router, options.bind)
         .await
-        .map_err(|error| format!("cannot bind {bind}: {error}"))?;
+        .map_err(|error| format!("cannot bind {}: {error}", options.bind))?;
 
-    let mcp_url = format!("http://{}/mcp", server.local_addr);
+    let url = format!("http://{}/mcp", server.local_addr);
+    *mcp_url.write() = url.clone();
 
     println!(
-        "conseqa-confluence serving\n  mcp:   {mcp_url}\n  admin: http://{}/admin/status\n  head:  revision {}",
+        "conseqa-confluence serving\n  mcp:   {url}\n  admin: http://{}/admin/status\n  head:  revision {}",
         server.local_addr,
         engine.head_revision().0,
     );
 
-    if session {
+    if options.session {
         let handle = engine
             .create_session(interactive_scope(), "interactive authoring session")
             .map_err(|error| format!("cannot create session: {error}"))?;
 
-        print_session_config(&mcp_url, &handle.token.0);
+        print_session_config(&url, &handle.token.0);
     }
 
     tokio::signal::ctrl_c()
@@ -192,6 +268,136 @@ async fn serve(
     server.shutdown().await;
 
     Ok(())
+}
+
+fn build_backend(backend: Backend, program: Option<String>) -> Arc<dyn AgentBackend> {
+    match backend {
+        Backend::Claude => {
+            let mut claude = ClaudeCliBackend::new();
+
+            if let Some(program) = program {
+                claude = claude.with_program(program);
+            }
+
+            Arc::new(claude)
+        }
+
+        Backend::Codex => {
+            let mut codex = CodexCliBackend::new();
+
+            if let Some(program) = program {
+                codex = codex.with_program(program);
+            }
+
+            Arc::new(codex)
+        }
+    }
+}
+
+/// Tracks whether a triggered workflow is running and the last report.
+#[derive(Default)]
+struct DesignState {
+    running: AtomicBool,
+    last_report: Mutex<Option<RunReport>>,
+}
+
+/// The daemon's implementation of the MCP `request_design` trigger:
+/// runs the harness workflow against this daemon's shared engine, with
+/// workers connecting back to its own MCP endpoint.
+struct DaemonDesignLauncher {
+    engine: ConfluenceEngine,
+    backend: Arc<dyn AgentBackend>,
+    mcp_url: Arc<RwLock<String>>,
+    out_dir: PathBuf,
+    max_agents: usize,
+    state: Arc<DesignState>,
+}
+
+impl DesignLauncher for DaemonDesignLauncher {
+    fn launch(&self, objective: Option<String>) -> Result<serde_json::Value, String> {
+        // One workflow at a time: the workers share the engine, and a
+        // second overlapping run would just contend for the same
+        // operations.
+        if self
+            .state
+            .running
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return Err("a design workflow is already running on this server".to_string());
+        }
+
+        let mcp_url = self.mcp_url.read().clone();
+
+        if mcp_url.is_empty() {
+            self.state.running.store(false, Ordering::SeqCst);
+
+            return Err("the MCP endpoint is not ready yet".to_string());
+        }
+
+        let work_dir = self.out_dir.join("work");
+
+        let supervisor = Supervisor::new(
+            self.engine.clone(),
+            Arc::clone(&self.backend),
+            mcp_url,
+            None,
+            work_dir,
+        );
+
+        let scheduler = Scheduler::new(
+            self.engine.clone(),
+            supervisor,
+            SchedulerPolicy {
+                max_concurrent_agents: self.max_agents,
+                invocation_budget: InvocationBudget {
+                    max_wall_time_secs: Some(600),
+                    max_turns: Some(60),
+                },
+                ..Default::default()
+            },
+        );
+
+        let workflow = Workflow::new(
+            scheduler,
+            WorkflowConfig {
+                out_dir: self.out_dir.clone(),
+                analysis_timeout: Duration::from_secs(180),
+                max_iterations: 8,
+            },
+        );
+
+        let started_revision = self.engine.head_revision().0;
+        let state = Arc::clone(&self.state);
+
+        tokio::spawn(async move {
+            tracing::info!("concurrent design workflow started");
+
+            match workflow.run().await {
+                Ok(report) => {
+                    tracing::info!(?report.status, "concurrent design workflow finished");
+                    *state.last_report.lock() = Some(report);
+                }
+                Err(error) => {
+                    tracing::error!("concurrent design workflow failed: {error}");
+                }
+            }
+
+            state.running.store(false, Ordering::SeqCst);
+        });
+
+        let _ = objective;
+
+        Ok(serde_json::json!({
+            "launched": true,
+            "backend": self.backend.name(),
+            "max_agents": self.max_agents,
+            "started_at_revision": started_revision,
+            "note": "Worker agents are running in the background against this shared model. \
+                     Watch the head advance with task_context and read the growing model \
+                     with the read tools; results also land in the design output directory.",
+        }))
+    }
 }
 
 /// The full authoring scope for an interactive UI session: it may
@@ -228,6 +434,14 @@ fn print_session_config(mcp_url: &str, token: &str) {
     );
 }
 
+/// Shared state for the admin surface: the engine and the design
+/// launcher.
+#[derive(Clone)]
+struct AdminState {
+    engine: ConfluenceEngine,
+    launcher: Arc<dyn DesignLauncher>,
+}
+
 #[derive(Deserialize)]
 struct AdminCreateTask {
     kind: TaskKind,
@@ -239,10 +453,10 @@ struct AdminCreateTask {
 }
 
 async fn admin_create_task(
-    State(engine): State<ConfluenceEngine>,
+    State(state): State<AdminState>,
     Json(request): Json<AdminCreateTask>,
 ) -> Json<serde_json::Value> {
-    match engine.create_task(CreateTask {
+    match state.engine.create_task(CreateTask {
         kind: request.kind,
         objective: request.objective,
         write_scope: request.write_scope,
@@ -261,10 +475,11 @@ async fn admin_create_task(
 
 /// Creates an interactive authoring session over the current head and
 /// returns its token plus a ready-to-paste authorization header.
-async fn admin_create_session(
-    State(engine): State<ConfluenceEngine>,
-) -> Json<serde_json::Value> {
-    match engine.create_session(interactive_scope(), "interactive authoring session") {
+async fn admin_create_session(State(state): State<AdminState>) -> Json<serde_json::Value> {
+    match state
+        .engine
+        .create_session(interactive_scope(), "interactive authoring session")
+    {
         Ok(handle) => Json(serde_json::json!({
             "task": handle.id.to_string(),
             "token": handle.token.0,
@@ -276,8 +491,17 @@ async fn admin_create_session(
     }
 }
 
+/// Launches the concurrent design workflow from a terminal trigger, the
+/// same one `request_design` uses from the UI.
+async fn admin_create_design(State(state): State<AdminState>) -> Json<serde_json::Value> {
+    match state.launcher.launch(None) {
+        Ok(value) => Json(value),
+        Err(error) => Json(serde_json::json!({ "launched": false, "error": error })),
+    }
+}
+
 async fn admin_cancel_task(
-    State(engine): State<ConfluenceEngine>,
+    State(state): State<AdminState>,
     Path(task): Path<String>,
 ) -> Json<serde_json::Value> {
     let Ok(task) = task
@@ -288,13 +512,14 @@ async fn admin_cancel_task(
         return Json(serde_json::json!({ "error": "not a task id" }));
     };
 
-    match engine.cancel_task(TaskId(task)) {
+    match state.engine.cancel_task(TaskId(task)) {
         Ok(()) => Json(serde_json::json!({ "cancelled": true })),
         Err(error) => Json(serde_json::json!({ "error": error.to_string() })),
     }
 }
 
-async fn admin_status(State(engine): State<ConfluenceEngine>) -> Json<serde_json::Value> {
+async fn admin_status(State(state): State<AdminState>) -> Json<serde_json::Value> {
+    let engine = &state.engine;
     let head = engine.head_revision();
 
     let tasks: Vec<serde_json::Value> = engine
@@ -319,10 +544,10 @@ async fn admin_status(State(engine): State<ConfluenceEngine>) -> Json<serde_json
 }
 
 async fn admin_analysis(
-    State(engine): State<ConfluenceEngine>,
+    State(state): State<AdminState>,
     Path(revision): Path<u64>,
 ) -> Json<serde_json::Value> {
-    let state = engine.analysis_state(Revision(revision));
+    let state = state.engine.analysis_state(Revision(revision));
 
     let value = match &state {
         AnalysisState::Ready(analysis) => serde_json::json!({
