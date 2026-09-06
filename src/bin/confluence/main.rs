@@ -117,6 +117,28 @@ enum Command {
         max_agents: usize,
     },
 
+    /// Serve one shared multi-project instance over stdio, for the
+    /// Claude Desktop / Code UI. The app spawns this command and speaks
+    /// MCP over stdin/stdout — no URL, no TLS, no certificate. Projects
+    /// are created and selected through the MCP project tools.
+    Stdio {
+        /// Directory holding one database per project.
+        #[arg(long, default_value_t = default_data_dir())]
+        data_dir: String,
+
+        /// Backend for the `request_design` concurrent workflow.
+        #[arg(long, value_enum, default_value_t = Backend::Claude)]
+        backend: Backend,
+
+        /// Path to the backend executable (non-default install).
+        #[arg(long)]
+        backend_program: Option<String>,
+
+        /// Maximum worker agents reasoning concurrently in a fanout.
+        #[arg(long, default_value_t = 4)]
+        max_agents: usize,
+    },
+
     /// Print the persisted head, tasks, and commit count.
     Status {
         #[arg(long, default_value = ".conseqa/confluence.redb")]
@@ -140,7 +162,10 @@ enum Command {
 
 #[tokio::main]
 async fn main() -> ExitCode {
+    // Logs go to stderr: the `stdio` command uses stdout as the MCP
+    // channel, and stderr is harmless for every other command too.
     tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| "info".into()),
@@ -186,6 +211,20 @@ async fn main() -> ExitCode {
                 data_dir: PathBuf::from(data_dir),
                 bind,
                 api_key,
+                backend,
+                backend_program,
+                max_agents,
+            })
+            .await
+        }
+        Command::Stdio {
+            data_dir,
+            backend,
+            backend_program,
+            max_agents,
+        } => {
+            serve_stdio_cmd(StdioOptions {
+                data_dir: PathBuf::from(data_dir),
                 backend,
                 backend_program,
                 max_agents,
@@ -471,6 +510,62 @@ fn print_global_config(mcp_url: &str, api_key: &str, data_dir: &std::path::Path)
          running; the API key is stable across restarts.\n",
         data_dir.display(),
     );
+}
+
+struct StdioOptions {
+    data_dir: PathBuf,
+    backend: Backend,
+    backend_program: Option<String>,
+    max_agents: usize,
+}
+
+async fn serve_stdio_cmd(options: StdioOptions) -> Result<(), String> {
+    std::fs::create_dir_all(&options.data_dir)
+        .map_err(|error| format!("cannot create {}: {error}", options.data_dir.display()))?;
+
+    let manager = Arc::new(conseqa::confluence::WorkspaceManager::new(&options.data_dir));
+
+    // Worker agents from request_design are `claude -p` subprocesses,
+    // which accept an http MCP URL. They connect back to a private
+    // loopback endpoint sharing this manager; the UI itself speaks over
+    // stdio and never touches http.
+    let mcp_url = Arc::new(RwLock::new(String::new()));
+    let backend = build_backend(options.backend, options.backend_program);
+
+    let launcher: Arc<dyn DesignLauncher> = Arc::new(DaemonDesignLauncher {
+        backend,
+        mcp_url: Arc::clone(&mcp_url),
+        out_dir: options.data_dir.join("design"),
+        max_agents: options.max_agents.max(1),
+        state: Arc::new(DesignState::default()),
+    });
+
+    let worker_key = conseqa::confluence::TaskToken::generate().0;
+
+    let worker_server = mcp::serve_router(
+        mcp::router_multi(Arc::clone(&manager), worker_key, Some(Arc::clone(&launcher))),
+        "127.0.0.1:0".parse().expect("valid bind address"),
+    )
+    .await
+    .map_err(|error| format!("cannot start the worker endpoint: {error}"))?;
+
+    *mcp_url.write() = format!("http://{}/mcp", worker_server.local_addr);
+
+    tracing::info!(
+        data_dir = %options.data_dir.display(),
+        worker_endpoint = %worker_server.local_addr,
+        "conseqa stdio server ready"
+    );
+
+    // Blocks until the UI client disconnects. Keep the worker endpoint
+    // alive for the duration.
+    let result = mcp::serve_stdio(manager, Some(launcher))
+        .await
+        .map_err(|error| format!("stdio server error: {error}"));
+
+    worker_server.shutdown().await;
+
+    result
 }
 
 fn build_backend(backend: Backend, program: Option<String>) -> Arc<dyn AgentBackend> {

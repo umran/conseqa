@@ -210,13 +210,22 @@ struct ProjectSession {
     token: String,
 }
 
-/// Multi-project hosting: a stable API key authenticates UI clients,
-/// which select the active project through the project tools.
+/// Shared project hosting: a manager of many project engines and the
+/// single active project. The active-project slot is server-wide (see
+/// [`ProjectSession`]).
 #[derive(Clone)]
-struct MultiProject {
+struct ProjectHost {
     manager: Arc<WorkspaceManager>,
-    api_key: String,
     active: Arc<parking_lot::RwLock<Option<ProjectSession>>>,
+}
+
+impl ProjectHost {
+    fn new(manager: Arc<WorkspaceManager>) -> Self {
+        Self {
+            manager,
+            active: Arc::new(parking_lot::RwLock::new(None)),
+        }
+    }
 }
 
 /// How the MCP server resolves credentials and finds engines.
@@ -226,10 +235,16 @@ enum Backing {
     /// embedded and single-project daemon paths.
     Single(ConfluenceEngine),
 
-    /// Many projects behind a stable API key; the UI selects a project
-    /// per connection, and worker capability tokens resolve against the
-    /// open engines.
-    Multi(MultiProject),
+    /// Many projects over HTTP behind a stable API key; the UI selects
+    /// the active project through the project tools, and worker
+    /// capability tokens resolve against the open engines.
+    Multi { host: ProjectHost, api_key: String },
+
+    /// Many projects over stdio: the single local client is inherently
+    /// trusted (no bearer to send), so no API key is required. Used by
+    /// the `stdio` command for the Claude Desktop / Code UI, which
+    /// accepts a command-based (stdio) MCP server without TLS.
+    Local(ProjectHost),
 }
 
 /// What one authenticated architecture request resolves to.
@@ -270,7 +285,7 @@ impl ConseqaMcp {
         }
     }
 
-    /// A multi-project server: a stable API key authenticates UI
+    /// A multi-project HTTP server: a stable API key authenticates UI
     /// clients, which select projects through the project tools.
     pub fn multi(
         manager: Arc<WorkspaceManager>,
@@ -278,11 +293,22 @@ impl ConseqaMcp {
         launcher: Option<Arc<dyn DesignLauncher>>,
     ) -> Self {
         Self {
-            backing: Backing::Multi(MultiProject {
-                manager,
+            backing: Backing::Multi {
+                host: ProjectHost::new(manager),
                 api_key: api_key.into(),
-                active: Arc::new(parking_lot::RwLock::new(None)),
-            }),
+            },
+            launcher,
+        }
+    }
+
+    /// A multi-project stdio server: no API key, since the single local
+    /// client is inherently trusted. For the Claude Desktop / Code UI.
+    pub fn local(
+        manager: Arc<WorkspaceManager>,
+        launcher: Option<Arc<dyn DesignLauncher>>,
+    ) -> Self {
+        Self {
+            backing: Backing::Local(ProjectHost::new(manager)),
             launcher,
         }
     }
@@ -308,10 +334,10 @@ impl ConseqaMcp {
 
     /// Resolves a request to an authorized `(engine, task)` (§43).
     fn resolve(&self, context: &RequestContext<RoleServer>) -> Result<Resolved, ResolveError> {
-        let bearer = Self::bearer(context)?;
-
         match &self.backing {
             Backing::Single(engine) => {
+                let bearer = Self::bearer(context)?;
+
                 let task = engine.resolve_token(&bearer).ok_or_else(|| {
                     ResolveError::Unauthorized(
                         "the task capability is not recognized; the task may have ended"
@@ -325,25 +351,15 @@ impl ConseqaMcp {
                 })
             }
 
-            Backing::Multi(multi) => {
-                if bearer == multi.api_key {
-                    // Interactive UI client: use the active project.
-                    let session = multi.active.read().clone().ok_or(ResolveError::NoProject)?;
+            Backing::Multi { host, api_key } => {
+                let bearer = Self::bearer(context)?;
 
-                    let task = session.engine.resolve_token(&session.token).ok_or_else(|| {
-                        ResolveError::Unauthorized(
-                            "the project session has ended; open a project again".to_string(),
-                        )
-                    })?;
-
-                    Ok(Resolved {
-                        engine: session.engine,
-                        task,
-                    })
+                if &bearer == api_key {
+                    host.active_resolved()
                 } else {
                     // Worker agent: its capability token resolves in
                     // whichever open project engine minted it.
-                    for engine in multi.manager.open_engines() {
+                    for engine in host.manager.open_engines() {
                         if let Some(task) = engine.resolve_token(&bearer) {
                             return Ok(Resolved { engine, task });
                         }
@@ -354,38 +370,63 @@ impl ConseqaMcp {
                     ))
                 }
             }
+
+            // stdio: the local client is trusted; no bearer to check.
+            Backing::Local(host) => host.active_resolved(),
         }
     }
 
-    /// Authenticates a UI client for the project tools (which select a
-    /// project rather than operate within one).
-    fn authenticate_client(
+    /// The project host for the project-selection tools, authenticated
+    /// as appropriate for the backing.
+    fn project_host(
         &self,
         context: &RequestContext<RoleServer>,
-    ) -> Result<MultiProject, McpError> {
-        let bearer = Self::bearer(context).map_err(resolve_to_mcp_error)?;
+    ) -> Result<ProjectHost, McpError> {
+        match &self.backing {
+            Backing::Multi { host, api_key } => {
+                let bearer = Self::bearer(context).map_err(resolve_to_mcp_error)?;
 
-        let Backing::Multi(multi) = &self.backing else {
-            return Err(McpError::invalid_request(
+                if &bearer != api_key {
+                    return Err(McpError::invalid_request("the API key is not recognized", None));
+                }
+
+                Ok(host.clone())
+            }
+
+            Backing::Local(host) => Ok(host.clone()),
+
+            Backing::Single(_) => Err(McpError::invalid_request(
                 "project selection is only available on a multi-project server",
                 None,
-            ));
-        };
-
-        if bearer != multi.api_key {
-            return Err(McpError::invalid_request("the API key is not recognized", None));
+            )),
         }
+    }
+}
 
-        Ok(multi.clone())
+impl ProjectHost {
+    /// Resolves the active project to `(engine, task)`.
+    fn active_resolved(&self) -> Result<Resolved, ResolveError> {
+        let session = self.active.read().clone().ok_or(ResolveError::NoProject)?;
+
+        let task = session.engine.resolve_token(&session.token).ok_or_else(|| {
+            ResolveError::Unauthorized(
+                "the project session has ended; open a project again".to_string(),
+            )
+        })?;
+
+        Ok(Resolved {
+            engine: session.engine,
+            task,
+        })
     }
 
     /// Opens or creates a project and makes it the active one.
-    fn open_project_session(
-        multi: &MultiProject,
+    fn activate(
+        &self,
         project: &str,
         prompt: Option<String>,
-    ) -> Result<(ConfluenceEngine, super::workspace_manager::ProjectInfo), String> {
-        let engine = multi
+    ) -> Result<super::workspace_manager::ProjectInfo, String> {
+        let engine = self
             .manager
             .open_or_create(project, prompt)
             .map_err(|error| error.to_string())?;
@@ -397,18 +438,16 @@ impl ConseqaMcp {
             )
             .map_err(|error| error.to_string())?;
 
-        *multi.active.write() = Some(ProjectSession {
+        *self.active.write() = Some(ProjectSession {
             engine: engine.clone(),
             token: handle.token.0,
         });
 
-        let info = super::workspace_manager::ProjectInfo {
+        Ok(super::workspace_manager::ProjectInfo {
             name: project.to_string(),
             open: true,
             revision: Some(engine.head_revision()),
-        };
-
-        Ok((engine, info))
+        })
     }
 }
 
@@ -849,9 +888,9 @@ impl ConseqaMcp {
         &self,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        let multi = self.authenticate_client(&context)?;
+        let host = self.project_host(&context)?;
 
-        let projects: Vec<serde_json::Value> = multi
+        let projects: Vec<serde_json::Value> = host
             .manager
             .list()
             .into_iter()
@@ -877,11 +916,11 @@ impl ConseqaMcp {
         params: Parameters<OpenProjectParams>,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        let multi = self.authenticate_client(&context)?;
+        let host = self.project_host(&context)?;
         let params = params.0;
 
-        match Self::open_project_session(&multi, &params.project, params.prompt) {
-            Ok((_engine, info)) => json_result(serde_json::json!({
+        match host.activate(&params.project, params.prompt) {
+            Ok(info) => json_result(serde_json::json!({
                 "project": info.name,
                 "opened": true,
                 "revision": info.revision.map(|revision| revision.0),
@@ -908,10 +947,10 @@ impl ConseqaMcp {
         params: Parameters<CreateProjectParams>,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        let multi = self.authenticate_client(&context)?;
+        let host = self.project_host(&context)?;
         let params = params.0;
 
-        if multi
+        if host
             .manager
             .list()
             .into_iter()
@@ -924,8 +963,8 @@ impl ConseqaMcp {
             }));
         }
 
-        match Self::open_project_session(&multi, &params.project, params.prompt) {
-            Ok((_engine, info)) => json_result(serde_json::json!({
+        match host.activate(&params.project, params.prompt) {
+            Ok(info) => json_result(serde_json::json!({
                 "project": info.name,
                 "created": true,
                 "note": "New project created and now active. Its prompt is in task_context. \
@@ -966,6 +1005,31 @@ impl ServerHandler for ConseqaMcp {
 
         info
     }
+}
+
+/// Serves a multi-project MCP server over stdio for `manager`, until
+/// the client disconnects. Nothing may be written to stdout by the rest
+/// of the process — stdout is the MCP channel — so route logs to stderr.
+///
+/// This is the transport Claude Desktop / Code accepts for a local
+/// server without TLS: the app spawns the command and speaks MCP over
+/// its stdin/stdout, so there is no `https` URL to satisfy.
+pub async fn serve_stdio(
+    manager: Arc<WorkspaceManager>,
+    launcher: Option<Arc<dyn DesignLauncher>>,
+) -> std::io::Result<()> {
+    use rmcp::{ServiceExt, transport::stdio};
+
+    let mcp = ConseqaMcp::local(manager, launcher);
+
+    let service = mcp
+        .serve(stdio())
+        .await
+        .map_err(std::io::Error::other)?;
+
+    service.waiting().await.map_err(std::io::Error::other)?;
+
+    Ok(())
 }
 
 /// A running MCP server bound to localhost.
