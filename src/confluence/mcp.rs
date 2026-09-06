@@ -191,9 +191,15 @@ pub trait DesignLauncher: Send + Sync {
     ) -> Result<serde_json::Value, String>;
 }
 
-/// One interactive UI connection's project state, keyed by its MCP
-/// transport session id. Established by `open_project` / `create_project`
-/// and reused across the connection's later tool calls.
+/// The active project the API key is working on. Established by
+/// `open_project` / `create_project` and used by later tool calls.
+///
+/// It is a single server-wide slot rather than per-connection state,
+/// because the Streamable HTTP transport can run statelessly — real
+/// clients (Claude Code) do not carry a stable session id across calls,
+/// so there is nothing per-connection to key on. For one human working
+/// one project at a time this is exactly right; concurrent isolation of
+/// two simultaneous UI connections is intentionally not offered here.
 #[derive(Clone)]
 struct ProjectSession {
     engine: ConfluenceEngine,
@@ -205,12 +211,12 @@ struct ProjectSession {
 }
 
 /// Multi-project hosting: a stable API key authenticates UI clients,
-/// and each connection selects a project through the project tools.
+/// which select the active project through the project tools.
 #[derive(Clone)]
 struct MultiProject {
     manager: Arc<WorkspaceManager>,
     api_key: String,
-    sessions: Arc<parking_lot::RwLock<rustc_hash::FxHashMap<String, ProjectSession>>>,
+    active: Arc<parking_lot::RwLock<Option<ProjectSession>>>,
 }
 
 /// How the MCP server resolves credentials and finds engines.
@@ -275,44 +281,34 @@ impl ConseqaMcp {
             backing: Backing::Multi(MultiProject {
                 manager,
                 api_key: api_key.into(),
-                sessions: Arc::new(parking_lot::RwLock::new(rustc_hash::FxHashMap::default())),
+                active: Arc::new(parking_lot::RwLock::new(None)),
             }),
             launcher,
         }
     }
 
-    /// The bearer credential and MCP transport session id of a request.
-    fn credentials(
-        context: &RequestContext<RoleServer>,
-    ) -> Result<(String, Option<String>), ResolveError> {
+    /// The bearer credential of a request.
+    fn bearer(context: &RequestContext<RoleServer>) -> Result<String, ResolveError> {
         let parts = context.extensions.get::<http::request::Parts>().ok_or_else(|| {
             ResolveError::Unauthorized("the transport did not carry HTTP request parts".to_string())
         })?;
 
-        let bearer = parts
+        parts
             .headers
             .get(http::header::AUTHORIZATION)
             .and_then(|value| value.to_str().ok())
             .and_then(|value| value.strip_prefix("Bearer "))
+            .map(str::to_string)
             .ok_or_else(|| {
                 ResolveError::Unauthorized(
                     "missing credential: send `Authorization: Bearer <token>`".to_string(),
                 )
-            })?
-            .to_string();
-
-        let session = parts
-            .headers
-            .get("mcp-session-id")
-            .and_then(|value| value.to_str().ok())
-            .map(str::to_string);
-
-        Ok((bearer, session))
+            })
     }
 
     /// Resolves a request to an authorized `(engine, task)` (§43).
     fn resolve(&self, context: &RequestContext<RoleServer>) -> Result<Resolved, ResolveError> {
-        let (bearer, mcp_session) = Self::credentials(context)?;
+        let bearer = Self::bearer(context)?;
 
         match &self.backing {
             Backing::Single(engine) => {
@@ -331,15 +327,8 @@ impl ConseqaMcp {
 
             Backing::Multi(multi) => {
                 if bearer == multi.api_key {
-                    // Interactive UI client: route by connection.
-                    let session_id = mcp_session.ok_or(ResolveError::NoProject)?;
-
-                    let session = multi
-                        .sessions
-                        .read()
-                        .get(&session_id)
-                        .cloned()
-                        .ok_or(ResolveError::NoProject)?;
+                    // Interactive UI client: use the active project.
+                    let session = multi.active.read().clone().ok_or(ResolveError::NoProject)?;
 
                     let task = session.engine.resolve_token(&session.token).ok_or_else(|| {
                         ResolveError::Unauthorized(
@@ -369,13 +358,12 @@ impl ConseqaMcp {
     }
 
     /// Authenticates a UI client for the project tools (which select a
-    /// project rather than operate within one), returning its MCP
-    /// session id.
+    /// project rather than operate within one).
     fn authenticate_client(
         &self,
         context: &RequestContext<RoleServer>,
-    ) -> Result<(MultiProject, String), McpError> {
-        let (bearer, mcp_session) = Self::credentials(context).map_err(resolve_to_mcp_error)?;
+    ) -> Result<MultiProject, McpError> {
+        let bearer = Self::bearer(context).map_err(resolve_to_mcp_error)?;
 
         let Backing::Multi(multi) = &self.backing else {
             return Err(McpError::invalid_request(
@@ -385,24 +373,15 @@ impl ConseqaMcp {
         };
 
         if bearer != multi.api_key {
-            return Err(McpError::invalid_request(
-                "the API key is not recognized",
-                None,
-            ));
+            return Err(McpError::invalid_request("the API key is not recognized", None));
         }
 
-        let session_id = mcp_session.ok_or_else(|| {
-            McpError::invalid_request("the transport did not carry an MCP session id", None)
-        })?;
-
-        Ok((multi.clone(), session_id))
+        Ok(multi.clone())
     }
 
-    /// Opens or creates a project for this connection and starts its
-    /// interactive session.
+    /// Opens or creates a project and makes it the active one.
     fn open_project_session(
         multi: &MultiProject,
-        mcp_session: &str,
         project: &str,
         prompt: Option<String>,
     ) -> Result<(ConfluenceEngine, super::workspace_manager::ProjectInfo), String> {
@@ -418,13 +397,10 @@ impl ConseqaMcp {
             )
             .map_err(|error| error.to_string())?;
 
-        multi.sessions.write().insert(
-            mcp_session.to_string(),
-            ProjectSession {
-                engine: engine.clone(),
-                token: handle.token.0,
-            },
-        );
+        *multi.active.write() = Some(ProjectSession {
+            engine: engine.clone(),
+            token: handle.token.0,
+        });
 
         let info = super::workspace_manager::ProjectInfo {
             name: project.to_string(),
@@ -866,14 +842,14 @@ impl ConseqaMcp {
 
     #[tool(
         description = "List the projects this server hosts, each an isolated architecture \
-                       model with its own history. Use open_project to select one for this \
-                       connection, or create_project to start a new one."
+                       model with its own history. Use open_project to make one \
+                       active, or create_project to start a new one."
     )]
     async fn list_projects(
         &self,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        let (multi, _session) = self.authenticate_client(&context)?;
+        let multi = self.authenticate_client(&context)?;
 
         let projects: Vec<serde_json::Value> = multi
             .manager
@@ -892,26 +868,27 @@ impl ConseqaMcp {
     }
 
     #[tool(
-        description = "Select an existing project for this connection. Every subsequent \
-                       architecture tool call operates on it. Creates the project if it does \
-                       not exist. Pass an optional prompt to seed a new project's intent."
+        description = "Select a project as the active one. Every subsequent architecture \
+                       tool call operates on it. Creates the project if it does not exist. \
+                       Pass an optional prompt to seed a new project's intent."
     )]
     async fn open_project(
         &self,
         params: Parameters<OpenProjectParams>,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        let (multi, session_id) = self.authenticate_client(&context)?;
+        let multi = self.authenticate_client(&context)?;
         let params = params.0;
 
-        match Self::open_project_session(&multi, &session_id, &params.project, params.prompt) {
+        match Self::open_project_session(&multi, &params.project, params.prompt) {
             Ok((_engine, info)) => json_result(serde_json::json!({
                 "project": info.name,
                 "opened": true,
                 "revision": info.revision.map(|revision| revision.0),
-                "note": "This connection is now working on this project. Use task_context and \
-                         the read tools to explore it, submit_patch to change it, and \
-                         request_design to fan out concurrent agents.",
+                "note": "This is now the active project. Use task_context and the read \
+                         tools to explore it, submit_patch to change it, and request_design \
+                         to fan out concurrent agents. Opening another project switches the \
+                         active one.",
             })),
 
             Err(error) => json_error(serde_json::json!({
@@ -922,7 +899,7 @@ impl ConseqaMcp {
     }
 
     #[tool(
-        description = "Create a new isolated project and select it for this connection, \
+        description = "Create a new isolated project and make it active, \
                        seeded with an optional natural-language prompt describing the system \
                        to build. Errors if a project of that name already exists."
     )]
@@ -931,7 +908,7 @@ impl ConseqaMcp {
         params: Parameters<CreateProjectParams>,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        let (multi, session_id) = self.authenticate_client(&context)?;
+        let multi = self.authenticate_client(&context)?;
         let params = params.0;
 
         if multi
@@ -947,13 +924,13 @@ impl ConseqaMcp {
             }));
         }
 
-        match Self::open_project_session(&multi, &session_id, &params.project, params.prompt) {
+        match Self::open_project_session(&multi, &params.project, params.prompt) {
             Ok((_engine, info)) => json_result(serde_json::json!({
                 "project": info.name,
                 "created": true,
-                "note": "New project created and selected for this connection. Its prompt is \
-                         in task_context. Build it with submit_patch, or call request_design \
-                         to fan out concurrent agents.",
+                "note": "New project created and now active. Its prompt is in task_context. \
+                         Build it with submit_patch, or call request_design to fan out \
+                         concurrent agents.",
             })),
 
             Err(error) => json_error(serde_json::json!({

@@ -280,8 +280,10 @@ async fn shared_skeleton_put_service_commits_over_mcp() {
 async fn a_multi_project_server_isolates_projects_behind_one_api_key() {
     use std::sync::Arc;
 
-    // One global server, a stable API key, two projects. Each connection
-    // selects a project and its edits are isolated to that project.
+    // One global server, a stable API key. Projects are isolated: the
+    // active project switches, and each keeps its own model. This does
+    // not depend on any MCP session id — real clients (Claude Code) run
+    // the transport statelessly — so the client never sends one.
     let dir = std::env::temp_dir().join(format!("conseqa-multi-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&dir).expect("data dir");
 
@@ -297,11 +299,11 @@ async fn a_multi_project_server_isolates_projects_behind_one_api_key() {
 
     let url = format!("http://{}/mcp", server.local_addr);
 
-    // Client A: create and work on project "checkout".
-    let mut a = McpClient::connect(&url, &api_key).await;
+    let mut client = McpClient::connect(&url, &api_key).await;
 
-    // Before opening a project, architecture tools guide the agent.
-    let (early, is_error) = a.call("task_context", serde_json::json!({})).await;
+    // Before any project is active, architecture tools guide rather than
+    // fail at the protocol level.
+    let (early, is_error) = client.call("task_context", serde_json::json!({})).await;
     assert!(is_error);
     assert!(
         early["error"]
@@ -311,7 +313,8 @@ async fn a_multi_project_server_isolates_projects_behind_one_api_key() {
         "{early}"
     );
 
-    let (created, is_error) = a
+    // Create "checkout", grounded by its prompt, and commit a service.
+    let (created, is_error) = client
         .call(
             "create_project",
             serde_json::json!({"project": "checkout", "prompt": "A checkout system."}),
@@ -320,12 +323,10 @@ async fn a_multi_project_server_isolates_projects_behind_one_api_key() {
     assert!(!is_error, "{created}");
     assert_eq!(created["created"], true);
 
-    // The project's prompt is grounded in task_context.
-    let (context, _) = a.call("task_context", serde_json::json!({})).await;
+    let (context, _) = client.call("task_context", serde_json::json!({})).await;
     assert_eq!(context["prompt_evidence"][0]["excerpt"], "A checkout system.");
 
-    // A commits a service into "checkout".
-    let (committed, is_error) = a
+    let (committed, is_error) = client
         .call(
             "submit_patch",
             serde_json::json!({"patch": {"mutations": [
@@ -336,17 +337,14 @@ async fn a_multi_project_server_isolates_projects_behind_one_api_key() {
     assert!(!is_error, "{committed}");
     assert_eq!(committed["committed"], true);
 
-    // Client B: a separate connection, same API key, opens a different
-    // project "billing".
-    let mut b = McpClient::connect(&url, &api_key).await;
-
-    let (_opened, is_error) = b
+    // Switch to a fresh "billing" project: it is empty — checkout's
+    // service is not visible.
+    let (_opened, is_error) = client
         .call("open_project", serde_json::json!({"project": "billing"}))
         .await;
     assert!(!is_error);
 
-    // B's project is empty — A's service is not visible here.
-    let (search, _) = b
+    let (search, _) = client
         .call("search_symbols", serde_json::json!({"kind": "service"}))
         .await;
     assert_eq!(
@@ -355,8 +353,28 @@ async fn a_multi_project_server_isolates_projects_behind_one_api_key() {
         "billing is isolated from checkout: {search}"
     );
 
+    // Switch back to checkout: its committed service is still there,
+    // proving projects persist independently.
+    client
+        .call("open_project", serde_json::json!({"project": "checkout"}))
+        .await;
+
+    let (search, _) = client
+        .call("search_symbols", serde_json::json!({"kind": "service"}))
+        .await;
+    let services: Vec<&str> = search["symbols"]
+        .as_array()
+        .expect("symbols")
+        .iter()
+        .filter_map(|s| s["value"].as_str())
+        .collect();
+    assert!(
+        services.contains(&"service.checkout"),
+        "checkout kept its service: {search}"
+    );
+
     // list_projects sees both.
-    let (list, _) = a.call("list_projects", serde_json::json!({})).await;
+    let (list, _) = client.call("list_projects", serde_json::json!({})).await;
     let names: Vec<&str> = list["projects"]
         .as_array()
         .expect("projects")
