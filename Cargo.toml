@@ -94,6 +94,14 @@ required-features = ["confluence"]
 name = "harness_backends"
 required-features = ["confluence"]
 
+[[test]]
+name = "harness_workflow"
+required-features = ["confluence"]
+
+[[test]]
+name = "harness_live"
+required-features = ["confluence"]
+
 [[bin]]
 name = "conseqa"
 path = "src/main.rs"

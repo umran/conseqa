@@ -12,7 +12,6 @@ use std::time::Duration;
 use clap::{Parser, Subcommand, ValueEnum};
 
 use conseqa::confluence::{ConfluenceEngine, RunId, RunMetadata, RunPolicy, WorkspaceState, mcp};
-use conseqa::harness::backend::InvocationBudget;
 use conseqa::harness::backends::{ClaudeCliBackend, CodexCliBackend};
 use conseqa::harness::{
     AgentBackend, Scheduler, SchedulerPolicy, Supervisor, Workflow, WorkflowConfig,
