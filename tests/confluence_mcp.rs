@@ -188,6 +188,438 @@ fn execution_patch(operation: &str, bound: u32) -> serde_json::Value {
 }
 
 #[tokio::test]
+async fn shared_skeleton_put_service_commits_over_mcp() {
+    // The exact path the live decomposer agent takes: an empty
+    // workspace, a shared-skeleton task, and one put_service mutation
+    // submitted through MCP. Existing tests only exercised
+    // replace_operation_execution, so this path was untested.
+    let engine = ConfluenceEngine::in_memory(WorkspaceState::empty(RunMetadata::new(RunId(
+        "skeleton".to_string(),
+    ))))
+    .expect("engine starts");
+
+    let server = mcp::serve(engine.clone(), "127.0.0.1:0".parse().expect("bind addr"))
+        .await
+        .expect("the mcp server binds");
+
+    let url = format!("http://{}/mcp", server.local_addr);
+
+    let handle = engine
+        .create_task(CreateTask {
+            kind: TaskKind::Decompose,
+            objective: "create a service".to_string(),
+            write_scope: WriteScope::shared_skeleton(),
+            prompt_evidence: Vec::new(),
+            budget: TaskBudget::default(),
+        })
+        .expect("task is created");
+
+    let mut client = McpClient::connect(&url, &handle.token.0).await;
+
+    // Raw response first, so a JSON-RPC error (what the live agent read
+    // as a "transport issue") is visible rather than swallowed.
+    let raw = client
+        .rpc(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 100,
+            "method": "tools/call",
+            "params": {
+                "name": "submit_patch",
+                "arguments": {
+                    "patch": {
+                        "mutations": [
+                            {"kind": "put_service", "id": "service.api",
+                             "value": {"kind": "backend"}}
+                        ]
+                    }
+                },
+            },
+        }))
+        .await;
+
+    assert!(
+        raw.get("result").is_some(),
+        "submit_patch returned a JSON-RPC error, not a tool result: {raw}"
+    );
+
+    // The single put_service committed and advanced the head.
+    let result = &raw["result"];
+    assert_eq!(result["isError"], false, "put_service was rejected: {raw}");
+
+    let head = engine.head_snapshot();
+    assert_eq!(head.revision.0, 1);
+    assert!(
+        head.workspace
+            .services
+            .contains_key(&Id("service.api".to_string()))
+    );
+
+    // A task commits exactly one patch. A second submission on the same
+    // task reports completion clearly, not a contradictory "adjust and
+    // retry" — the confusion the live agent hit.
+    let (again, _) = client
+        .call(
+            "submit_patch",
+            serde_json::json!({
+                "patch": {
+                    "mutations": [
+                        {"kind": "put_service", "id": "service.other",
+                         "value": {"kind": "worker"}}
+                    ]
+                }
+            }),
+        )
+        .await;
+
+    assert_eq!(again["already_committed"], true, "{again}");
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_multi_project_server_isolates_projects_behind_one_api_key() {
+    use std::sync::Arc;
+
+    // One global server, a stable API key, two projects. Each connection
+    // selects a project and its edits are isolated to that project.
+    let dir = std::env::temp_dir().join(format!("conseqa-multi-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).expect("data dir");
+
+    let manager = Arc::new(conseqa::confluence::WorkspaceManager::new(&dir));
+    let api_key = "test-api-key-xyz".to_string();
+
+    let server = mcp::serve_router(
+        mcp::router_multi(Arc::clone(&manager), api_key.clone(), None),
+        "127.0.0.1:0".parse().expect("addr"),
+    )
+    .await
+    .expect("server binds");
+
+    let url = format!("http://{}/mcp", server.local_addr);
+
+    // Client A: create and work on project "checkout".
+    let mut a = McpClient::connect(&url, &api_key).await;
+
+    // Before opening a project, architecture tools guide the agent.
+    let (early, is_error) = a.call("task_context", serde_json::json!({})).await;
+    assert!(is_error);
+    assert!(
+        early["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("no project is open"),
+        "{early}"
+    );
+
+    let (created, is_error) = a
+        .call(
+            "create_project",
+            serde_json::json!({"project": "checkout", "prompt": "A checkout system."}),
+        )
+        .await;
+    assert!(!is_error, "{created}");
+    assert_eq!(created["created"], true);
+
+    // The project's prompt is grounded in task_context.
+    let (context, _) = a.call("task_context", serde_json::json!({})).await;
+    assert_eq!(context["prompt_evidence"][0]["excerpt"], "A checkout system.");
+
+    // A commits a service into "checkout".
+    let (committed, is_error) = a
+        .call(
+            "submit_patch",
+            serde_json::json!({"patch": {"mutations": [
+                {"kind": "put_service", "id": "service.checkout", "value": {"kind": "backend"}}
+            ]}}),
+        )
+        .await;
+    assert!(!is_error, "{committed}");
+    assert_eq!(committed["committed"], true);
+
+    // Client B: a separate connection, same API key, opens a different
+    // project "billing".
+    let mut b = McpClient::connect(&url, &api_key).await;
+
+    let (_opened, is_error) = b
+        .call("open_project", serde_json::json!({"project": "billing"}))
+        .await;
+    assert!(!is_error);
+
+    // B's project is empty — A's service is not visible here.
+    let (search, _) = b
+        .call("search_symbols", serde_json::json!({"kind": "service"}))
+        .await;
+    assert_eq!(
+        search["symbols"].as_array().map(|a| a.len()),
+        Some(0),
+        "billing is isolated from checkout: {search}"
+    );
+
+    // list_projects sees both.
+    let (list, _) = a.call("list_projects", serde_json::json!({})).await;
+    let names: Vec<&str> = list["projects"]
+        .as_array()
+        .expect("projects")
+        .iter()
+        .filter_map(|p| p["name"].as_str())
+        .collect();
+    assert!(names.contains(&"checkout"), "{list}");
+    assert!(names.contains(&"billing"), "{list}");
+
+    // A wrong API key is refused.
+    let mut intruder = McpClient::connect(&url, "wrong-key").await;
+    let refused = intruder
+        .rpc(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 500,
+            "method": "tools/call",
+            "params": {"name": "list_projects", "arguments": {}},
+        }))
+        .await;
+    assert!(
+        refused.get("error").is_some(),
+        "a wrong API key is refused: {refused}"
+    );
+
+    server.shutdown().await;
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test]
+async fn request_design_invokes_the_injected_launcher() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    // A stand-in launcher records how many times the tool triggered it,
+    // proving the MCP tool reaches the injected orchestrator without
+    // confluence depending on the harness.
+    struct MockLauncher {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl mcp::DesignLauncher for MockLauncher {
+        fn launch(
+            &self,
+            _engine: ConfluenceEngine,
+            _objective: Option<String>,
+        ) -> Result<serde_json::Value, String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+
+            Ok(serde_json::json!({ "launched": true, "backend": "mock" }))
+        }
+    }
+
+    let engine = ConfluenceEngine::in_memory(WorkspaceState::empty(RunMetadata::new(RunId(
+        "design".to_string(),
+    ))))
+    .expect("engine starts");
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let launcher = Arc::new(MockLauncher {
+        calls: Arc::clone(&calls),
+    });
+
+    let router = mcp::router_with_launcher(engine.clone(), launcher);
+
+    let server = mcp::serve_router(router, "127.0.0.1:0".parse().expect("addr"))
+        .await
+        .expect("mcp server binds");
+
+    let url = format!("http://{}/mcp", server.local_addr);
+
+    let handle = engine
+        .create_session(WriteScope::shared_skeleton(), "ui")
+        .expect("session");
+
+    let mut client = McpClient::connect(&url, &handle.token.0).await;
+
+    let (result, is_error) = client.call("request_design", serde_json::json!({})).await;
+
+    assert!(!is_error, "{result}");
+    assert_eq!(result["launched"], true);
+    assert_eq!(result["backend"], "mock");
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn request_design_reports_when_no_launcher_is_configured() {
+    // A plain confluence server (no orchestration backend) reports the
+    // feature is unavailable rather than erroring at the protocol level.
+    let engine = ConfluenceEngine::in_memory(WorkspaceState::empty(RunMetadata::new(RunId(
+        "no-design".to_string(),
+    ))))
+    .expect("engine starts");
+
+    let server = mcp::serve(engine.clone(), "127.0.0.1:0".parse().expect("addr"))
+        .await
+        .expect("mcp server binds");
+
+    let url = format!("http://{}/mcp", server.local_addr);
+
+    let handle = engine
+        .create_session(WriteScope::shared_skeleton(), "ui")
+        .expect("session");
+
+    let mut client = McpClient::connect(&url, &handle.token.0).await;
+
+    let (result, is_error) = client.call("request_design", serde_json::json!({})).await;
+
+    assert!(is_error);
+    assert_eq!(result["launched"], false);
+    assert!(
+        result["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("not available"),
+        "{result}"
+    );
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn an_interactive_session_commits_repeatedly_under_one_bearer_token() {
+    // The UI demo shape: one interactive session token, driven over MCP,
+    // committing several patches in a row. The token rolls to a fresh
+    // task after each commit, so the client's bearer value never changes.
+    let engine = ConfluenceEngine::in_memory(WorkspaceState::empty(RunMetadata::new(RunId(
+        "interactive".to_string(),
+    ))))
+    .expect("engine starts");
+
+    let server = mcp::serve(engine.clone(), "127.0.0.1:0".parse().expect("bind addr"))
+        .await
+        .expect("the mcp server binds");
+
+    let url = format!("http://{}/mcp", server.local_addr);
+
+    let handle = engine
+        .create_session(WriteScope::shared_skeleton(), "ui demo")
+        .expect("session is created");
+
+    let mut client = McpClient::connect(&url, &handle.token.0).await;
+
+    for index in 0..3 {
+        let (committed, is_error) = client
+            .call(
+                "submit_patch",
+                serde_json::json!({
+                    "patch": {"mutations": [
+                        {"kind": "put_service", "id": format!("service.s{index}"),
+                         "value": {"kind": "backend"}}
+                    ]}
+                }),
+            )
+            .await;
+
+        assert!(!is_error, "commit {index} rejected: {committed}");
+        assert_eq!(committed["committed"], true, "{committed}");
+        assert_eq!(committed["revision"], index + 1);
+
+        // task_context still works under the same token, now pointing at
+        // the rolled successor pinned to the new head.
+        let (context, is_error) = client.call("task_context", serde_json::json!({})).await;
+
+        assert!(!is_error);
+        assert_eq!(context["state"], "running");
+        assert_eq!(context["snapshot_revision"], index + 1);
+    }
+
+    assert_eq!(engine.head_revision().0, 3);
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_malformed_patch_returns_actionable_feedback_not_a_protocol_error() {
+    // The live decomposer read a malformed submit_patch response as a
+    // "transport issue" because the handler returned a JSON-RPC error.
+    // A bad argument must come back as a readable tool result instead.
+    let engine = ConfluenceEngine::in_memory(WorkspaceState::empty(RunMetadata::new(RunId(
+        "malformed".to_string(),
+    ))))
+    .expect("engine starts");
+
+    let server = mcp::serve(engine.clone(), "127.0.0.1:0".parse().expect("bind addr"))
+        .await
+        .expect("the mcp server binds");
+
+    let url = format!("http://{}/mcp", server.local_addr);
+
+    let handle = engine
+        .create_task(CreateTask {
+            kind: TaskKind::Decompose,
+            objective: "create a service".to_string(),
+            write_scope: WriteScope::shared_skeleton(),
+            prompt_evidence: Vec::new(),
+            budget: TaskBudget::default(),
+        })
+        .expect("task is created");
+
+    let mut client = McpClient::connect(&url, &handle.token.0).await;
+
+    // Non-JSON garbage and an unknown mutation kind are argument errors
+    // the agent must be able to read and correct — never protocol
+    // errors.
+    for bad in [
+        serde_json::json!({"patch": "this is not json at all"}),
+        serde_json::json!({"patch": {"mutations": [{"kind": "make_service"}]}}),
+    ] {
+        let raw = client
+            .rpc(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 200,
+                "method": "tools/call",
+                "params": {"name": "submit_patch", "arguments": bad},
+            }))
+            .await;
+
+        // A tool result (with isError), never a JSON-RPC protocol error.
+        assert!(
+            raw.get("result").is_some() && raw.get("error").is_none(),
+            "a malformed patch produced a protocol error, not a tool result: {raw}"
+        );
+
+        let text = raw["result"]["content"][0]["text"]
+            .as_str()
+            .expect("text content");
+
+        assert!(
+            text.contains("dsl_reference"),
+            "the feedback points at dsl_reference: {text}"
+        );
+    }
+
+    // The exact failure the live agent hit: the patch passed as a
+    // JSON-encoded string rather than an object. The handler coerces
+    // it and commits, so the agent's stringified argument succeeds.
+    let (committed, is_error) = client
+        .call(
+            "submit_patch",
+            serde_json::json!({
+                "patch": "{\"mutations\":[{\"kind\":\"put_service\",\
+                          \"id\":\"service.api\",\"value\":{\"kind\":\"backend\"}}]}"
+            }),
+        )
+        .await;
+
+    assert!(!is_error, "a stringified patch was not accepted: {committed}");
+    assert_eq!(committed["committed"], true);
+
+    assert!(
+        engine
+            .head_snapshot()
+            .workspace
+            .services
+            .contains_key(&Id("service.api".to_string()))
+    );
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
 async fn two_mcp_clients_read_pinned_snapshots_and_commit_safely() {
     let engine = ConfluenceEngine::in_memory(fixture_workspace()).expect("engine starts");
 

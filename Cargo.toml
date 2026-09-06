@@ -11,9 +11,11 @@ default = ["confluence"]
 # default; `--no-default-features` still builds the lean checker.
 confluence = [
     "dep:arc-swap",
+    "dep:async-trait",
     "dep:axum",
     "dep:blake3",
     "dep:clap",
+    "dep:futures",
     "dep:getrandom",
     "dep:http",
     "dep:parking_lot",
@@ -24,6 +26,7 @@ confluence = [
     "dep:smallvec",
     "dep:thiserror",
     "dep:tokio",
+    "dep:tokio-util",
     "dep:tracing",
     "dep:tracing-subscriber",
     "dep:uuid",
@@ -35,7 +38,9 @@ serde_yaml = { package = "serde_yaml_ng", version = "0.10" }
 serde_json = "1"
 
 arc-swap = { version = "1", optional = true }
+async-trait = { version = "0.1", optional = true }
 axum = { version = "0.8", optional = true }
+futures = { version = "0.3", optional = true }
 blake3 = { version = "1", optional = true }
 clap = { version = "4", features = ["derive"], optional = true }
 getrandom = { version = "0.3", optional = true }
@@ -56,9 +61,12 @@ tokio = { version = "1", features = [
     "rt-multi-thread",
     "macros",
     "net",
+    "process",
+    "io-util",
     "signal",
     "time",
 ], optional = true }
+tokio-util = { version = "0.7", optional = true }
 tracing = { version = "0.1", optional = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
 uuid = { version = "1", features = ["v4", "serde"], optional = true }
@@ -84,6 +92,18 @@ required-features = ["confluence"]
 name = "confluence_analysis"
 required-features = ["confluence"]
 
+[[test]]
+name = "harness_backends"
+required-features = ["confluence"]
+
+[[test]]
+name = "harness_workflow"
+required-features = ["confluence"]
+
+[[test]]
+name = "harness_live"
+required-features = ["confluence"]
+
 [[bin]]
 name = "conseqa"
 path = "src/main.rs"
@@ -91,6 +111,11 @@ path = "src/main.rs"
 [[bin]]
 name = "conseqa-confluence"
 path = "src/bin/confluence/main.rs"
+required-features = ["confluence"]
+
+[[bin]]
+name = "conseqa-harness"
+path = "src/bin/harness/main.rs"
 required-features = ["confluence"]
 
 [[bin]]

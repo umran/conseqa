@@ -293,9 +293,11 @@ name = "conseqa"
 version = "0.1.0"
 dependencies = [
  "arc-swap",
+ "async-trait",
  "axum",
  "blake3",
  "clap",
+ "futures",
  "getrandom 0.3.4",
  "http",
  "parking_lot",
@@ -310,6 +312,7 @@ dependencies = [
  "smallvec",
  "thiserror",
  "tokio",
+ "tokio-util",
  "tracing",
  "tracing-subscriber",
  "uuid",

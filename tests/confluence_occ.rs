@@ -22,7 +22,7 @@ use conseqa::spec::{
     FieldPath, Id, IdempotencyGuarantee, Input, LaneConcurrency, MessageSelector, ObjectSelector,
     OperationBlock, OperationConcurrency, OperationStep, Revision, SelectorPredicate,
     SerializationRequirement, SubscriptionInput, Transaction, TransactionIsolation,
-    TransactionStep, ValueRef, ValueSource, Write,
+    Service, ServiceKind, TransactionStep, ValueRef, ValueSource, Write,
 };
 use uuid::Uuid;
 
@@ -81,6 +81,89 @@ fn execution(bound: u32) -> ExecutionSemantics {
     }
 }
 
+/// Commits a patch through the current task in an interactive session's
+/// token chain, using that task's live pinned revision as the base.
+fn submit_session(engine: &ConfluenceEngine, token: &str, mutations: Vec<Mutation>) {
+    let task = engine.resolve_token(token).expect("session token valid");
+
+    let base_revision = engine
+        .task_context(task)
+        .expect("context")
+        .snapshot_revision;
+
+    engine
+        .submit_blocking(CommitRequest {
+            task,
+            patch_id: PatchId::fresh(),
+            base_revision,
+            patch: SpecPatch { mutations },
+            client_nonce: Uuid::new_v4(),
+        })
+        .expect("sequencer runs")
+        .expect("the session commit is accepted");
+}
+
+fn canonical_schema(fields: &[(&str, &str)]) -> conseqa::spec::Schema {
+    conseqa::spec::Schema::Canonical(conseqa::spec::CanonicalSchema {
+        description: None,
+        completeness: conseqa::spec::SchemaCompleteness::Complete,
+        fields: fields
+            .iter()
+            .map(|(name, ty)| {
+                (
+                    name.to_string(),
+                    conseqa::spec::Field {
+                        ty: conseqa::spec::TypeRef::Scalar(match *ty {
+                            "uuid" => conseqa::spec::ScalarType::Uuid,
+                            _ => conseqa::spec::ScalarType::String,
+                        }),
+                        optional: false,
+                    },
+                )
+            })
+            .collect(),
+    })
+}
+
+fn ping_interface() -> OperationInterfaceDraft {
+    OperationInterfaceDraft {
+        service: id("service.api"),
+        description: Some("Echo the request id.".to_string()),
+        inputs: BTreeMap::from([(
+            id("input.ping.request"),
+            Input::Request(conseqa::spec::RequestInput {
+                schema: id("schema.PingRequest"),
+                identity: conseqa::spec::RequestIdentity::Keyed {
+                    fields: vec![path("id")],
+                },
+                result: conseqa::spec::ResultType {
+                    ok: id("schema.PingResponse"),
+                    err: conseqa::spec::ErrorResultType {
+                        schema: id("schema.Rejected"),
+                        disposition: conseqa::spec::ErrorDisposition::Terminal,
+                    },
+                },
+            }),
+        )]),
+    }
+}
+
+fn ping_program() -> OperationBlock {
+    OperationBlock {
+        steps: vec![OperationStep::Return(conseqa::spec::Return {
+            request: id("input.ping.request"),
+            outcome: conseqa::spec::ResultOutcome::Ok {
+                values: Derivation::Deterministic {
+                    from: vec![ValueRef {
+                        source: ValueSource::Input(id("input.ping.request")),
+                        path: path("id"),
+                    }],
+                },
+            },
+        })],
+    }
+}
+
 /// A program writing `object.order.status` directly — a new writer for
 /// phantom tests.
 fn status_writer_program() -> OperationBlock {
@@ -103,6 +186,191 @@ fn status_writer_program() -> OperationBlock {
             OperationStep::Complete,
         ],
     }
+}
+
+#[test]
+fn interactive_session_commits_repeatedly_under_one_token() {
+    let engine = engine();
+    let mut events = engine.subscribe();
+
+    let session = engine
+        .create_session(WriteScope::shared_skeleton(), "interactive demo")
+        .expect("session is created");
+
+    let token = session.token.0.clone();
+    let start = engine.head_revision().0;
+
+    // Commit three services in a row through the one session token.
+    let mut task_ids = Vec::new();
+
+    for index in 0..3 {
+        // The token resolves to the current task in the session's chain.
+        let current = engine
+            .resolve_token(&token)
+            .expect("the session token stays valid");
+
+        task_ids.push(current);
+
+        // Each successive task is fresh and running, pinned to the head
+        // the previous commit produced.
+        let context = engine.task_context(current).expect("context");
+        assert_eq!(context.state, TaskState::Running);
+        assert_eq!(context.snapshot_revision.0, start + index);
+
+        let receipt = engine
+            .submit_blocking(CommitRequest {
+                task: current,
+                patch_id: PatchId::fresh(),
+                base_revision: context.snapshot_revision,
+                patch: SpecPatch {
+                    mutations: vec![Mutation::PutService {
+                        id: id(&format!("service.demo{index}")),
+                        value: Service {
+                            kind: ServiceKind::Backend,
+                        },
+                    }],
+                },
+                client_nonce: Uuid::new_v4(),
+            })
+            .expect("sequencer runs")
+            .expect("the session commit is accepted");
+
+        assert_eq!(receipt.revision.0, start + index + 1);
+    }
+
+    // Each commit rolled the token to a distinct successor task.
+    assert_eq!(
+        task_ids.iter().collect::<std::collections::BTreeSet<_>>().len(),
+        3,
+        "each commit rolled to a fresh task"
+    );
+
+    // The head advanced once per commit, and all three services landed.
+    assert_eq!(engine.head_revision().0, start + 3);
+
+    let head = engine.head_snapshot();
+
+    for index in 0..3 {
+        assert!(
+            head.workspace
+                .services
+                .contains_key(&id(&format!("service.demo{index}")))
+        );
+    }
+
+    // The committed tasks emitted commit events; no invalidation of the
+    // session ever occurred.
+    let mut commits = 0;
+
+    while let Ok(event) = events.try_recv() {
+        match event {
+            EngineEvent::TaskCommitted { .. } => commits += 1,
+            EngineEvent::TaskInvalidated { task, .. } => {
+                assert!(!task_ids.contains(&task), "the session was never invalidated");
+            }
+            _ => {}
+        }
+    }
+
+    assert_eq!(commits, 3);
+}
+
+#[test]
+fn an_interactive_session_surfaces_the_run_prompt() {
+    let mut run_meta = RunMetadata::new(RunId("prompted".to_string()));
+    run_meta.prompt = Some("Build a URL shortener.".to_string());
+
+    let engine = ConfluenceEngine::in_memory(WorkspaceState::empty(run_meta)).expect("engine");
+
+    let session = engine
+        .create_session(WriteScope::of([WriteGrant::All]), "build")
+        .expect("session");
+
+    let context = engine.task_context(session.id).expect("context");
+
+    assert_eq!(context.prompt_evidence.len(), 1);
+    assert_eq!(context.prompt_evidence[0].excerpt, "Build a URL shortener.");
+}
+
+#[test]
+fn an_interactive_session_builds_a_new_project_from_empty() {
+    // The new-project flow: an empty workspace, an interactive session
+    // with the full authoring grant, building an architecture across
+    // commits — including authoring an operation it created earlier in
+    // the same session, which a per-existing-operation scope could not.
+    let engine = ConfluenceEngine::in_memory(WorkspaceState::empty(RunMetadata::new(RunId(
+        "new-project".to_string(),
+    ))))
+    .expect("engine starts");
+
+    let session = engine
+        .create_session(WriteScope::of([WriteGrant::All]), "build a system")
+        .expect("session created");
+
+    let token = session.token.0.clone();
+
+    // Commit 1: the shared skeleton — a service, request/response
+    // schemas, and one operation interface.
+    let current = engine.resolve_token(&token).unwrap();
+
+    submit_session(
+        &engine,
+        &token,
+        vec![
+            Mutation::PutService {
+                id: id("service.api"),
+                value: Service {
+                    kind: ServiceKind::Backend,
+                },
+            },
+            Mutation::PutSchema {
+                id: id("schema.PingRequest"),
+                value: canonical_schema(&[("id", "uuid")]),
+            },
+            Mutation::PutSchema {
+                id: id("schema.PingResponse"),
+                value: canonical_schema(&[("id", "uuid")]),
+            },
+            Mutation::PutSchema {
+                id: id("schema.Rejected"),
+                value: canonical_schema(&[("reason", "string")]),
+            },
+            Mutation::PutOperationInterface {
+                operation: id("operation.ping"),
+                value: ping_interface(),
+            },
+        ],
+    );
+
+    let _ = current;
+
+    // Commit 2: author the program and execution facts of the operation
+    // the session created in commit 1. Requires the All grant — a
+    // per-existing-operation scope, fixed at session creation, would
+    // not have covered operation.ping.
+    submit_session(
+        &engine,
+        &token,
+        vec![
+            Mutation::ReplaceOperationProgram {
+                operation: id("operation.ping"),
+                program: ping_program(),
+            },
+            Mutation::ReplaceOperationExecution {
+                operation: id("operation.ping"),
+                execution: execution(1),
+            },
+        ],
+    );
+
+    assert_eq!(engine.head_revision().0, 2);
+
+    let head = engine.head_snapshot();
+    let draft = &head.workspace.operations[&id("operation.ping")];
+
+    assert!(draft.program.is_some(), "the program was authored");
+    assert!(draft.execution.is_some(), "the execution facts were authored");
+    assert!(draft.assemblable());
 }
 
 #[test]

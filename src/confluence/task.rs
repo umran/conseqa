@@ -135,6 +135,15 @@ pub struct WriteScope {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "value", rename_all = "snake_case")]
 pub enum WriteGrant {
+    /// Full authoring authority over every symbol, deletion included —
+    /// the coordinator grant. Assigned to an interactive human session
+    /// (§6.2), which authors freely including operations it creates
+    /// mid-session. It relaxes only write scope; read-before-reference,
+    /// draft validation, and OCC still apply. Never assigned to a
+    /// concurrent synthesis agent, which gets a narrow scope so the
+    /// scheduler keeps ownership boundaries.
+    All,
+
     /// Create or replace shared-skeleton symbols: services, schemas,
     /// data models, topics, state machines, operation interfaces, and
     /// prompt obligations. Deletion is not included — it is a
@@ -209,6 +218,8 @@ impl WriteScope {
 
 fn grant_covers(grant: &WriteGrant, mutation: &Mutation) -> bool {
     match grant {
+        WriteGrant::All => true,
+
         WriteGrant::SharedSkeleton => matches!(
             mutation,
             Mutation::PutService { .. }
@@ -276,14 +287,21 @@ pub struct TaskBudget {
     pub max_usd_cents: Option<u64>,
 }
 
-/// What a task must do to be complete. V1 tasks end after one commit —
-/// a task's snapshot is immutable, so a second patch against the same
-/// snapshot would conflict with the task's own first commit.
+/// What a task must do to be complete. Normal tasks end after one
+/// commit — a task's snapshot is immutable, so a second patch against
+/// the same snapshot would conflict with the task's own first commit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskCompletionGate {
     #[default]
     SinglePatch,
+
+    /// An interactive authoring session (§6.2): one human driving one
+    /// session with no concurrent agents. On each successful commit the
+    /// engine rolls the session's capability token to a fresh successor
+    /// task pinned to the new head, so the session can commit repeatedly
+    /// while every individual task keeps its frozen-snapshot invariant.
+    Interactive,
 }
 
 /// Identity of one dependency request.
