@@ -16,8 +16,10 @@ use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
 
+use crate::analyzer::report::{Property, Subject};
 use crate::spec::{Id, Revision};
 
+use super::analysis::{AnalysisHub, AnalysisPin, AnalysisState};
 use super::auth::{TaskToken, TokenMap};
 use super::commit::{
     CommitReceipt, CommitRecord, CommitRejection, CommitRequest, apply_patch,
@@ -31,7 +33,8 @@ use super::read_set::{
     search_fingerprint,
 };
 use super::snapshot::{Head, WorkspaceSnapshot};
-use super::symbol::{SymbolKey, SymbolKind, SymbolVersion};
+use super::summary::OperationSummary;
+use super::symbol::{SymbolKey, SymbolKind, SymbolOwner, SymbolVersion};
 use super::task::{
     DependencyRequest, DependencyRequestId, PromptEvidence, TaskBudget, TaskCompletionGate,
     TaskId, TaskKind, TaskSpec, TaskState, WriteScope,
@@ -129,6 +132,48 @@ pub struct OperationView {
     pub content: serde_json::Value,
 }
 
+/// What a scheduler asks a context bundle to cover.
+#[derive(Debug, Clone, Default)]
+pub struct BundleSpec {
+    /// The operation the task owns or repairs; its full draft enters
+    /// the bundle and its shared dependencies are sliced in (§94).
+    pub operation: Option<Id>,
+
+    /// The requirement under repair; its analyzer obligation becomes
+    /// the bundle's evidence.
+    pub requirement: Option<(super::symbol::RequirementFamily, usize)>,
+
+    /// Extra shared symbols the scheduler wants included.
+    pub include: Vec<SymbolKey>,
+}
+
+/// A tracked initial context bundle (§23): everything it includes is
+/// recorded in the task's read-set at creation, so prompt context
+/// never bypasses dependency tracking.
+#[derive(Debug, Clone, Serialize)]
+pub struct ContextBundle {
+    pub task: TaskId,
+    pub revision: Revision,
+
+    /// The task's operation draft, in full.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub operation: Option<serde_json::Value>,
+
+    pub shared_symbols: Vec<SymbolView>,
+
+    /// Proof summaries of the operations this one calls, when
+    /// analysis is ready; otherwise their interfaces appear among the
+    /// shared symbols instead.
+    pub dependency_summaries: Vec<OperationSummary>,
+
+    pub prompt_evidence: Vec<PromptEvidence>,
+
+    /// The analyzer obligation under repair, when one was requested
+    /// and analysis is ready.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub analyzer_evidence: Option<serde_json::Value>,
+}
+
 struct TaskEntry {
     spec: TaskSpec,
     snapshot: Arc<WorkspaceSnapshot>,
@@ -141,6 +186,7 @@ struct EngineInner {
     tasks: RwLock<FxHashMap<TaskId, Arc<TaskEntry>>>,
     tokens: TokenMap,
     events: EventBus,
+    analysis: AnalysisHub,
     persistence: Persistence,
 }
 
@@ -199,13 +245,20 @@ impl ConfluenceEngine {
 
         let snapshot = WorkspaceSnapshot::build(workspace, None);
 
+        let events = EventBus::new(256);
+        let analysis = AnalysisHub::start(events.clone());
+
         let inner = Arc::new(EngineInner {
             head: Head::new(snapshot),
             tasks: RwLock::new(FxHashMap::default()),
             tokens: TokenMap::default(),
-            events: EventBus::new(256),
+            events,
+            analysis,
             persistence,
         });
+
+        // The initial head gets its analysis like any commit's.
+        inner.analysis.enqueue(inner.head.load());
 
         if recovering {
             recover_tasks(&inner)?;
@@ -313,9 +366,51 @@ impl ConfluenceEngine {
         Ok(*self.entry(task)?.state.lock())
     }
 
+    /// Every task this engine knows, for supervision and diagnostics.
+    pub fn list_tasks(&self) -> Vec<TaskContext> {
+        let mut contexts: Vec<TaskContext> = self
+            .inner
+            .tasks
+            .read()
+            .values()
+            .map(|entry| TaskContext {
+                id: entry.spec.id,
+                kind: entry.spec.kind,
+                objective: entry.spec.objective.clone(),
+                snapshot_revision: entry.spec.snapshot_revision,
+                write_scope: entry.spec.write_scope.clone(),
+                prompt_evidence: entry.spec.prompt_evidence.clone(),
+                budget: entry.spec.budget,
+                completion_gate: entry.spec.completion_gate,
+                state: *entry.state.lock(),
+            })
+            .collect();
+
+        contexts.sort_by_key(|context| context.id);
+
+        contexts
+    }
+
     /// Reads one symbol from the task's pinned snapshot, recording the
     /// observation (§46).
     pub fn read_symbol(&self, task: TaskId, key: &SymbolKey) -> Result<SymbolView, EngineError> {
+        // Summaries are analysis output, not workspace content; serve
+        // them through the summary path, which records the summary's
+        // inputs as the observation (§41).
+        if let SymbolKey::OperationSummary(operation) = key {
+            let revision = self.active_entry(task)?.snapshot.revision;
+
+            let view =
+                self.read_operation(task, operation, OperationReadMode::ProofSummary)?;
+
+            return Ok(SymbolView {
+                key: key.clone(),
+                kind: SymbolKind::OperationSummary,
+                version: SymbolVersion(revision.0),
+                content: view.content,
+            });
+        }
+
         let entry = self.active_entry(task)?;
 
         let node = entry
@@ -378,17 +473,39 @@ impl ConfluenceEngine {
         };
 
         let content = match mode {
-            OperationReadMode::Interface => serde_json::to_value(draft.interface()),
-            OperationReadMode::Program => serde_json::to_value(&draft.program),
-            OperationReadMode::Requirements => serde_json::to_value(&draft.requirements),
-            OperationReadMode::Full => serde_json::to_value(draft),
+            OperationReadMode::Interface => {
+                serde_json::to_value(draft.interface()).expect("interface serializes")
+            }
+            OperationReadMode::Program => {
+                serde_json::to_value(&draft.program).expect("program serializes")
+            }
+            OperationReadMode::Requirements => {
+                serde_json::to_value(&draft.requirements).expect("requirements serialize")
+            }
+            OperationReadMode::Full => serde_json::to_value(draft).expect("draft serializes"),
 
             OperationReadMode::ProofSummary => {
-                // Summaries are analysis output; phase 4 serves them.
-                return Err(EngineError::AnalysisNotReady(entry.snapshot.revision));
+                let AnalysisState::Ready(analysis) =
+                    self.inner.analysis.state(entry.snapshot.revision)
+                else {
+                    return Err(EngineError::AnalysisNotReady(entry.snapshot.revision));
+                };
+
+                let summary = analysis
+                    .summaries
+                    .get(operation)
+                    .ok_or_else(|| EngineError::UnknownOperation(operation.clone()))?;
+
+                entry.read_set.lock().record_summary(
+                    operation.clone(),
+                    SummaryObservation {
+                        summary_hash: summary.summary_hash,
+                    },
+                );
+
+                serde_json::to_value(summary).expect("summary serializes")
             }
-        }
-        .expect("draft slices serialize to JSON");
+        };
 
         {
             let mut read_set = entry.read_set.lock();
@@ -455,8 +572,11 @@ impl ConfluenceEngine {
         Ok(rows)
     }
 
-    /// Analyzer verdicts for the task's snapshot revision (§50).
-    /// Until phase 4 wires background analysis, reports are pending.
+    /// Analyzer verdicts for the task's snapshot revision (§50):
+    /// proven/unproven per obligation, with structured proofs and
+    /// obstacles. Scoping the report to one operation records the
+    /// operation's sub-symbols (and summary) as observations, so a
+    /// repair built on the report is guarded by the commit gate.
     pub fn requirement_report(
         &self,
         task: TaskId,
@@ -464,14 +584,120 @@ impl ConfluenceEngine {
         family: Option<&str>,
     ) -> Result<serde_json::Value, EngineError> {
         let entry = self.active_entry(task)?;
+        let revision = entry.snapshot.revision;
+        let state = self.inner.analysis.state(revision);
 
-        let _ = (operation, family);
+        let value = match &state {
+            AnalysisState::Pending | AnalysisState::Validating | AnalysisState::Verifying => {
+                serde_json::json!({
+                    "revision": revision.0,
+                    "analysis": state.label(),
+                    "note": "verification has not finished for this revision yet",
+                })
+            }
 
-        Ok(serde_json::json!({
-            "revision": entry.snapshot.revision.0,
-            "analysis": "pending",
-            "note": "verification has not run for this revision yet",
-        }))
+            AnalysisState::NotAssemblable { gaps } => serde_json::json!({
+                "revision": revision.0,
+                "analysis": "not_assemblable",
+                "gaps": gaps,
+            }),
+
+            AnalysisState::ValidationFailed { errors } => serde_json::json!({
+                "revision": revision.0,
+                "analysis": "validation_failed",
+                "errors": errors,
+            }),
+
+            AnalysisState::Ready(analysis) => {
+                if let Some(operation) = &operation {
+                    if !entry
+                        .snapshot
+                        .workspace
+                        .operations
+                        .contains_key(operation)
+                    {
+                        return Err(EngineError::UnknownOperation(operation.clone()));
+                    }
+
+                    self.record_operation_inputs(&entry, operation);
+
+                    if let Some(summary) = analysis.summaries.get(operation) {
+                        entry.read_set.lock().record_summary(
+                            operation.clone(),
+                            SummaryObservation {
+                                summary_hash: summary.summary_hash,
+                            },
+                        );
+                    }
+                }
+
+                let obligations: Vec<&crate::analyzer::report::Obligation> = analysis
+                    .obligations
+                    .obligations
+                    .iter()
+                    .filter(|obligation| match (&operation, &obligation.subject) {
+                        (None, _) => true,
+                        (Some(operation), Subject::Operation { operation: subject, .. }) => {
+                            operation == subject
+                        }
+                        (Some(_), _) => false,
+                    })
+                    .filter(|obligation| match family {
+                        None => true,
+                        Some(family) => property_matches(&obligation.property, family),
+                    })
+                    .collect();
+
+                serde_json::json!({
+                    "revision": revision.0,
+                    "analysis": "ready",
+                    "all_proven": analysis.verification.all_proven(),
+                    "obligations": obligations,
+                    "notes": analysis.obligations.notes,
+                })
+            }
+        };
+
+        Ok(value)
+    }
+
+    /// Records conservative observations of an operation's summary
+    /// inputs: interface, program, requirements, and execution (§41).
+    fn record_operation_inputs(&self, entry: &Arc<TaskEntry>, operation: &Id) {
+        let mut read_set = entry.read_set.lock();
+
+        for key in [
+            SymbolKey::OperationInterface(operation.clone()),
+            SymbolKey::OperationProgram(operation.clone()),
+            SymbolKey::OperationRequirements(operation.clone()),
+            SymbolKey::OperationExecution(operation.clone()),
+        ] {
+            if let Some(node) = entry.snapshot.graph.node(&key) {
+                read_set.record_symbol(
+                    key,
+                    SymbolObservation {
+                        version: node.version,
+                        fingerprint: node.fingerprint,
+                    },
+                );
+            }
+        }
+    }
+
+    /// The analysis state of one revision.
+    pub fn analysis_state(&self, revision: Revision) -> AnalysisState {
+        self.inner.analysis.state(revision)
+    }
+
+    /// Waits until a revision's analysis is terminal, pinning it so
+    /// coalescing cannot drop it.
+    pub async fn analysis_ready(&self, revision: Revision) -> AnalysisState {
+        self.inner.analysis.ready(revision).await
+    }
+
+    /// Pins one revision's analysis (repair, finalization).
+    pub fn pin_analysis(&self, revision: Revision) -> AnalysisPin {
+        self.inner.analysis.pin(revision)
     }
 
     /// Records that a task consumed an operation summary; V1 tracks
@@ -602,6 +828,133 @@ impl ConfluenceEngine {
             .emit(EngineEvent::TaskStateChanged { task, state });
 
         Ok(())
+    }
+
+    /// Builds the task's tracked initial context bundle (§23, §94):
+    /// the operation's own draft, a deterministic slice of the shared
+    /// symbols it depends on, callee proof summaries (interfaces when
+    /// analysis is not ready), and the analyzer evidence for a
+    /// requirement under repair. Every included fact is recorded as
+    /// observed.
+    pub fn context_bundle(
+        &self,
+        task: TaskId,
+        spec: &BundleSpec,
+    ) -> Result<ContextBundle, EngineError> {
+        let entry = self.active_entry(task)?;
+        let snapshot = &entry.snapshot;
+
+        let mut shared: std::collections::BTreeSet<SymbolKey> =
+            spec.include.iter().cloned().collect();
+
+        let mut dependency_summaries = Vec::new();
+        let mut operation_view = None;
+        let mut analyzer_evidence = None;
+
+        if let Some(operation) = &spec.operation {
+            let draft = snapshot
+                .workspace
+                .operations
+                .get(operation)
+                .ok_or_else(|| EngineError::UnknownOperation(operation.clone()))?;
+
+            operation_view =
+                Some(serde_json::to_value(draft).expect("draft serializes"));
+
+            self.record_operation_inputs(&entry, operation);
+
+            shared.extend(slice_shared_symbols(snapshot, operation));
+
+            let analysis = self.inner.analysis.state(snapshot.revision);
+
+            let callees: Vec<Id> = snapshot
+                .graph
+                .indexes
+                .callees
+                .get(operation)
+                .into_iter()
+                .flatten()
+                .map(|call| call.target.clone())
+                .collect();
+
+            for target in callees {
+                let summary = match &analysis {
+                    AnalysisState::Ready(analysis) => analysis.summaries.get(&target).cloned(),
+                    _ => None,
+                };
+
+                match summary {
+                    Some(summary) => {
+                        self.record_operation_inputs(&entry, &target);
+
+                        entry.read_set.lock().record_summary(
+                            target.clone(),
+                            SummaryObservation {
+                                summary_hash: summary.summary_hash,
+                            },
+                        );
+
+                        dependency_summaries.push(summary);
+                    }
+
+                    None => {
+                        shared.insert(SymbolKey::OperationInterface(target));
+                    }
+                }
+            }
+
+            if let (Some((family, index)), AnalysisState::Ready(analysis)) =
+                (&spec.requirement, self.inner.analysis.state(snapshot.revision))
+            {
+                let id = format!("oblig.{operation}.{family}.{index}");
+
+                analyzer_evidence = analysis
+                    .obligations
+                    .obligations
+                    .iter()
+                    .find(|obligation| obligation.id == id)
+                    .map(|obligation| {
+                        serde_json::to_value(obligation).expect("obligation serializes")
+                    });
+            }
+        }
+
+        let mut shared_symbols = Vec::new();
+
+        for key in shared {
+            let Some(node) = snapshot.graph.node(&key) else {
+                continue;
+            };
+
+            let Some(content) = render_symbol(&snapshot.workspace, &key) else {
+                continue;
+            };
+
+            entry.read_set.lock().record_symbol(
+                key.clone(),
+                SymbolObservation {
+                    version: node.version,
+                    fingerprint: node.fingerprint,
+                },
+            );
+
+            shared_symbols.push(SymbolView {
+                key,
+                kind: node.kind,
+                version: node.version,
+                content,
+            });
+        }
+
+        Ok(ContextBundle {
+            task,
+            revision: snapshot.revision,
+            operation: operation_view,
+            shared_symbols,
+            dependency_summaries,
+            prompt_evidence: entry.spec.prompt_evidence.clone(),
+            analyzer_evidence,
+        })
     }
 
     fn entry(&self, task: TaskId) -> Result<Arc<TaskEntry>, EngineError> {
@@ -899,6 +1252,9 @@ fn validate_and_commit(
         revision: snapshot.revision,
     });
 
+    // 17. Background analysis; never on the commit path (§37).
+    inner.analysis.enqueue(Arc::clone(&snapshot));
+
     // 16. Invalidate active tasks whose observed context changed
     // (§34).
     invalidate_stale_tasks(inner, request.task, &changed, &snapshot);
@@ -1150,6 +1506,59 @@ fn requirement_content(
             pick(&draft.requirements.recoverability, fingerprint, occurrence)
         }
     }
+}
+
+fn property_matches(property: &Property, family: &str) -> bool {
+    match property {
+        Property::Serialization => family == "serialization",
+        Property::Ordering => family == "ordering",
+        Property::Idempotency => family == "idempotency",
+        Property::ResultReplay => family == "result_replay",
+        Property::Recoverability => family == "recoverability",
+        Property::Custom { name } => name == family,
+    }
+}
+
+/// The deterministic shared-symbol slice of one operation (§94): the
+/// service it belongs to and every schema, topic, data object (with
+/// its data model), state machine, and transition its symbols reach
+/// through contract, reference, access, and application edges.
+fn slice_shared_symbols(snapshot: &WorkspaceSnapshot, operation: &Id) -> Vec<SymbolKey> {
+    let mut shared = std::collections::BTreeSet::new();
+
+    if let Some(draft) = snapshot.workspace.operations.get(operation) {
+        shared.insert(SymbolKey::Service(draft.service.clone()));
+    }
+
+    let owner = SymbolOwner::Operation(operation.clone());
+
+    for (index, node) in snapshot.graph.nodes.iter().enumerate() {
+        if node.owner != owner {
+            continue;
+        }
+
+        for edge in snapshot.graph.outgoing_of(super::graph::NodeId(index as u32)) {
+            let target = &snapshot.graph.node_at(edge.to).key;
+
+            match target {
+                SymbolKey::Schema(_)
+                | SymbolKey::Topic(_)
+                | SymbolKey::StateMachine(_)
+                | SymbolKey::Transition { .. } => {
+                    shared.insert(target.clone());
+                }
+
+                SymbolKey::DataObject { data_model, .. } => {
+                    shared.insert(target.clone());
+                    shared.insert(SymbolKey::DataModel(data_model.clone()));
+                }
+
+                _ => {}
+            }
+        }
+    }
+
+    shared.into_iter().collect()
 }
 
 pub(crate) fn now_unix_ms() -> u64 {

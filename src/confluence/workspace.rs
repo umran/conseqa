@@ -22,6 +22,34 @@ use crate::spec::{
 
 use super::symbol::RequirementFamily;
 
+/// Why a workspace cannot yet become a `Model`, operation by
+/// operation and field by field.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
+#[error("the workspace is not assemblable: {}", self.describe())]
+pub struct AssemblyError {
+    pub gaps: Vec<AssemblyGap>,
+}
+
+impl AssemblyError {
+    fn describe(&self) -> String {
+        self.gaps
+            .iter()
+            .map(AssemblyGap::to_string)
+            .collect::<Vec<_>>()
+            .join("; ")
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AssemblyGap {
+    #[error("operation {operation} has no program")]
+    MissingProgram { operation: Id },
+
+    #[error("operation {operation} has no execution facts")]
+    MissingExecution { operation: Id },
+}
+
 /// The authoritative shared architecture state at one revision.
 ///
 /// Owned by the confluence engine; agents interact with it only
@@ -62,6 +90,62 @@ impl WorkspaceState {
             requirement_proposals: Vec::new(),
             run_meta,
         }
+    }
+
+    /// Assembles a real `Model` from the workspace (§8). Succeeds only
+    /// when every draft carries a program and execution facts; the
+    /// error names every gap precisely. Structural validation is the
+    /// analyzer's judgment over the assembled model, never implied
+    /// here.
+    pub fn assemble_model(&self) -> Result<Model, AssemblyError> {
+        let mut gaps = Vec::new();
+        let mut operations = BTreeMap::new();
+
+        for (id, draft) in &self.operations {
+            match (&draft.program, &draft.execution) {
+                (Some(program), Some(execution)) => {
+                    operations.insert(
+                        id.clone(),
+                        Operation {
+                            service: draft.service.clone(),
+                            description: draft.description.clone(),
+                            inputs: draft.inputs.clone(),
+                            program: program.clone(),
+                            requirements: draft.requirements.clone(),
+                            execution: execution.clone(),
+                        },
+                    );
+                }
+
+                (program, execution) => {
+                    if program.is_none() {
+                        gaps.push(AssemblyGap::MissingProgram {
+                            operation: id.clone(),
+                        });
+                    }
+
+                    if execution.is_none() {
+                        gaps.push(AssemblyGap::MissingExecution {
+                            operation: id.clone(),
+                        });
+                    }
+                }
+            }
+        }
+
+        if !gaps.is_empty() {
+            return Err(AssemblyError { gaps });
+        }
+
+        Ok(Model {
+            revision: self.revision,
+            services: self.services.clone(),
+            schemas: self.schemas.clone(),
+            data_models: self.data_models.clone(),
+            topics: self.topics.clone(),
+            state_machines: self.state_machines.clone(),
+            operations,
+        })
     }
 
     /// A workspace holding an existing complete model: every operation

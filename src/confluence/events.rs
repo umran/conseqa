@@ -68,6 +68,7 @@ pub enum InvalidationCause {
 
 /// The engine's broadcast hub. Slow subscribers may observe
 /// `Lagged` — acceptable for an advisory channel.
+#[derive(Clone)]
 pub struct EventBus {
     sender: broadcast::Sender<EngineEvent>,
 }

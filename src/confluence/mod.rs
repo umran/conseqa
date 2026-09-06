@@ -17,6 +17,7 @@
 //! A structurally coherent `Model` is assembled from the workspace
 //! only for validation and verification.
 
+pub mod analysis;
 pub mod auth;
 pub mod commit;
 pub mod engine;
@@ -31,10 +32,12 @@ pub mod patch;
 pub mod persistence;
 pub mod read_set;
 pub mod snapshot;
+pub mod summary;
 pub mod symbol;
 pub mod task;
 pub mod workspace;
 
+pub use analysis::*;
 pub use auth::*;
 pub use commit::*;
 pub use engine::*;
@@ -46,6 +49,7 @@ pub use patch::*;
 pub use persistence::*;
 pub use read_set::*;
 pub use snapshot::*;
+pub use summary::*;
 pub use symbol::*;
 pub use task::*;
 pub use workspace::*;
