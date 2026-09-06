@@ -17,17 +17,34 @@
 //! A structurally coherent `Model` is assembled from the workspace
 //! only for validation and verification.
 
+pub mod auth;
+pub mod commit;
+pub mod engine;
+pub mod events;
 pub mod fingerprint;
 pub mod graph;
 pub mod graph_build;
 pub mod graph_query;
+pub mod invalidation;
+pub mod patch;
+pub mod persistence;
+pub mod read_set;
 pub mod snapshot;
 pub mod symbol;
+pub mod task;
 pub mod workspace;
 
+pub use auth::*;
+pub use commit::*;
+pub use engine::*;
+pub use events::*;
 pub use fingerprint::*;
 pub use graph::*;
 pub use graph_query::*;
+pub use patch::*;
+pub use persistence::*;
+pub use read_set::*;
 pub use snapshot::*;
 pub use symbol::*;
+pub use task::*;
 pub use workspace::*;

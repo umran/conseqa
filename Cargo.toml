@@ -12,9 +12,14 @@ default = ["confluence"]
 confluence = [
     "dep:arc-swap",
     "dep:blake3",
+    "dep:getrandom",
+    "dep:parking_lot",
+    "dep:redb",
     "dep:rustc-hash",
     "dep:smallvec",
     "dep:thiserror",
+    "dep:tokio",
+    "dep:uuid",
 ]
 
 [dependencies]
@@ -24,12 +29,24 @@ serde_json = "1"
 
 arc-swap = { version = "1", optional = true }
 blake3 = { version = "1", optional = true }
+getrandom = { version = "0.3", optional = true }
+parking_lot = { version = "0.12", optional = true }
+redb = { version = "4", optional = true }
 rustc-hash = { version = "2", optional = true }
 smallvec = { version = "1", optional = true }
 thiserror = { version = "2", optional = true }
+tokio = { version = "1", features = ["sync"], optional = true }
+uuid = { version = "1", features = ["v4", "serde"], optional = true }
+
+[dev-dependencies]
+uuid = { version = "1", features = ["v4"] }
 
 [[test]]
 name = "confluence_graph"
+required-features = ["confluence"]
+
+[[test]]
+name = "confluence_occ"
 required-features = ["confluence"]
 
 [[bin]]
