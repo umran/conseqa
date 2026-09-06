@@ -748,6 +748,7 @@ async fn operation_fanout_runs_agents_concurrently() {
                 include: Vec::new(),
             },
             prompt_evidence: Vec::new(),
+            interactive: false,
         })
         .collect();
 

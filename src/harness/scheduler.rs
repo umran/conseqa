@@ -48,6 +48,11 @@ pub struct LogicalTask {
     pub write_scope: WriteScope,
     pub bundle: BundleSpec,
     pub prompt_evidence: Vec<PromptEvidence>,
+
+    /// Whether the worker may commit repeatedly (building incrementally)
+    /// rather than being held to a single patch. Used for decomposition,
+    /// which authors a whole skeleton across several commits.
+    pub interactive: bool,
 }
 
 /// Scheduler policy knobs.
@@ -198,13 +203,21 @@ impl Scheduler {
         let mut attempts = Vec::new();
 
         for attempt in 0..self.policy.max_attempts {
-            let handle = self.engine.create_task(CreateTask {
+            let params = CreateTask {
                 kind: logical.kind,
                 objective: logical.objective.clone(),
                 write_scope: logical.write_scope.clone(),
                 prompt_evidence: logical.prompt_evidence.clone(),
                 budget: self.policy.task_budget,
-            })?;
+            };
+
+            // An interactive worker commits incrementally (rolling its
+            // token on each commit); a single-patch worker commits once.
+            let handle = if logical.interactive {
+                self.engine.create_interactive_task(params)?
+            } else {
+                self.engine.create_task(params)?
+            };
 
             // Build the tracked bundle against this attempt's pinned
             // snapshot, then render it into the prompt.

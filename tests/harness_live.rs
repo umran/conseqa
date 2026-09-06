@@ -91,6 +91,7 @@ async fn run_live(backend: Arc<dyn AgentBackend>, label: &str) {
             write_scope: WriteScope::shared_skeleton(),
             bundle: BundleSpec::default(),
             prompt_evidence: Vec::new(),
+            interactive: false,
         })
         .await
         .expect("the live task runs");

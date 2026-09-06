@@ -247,6 +247,9 @@ impl Workflow {
                 write_scope: WriteScope::shared_skeleton(),
                 bundle: BundleSpec::default(),
                 prompt_evidence: self.prompt_evidence(),
+                // Decomposition builds a whole skeleton, so let it commit
+                // incrementally rather than in a single locked-in patch.
+                interactive: true,
             })
             .await?;
 
@@ -276,6 +279,7 @@ impl Workflow {
                     include: Vec::new(),
                 },
                 prompt_evidence: self.prompt_evidence(),
+                interactive: false,
             })
             .collect();
 
@@ -310,6 +314,7 @@ impl Workflow {
                     include: Vec::new(),
                 },
                 prompt_evidence: self.prompt_evidence(),
+                interactive: false,
             })
             .collect();
 
@@ -341,6 +346,7 @@ impl Workflow {
                     include: Vec::new(),
                 },
                 prompt_evidence: self.prompt_evidence(),
+                interactive: false,
             })
             .collect();
 
