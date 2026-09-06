@@ -26,6 +26,7 @@ pub mod graph;
 pub mod graph_build;
 pub mod graph_query;
 pub mod invalidation;
+pub mod mcp;
 pub mod patch;
 pub mod persistence;
 pub mod read_set;

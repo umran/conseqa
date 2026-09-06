@@ -11,14 +11,21 @@ default = ["confluence"]
 # default; `--no-default-features` still builds the lean checker.
 confluence = [
     "dep:arc-swap",
+    "dep:axum",
     "dep:blake3",
+    "dep:clap",
     "dep:getrandom",
+    "dep:http",
     "dep:parking_lot",
     "dep:redb",
+    "dep:rmcp",
     "dep:rustc-hash",
+    "dep:schemars",
     "dep:smallvec",
     "dep:thiserror",
     "dep:tokio",
+    "dep:tracing",
+    "dep:tracing-subscriber",
     "dep:uuid",
 ]
 
@@ -28,17 +35,36 @@ serde_yaml = { package = "serde_yaml_ng", version = "0.10" }
 serde_json = "1"
 
 arc-swap = { version = "1", optional = true }
+axum = { version = "0.8", optional = true }
 blake3 = { version = "1", optional = true }
+clap = { version = "4", features = ["derive"], optional = true }
 getrandom = { version = "0.3", optional = true }
+http = { version = "1", optional = true }
 parking_lot = { version = "0.12", optional = true }
 redb = { version = "4", optional = true }
+rmcp = { version = "3", features = [
+    "server",
+    "macros",
+    "transport-streamable-http-server",
+], optional = true }
 rustc-hash = { version = "2", optional = true }
+schemars = { version = "1", optional = true }
 smallvec = { version = "1", optional = true }
 thiserror = { version = "2", optional = true }
-tokio = { version = "1", features = ["sync"], optional = true }
+tokio = { version = "1", features = [
+    "sync",
+    "rt-multi-thread",
+    "macros",
+    "net",
+    "time",
+], optional = true }
+tracing = { version = "0.1", optional = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
 uuid = { version = "1", features = ["v4", "serde"], optional = true }
 
 [dev-dependencies]
+reqwest = { version = "0.12", features = ["json"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 uuid = { version = "1", features = ["v4"] }
 
 [[test]]
@@ -47,6 +73,10 @@ required-features = ["confluence"]
 
 [[test]]
 name = "confluence_occ"
+required-features = ["confluence"]
+
+[[test]]
+name = "confluence_mcp"
 required-features = ["confluence"]
 
 [[bin]]

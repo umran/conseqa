@@ -455,6 +455,25 @@ impl ConfluenceEngine {
         Ok(rows)
     }
 
+    /// Analyzer verdicts for the task's snapshot revision (§50).
+    /// Until phase 4 wires background analysis, reports are pending.
+    pub fn requirement_report(
+        &self,
+        task: TaskId,
+        operation: Option<Id>,
+        family: Option<&str>,
+    ) -> Result<serde_json::Value, EngineError> {
+        let entry = self.active_entry(task)?;
+
+        let _ = (operation, family);
+
+        Ok(serde_json::json!({
+            "revision": entry.snapshot.revision.0,
+            "analysis": "pending",
+            "note": "verification has not run for this revision yet",
+        }))
+    }
+
     /// Records that a task consumed an operation summary; V1 tracks
     /// the summary's inputs as symbol observations at bundle/serve
     /// time.
@@ -706,9 +725,10 @@ fn process_commit(
 
         Err(rejection) => {
             if rejection.is_stale_context() {
+                // The token stays resolvable: an invalidated task keeps
+                // status/reporting tools (§53); every other tool is
+                // refused by the state gate.
                 *entry.state.lock() = TaskState::Invalidated;
-
-                inner.tokens.revoke(request.task);
 
                 let _ = inner.persistence.update_task_state(
                     request.task,
@@ -956,8 +976,6 @@ fn invalidate_stale_tasks(
 
             *state = TaskState::Invalidated;
         }
-
-        inner.tokens.revoke(id);
 
         let _ = inner
             .persistence
