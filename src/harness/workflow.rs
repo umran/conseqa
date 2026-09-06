@@ -106,7 +106,7 @@ impl Workflow {
     }
 
     /// Drives the whole design to a fixpoint.
-    pub async fn run(&mut self) -> Result<RunReport, WorkflowError> {
+    pub async fn run(&self) -> Result<RunReport, WorkflowError> {
         // Phase 2: decomposition establishes the interface epoch before
         // any operation fanout (§62, §96).
         self.decompose().await?;
@@ -208,7 +208,7 @@ impl Workflow {
         }
     }
 
-    async fn decompose(&mut self) -> Result<(), WorkflowError> {
+    async fn decompose(&self) -> Result<(), WorkflowError> {
         // Only decompose an empty head; an adopted model skips
         // straight to convergence.
         if !self.engine().head_snapshot().workspace.operations.is_empty() {
@@ -232,35 +232,40 @@ impl Workflow {
         Ok(())
     }
 
-    async fn operation_fanout(&mut self) -> Result<(), WorkflowError> {
+    async fn operation_fanout(&self) -> Result<(), WorkflowError> {
         let planned = self.missing_program_operations();
 
         self.synthesize_operations(&planned).await
     }
 
-    async fn synthesize_operations(&mut self, operations: &[Id]) -> Result<(), WorkflowError> {
-        for operation in operations {
-            self.scheduler
-                .run(&LogicalTask {
-                    kind: TaskKind::OperationSynthesis,
-                    objective: format!("Synthesize the program and execution facts of {operation}."),
-                    write_scope: WriteScope::operation_synthesis(operation.clone()),
-                    bundle: BundleSpec {
-                        operation: Some(operation.clone()),
-                        requirement: None,
-                        include: Vec::new(),
-                    },
-                    prompt_evidence: Vec::new(),
-                })
-                .await?;
-        }
+    /// Phase 3: synthesize the given operations concurrently (§64).
+    /// Each task writes only its own operation's program and execution
+    /// facts and reads shared symbols frozen for the duration of the
+    /// fanout, so the sessions reason in parallel without contending.
+    async fn synthesize_operations(&self, operations: &[Id]) -> Result<(), WorkflowError> {
+        let tasks: Vec<LogicalTask> = operations
+            .iter()
+            .map(|operation| LogicalTask {
+                kind: TaskKind::OperationSynthesis,
+                objective: format!("Synthesize the program and execution facts of {operation}."),
+                write_scope: WriteScope::operation_synthesis(operation.clone()),
+                bundle: BundleSpec {
+                    operation: Some(operation.clone()),
+                    requirement: None,
+                    include: Vec::new(),
+                },
+                prompt_evidence: Vec::new(),
+            })
+            .collect();
+
+        self.scheduler.run_many(tasks).await?;
 
         Ok(())
     }
 
     /// Phase 5: one discovery task per operation with no declared
-    /// requirements yet. Returns how many ran.
-    async fn requirement_discovery(&mut self) -> Result<u32, WorkflowError> {
+    /// requirements yet, run concurrently. Returns how many ran.
+    async fn requirement_discovery(&self) -> Result<u32, WorkflowError> {
         let candidates: Vec<Id> = {
             let head = self.engine().head_snapshot();
 
@@ -272,56 +277,55 @@ impl Workflow {
                 .collect()
         };
 
-        let mut ran = 0;
+        let tasks: Vec<LogicalTask> = candidates
+            .into_iter()
+            .map(|operation| LogicalTask {
+                kind: TaskKind::RequirementDiscovery,
+                objective: format!("Discover the correctness requirements of {operation}."),
+                write_scope: WriteScope::requirement_discovery(operation.clone()),
+                bundle: BundleSpec {
+                    operation: Some(operation),
+                    requirement: None,
+                    include: Vec::new(),
+                },
+                prompt_evidence: Vec::new(),
+            })
+            .collect();
 
-        for operation in candidates {
-            self.scheduler
-                .run(&LogicalTask {
-                    kind: TaskKind::RequirementDiscovery,
-                    objective: format!("Discover the correctness requirements of {operation}."),
-                    write_scope: WriteScope::requirement_discovery(operation.clone()),
-                    bundle: BundleSpec {
-                        operation: Some(operation.clone()),
-                        requirement: None,
-                        include: Vec::new(),
-                    },
-                    prompt_evidence: Vec::new(),
-                })
-                .await?;
+        let ran = tasks.len() as u32;
 
-            ran += 1;
-        }
+        self.scheduler.run_many(tasks).await?;
 
         Ok(ran)
     }
 
     /// Phases 6–7: for every unproven obligation at `revision`, run one
-    /// requirement-scoped repair task. Returns how many ran.
-    async fn repair_unproven(&mut self, revision: Revision) -> Result<u32, WorkflowError> {
+    /// requirement-scoped repair task, concurrently. Returns how many
+    /// ran.
+    async fn repair_unproven(&self, revision: Revision) -> Result<u32, WorkflowError> {
         let unproven = self.unproven_obligations(revision)?;
 
-        let mut ran = 0;
+        let tasks: Vec<LogicalTask> = unproven
+            .into_iter()
+            .map(|target| LogicalTask {
+                kind: TaskKind::RequirementRepair,
+                objective: format!(
+                    "Make the {} requirement #{} of {} provable.",
+                    target.family, target.index, target.operation
+                ),
+                write_scope: WriteScope::requirement_repair(target.operation.clone()),
+                bundle: BundleSpec {
+                    operation: Some(target.operation),
+                    requirement: Some((target.family, target.index)),
+                    include: Vec::new(),
+                },
+                prompt_evidence: Vec::new(),
+            })
+            .collect();
 
-        for target in unproven {
-            self.scheduler
-                .run(&LogicalTask {
-                    kind: TaskKind::RequirementRepair,
-                    objective: format!(
-                        "Make the {} requirement #{} of {} provable.",
-                        target.family, target.index, target.operation
-                    ),
-                    write_scope: WriteScope::requirement_repair(target.operation.clone()),
-                    bundle: BundleSpec {
-                        operation: Some(target.operation.clone()),
-                        requirement: Some((target.family, target.index)),
-                        include: Vec::new(),
-                    },
-                    prompt_evidence: Vec::new(),
-                })
-                .await?;
+        let ran = tasks.len() as u32;
 
-            ran += 1;
-        }
+        self.scheduler.run_many(tasks).await?;
 
         Ok(ran)
     }
@@ -403,7 +407,7 @@ impl Workflow {
     }
 
     async fn incomplete(
-        &mut self,
+        &self,
         revision: Revision,
         reason: String,
     ) -> Result<RunReport, WorkflowError> {
@@ -425,7 +429,7 @@ impl Workflow {
     /// artifacts (§76). When `revision` is `None`, the fixpoint budget
     /// was exhausted.
     async fn finalize(
-        &mut self,
+        &self,
         iterations: u32,
         revision: Option<Revision>,
     ) -> Result<RunReport, WorkflowError> {

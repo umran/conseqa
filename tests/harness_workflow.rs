@@ -459,7 +459,7 @@ fn workflow(
 async fn prompt_to_validated_model_with_all_requirements_proven() {
     let out_dir = std::env::temp_dir().join(format!("conseqa-wf-{}", Uuid::new_v4()));
 
-    let (mut workflow, engine) = workflow(out_dir.clone(), success_script(), 8);
+    let (workflow, engine) = workflow(out_dir.clone(), success_script(), 8);
 
     let report = workflow.run().await.expect("the workflow runs");
 
@@ -523,7 +523,7 @@ async fn an_unprovable_obligation_yields_incomplete_preserving_the_gap() {
 
     // Cap iterations low: repair cannot fix the obstacle, so the
     // fixpoint loop would otherwise spin until the budget.
-    let (mut workflow, engine) = workflow(out_dir.clone(), incomplete_script(), 2);
+    let (workflow, engine) = workflow(out_dir.clone(), incomplete_script(), 2);
 
     let report = workflow.run().await.expect("the workflow runs");
 
@@ -547,4 +547,207 @@ async fn an_unprovable_obligation_yields_incomplete_preserving_the_gap() {
     assert_eq!(draft.requirements.recoverability.len(), 1);
 
     std::fs::remove_dir_all(&out_dir).ok();
+}
+
+/// A workspace with `count` planned operations, each a subscription on
+/// one shared topic — the setup an operation-synthesis fanout starts
+/// from.
+fn planned_workspace(count: usize) -> WorkspaceState {
+    use conseqa::spec::{
+        DeliverySemantics, DispatchRouting, DispatchSemantics, LaneConcurrency, MessageSelector,
+        SubscriptionInput, Topic, TopicOrdering,
+    };
+
+    let mut workspace = WorkspaceState::empty(RunMetadata::new(RunId("fanout".to_string())));
+
+    workspace.services.insert(
+        id("service.api"),
+        Service {
+            kind: ServiceKind::Backend,
+        },
+    );
+
+    workspace
+        .schemas
+        .insert(id("schema.Event"), canonical(&[("id", ScalarType::Uuid)]));
+
+    workspace.topics.insert(
+        id("topic.events"),
+        Topic {
+            messages: [id("schema.Event")].into_iter().collect(),
+            ordering: TopicOrdering::Unordered,
+            message_identity: conseqa::spec::MessageIdentity::Unspecified,
+        },
+    );
+
+    for index in 0..count {
+        let operation = id(&format!("operation.worker{index}"));
+        let input = id(&format!("input.worker{index}.event"));
+
+        workspace.operations.insert(
+            operation,
+            conseqa::confluence::DraftOperation::planned(OperationInterfaceDraft {
+                service: id("service.api"),
+                description: Some(format!("Worker {index}.")),
+                inputs: BTreeMap::from([(
+                    input,
+                    Input::Subscription(SubscriptionInput {
+                        topic: id("topic.events"),
+                        messages: MessageSelector::Only(
+                            [id("schema.Event")].into_iter().collect(),
+                        ),
+                        delivery: DeliverySemantics::AtLeastOnce,
+                        dispatch: DispatchSemantics {
+                            routing: DispatchRouting::ByTopicKey,
+                            lane_concurrency: LaneConcurrency::Bounded(
+                                NonZeroU32::new(1).expect("non-zero"),
+                            ),
+                        },
+                    }),
+                )]),
+            }),
+        );
+    }
+
+    workspace
+}
+
+/// The operation a task's write scope names, read from its context —
+/// how the scripted agent learns which operation it owns.
+fn scoped_operation(engine: &ConfluenceEngine, invocation: &AgentInvocation) -> Option<Id> {
+    use conseqa::confluence::WriteGrant;
+
+    let task = engine.resolve_token(&invocation.task_token)?;
+    let context = engine.task_context(task).ok()?;
+
+    context.write_scope.grants.iter().find_map(|grant| match grant {
+        WriteGrant::OperationProgram(operation) => Some(operation.clone()),
+        _ => None,
+    })
+}
+
+#[tokio::test]
+async fn operation_fanout_runs_agents_concurrently() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    const OPERATIONS: usize = 4;
+
+    let engine =
+        ConfluenceEngine::in_memory(planned_workspace(OPERATIONS)).expect("engine starts");
+
+    // Each session records the concurrent-session high-water mark, then
+    // holds itself open long enough for the others to overlap before
+    // committing its own operation's program.
+    let active = Arc::new(AtomicUsize::new(0));
+    let peak = Arc::new(AtomicUsize::new(0));
+
+    let script: ScriptFn = {
+        let active = active.clone();
+        let peak = peak.clone();
+
+        Arc::new(move |engine, invocation| {
+            let active = active.clone();
+            let peak = peak.clone();
+
+            Box::pin(async move {
+                let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(now, Ordering::SeqCst);
+
+                // Hold the session open so genuinely concurrent runs
+                // overlap; a sequential scheduler would serialize these.
+                tokio::time::sleep(Duration::from_millis(200)).await;
+
+                active.fetch_sub(1, Ordering::SeqCst);
+
+                let operation =
+                    scoped_operation(&engine, &invocation).expect("a program scope");
+
+                commit(
+                    &engine,
+                    &invocation,
+                    vec![
+                        Mutation::ReplaceOperationProgram {
+                            operation: operation.clone(),
+                            program: OperationBlock {
+                                steps: vec![OperationStep::Complete],
+                            },
+                        },
+                        Mutation::ReplaceOperationExecution {
+                            operation,
+                            execution: bounded_one(),
+                        },
+                    ],
+                )
+                .await;
+            })
+        })
+    };
+
+    let backend = Arc::new(ScriptedBackend {
+        engine: engine.clone(),
+        script,
+    });
+
+    let supervisor = Supervisor::new(
+        engine.clone(),
+        backend,
+        "http://127.0.0.1:0/mcp",
+        None,
+        std::env::temp_dir().join(format!("conseqa-fanout-{}", Uuid::new_v4())),
+    );
+
+    let scheduler = Scheduler::new(
+        engine.clone(),
+        supervisor,
+        SchedulerPolicy {
+            max_attempts: 1,
+            max_concurrent_agents: OPERATIONS,
+            ..Default::default()
+        },
+    );
+
+    let tasks: Vec<conseqa::harness::LogicalTask> = (0..OPERATIONS)
+        .map(|index| conseqa::harness::LogicalTask {
+            kind: conseqa::confluence::TaskKind::OperationSynthesis,
+            objective: format!("synthesize worker{index}"),
+            write_scope: conseqa::confluence::WriteScope::operation_synthesis(id(&format!(
+                "operation.worker{index}"
+            ))),
+            bundle: conseqa::confluence::BundleSpec {
+                operation: Some(id(&format!("operation.worker{index}"))),
+                requirement: None,
+                include: Vec::new(),
+            },
+            prompt_evidence: Vec::new(),
+        })
+        .collect();
+
+    let started = std::time::Instant::now();
+
+    let runs = scheduler.run_many(tasks).await.expect("the fanout runs");
+
+    let elapsed = started.elapsed();
+
+    // Every session committed its operation's program.
+    assert_eq!(runs.len(), OPERATIONS);
+    assert!(runs.iter().all(|run| run.committed()), "{runs:?}");
+
+    // The sessions genuinely overlapped: all four were active at once.
+    // A sequential scheduler would peak at 1.
+    assert_eq!(
+        peak.load(Ordering::SeqCst),
+        OPERATIONS,
+        "expected all {OPERATIONS} sessions active simultaneously"
+    );
+
+    // And the wall time reflects concurrency: four 200ms sessions in
+    // parallel finish far under the ~800ms a sequential run would take.
+    assert!(
+        elapsed < Duration::from_millis(600),
+        "fanout took {elapsed:?}, which looks sequential"
+    );
+
+    // All four commits landed through the one sequencer, at distinct
+    // revisions.
+    assert_eq!(engine.head_revision().0, OPERATIONS as u64);
 }

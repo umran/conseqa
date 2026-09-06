@@ -67,6 +67,11 @@ enum Command {
         #[arg(long, default_value_t = 4)]
         max_restarts: u32,
 
+        /// Maximum agent sessions reasoning concurrently during a
+        /// fanout.
+        #[arg(long, default_value_t = 4)]
+        max_agents: usize,
+
         /// Keep the authoring database after the run.
         #[arg(long)]
         keep_workspace: bool,
@@ -116,6 +121,7 @@ async fn run(command: Command) -> Result<ExitCode, String> {
         out,
         strict_requirements,
         max_restarts,
+        max_agents,
         keep_workspace,
         backend_program,
     } = command;
@@ -210,11 +216,12 @@ async fn run(command: Command) -> Result<ExitCode, String> {
         supervisor,
         SchedulerPolicy {
             max_attempts: max_restarts,
+            max_concurrent_agents: max_agents.max(1),
             ..Default::default()
         },
     );
 
-    let mut workflow = Workflow::new(
+    let workflow = Workflow::new(
         scheduler,
         WorkflowConfig {
             out_dir: out,

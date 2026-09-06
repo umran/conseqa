@@ -52,7 +52,7 @@ async fn run_live(backend: Arc<dyn AgentBackend>, label: &str) {
         work_dir.clone(),
     );
 
-    let mut scheduler = Scheduler::new(
+    let scheduler = Scheduler::new(
         engine.clone(),
         supervisor,
         SchedulerPolicy {

@@ -1,25 +1,43 @@
-//! The scheduler: turning a logical task specification into a
-//! completed confluence commit, restarting in a fresh session when the
-//! task is invalidated.
+//! The scheduler: turning logical task specifications into completed
+//! confluence commits, restarting a session when its task is
+//! invalidated and running a fanout's tasks concurrently.
 //!
-//! The scheduler owns the work-assignment policy the spec calls for:
-//! one primary program writer per operation (§65), and staged fanout
-//! behind an interface epoch so OCC is an exception path rather than
-//! the coordination mechanism (§96–§97). An invalidated task is
-//! terminal; its replacement is a new task in a new session against a
-//! fresh snapshot (§2.6), and the scheduler bounds how many times it
-//! will retry.
+//! `run_many` fans out a batch of tasks — the agents reason in
+//! parallel, bounded by `max_concurrent_agents`, while their commits
+//! serialize through the engine's single sequencer and each validates
+//! against the live head (§28, §64). The scheduler owns the
+//! work-assignment policy the spec calls for: one primary program
+//! writer per operation (§65), and staged fanout behind decomposition
+//! so OCC is an exception path rather than the coordination mechanism
+//! (§96–§97). An invalidated task is terminal; its replacement is a new
+//! task in a new session against a fresh snapshot (§2.6), and the
+//! scheduler bounds how many times it will retry.
 
 use std::collections::HashSet;
+
+use parking_lot::Mutex;
 
 use crate::confluence::{
     BundleSpec, ConfluenceEngine, CreateTask, EngineError, PromptEvidence, TaskBudget, TaskId,
     TaskKind, TaskState, WriteScope,
 };
+use crate::spec::Id;
 
 use super::backend::InvocationBudget;
 use super::supervisor::{SessionOutcome, Supervisor};
 use super::task_prompt;
+
+/// Releases an operation's advisory primary-writer claim on drop.
+struct ProgramWriterGuard<'a> {
+    writers: &'a Mutex<HashSet<Id>>,
+    operation: Id,
+}
+
+impl Drop for ProgramWriterGuard<'_> {
+    fn drop(&mut self) {
+        self.writers.lock().remove(&self.operation);
+    }
+}
 
 /// One logical unit of architecture work: its kind, objective, write
 /// scope, and the context slice its bundle should cover.
@@ -40,6 +58,12 @@ pub struct SchedulerPolicy {
     /// failures both count).
     pub max_attempts: u32,
 
+    /// The maximum number of agent sessions running concurrently
+    /// during a fanout (§88 `--max-agents`). Commits still serialize at
+    /// the engine's single sequencer; this bounds how many agents
+    /// *reason* at once.
+    pub max_concurrent_agents: usize,
+
     pub task_budget: TaskBudget,
     pub invocation_budget: InvocationBudget,
 }
@@ -48,6 +72,7 @@ impl Default for SchedulerPolicy {
     fn default() -> Self {
         Self {
             max_attempts: 4,
+            max_concurrent_agents: 4,
             task_budget: TaskBudget::default(),
             invocation_budget: InvocationBudget::default(),
         }
@@ -86,8 +111,10 @@ pub struct Scheduler {
     policy: SchedulerPolicy,
 
     /// Operations with an active primary program writer, enforcing one
-    /// writer per operation (§65).
-    program_writers: HashSet<crate::spec::Id>,
+    /// writer per operation (§65). Behind a mutex so concurrent fanout
+    /// shares it; the check is advisory — the OCC gate is the real
+    /// safety net (§65), so distinct-operation tasks never contend.
+    program_writers: Mutex<HashSet<crate::spec::Id>>,
 }
 
 impl Scheduler {
@@ -96,7 +123,7 @@ impl Scheduler {
             engine,
             supervisor,
             policy,
-            program_writers: HashSet::new(),
+            program_writers: Mutex::new(HashSet::new()),
         }
     }
 
@@ -109,18 +136,51 @@ impl Scheduler {
         self.supervisor.backend_name()
     }
 
+    /// Runs a batch of logical tasks concurrently, at most
+    /// `max_concurrent_agents` at a time, and returns their runs. The
+    /// agents *reason* in parallel; their commits still serialize
+    /// through the engine's single sequencer, and each task validates
+    /// against the live head at commit — so concurrent fanout over
+    /// distinct operations never stale-commits (§28, §64).
+    ///
+    /// The first task to exhaust its attempts fails the batch, matching
+    /// the sequential caller's error propagation.
+    pub async fn run_many(
+        &self,
+        tasks: Vec<LogicalTask>,
+    ) -> Result<Vec<TaskRun>, SchedulerError> {
+        use futures::stream::{self, StreamExt};
+
+        let concurrency = self.policy.max_concurrent_agents.max(1);
+
+        let results: Vec<Result<TaskRun, SchedulerError>> = stream::iter(tasks)
+            .map(|task| async move { self.run(&task).await })
+            .buffer_unordered(concurrency)
+            .collect()
+            .await;
+
+        results.into_iter().collect()
+    }
+
     /// Runs one logical task to a terminal confluence state, creating a
     /// fresh task and session each time an attempt is invalidated or
     /// its process fails, up to the policy's attempt bound.
-    pub async fn run(&mut self, logical: &LogicalTask) -> Result<TaskRun, SchedulerError> {
+    pub async fn run(&self, logical: &LogicalTask) -> Result<TaskRun, SchedulerError> {
         // Enforce one primary program writer per operation for
         // program-scope tasks; the OCC gate is the safety net, not the
-        // work-assignment mechanism (§65).
-        let guarded = self.program_write_target(logical);
+        // work-assignment mechanism (§65). The guard releases the
+        // operation on drop, even if the task panics.
+        let _guard = self.claim_program_writer(logical);
 
-        if let Some(operation) = &guarded
-            && !self.program_writers.insert(operation.clone())
-        {
+        self.run_inner(logical).await
+    }
+
+    /// Advisory claim on an operation's primary-writer slot, released
+    /// when the returned guard drops. `None` for non-program tasks.
+    fn claim_program_writer(&self, logical: &LogicalTask) -> Option<ProgramWriterGuard<'_>> {
+        let operation = self.program_write_target(logical)?;
+
+        if !self.program_writers.lock().insert(operation.clone()) {
             tracing::warn!(
                 %operation,
                 "a primary program writer is already active for this operation; \
@@ -128,13 +188,10 @@ impl Scheduler {
             );
         }
 
-        let result = self.run_inner(logical).await;
-
-        if let Some(operation) = &guarded {
-            self.program_writers.remove(operation);
-        }
-
-        result
+        Some(ProgramWriterGuard {
+            writers: &self.program_writers,
+            operation,
+        })
     }
 
     async fn run_inner(&self, logical: &LogicalTask) -> Result<TaskRun, SchedulerError> {
