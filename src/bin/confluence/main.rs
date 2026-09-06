@@ -177,7 +177,7 @@ async fn serve(
 
     if session {
         let handle = engine
-            .create_session(interactive_scope(&engine), "interactive authoring session")
+            .create_session(interactive_scope(), "interactive authoring session")
             .map_err(|error| format!("cannot create session: {error}"))?;
 
         print_session_config(&mcp_url, &handle.token.0);
@@ -194,18 +194,12 @@ async fn serve(
     Ok(())
 }
 
-/// A broad interactive write scope over the current head: the shared
-/// skeleton plus every operation, so a UI session can edit anything.
-fn interactive_scope(engine: &ConfluenceEngine) -> conseqa::confluence::WriteScope {
-    use conseqa::confluence::WriteGrant;
-
-    let mut grants = vec![WriteGrant::SharedSkeleton];
-
-    for operation in engine.head_snapshot().workspace.operations.keys() {
-        grants.push(WriteGrant::Operation(operation.clone()));
-    }
-
-    conseqa::confluence::WriteScope::of(grants)
+/// The full authoring scope for an interactive UI session: it may
+/// create and edit anything, including operations it creates during the
+/// session. The human is the coordinator; read-before-reference, draft
+/// validation, and OCC still apply.
+fn interactive_scope() -> conseqa::confluence::WriteScope {
+    conseqa::confluence::WriteScope::of([conseqa::confluence::WriteGrant::All])
 }
 
 /// Prints a ready-to-paste `.mcp.json` block for the Claude Code UI,
@@ -270,7 +264,7 @@ async fn admin_create_task(
 async fn admin_create_session(
     State(engine): State<ConfluenceEngine>,
 ) -> Json<serde_json::Value> {
-    match engine.create_session(interactive_scope(&engine), "interactive authoring session") {
+    match engine.create_session(interactive_scope(), "interactive authoring session") {
         Ok(handle) => Json(serde_json::json!({
             "task": handle.id.to_string(),
             "token": handle.token.0,

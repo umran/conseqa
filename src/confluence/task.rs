@@ -135,6 +135,15 @@ pub struct WriteScope {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "value", rename_all = "snake_case")]
 pub enum WriteGrant {
+    /// Full authoring authority over every symbol, deletion included —
+    /// the coordinator grant. Assigned to an interactive human session
+    /// (§6.2), which authors freely including operations it creates
+    /// mid-session. It relaxes only write scope; read-before-reference,
+    /// draft validation, and OCC still apply. Never assigned to a
+    /// concurrent synthesis agent, which gets a narrow scope so the
+    /// scheduler keeps ownership boundaries.
+    All,
+
     /// Create or replace shared-skeleton symbols: services, schemas,
     /// data models, topics, state machines, operation interfaces, and
     /// prompt obligations. Deletion is not included — it is a
@@ -209,6 +218,8 @@ impl WriteScope {
 
 fn grant_covers(grant: &WriteGrant, mutation: &Mutation) -> bool {
     match grant {
+        WriteGrant::All => true,
+
         WriteGrant::SharedSkeleton => matches!(
             mutation,
             Mutation::PutService { .. }
