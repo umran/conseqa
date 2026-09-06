@@ -310,6 +310,24 @@ impl ConfluenceEngine {
     /// Creates a task pinned to the current head and mints its
     /// capability token.
     pub fn create_task(&self, params: CreateTask) -> Result<TaskHandle, EngineError> {
+        self.create_task_with_gate(params, TaskCompletionGate::SinglePatch)
+    }
+
+    /// Like [`create_task`], but the task commits repeatedly: on each
+    /// commit its token rolls to a fresh successor at the new head, so
+    /// a worker agent can build incrementally instead of being locked
+    /// out after one patch. Used for the decomposition worker, which
+    /// authors a whole skeleton across several commits. The commit gate
+    /// still validates every commit.
+    pub fn create_interactive_task(&self, params: CreateTask) -> Result<TaskHandle, EngineError> {
+        self.create_task_with_gate(params, TaskCompletionGate::Interactive)
+    }
+
+    fn create_task_with_gate(
+        &self,
+        params: CreateTask,
+        completion_gate: TaskCompletionGate,
+    ) -> Result<TaskHandle, EngineError> {
         let spec = TaskSpec {
             id: TaskId::fresh(),
             kind: params.kind,
@@ -318,7 +336,7 @@ impl ConfluenceEngine {
             write_scope: params.write_scope,
             prompt_evidence: params.prompt_evidence,
             budget: params.budget,
-            completion_gate: TaskCompletionGate::SinglePatch,
+            completion_gate,
         };
 
         let token = self.inner.tokens.issue(spec.id);

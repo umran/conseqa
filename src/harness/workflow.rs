@@ -16,8 +16,8 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use crate::confluence::{
-    AnalysisState, BundleSpec, ConfluenceEngine, PromptObligationStatus, RequirementFamily,
-    TaskKind, WriteScope,
+    AnalysisState, BundleSpec, ConfluenceEngine, EvidenceRef, PromptEvidence,
+    PromptObligationStatus, RequirementFamily, TaskKind, WriteScope,
 };
 use crate::spec::{Id, Model, Revision};
 
@@ -153,8 +153,10 @@ impl Workflow {
 
                 AnalysisState::ValidationFailed { errors } => {
                     // Phase 4 repair: structural diagnostics become
-                    // targeted repair. V1 surfaces them and retries
-                    // synthesis of every operation an error names.
+                    // targeted repair. Each operation an error names is
+                    // repaired with the specific diagnostics as its
+                    // obstacle, so the agent is told exactly what failed
+                    // validation rather than resynthesizing it blind.
                     let operations = self.operations_named_by(&errors);
 
                     if operations.is_empty() {
@@ -173,7 +175,7 @@ impl Workflow {
                             .await;
                     }
 
-                    self.synthesize_operations(&operations).await?;
+                    self.repair_validation(&operations, &errors).await?;
 
                     continue;
                 }
@@ -181,11 +183,17 @@ impl Workflow {
                 AnalysisState::Ready(_) => {
                     // Structurally valid. Phase 5: discover
                     // requirements for operations that have none yet.
-                    let discovered = self.requirement_discovery().await?;
+                    // Reconverge only if discovery actually committed
+                    // something — gating on tasks *run* re-runs discovery
+                    // every iteration when no proposal is adoptable (a
+                    // prompt with no explicit obligation under a policy
+                    // that adopts none), spinning to the iteration bound
+                    // instead of proceeding to verify and finalize.
+                    let before = self.engine().head_revision();
 
-                    if discovered > 0 {
-                        // New requirements changed the head; reconverge
-                        // before judging proofs.
+                    self.requirement_discovery().await?;
+
+                    if self.engine().head_revision() != before {
                         continue;
                     }
 
@@ -208,6 +216,25 @@ impl Workflow {
         }
     }
 
+    /// The run's natural-language prompt as task evidence, so every
+    /// worker is told what to build. Without this a decompose worker
+    /// has nothing to decompose.
+    fn prompt_evidence(&self) -> Vec<PromptEvidence> {
+        self.engine()
+            .head_snapshot()
+            .workspace
+            .run_meta
+            .prompt
+            .clone()
+            .map(|prompt| {
+                vec![PromptEvidence {
+                    source: EvidenceRef("run.prompt".to_string()),
+                    excerpt: prompt,
+                }]
+            })
+            .unwrap_or_default()
+    }
+
     async fn decompose(&self) -> Result<(), WorkflowError> {
         // Only decompose an empty head; an adopted model skips
         // straight to convergence.
@@ -216,7 +243,9 @@ impl Workflow {
         }
 
         let objective =
-            "Decompose the application prompt into the shared architecture skeleton."
+            "Decompose the application prompt into the shared architecture skeleton: \
+             services, schemas, data models, topics, state machines, one interface per \
+             planned operation, and the explicit prompt obligations. Commit one patch."
                 .to_string();
 
         self.scheduler
@@ -225,7 +254,10 @@ impl Workflow {
                 objective,
                 write_scope: WriteScope::shared_skeleton(),
                 bundle: BundleSpec::default(),
-                prompt_evidence: Vec::new(),
+                prompt_evidence: self.prompt_evidence(),
+                // Decomposition builds a whole skeleton, so let it commit
+                // incrementally rather than in a single locked-in patch.
+                interactive: true,
             })
             .await?;
 
@@ -254,13 +286,65 @@ impl Workflow {
                     requirement: None,
                     include: Vec::new(),
                 },
-                prompt_evidence: Vec::new(),
+                prompt_evidence: self.prompt_evidence(),
+                interactive: false,
             })
             .collect();
 
         self.scheduler.run_many(tasks).await?;
 
         Ok(())
+    }
+
+    /// Phase 4 repair: for every operation a structural diagnostic names,
+    /// run one repair task carrying the specific diagnostics as its
+    /// obstacle. The agent is told exactly what failed validation and
+    /// revises the program to resolve it — the structural counterpart of
+    /// requirement-scoped repair, closing the asymmetry where only
+    /// verification obstacles were fed back precisely. Returns how many
+    /// ran.
+    async fn repair_validation(
+        &self,
+        operations: &[Id],
+        errors: &[crate::confluence::AnalysisDiagnostic],
+    ) -> Result<u32, WorkflowError> {
+        let tasks: Vec<LogicalTask> = operations
+            .iter()
+            .map(|operation| {
+                let obstacle = errors
+                    .iter()
+                    .filter(|error| {
+                        error.message.contains(&operation.0)
+                            || error.subject.as_deref() == Some(&operation.0)
+                    })
+                    .map(|error| format!("- {}", error.message))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+
+                LogicalTask {
+                    kind: TaskKind::OperationSynthesis,
+                    objective: format!(
+                        "The program of {operation} does not pass structural validation. \
+                         Revise the program so these obstacles are resolved, keeping the \
+                         operation's interface stable:\n{obstacle}"
+                    ),
+                    write_scope: WriteScope::operation_synthesis(operation.clone()),
+                    bundle: BundleSpec {
+                        operation: Some(operation.clone()),
+                        requirement: None,
+                        include: Vec::new(),
+                    },
+                    prompt_evidence: self.prompt_evidence(),
+                    interactive: false,
+                }
+            })
+            .collect();
+
+        let ran = tasks.len() as u32;
+
+        self.scheduler.run_many(tasks).await?;
+
+        Ok(ran)
     }
 
     /// Phase 5: one discovery task per operation with no declared
@@ -288,7 +372,8 @@ impl Workflow {
                     requirement: None,
                     include: Vec::new(),
                 },
-                prompt_evidence: Vec::new(),
+                prompt_evidence: self.prompt_evidence(),
+                interactive: false,
             })
             .collect();
 
@@ -319,7 +404,8 @@ impl Workflow {
                     requirement: Some((target.family, target.index)),
                     include: Vec::new(),
                 },
-                prompt_evidence: Vec::new(),
+                prompt_evidence: self.prompt_evidence(),
+                interactive: false,
             })
             .collect();
 
@@ -362,10 +448,22 @@ impl Workflow {
         let head = self.engine().head_snapshot();
         let mut named = Vec::new();
 
-        for id in head.workspace.operations.keys() {
-            if errors.iter().any(|error| {
-                error.message.contains(&id.0) || error.subject.as_deref() == Some(&id.0)
-            }) {
+        for (id, draft) in &head.workspace.operations {
+            // A structural diagnostic usually names an effect or
+            // transaction id, not the operation, so match against every
+            // symbol the operation owns — otherwise the obstacle reaches
+            // no repair task.
+            let owned = operation_owned_ids(id, draft);
+
+            let matches = errors.iter().any(|error| {
+                error
+                    .subject
+                    .as_deref()
+                    .is_some_and(|subject| owned.contains(subject))
+                    || error.message.contains(&id.0)
+            });
+
+            if matches {
                 named.push(id.clone());
             }
         }
@@ -458,7 +556,21 @@ impl Workflow {
             .assemble_model()
             .map_err(|error| WorkflowError::Finalization(error.to_string()))?;
 
-        let status = if all_proven && unmapped.is_empty() {
+        // A model with no operations is vacuously "all proven" — but the
+        // workers built nothing. That is not success; report it as such
+        // so an empty run cannot masquerade as a completed design.
+        let built_nothing = model.operations.is_empty();
+
+        let status = if built_nothing {
+            RunStatus::Incomplete {
+                revision: revision.0,
+                reason: "no operations were synthesized: the decomposition and fanout \
+                         produced no architecture. The worker agents likely could not run \
+                         (check their availability and authentication) or committed nothing."
+                    .to_string(),
+                unresolved: vec!["the model has no operations".to_string()],
+            }
+        } else if all_proven && unmapped.is_empty() {
             RunStatus::Success {
                 revision: revision.0,
             }
@@ -608,6 +720,78 @@ struct RepairTarget {
     index: usize,
 }
 
+/// Every symbol id an operation owns: the operation and its inputs, plus
+/// the transactions, effects, intent and output bindings, and reads its
+/// program declares. A structural diagnostic's subject is usually one of
+/// these (an effect or transaction id, not the operation), so matching
+/// against the owned set attributes the obstacle to the operation that
+/// must repair it.
+fn operation_owned_ids(
+    operation: &Id,
+    draft: &crate::confluence::DraftOperation,
+) -> std::collections::BTreeSet<String> {
+    use crate::spec::{OperationStep, TransactionStep};
+
+    let mut owned = std::collections::BTreeSet::new();
+
+    owned.insert(operation.0.clone());
+
+    for input in draft.inputs.keys() {
+        owned.insert(input.0.clone());
+    }
+
+    let Some(program) = &draft.program else {
+        return owned;
+    };
+
+    for (_, step) in program.steps_with_locations() {
+        match step {
+            OperationStep::Transaction(transaction) => {
+                owned.insert(transaction.id.0.clone());
+
+                for inner in &transaction.steps {
+                    match inner {
+                        TransactionStep::Read(read) => {
+                            owned.insert(read.bind.0.clone());
+                        }
+                        TransactionStep::EstablishEffectIntent(establish) => {
+                            owned.insert(establish.effect_id.0.clone());
+                            owned.insert(establish.bind.0.clone());
+                        }
+                        TransactionStep::EstablishTransactionOutput(establish) => {
+                            owned.insert(establish.bind.0.clone());
+                        }
+                        TransactionStep::Transition(transition) => {
+                            for intent in transition.effect_intents.values() {
+                                owned.insert(intent.bind.0.clone());
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+
+            OperationStep::ExecuteEffect(execute) => {
+                owned.insert(execute.effect_id.0.clone());
+
+                if let Some(bind) = &execute.bind {
+                    owned.insert(bind.0.clone());
+                }
+            }
+
+            OperationStep::ExecuteEffectIntent(execute) => {
+                if let Some(bind) = &execute.bind {
+                    owned.insert(bind.0.clone());
+                }
+            }
+
+            _ => {}
+        }
+    }
+
+    owned
+}
+
 fn requirements_empty(requirements: &crate::spec::OperationRequirements) -> bool {
     requirements.serialization.is_empty()
         && requirements.ordering.is_empty()
@@ -633,4 +817,87 @@ fn describe_gaps(gaps: &[crate::confluence::AssemblyGap]) -> String {
         .map(|gap| gap.to_string())
         .collect::<Vec<_>>()
         .join("; ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::operation_owned_ids;
+    use crate::confluence::{DraftOperation, OperationInterfaceDraft};
+    use crate::spec::{
+        Derivation, Effect, EstablishEffectIntent, EstablishTransactionOutput, ExecuteEffectIntent,
+        Id, IdempotencyGuarantee, OperationBlock, OperationStep, PublicationEffect, ResultOutcome,
+        Return, Transaction, TransactionIsolation, TransactionStep,
+    };
+    use std::collections::BTreeMap;
+
+    fn id(text: &str) -> Id {
+        Id(text.to_string())
+    }
+
+    // A structural diagnostic's subject is an owned symbol id — an effect
+    // or transaction — not the operation id, so attribution must resolve
+    // those to the owning operation for the obstacle to reach a repair
+    // task. This pins that the owned set covers a program's declared
+    // transactions, effects, and bindings.
+    #[test]
+    fn owned_ids_cover_a_programs_declared_symbols() {
+        let mut draft = DraftOperation::planned(OperationInterfaceDraft {
+            service: id("service.x"),
+            description: None,
+            inputs: BTreeMap::new(),
+        });
+
+        draft.program = Some(OperationBlock {
+            steps: vec![
+                OperationStep::Transaction(Transaction {
+                    id: id("tx.echo.write"),
+                    data_model: None,
+                    isolation: TransactionIsolation::ReadCommitted,
+                    idempotency: IdempotencyGuarantee::NotDeduplicated,
+                    steps: vec![
+                        TransactionStep::EstablishTransactionOutput(EstablishTransactionOutput {
+                            bind: id("output.echo"),
+                            schema: id("schema.Result"),
+                            values: Derivation::Unspecified,
+                        }),
+                        TransactionStep::EstablishEffectIntent(EstablishEffectIntent {
+                            bind: id("intent.echo.notify"),
+                            effect_id: id("effect.echo.notify"),
+                            effect: Effect::Publication(PublicationEffect {
+                                topic: id("topic.events"),
+                                schema: id("schema.Event"),
+                                idempotency_key_propagation: Vec::new(),
+                            }),
+                            values: Derivation::Unspecified,
+                        }),
+                    ],
+                }),
+                OperationStep::ExecuteEffectIntent(ExecuteEffectIntent {
+                    intent: id("intent.echo.notify"),
+                    bind: None,
+                }),
+                OperationStep::Return(Return {
+                    request: id("input.echo.request"),
+                    outcome: ResultOutcome::Ok {
+                        values: Derivation::Unspecified,
+                    },
+                }),
+            ],
+        });
+
+        let owned = operation_owned_ids(&id("operation.echo"), &draft);
+
+        for expected in [
+            "operation.echo",
+            "tx.echo.write",
+            "output.echo",
+            "intent.echo.notify",
+            "effect.echo.notify",
+        ] {
+            assert!(
+                owned.contains(expected),
+                "owned ids should include `{expected}`, got: {owned:?}"
+            );
+        }
+    }
 }

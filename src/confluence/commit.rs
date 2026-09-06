@@ -10,8 +10,9 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::spec::{
-    Effect, Id, Input, MessageSelector, OperationStep, Revision, Schema, StateMachineSubject,
-    TransactionStep, TransitionSideEffect, TypeRef, ValueSource,
+    Effect, ExecutionSemantics, Id, Input, MessageSelector, Model, Operation, OperationConcurrency,
+    OperationStep, Revision, Schema, StateMachineSubject, TransactionStep, TransitionSideEffect,
+    TypeRef, ValueSource,
 };
 
 use super::fingerprint::SemanticHash;
@@ -557,7 +558,74 @@ fn check_patch(candidate: &WorkspaceState, patch: &SpecPatch) -> Vec<DraftDiagno
         }
     }
 
+    // For any program written by this patch, run the validator's own
+    // reference-resolution and definite-availability passes over a probe
+    // of the shared symbols plus that one operation, so a dangling effect
+    // intent, result, or transaction binding — or a value that is not
+    // definitely available — is rejected here and fixed in-session,
+    // rather than committing and only failing whole-model validation
+    // asynchronously (§8.1). Reusing the validator keeps the gate from
+    // drifting from the authority; the operation-local error filter makes
+    // it sound over a model that omits sibling operations.
+    let programs_written: std::collections::BTreeSet<&Id> = patch
+        .mutations
+        .iter()
+        .filter_map(|mutation| match mutation {
+            Mutation::ReplaceOperationProgram { operation, .. } => Some(operation),
+            _ => None,
+        })
+        .collect();
+
+    for operation in programs_written {
+        let Some(model) = probe_model(candidate, operation) else {
+            continue;
+        };
+
+        for diagnostic in crate::analyzer::validation::program_local_diagnostics(&model, operation) {
+            diagnostics.push(DraftDiagnostic::new(
+                Some(SymbolKey::OperationProgram(operation.clone())),
+                diagnostic.message,
+            ));
+        }
+    }
+
     diagnostics
+}
+
+/// A minimal, deliberately partial `Model` for draft-time validation of
+/// one operation's program: every committed shared symbol plus the one
+/// operation, whose program was just written. Sibling operations are
+/// omitted — the draft state is not assemblable mid-fanout — so only the
+/// operation-local diagnostics of [`program_local_diagnostics`] are
+/// sound over it. Execution facts, which the reference and dataflow
+/// passes never read, are stubbed when the draft has none yet.
+fn probe_model(candidate: &WorkspaceState, operation: &Id) -> Option<Model> {
+    let draft = candidate.operations.get(operation)?;
+    let program = draft.program.clone()?;
+
+    let assembled = Operation {
+        service: draft.service.clone(),
+        description: draft.description.clone(),
+        inputs: draft.inputs.clone(),
+        program,
+        requirements: draft.requirements.clone(),
+        execution: draft.execution.clone().unwrap_or(ExecutionSemantics {
+            concurrency: OperationConcurrency::Unspecified,
+        }),
+    };
+
+    let mut operations = std::collections::BTreeMap::new();
+    operations.insert(operation.clone(), assembled);
+
+    Some(Model {
+        revision: candidate.revision,
+        services: candidate.services.clone(),
+        schemas: candidate.schemas.clone(),
+        data_models: candidate.data_models.clone(),
+        topics: candidate.topics.clone(),
+        state_machines: candidate.state_machines.clone(),
+        operations,
+    })
 }
 
 fn check_schema(
