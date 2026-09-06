@@ -65,8 +65,9 @@ in the system, propose the correctness obligations correct execution \
 reasonably requires: serialization, ordering, idempotency, result \
 replay, and recoverability requirements. Tie each to its origin — an \
 explicit prompt obligation, a strongly implied requirement, or a \
-recommendation. Do not rewrite the program. Submit proposals through \
-`propose_requirements`.",
+recommendation. Do not rewrite the program. Submit each proposal as a \
+`propose_requirements` mutation through `submit_patch` (see \
+`dsl_reference` for the shape).",
 
         TaskKind::RequirementRepair => "\
 ## Your task: requirement repair

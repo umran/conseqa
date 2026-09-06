@@ -183,11 +183,17 @@ impl Workflow {
                 AnalysisState::Ready(_) => {
                     // Structurally valid. Phase 5: discover
                     // requirements for operations that have none yet.
-                    let discovered = self.requirement_discovery().await?;
+                    // Reconverge only if discovery actually committed
+                    // something — gating on tasks *run* re-runs discovery
+                    // every iteration when no proposal is adoptable (a
+                    // prompt with no explicit obligation under a policy
+                    // that adopts none), spinning to the iteration bound
+                    // instead of proceeding to verify and finalize.
+                    let before = self.engine().head_revision();
 
-                    if discovered > 0 {
-                        // New requirements changed the head; reconverge
-                        // before judging proofs.
+                    self.requirement_discovery().await?;
+
+                    if self.engine().head_revision() != before {
                         continue;
                     }
 
