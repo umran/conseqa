@@ -16,8 +16,8 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use crate::confluence::{
-    AnalysisState, BundleSpec, ConfluenceEngine, PromptObligationStatus, RequirementFamily,
-    TaskKind, WriteScope,
+    AnalysisState, BundleSpec, ConfluenceEngine, EvidenceRef, PromptEvidence,
+    PromptObligationStatus, RequirementFamily, TaskKind, WriteScope,
 };
 use crate::spec::{Id, Model, Revision};
 
@@ -208,6 +208,25 @@ impl Workflow {
         }
     }
 
+    /// The run's natural-language prompt as task evidence, so every
+    /// worker is told what to build. Without this a decompose worker
+    /// has nothing to decompose.
+    fn prompt_evidence(&self) -> Vec<PromptEvidence> {
+        self.engine()
+            .head_snapshot()
+            .workspace
+            .run_meta
+            .prompt
+            .clone()
+            .map(|prompt| {
+                vec![PromptEvidence {
+                    source: EvidenceRef("run.prompt".to_string()),
+                    excerpt: prompt,
+                }]
+            })
+            .unwrap_or_default()
+    }
+
     async fn decompose(&self) -> Result<(), WorkflowError> {
         // Only decompose an empty head; an adopted model skips
         // straight to convergence.
@@ -216,7 +235,9 @@ impl Workflow {
         }
 
         let objective =
-            "Decompose the application prompt into the shared architecture skeleton."
+            "Decompose the application prompt into the shared architecture skeleton: \
+             services, schemas, data models, topics, state machines, one interface per \
+             planned operation, and the explicit prompt obligations. Commit one patch."
                 .to_string();
 
         self.scheduler
@@ -225,7 +246,7 @@ impl Workflow {
                 objective,
                 write_scope: WriteScope::shared_skeleton(),
                 bundle: BundleSpec::default(),
-                prompt_evidence: Vec::new(),
+                prompt_evidence: self.prompt_evidence(),
             })
             .await?;
 
@@ -254,7 +275,7 @@ impl Workflow {
                     requirement: None,
                     include: Vec::new(),
                 },
-                prompt_evidence: Vec::new(),
+                prompt_evidence: self.prompt_evidence(),
             })
             .collect();
 
@@ -288,7 +309,7 @@ impl Workflow {
                     requirement: None,
                     include: Vec::new(),
                 },
-                prompt_evidence: Vec::new(),
+                prompt_evidence: self.prompt_evidence(),
             })
             .collect();
 
@@ -319,7 +340,7 @@ impl Workflow {
                     requirement: Some((target.family, target.index)),
                     include: Vec::new(),
                 },
-                prompt_evidence: Vec::new(),
+                prompt_evidence: self.prompt_evidence(),
             })
             .collect();
 
@@ -458,7 +479,21 @@ impl Workflow {
             .assemble_model()
             .map_err(|error| WorkflowError::Finalization(error.to_string()))?;
 
-        let status = if all_proven && unmapped.is_empty() {
+        // A model with no operations is vacuously "all proven" — but the
+        // workers built nothing. That is not success; report it as such
+        // so an empty run cannot masquerade as a completed design.
+        let built_nothing = model.operations.is_empty();
+
+        let status = if built_nothing {
+            RunStatus::Incomplete {
+                revision: revision.0,
+                reason: "no operations were synthesized: the decomposition and fanout \
+                         produced no architecture. The worker agents likely could not run \
+                         (check their availability and authentication) or committed nothing."
+                    .to_string(),
+                unresolved: vec!["the model has no operations".to_string()],
+            }
+        } else if all_proven && unmapped.is_empty() {
             RunStatus::Success {
                 revision: revision.0,
             }

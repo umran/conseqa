@@ -366,6 +366,16 @@ struct GlobalOptions {
     max_agents: usize,
 }
 
+/// Where design-run artifacts go: a sibling of the projects directory,
+/// so a run's output never appears as a project. Each run then gets its
+/// own subdirectory by project name.
+fn design_runs_root(data_dir: &std::path::Path) -> PathBuf {
+    data_dir
+        .parent()
+        .unwrap_or(data_dir)
+        .join("design-runs")
+}
+
 /// The default per-user data directory, `~/.conseqa/projects`.
 fn default_data_dir() -> String {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
@@ -431,7 +441,7 @@ async fn serve_global(options: GlobalOptions) -> Result<(), String> {
     let launcher: Arc<dyn DesignLauncher> = Arc::new(DaemonDesignLauncher {
         backend,
         mcp_url: Arc::clone(&mcp_url),
-        out_dir: options.data_dir.join("design"),
+        out_dir: design_runs_root(&options.data_dir),
         max_agents: options.max_agents.max(1),
         state: Arc::new(DesignState::default()),
     });
@@ -535,7 +545,7 @@ async fn serve_stdio_cmd(options: StdioOptions) -> Result<(), String> {
     let launcher: Arc<dyn DesignLauncher> = Arc::new(DaemonDesignLauncher {
         backend,
         mcp_url: Arc::clone(&mcp_url),
-        out_dir: options.data_dir.join("design"),
+        out_dir: design_runs_root(&options.data_dir),
         max_agents: options.max_agents.max(1),
         state: Arc::new(DesignState::default()),
     });
@@ -658,10 +668,16 @@ impl DesignLauncher for DaemonDesignLauncher {
             },
         );
 
+        // Each run writes its artifacts under its own project name, so
+        // runs never collide and the directory never looks like a
+        // project itself.
+        let run_name = engine.head_snapshot().workspace.run_meta.run.0.clone();
+        let run_out = self.out_dir.join(&run_name);
+
         let workflow = Workflow::new(
             scheduler,
             WorkflowConfig {
-                out_dir: self.out_dir.clone(),
+                out_dir: run_out,
                 analysis_timeout: Duration::from_secs(180),
                 max_iterations: 8,
             },

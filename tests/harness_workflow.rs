@@ -549,6 +549,35 @@ async fn an_unprovable_obligation_yields_incomplete_preserving_the_gap() {
     std::fs::remove_dir_all(&out_dir).ok();
 }
 
+#[tokio::test]
+async fn workers_that_build_nothing_yield_incomplete_not_false_success() {
+    // The failure a live run hit: workers produced no architecture, and
+    // the operation-less model was vacuously "all proven", so the run
+    // reported success. It must report Incomplete instead.
+    let out_dir = std::env::temp_dir().join(format!("conseqa-wf-{}", Uuid::new_v4()));
+
+    // A backend that commits nothing, whatever the task.
+    let script: ScriptFn = Arc::new(|_engine, _invocation| Box::pin(async {}));
+
+    let (workflow, engine) = workflow(out_dir.clone(), script, 2);
+
+    let report = workflow.run().await.expect("the workflow runs");
+
+    let RunStatus::Incomplete { reason, .. } = &report.status else {
+        panic!("expected incomplete, got {:?}", report.status);
+    };
+
+    assert!(
+        reason.contains("no operations were synthesized"),
+        "{reason}"
+    );
+
+    // Nothing was committed, so the head never advanced past empty.
+    assert!(engine.head_snapshot().workspace.operations.is_empty());
+
+    std::fs::remove_dir_all(&out_dir).ok();
+}
+
 /// A workspace with `count` planned operations, each a subscription on
 /// one shared topic — the setup an operation-synthesis fanout starts
 /// from.
