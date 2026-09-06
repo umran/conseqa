@@ -277,6 +277,59 @@ async fn shared_skeleton_put_service_commits_over_mcp() {
 }
 
 #[tokio::test]
+async fn an_interactive_session_commits_repeatedly_under_one_bearer_token() {
+    // The UI demo shape: one interactive session token, driven over MCP,
+    // committing several patches in a row. The token rolls to a fresh
+    // task after each commit, so the client's bearer value never changes.
+    let engine = ConfluenceEngine::in_memory(WorkspaceState::empty(RunMetadata::new(RunId(
+        "interactive".to_string(),
+    ))))
+    .expect("engine starts");
+
+    let server = mcp::serve(engine.clone(), "127.0.0.1:0".parse().expect("bind addr"))
+        .await
+        .expect("the mcp server binds");
+
+    let url = format!("http://{}/mcp", server.local_addr);
+
+    let handle = engine
+        .create_session(WriteScope::shared_skeleton(), "ui demo")
+        .expect("session is created");
+
+    let mut client = McpClient::connect(&url, &handle.token.0).await;
+
+    for index in 0..3 {
+        let (committed, is_error) = client
+            .call(
+                "submit_patch",
+                serde_json::json!({
+                    "patch": {"mutations": [
+                        {"kind": "put_service", "id": format!("service.s{index}"),
+                         "value": {"kind": "backend"}}
+                    ]}
+                }),
+            )
+            .await;
+
+        assert!(!is_error, "commit {index} rejected: {committed}");
+        assert_eq!(committed["committed"], true, "{committed}");
+        assert_eq!(committed["revision"], index + 1);
+
+        // task_context still works under the same token, now pointing at
+        // the rolled successor pinned to the new head.
+        let (context, is_error) = client.call("task_context", serde_json::json!({})).await;
+
+        assert!(!is_error);
+        assert_eq!(context["state"], "running");
+        assert_eq!(context["snapshot_revision"], index + 1);
+    }
+
+    assert_eq!(engine.head_revision().0, 3);
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
 async fn a_malformed_patch_returns_actionable_feedback_not_a_protocol_error() {
     // The live decomposer read a malformed submit_patch response as a
     // "transport issue" because the handler returned a JSON-RPC error.

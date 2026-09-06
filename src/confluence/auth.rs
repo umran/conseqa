@@ -54,6 +54,13 @@ impl TokenMap {
         self.tokens.read().get(token).copied()
     }
 
+    /// Re-points an existing token at a new task — how an interactive
+    /// session's token rolls from one task in its chain to the next
+    /// without the client's configured bearer value ever changing.
+    pub fn repoint(&self, token: &str, task: TaskId) {
+        self.tokens.write().insert(token.to_string(), task);
+    }
+
     /// Drops every token resolving to `task`, ending its authority.
     pub fn revoke(&self, task: TaskId) {
         self.tokens.write().retain(|_, held| *held != task);

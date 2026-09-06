@@ -52,6 +52,12 @@ enum Command {
         /// The natural-language application prompt for a fresh run.
         #[arg(long)]
         prompt: Option<String>,
+
+        /// On startup, create an interactive authoring session and
+        /// print a ready-to-paste `.mcp.json` for the Claude Code UI.
+        /// The session can commit repeatedly under one token.
+        #[arg(long)]
+        session: bool,
     },
 
     /// Print the persisted head, tasks, and commit count.
@@ -92,7 +98,8 @@ async fn main() -> ExitCode {
             bind,
             model,
             prompt,
-        } => serve(database, bind, model, prompt).await,
+            session,
+        } => serve(database, bind, model, prompt, session).await,
         Command::Status { database } => status(database),
         Command::Export {
             database,
@@ -139,6 +146,7 @@ async fn serve(
     bind: SocketAddr,
     model: Option<PathBuf>,
     prompt: Option<String>,
+    session: bool,
 ) -> Result<(), String> {
     let initial = initial_workspace(model, prompt)?;
 
@@ -148,6 +156,7 @@ async fn serve(
     let admin = axum::Router::new()
         .route("/admin/status", get(admin_status))
         .route("/admin/tasks", post(admin_create_task))
+        .route("/admin/session", post(admin_create_session))
         .route("/admin/tasks/{task}/cancel", post(admin_cancel_task))
         .route("/admin/analysis/{revision}", get(admin_analysis))
         .with_state(engine.clone());
@@ -158,12 +167,21 @@ async fn serve(
         .await
         .map_err(|error| format!("cannot bind {bind}: {error}"))?;
 
+    let mcp_url = format!("http://{}/mcp", server.local_addr);
+
     println!(
-        "conseqa-confluence serving\n  mcp:   http://{}/mcp\n  admin: http://{}/admin/status\n  head:  revision {}",
-        server.local_addr,
+        "conseqa-confluence serving\n  mcp:   {mcp_url}\n  admin: http://{}/admin/status\n  head:  revision {}",
         server.local_addr,
         engine.head_revision().0,
     );
+
+    if session {
+        let handle = engine
+            .create_session(interactive_scope(&engine), "interactive authoring session")
+            .map_err(|error| format!("cannot create session: {error}"))?;
+
+        print_session_config(&mcp_url, &handle.token.0);
+    }
 
     tokio::signal::ctrl_c()
         .await
@@ -174,6 +192,46 @@ async fn serve(
     server.shutdown().await;
 
     Ok(())
+}
+
+/// A broad interactive write scope over the current head: the shared
+/// skeleton plus every operation, so a UI session can edit anything.
+fn interactive_scope(engine: &ConfluenceEngine) -> conseqa::confluence::WriteScope {
+    use conseqa::confluence::WriteGrant;
+
+    let mut grants = vec![WriteGrant::SharedSkeleton];
+
+    for operation in engine.head_snapshot().workspace.operations.keys() {
+        grants.push(WriteGrant::Operation(operation.clone()));
+    }
+
+    conseqa::confluence::WriteScope::of(grants)
+}
+
+/// Prints a ready-to-paste `.mcp.json` block for the Claude Code UI,
+/// with the session token filled in.
+fn print_session_config(mcp_url: &str, token: &str) {
+    let config = serde_json::json!({
+        "mcpServers": {
+            "conseqa": {
+                "type": "http",
+                "url": mcp_url,
+                "headers": { "Authorization": format!("Bearer {token}") },
+            }
+        }
+    });
+
+    let pretty = serde_json::to_string_pretty(&config).unwrap_or_default();
+
+    println!(
+        "\ninteractive session ready. Register it with Claude Code:\n\n\
+         1. Write this to `.mcp.json` at your project root:\n\n{pretty}\n\n\
+         2. Restart Claude Code (or run `/mcp` and connect `conseqa`), approve the\n\
+         \x20  server, and ask it to use the conseqa tools — start with `task_context`\n\
+         \x20  and `dsl_reference`.\n\n\
+         The session commits repeatedly under this one token. Keep this daemon\n\
+         running; the token is valid only for this run.\n"
+    );
 }
 
 #[derive(Deserialize)]
@@ -201,6 +259,23 @@ async fn admin_create_task(
             "task": handle.id.to_string(),
             "token": handle.token.0,
             "snapshot_revision": handle.snapshot_revision.0,
+        })),
+
+        Err(error) => Json(serde_json::json!({ "error": error.to_string() })),
+    }
+}
+
+/// Creates an interactive authoring session over the current head and
+/// returns its token plus a ready-to-paste authorization header.
+async fn admin_create_session(
+    State(engine): State<ConfluenceEngine>,
+) -> Json<serde_json::Value> {
+    match engine.create_session(interactive_scope(&engine), "interactive authoring session") {
+        Ok(handle) => Json(serde_json::json!({
+            "task": handle.id.to_string(),
+            "token": handle.token.0,
+            "snapshot_revision": handle.snapshot_revision.0,
+            "authorization_header": format!("Bearer {}", handle.token.0),
         })),
 
         Err(error) => Json(serde_json::json!({ "error": error.to_string() })),

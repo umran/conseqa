@@ -179,6 +179,16 @@ struct TaskEntry {
     snapshot: Arc<WorkspaceSnapshot>,
     state: Mutex<TaskState>,
     read_set: Mutex<TaskReadSet>,
+
+    /// The capability token string, retained so an interactive
+    /// session's token can be rolled to its successor task on commit.
+    token: String,
+}
+
+impl TaskEntry {
+    fn interactive(&self) -> bool {
+        self.spec.completion_gate == TaskCompletionGate::Interactive
+    }
 }
 
 struct EngineInner {
@@ -300,46 +310,46 @@ impl ConfluenceEngine {
     /// Creates a task pinned to the current head and mints its
     /// capability token.
     pub fn create_task(&self, params: CreateTask) -> Result<TaskHandle, EngineError> {
-        let snapshot = self.inner.head.load();
-
         let spec = TaskSpec {
             id: TaskId::fresh(),
             kind: params.kind,
             objective: params.objective,
-            snapshot_revision: snapshot.revision,
+            snapshot_revision: self.inner.head.load().revision,
             write_scope: params.write_scope,
             prompt_evidence: params.prompt_evidence,
             budget: params.budget,
             completion_gate: TaskCompletionGate::SinglePatch,
         };
 
-        self.inner
-            .persistence
-            .record_task(&spec, TaskState::Running, now_unix_ms())?;
+        let token = self.inner.tokens.issue(spec.id);
+
+        install_task(&self.inner, spec, token.0)
+    }
+
+    /// Creates an interactive authoring session (§6.2): one token that
+    /// can commit repeatedly, driven by a single human in a UI. On each
+    /// commit the engine rolls the token to a fresh successor task at
+    /// the new head, so every underlying task keeps its frozen snapshot.
+    /// Meant for a single client with no concurrent agents.
+    pub fn create_session(
+        &self,
+        write_scope: WriteScope,
+        objective: impl Into<String>,
+    ) -> Result<TaskHandle, EngineError> {
+        let spec = TaskSpec {
+            id: TaskId::fresh(),
+            kind: TaskKind::Decompose,
+            objective: objective.into(),
+            snapshot_revision: self.inner.head.load().revision,
+            write_scope,
+            prompt_evidence: Vec::new(),
+            budget: TaskBudget::default(),
+            completion_gate: TaskCompletionGate::Interactive,
+        };
 
         let token = self.inner.tokens.issue(spec.id);
 
-        let handle = TaskHandle {
-            id: spec.id,
-            token,
-            snapshot_revision: snapshot.revision,
-        };
-
-        let entry = Arc::new(TaskEntry {
-            spec,
-            snapshot,
-            state: Mutex::new(TaskState::Running),
-            read_set: Mutex::new(TaskReadSet::default()),
-        });
-
-        self.inner.tasks.write().insert(handle.id, entry);
-
-        self.inner.events.emit(EngineEvent::TaskStateChanged {
-            task: handle.id,
-            state: TaskState::Running,
-        });
-
-        Ok(handle)
+        install_task(&self.inner, spec, token.0)
     }
 
     /// The task's own context (§45). Available in every state.
@@ -1006,12 +1016,81 @@ fn recover_tasks(inner: &Arc<EngineInner>) -> Result<(), EngineError> {
             snapshot: Arc::clone(&snapshot),
             state: Mutex::new(state),
             read_set: Mutex::new(TaskReadSet::default()),
+            // Tokens are not persisted; a recovered task holds no live
+            // capability and is invalidated regardless.
+            token: String::new(),
         });
 
         inner.tasks.write().insert(id, entry);
     }
 
     Ok(())
+}
+
+/// Records, pins, and installs a task at the current head under an
+/// already-issued token, returning its handle. Shared by `create_task`,
+/// `create_session`, and interactive successor rolls.
+fn install_task(
+    inner: &Arc<EngineInner>,
+    mut spec: TaskSpec,
+    token: String,
+) -> Result<TaskHandle, EngineError> {
+    let snapshot = inner.head.load();
+
+    // Pin and record against the same head load, so the entry's
+    // snapshot revision and the recorded spec always agree.
+    spec.snapshot_revision = snapshot.revision;
+
+    inner
+        .persistence
+        .record_task(&spec, TaskState::Running, now_unix_ms())?;
+
+    let handle = TaskHandle {
+        id: spec.id,
+        token: TaskToken(token.clone()),
+        snapshot_revision: spec.snapshot_revision,
+    };
+
+    let entry = Arc::new(TaskEntry {
+        spec,
+        snapshot,
+        state: Mutex::new(TaskState::Running),
+        read_set: Mutex::new(TaskReadSet::default()),
+        token,
+    });
+
+    inner.tasks.write().insert(handle.id, Arc::clone(&entry));
+
+    inner.events.emit(EngineEvent::TaskStateChanged {
+        task: handle.id,
+        state: TaskState::Running,
+    });
+
+    Ok(handle)
+}
+
+/// Rolls an interactive session forward: installs a successor task at
+/// the new head with the predecessor's kind, objective, and scope, then
+/// re-points the session's token to it. Best-effort — a persistence
+/// failure here leaves the committed head intact and the session on its
+/// committed (now terminal) task, which the client learns on its next
+/// call.
+fn spawn_interactive_successor(inner: &Arc<EngineInner>, predecessor: &TaskSpec, token: String) {
+    let spec = TaskSpec {
+        id: TaskId::fresh(),
+        kind: predecessor.kind,
+        objective: predecessor.objective.clone(),
+        snapshot_revision: Revision(0),
+        write_scope: predecessor.write_scope.clone(),
+        prompt_evidence: predecessor.prompt_evidence.clone(),
+        budget: predecessor.budget,
+        completion_gate: TaskCompletionGate::Interactive,
+    };
+
+    match install_task(inner, spec, token.clone()) {
+        Ok(handle) => inner.tokens.repoint(&token, handle.id),
+        Err(error) => tracing::error!("interactive session could not roll forward: {error}"),
+    }
 }
 
 /// The commit sequencer: one logical writer draining the queue (§28).
@@ -1073,11 +1152,20 @@ fn process_commit(
                 revision: receipt.revision,
             });
 
+            // An interactive session rolls its token to a fresh
+            // successor task at the new head, so it can keep committing.
+            if entry.interactive() {
+                spawn_interactive_successor(inner, &entry.spec, entry.token.clone());
+            }
+
             Ok(receipt)
         }
 
         Err(rejection) => {
-            if rejection.is_stale_context() {
+            // An interactive session is never terminalized by a
+            // rejection: its single human driver simply retries against
+            // the current head.
+            if rejection.is_stale_context() && !entry.interactive() {
                 // The token stays resolvable: an invalidated task keeps
                 // status/reporting tools (§53); every other tool is
                 // refused by the state gate.
@@ -1304,6 +1392,12 @@ fn invalidate_stale_tasks(
     entries.sort_by_key(|(id, _)| *id);
 
     for (id, entry) in entries {
+        // Interactive sessions re-pin themselves on every commit and
+        // have no concurrent competitor; they are never auto-invalidated.
+        if entry.interactive() {
+            continue;
+        }
+
         {
             let state = entry.state.lock();
 

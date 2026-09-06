@@ -22,7 +22,7 @@ use conseqa::spec::{
     FieldPath, Id, IdempotencyGuarantee, Input, LaneConcurrency, MessageSelector, ObjectSelector,
     OperationBlock, OperationConcurrency, OperationStep, Revision, SelectorPredicate,
     SerializationRequirement, SubscriptionInput, Transaction, TransactionIsolation,
-    TransactionStep, ValueRef, ValueSource, Write,
+    Service, ServiceKind, TransactionStep, ValueRef, ValueSource, Write,
 };
 use uuid::Uuid;
 
@@ -103,6 +103,93 @@ fn status_writer_program() -> OperationBlock {
             OperationStep::Complete,
         ],
     }
+}
+
+#[test]
+fn interactive_session_commits_repeatedly_under_one_token() {
+    let engine = engine();
+    let mut events = engine.subscribe();
+
+    let session = engine
+        .create_session(WriteScope::shared_skeleton(), "interactive demo")
+        .expect("session is created");
+
+    let token = session.token.0.clone();
+    let start = engine.head_revision().0;
+
+    // Commit three services in a row through the one session token.
+    let mut task_ids = Vec::new();
+
+    for index in 0..3 {
+        // The token resolves to the current task in the session's chain.
+        let current = engine
+            .resolve_token(&token)
+            .expect("the session token stays valid");
+
+        task_ids.push(current);
+
+        // Each successive task is fresh and running, pinned to the head
+        // the previous commit produced.
+        let context = engine.task_context(current).expect("context");
+        assert_eq!(context.state, TaskState::Running);
+        assert_eq!(context.snapshot_revision.0, start + index);
+
+        let receipt = engine
+            .submit_blocking(CommitRequest {
+                task: current,
+                patch_id: PatchId::fresh(),
+                base_revision: context.snapshot_revision,
+                patch: SpecPatch {
+                    mutations: vec![Mutation::PutService {
+                        id: id(&format!("service.demo{index}")),
+                        value: Service {
+                            kind: ServiceKind::Backend,
+                        },
+                    }],
+                },
+                client_nonce: Uuid::new_v4(),
+            })
+            .expect("sequencer runs")
+            .expect("the session commit is accepted");
+
+        assert_eq!(receipt.revision.0, start + index + 1);
+    }
+
+    // Each commit rolled the token to a distinct successor task.
+    assert_eq!(
+        task_ids.iter().collect::<std::collections::BTreeSet<_>>().len(),
+        3,
+        "each commit rolled to a fresh task"
+    );
+
+    // The head advanced once per commit, and all three services landed.
+    assert_eq!(engine.head_revision().0, start + 3);
+
+    let head = engine.head_snapshot();
+
+    for index in 0..3 {
+        assert!(
+            head.workspace
+                .services
+                .contains_key(&id(&format!("service.demo{index}")))
+        );
+    }
+
+    // The committed tasks emitted commit events; no invalidation of the
+    // session ever occurred.
+    let mut commits = 0;
+
+    while let Ok(event) = events.try_recv() {
+        match event {
+            EngineEvent::TaskCommitted { .. } => commits += 1,
+            EngineEvent::TaskInvalidated { task, .. } => {
+                assert!(!task_ids.contains(&task), "the session was never invalidated");
+            }
+            _ => {}
+        }
+    }
+
+    assert_eq!(commits, 3);
 }
 
 #[test]
