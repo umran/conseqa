@@ -554,21 +554,11 @@ impl Workflow {
         serde_json::json!({
             "final_revision": revision.0,
             "run": head.workspace.run_meta.run.0,
-            "backend": self.scheduler_backend_name(),
+            "backend": self.scheduler.backend_name(),
             "status": status,
             "prompt_obligations": obligations,
             "tasks": self.engine().list_tasks().len(),
         })
-    }
-
-    fn scheduler_backend_name(&self) -> String {
-        // The supervisor owns the backend; surface its name through the
-        // engine's task history instead of threading it here.
-        self.engine()
-            .list_tasks()
-            .first()
-            .map(|_| "confluence-backend".to_string())
-            .unwrap_or_else(|| "none".to_string())
     }
 
     fn unmapped_obligations(&self) -> Vec<String> {

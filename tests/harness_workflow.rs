@@ -505,6 +505,7 @@ async fn prompt_to_validated_model_with_all_requirements_proven() {
             .expect("manifest is json");
 
     assert_eq!(manifest_json["status"]["kind"], "success");
+    assert_eq!(manifest_json["backend"], "scripted");
     assert!(
         manifest_json["prompt_obligations"][OBLIGATION]
             .as_str()

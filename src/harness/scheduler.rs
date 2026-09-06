@@ -104,6 +104,11 @@ impl Scheduler {
         &self.engine
     }
 
+    /// The name of the backend the supervisor drives, for manifests.
+    pub fn backend_name(&self) -> &str {
+        self.supervisor.backend_name()
+    }
+
     /// Runs one logical task to a terminal confluence state, creating a
     /// fresh task and session each time an attempt is invalidated or
     /// its process fails, up to the policy's attempt bound.
