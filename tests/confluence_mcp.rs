@@ -188,6 +188,182 @@ fn execution_patch(operation: &str, bound: u32) -> serde_json::Value {
 }
 
 #[tokio::test]
+async fn shared_skeleton_put_service_commits_over_mcp() {
+    // The exact path the live decomposer agent takes: an empty
+    // workspace, a shared-skeleton task, and one put_service mutation
+    // submitted through MCP. Existing tests only exercised
+    // replace_operation_execution, so this path was untested.
+    let engine = ConfluenceEngine::in_memory(WorkspaceState::empty(RunMetadata::new(RunId(
+        "skeleton".to_string(),
+    ))))
+    .expect("engine starts");
+
+    let server = mcp::serve(engine.clone(), "127.0.0.1:0".parse().expect("bind addr"))
+        .await
+        .expect("the mcp server binds");
+
+    let url = format!("http://{}/mcp", server.local_addr);
+
+    let handle = engine
+        .create_task(CreateTask {
+            kind: TaskKind::Decompose,
+            objective: "create a service".to_string(),
+            write_scope: WriteScope::shared_skeleton(),
+            prompt_evidence: Vec::new(),
+            budget: TaskBudget::default(),
+        })
+        .expect("task is created");
+
+    let mut client = McpClient::connect(&url, &handle.token.0).await;
+
+    // Raw response first, so a JSON-RPC error (what the live agent read
+    // as a "transport issue") is visible rather than swallowed.
+    let raw = client
+        .rpc(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 100,
+            "method": "tools/call",
+            "params": {
+                "name": "submit_patch",
+                "arguments": {
+                    "patch": {
+                        "mutations": [
+                            {"kind": "put_service", "id": "service.api",
+                             "value": {"kind": "backend"}}
+                        ]
+                    }
+                },
+            },
+        }))
+        .await;
+
+    assert!(
+        raw.get("result").is_some(),
+        "submit_patch returned a JSON-RPC error, not a tool result: {raw}"
+    );
+
+    // The single put_service committed and advanced the head.
+    let result = &raw["result"];
+    assert_eq!(result["isError"], false, "put_service was rejected: {raw}");
+
+    let head = engine.head_snapshot();
+    assert_eq!(head.revision.0, 1);
+    assert!(
+        head.workspace
+            .services
+            .contains_key(&Id("service.api".to_string()))
+    );
+
+    // A task commits exactly one patch. A second submission on the same
+    // task reports completion clearly, not a contradictory "adjust and
+    // retry" — the confusion the live agent hit.
+    let (again, _) = client
+        .call(
+            "submit_patch",
+            serde_json::json!({
+                "patch": {
+                    "mutations": [
+                        {"kind": "put_service", "id": "service.other",
+                         "value": {"kind": "worker"}}
+                    ]
+                }
+            }),
+        )
+        .await;
+
+    assert_eq!(again["already_committed"], true, "{again}");
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_malformed_patch_returns_actionable_feedback_not_a_protocol_error() {
+    // The live decomposer read a malformed submit_patch response as a
+    // "transport issue" because the handler returned a JSON-RPC error.
+    // A bad argument must come back as a readable tool result instead.
+    let engine = ConfluenceEngine::in_memory(WorkspaceState::empty(RunMetadata::new(RunId(
+        "malformed".to_string(),
+    ))))
+    .expect("engine starts");
+
+    let server = mcp::serve(engine.clone(), "127.0.0.1:0".parse().expect("bind addr"))
+        .await
+        .expect("the mcp server binds");
+
+    let url = format!("http://{}/mcp", server.local_addr);
+
+    let handle = engine
+        .create_task(CreateTask {
+            kind: TaskKind::Decompose,
+            objective: "create a service".to_string(),
+            write_scope: WriteScope::shared_skeleton(),
+            prompt_evidence: Vec::new(),
+            budget: TaskBudget::default(),
+        })
+        .expect("task is created");
+
+    let mut client = McpClient::connect(&url, &handle.token.0).await;
+
+    // Non-JSON garbage and an unknown mutation kind are argument errors
+    // the agent must be able to read and correct — never protocol
+    // errors.
+    for bad in [
+        serde_json::json!({"patch": "this is not json at all"}),
+        serde_json::json!({"patch": {"mutations": [{"kind": "make_service"}]}}),
+    ] {
+        let raw = client
+            .rpc(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 200,
+                "method": "tools/call",
+                "params": {"name": "submit_patch", "arguments": bad},
+            }))
+            .await;
+
+        // A tool result (with isError), never a JSON-RPC protocol error.
+        assert!(
+            raw.get("result").is_some() && raw.get("error").is_none(),
+            "a malformed patch produced a protocol error, not a tool result: {raw}"
+        );
+
+        let text = raw["result"]["content"][0]["text"]
+            .as_str()
+            .expect("text content");
+
+        assert!(
+            text.contains("dsl_reference"),
+            "the feedback points at dsl_reference: {text}"
+        );
+    }
+
+    // The exact failure the live agent hit: the patch passed as a
+    // JSON-encoded string rather than an object. The handler coerces
+    // it and commits, so the agent's stringified argument succeeds.
+    let (committed, is_error) = client
+        .call(
+            "submit_patch",
+            serde_json::json!({
+                "patch": "{\"mutations\":[{\"kind\":\"put_service\",\
+                          \"id\":\"service.api\",\"value\":{\"kind\":\"backend\"}}]}"
+            }),
+        )
+        .await;
+
+    assert!(!is_error, "a stringified patch was not accepted: {committed}");
+    assert_eq!(committed["committed"], true);
+
+    assert!(
+        engine
+            .head_snapshot()
+            .workspace
+            .services
+            .contains_key(&Id("service.api".to_string()))
+    );
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
 async fn two_mcp_clients_read_pinned_snapshots_and_commit_safely() {
     let engine = ConfluenceEngine::in_memory(fixture_workspace()).expect("engine starts");
 

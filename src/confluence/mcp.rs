@@ -32,7 +32,7 @@ use super::graph_query::GraphQuery;
 use super::patch::{PatchId, SpecPatch};
 use super::read_set::SearchSpec;
 use super::symbol::SymbolKey;
-use super::task::TaskId;
+use super::task::{TaskId, TaskState};
 use super::workspace::EvidenceRef;
 
 /// The invariants every architecture agent operates under (§89),
@@ -206,16 +206,57 @@ fn engine_error(error: EngineError) -> Result<CallToolResult, McpError> {
     json_error(serde_json::json!({ "error": error.to_string() }))
 }
 
+/// Parses one tool argument, returning an in-band tool-result error on
+/// failure rather than a JSON-RPC protocol error. A protocol error is
+/// what an MCP client surfaces as a "transport" failure — opaque to the
+/// model — so a malformed argument must come back as a readable tool
+/// result the agent can correct, pointing at `dsl_reference`.
+///
+/// A structured argument is accepted whether it arrives as a JSON
+/// object or as a JSON-encoded string: some models serialize nested
+/// arguments as strings when the parameter's schema is permissive, and
+/// rejecting that is needless friction.
+///
+/// The `Err` arm is an already-formed tool result; handlers return it
+/// with `?` short-circuiting turned into an explicit `return`.
 fn parse<T: serde::de::DeserializeOwned>(
     value: serde_json::Value,
     what: &str,
-) -> Result<T, McpError> {
+) -> Result<T, Result<CallToolResult, McpError>> {
+    let value = coerce_stringified_json(value);
+
     serde_json::from_value(value).map_err(|error| {
-        McpError::invalid_params(
-            format!("{what} does not parse: {error}; call dsl_reference for the expected shape"),
-            None,
-        )
+        json_error(serde_json::json!({
+            "error": format!("{what} did not parse: {error}"),
+            "guidance": format!(
+                "Pass `{what}` as a JSON object, not a JSON string. Call dsl_reference \
+                 for the exact shapes, then try again."
+            ),
+        }))
     })
+}
+
+/// If a value is a string that itself holds JSON, returns the parsed
+/// JSON; otherwise returns the value unchanged. Non-JSON strings pass
+/// through so the typed deserialize can report a readable error.
+fn coerce_stringified_json(value: serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::String(text) => {
+            serde_json::from_str(&text).unwrap_or(serde_json::Value::String(text))
+        }
+        other => other,
+    }
+}
+
+/// Unwraps a [`parse`] result, returning the tool-result error from the
+/// enclosing handler on failure.
+macro_rules! parse_arg {
+    ($value:expr, $what:expr) => {
+        match parse($value, $what) {
+            Ok(value) => value,
+            Err(result) => return result,
+        }
+    };
 }
 
 fn id_from(text: &str) -> Id {
@@ -266,7 +307,7 @@ impl ConseqaMcp {
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         let task = self.authenticate(&context)?;
-        let key: SymbolKey = parse(params.0.symbol, "symbol")?;
+        let key: SymbolKey = parse_arg!(params.0.symbol, "symbol");
 
         match self.engine.read_symbol(task, &key) {
             Ok(view) => json_result(serde_json::to_value(view).expect("view serializes")),
@@ -288,7 +329,7 @@ impl ConseqaMcp {
 
         let kind = match params.kind {
             None => None,
-            Some(kind) => Some(parse(serde_json::Value::String(kind), "kind")?),
+            Some(kind) => Some(parse_arg!(serde_json::Value::String(kind), "kind")),
         };
 
         let spec = SearchSpec {
@@ -319,7 +360,7 @@ impl ConseqaMcp {
         let params = params.0;
 
         let mode: OperationReadMode =
-            parse(serde_json::Value::String(params.mode), "mode")?;
+            parse_arg!(serde_json::Value::String(params.mode), "mode");
 
         match self
             .engine
@@ -343,7 +384,7 @@ impl ConseqaMcp {
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         let task = self.authenticate(&context)?;
-        let query: GraphQuery = parse(params.0.query, "query")?;
+        let query: GraphQuery = parse_arg!(params.0.query, "query");
 
         match self.engine.graph_query(task, &query) {
             Ok(result) => json_result(serde_json::json!({
@@ -390,7 +431,17 @@ impl ConseqaMcp {
         let task = self.authenticate(&context)?;
         let params = params.0;
 
-        let patch: SpecPatch = parse(params.patch, "patch")?;
+        let patch: SpecPatch = parse_arg!(params.patch, "patch");
+
+        if patch.mutations.is_empty() {
+            return json_error(serde_json::json!({
+                "committed": false,
+                "error": "empty patch",
+                "guidance": "A patch must contain at least one mutation. Call dsl_reference \
+                             for mutation shapes and submit a non-empty patch, or finish \
+                             the task another way if there is nothing to change.",
+            }));
+        }
 
         let base_revision = match params.base_revision {
             Some(revision) => Revision(revision),
@@ -423,6 +474,17 @@ impl ConseqaMcp {
                 "revision": receipt.revision.0,
                 "replayed": receipt.replayed,
                 "client_nonce": client_nonce.to_string(),
+            })),
+
+            // An already-committed task is success, not a failure to
+            // fix: a task commits exactly one patch, then it is done.
+            Ok(Err(CommitRejection::TaskNotRunning {
+                state: TaskState::Committed,
+            })) => json_result(serde_json::json!({
+                "committed": true,
+                "already_committed": true,
+                "message": "This task already committed its one patch; it is complete. \
+                            Stop here — do not submit again.",
             })),
 
             Ok(Err(rejection)) => {
@@ -458,7 +520,7 @@ impl ConseqaMcp {
         let task = self.authenticate(&context)?;
         let params = params.0;
 
-        let target: SymbolKey = parse(params.target, "target")?;
+        let target: SymbolKey = parse_arg!(params.target, "target");
 
         match self.engine.dependency_request(
             task,

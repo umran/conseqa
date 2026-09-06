@@ -31,6 +31,16 @@ fn enabled(var: &str) -> bool {
 }
 
 async fn run_live(backend: Arc<dyn AgentBackend>, label: &str) {
+    // Route the supervisor's tool-call and session tracing to the test
+    // output so `--nocapture` shows what the live agent actually did.
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "conseqa=debug".into()),
+        )
+        .with_test_writer()
+        .try_init();
+
     let engine = ConfluenceEngine::in_memory(WorkspaceState::empty(RunMetadata::new(RunId(
         format!("live-{label}"),
     ))))
@@ -58,19 +68,25 @@ async fn run_live(backend: Arc<dyn AgentBackend>, label: &str) {
         SchedulerPolicy {
             max_attempts: 1,
             invocation_budget: InvocationBudget {
-                max_wall_time_secs: Some(120),
-                max_turns: Some(12),
+                max_wall_time_secs: Some(150),
+                max_turns: Some(20),
             },
             ..Default::default()
         },
     );
 
+    // A concrete task with a definite engine-side effect: creating one
+    // service through submit_patch. The assertion below proves a real
+    // agent process reached through MCP into the confluence engine and
+    // committed — not merely that a subprocess started.
     let run = scheduler
         .run(&LogicalTask {
             kind: TaskKind::Decompose,
-            objective: "Call task_context, then read_symbol on any symbol you like \
-                        (there are none yet — that is fine), then finish. This is a \
-                        connectivity smoke test; you do not need to submit a patch."
+            objective: "Create exactly one service in the shared architecture. Call \
+                        dsl_reference to see the mutation shape, then call submit_patch \
+                        with a single put_service mutation for a backend service named \
+                        `service.api`. Do not create anything else. Finish once the \
+                        patch commits."
                 .to_string(),
             write_scope: WriteScope::shared_skeleton(),
             bundle: BundleSpec::default(),
@@ -79,16 +95,40 @@ async fn run_live(backend: Arc<dyn AgentBackend>, label: &str) {
         .await
         .expect("the live task runs");
 
-    // The session reached a terminal confluence state; we do not assert
-    // which one, since a live model may or may not commit.
-    println!("live {label} task {} ended {}", run.task, run.final_state);
+    let head = engine.head_revision();
+
+    println!(
+        "live {label}: task {} ended {}, head at revision {}",
+        run.task, run.final_state, head.0
+    );
 
     assert!(!run.attempts.is_empty(), "at least one session ran");
 
     let attempt = &run.attempts[0];
     assert!(
         attempt.agent_exit.session.is_some(),
-        "a real session id was reported"
+        "a real session id was reported: {:?}",
+        attempt.agent_exit
+    );
+
+    // The definitive end-to-end proof: the agent reached the confluence
+    // engine over MCP and committed, advancing the head past the empty
+    // initial revision, and its service is in the workspace.
+    assert!(
+        head.0 > 0,
+        "the live agent did not commit; head is still at revision 0 \
+         (agent exit: {:?})",
+        attempt.agent_exit
+    );
+
+    let committed = engine.head_snapshot();
+    assert!(
+        committed
+            .workspace
+            .services
+            .contains_key(&conseqa::spec::Id("service.api".to_string())),
+        "expected service.api in the committed workspace, found: {:?}",
+        committed.workspace.services.keys().collect::<Vec<_>>()
     );
 
     server.shutdown().await;
