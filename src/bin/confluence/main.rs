@@ -86,6 +86,37 @@ enum Command {
         design_out: PathBuf,
     },
 
+    /// Run one shared server hosting many projects, for global use from
+    /// the Claude Code UI. No per-project database is given up front;
+    /// projects are created and selected through the MCP project tools.
+    Global {
+        /// Directory holding one database per project.
+        #[arg(long, default_value_t = default_data_dir())]
+        data_dir: String,
+
+        /// Bind address for MCP (`/mcp`) and admin (`/admin/...`).
+        #[arg(long, default_value = "127.0.0.1:43127")]
+        bind: SocketAddr,
+
+        /// Stable API key clients authenticate with. Defaults to
+        /// `CONSEQA_API_KEY`, else a key persisted next to the data
+        /// directory (generated on first run).
+        #[arg(long)]
+        api_key: Option<String>,
+
+        /// Backend for the `request_design` concurrent workflow.
+        #[arg(long, value_enum, default_value_t = Backend::Claude)]
+        backend: Backend,
+
+        /// Path to the backend executable (non-default install).
+        #[arg(long)]
+        backend_program: Option<String>,
+
+        /// Maximum worker agents reasoning concurrently in a fanout.
+        #[arg(long, default_value_t = 4)]
+        max_agents: usize,
+    },
+
     /// Print the persisted head, tasks, and commit count.
     Status {
         #[arg(long, default_value = ".conseqa/confluence.redb")]
@@ -140,6 +171,24 @@ async fn main() -> ExitCode {
                 backend_program,
                 max_agents,
                 design_out,
+            })
+            .await
+        }
+        Command::Global {
+            data_dir,
+            bind,
+            api_key,
+            backend,
+            backend_program,
+            max_agents,
+        } => {
+            serve_global(GlobalOptions {
+                data_dir: PathBuf::from(data_dir),
+                bind,
+                api_key,
+                backend,
+                backend_program,
+                max_agents,
             })
             .await
         }
@@ -216,7 +265,6 @@ async fn serve(options: ServeOptions) -> Result<(), String> {
     let backend = build_backend(options.backend, options.backend_program);
 
     let launcher: Arc<dyn DesignLauncher> = Arc::new(DaemonDesignLauncher {
-        engine: engine.clone(),
         backend,
         mcp_url: Arc::clone(&mcp_url),
         out_dir: options.design_out,
@@ -270,6 +318,161 @@ async fn serve(options: ServeOptions) -> Result<(), String> {
     Ok(())
 }
 
+struct GlobalOptions {
+    data_dir: PathBuf,
+    bind: SocketAddr,
+    api_key: Option<String>,
+    backend: Backend,
+    backend_program: Option<String>,
+    max_agents: usize,
+}
+
+/// The default per-user data directory, `~/.conseqa/projects`.
+fn default_data_dir() -> String {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+
+    format!("{home}/.conseqa/projects")
+}
+
+/// Loads the stable API key: an explicit value, else `CONSEQA_API_KEY`,
+/// else a key persisted at `<data_dir>/../api-key` (generated on first
+/// run). Persisting it is what makes the UI config set-once.
+fn load_or_create_api_key(
+    explicit: Option<String>,
+    data_dir: &std::path::Path,
+) -> Result<String, String> {
+    if let Some(key) = explicit {
+        return Ok(key);
+    }
+
+    if let Ok(key) = std::env::var("CONSEQA_API_KEY")
+        && !key.is_empty()
+    {
+        return Ok(key);
+    }
+
+    let path = data_dir
+        .parent()
+        .unwrap_or(data_dir)
+        .join("api-key");
+
+    if let Ok(existing) = std::fs::read_to_string(&path) {
+        let existing = existing.trim().to_string();
+
+        if !existing.is_empty() {
+            return Ok(existing);
+        }
+    }
+
+    let key = conseqa::confluence::TaskToken::generate().0;
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|error| format!("cannot create {}: {error}", parent.display()))?;
+    }
+
+    std::fs::write(&path, format!("{key}\n"))
+        .map_err(|error| format!("cannot write {}: {error}", path.display()))?;
+
+    Ok(key)
+}
+
+async fn serve_global(options: GlobalOptions) -> Result<(), String> {
+    std::fs::create_dir_all(&options.data_dir)
+        .map_err(|error| format!("cannot create {}: {error}", options.data_dir.display()))?;
+
+    let api_key = load_or_create_api_key(options.api_key, &options.data_dir)?;
+
+    let manager = Arc::new(conseqa::confluence::WorkspaceManager::new(&options.data_dir));
+
+    let mcp_url = Arc::new(RwLock::new(String::new()));
+
+    let backend = build_backend(options.backend, options.backend_program);
+
+    let launcher: Arc<dyn DesignLauncher> = Arc::new(DaemonDesignLauncher {
+        backend,
+        mcp_url: Arc::clone(&mcp_url),
+        out_dir: options.data_dir.join("design"),
+        max_agents: options.max_agents.max(1),
+        state: Arc::new(DesignState::default()),
+    });
+
+    let manager_for_admin = Arc::clone(&manager);
+
+    let admin = axum::Router::new()
+        .route(
+            "/admin/projects",
+            get(move || {
+                let manager = Arc::clone(&manager_for_admin);
+
+                async move {
+                    let projects: Vec<serde_json::Value> = manager
+                        .list()
+                        .into_iter()
+                        .map(|project| {
+                            serde_json::json!({
+                                "name": project.name,
+                                "open": project.open,
+                                "revision": project.revision.map(|revision| revision.0),
+                            })
+                        })
+                        .collect();
+
+                    Json(serde_json::json!({ "projects": projects }))
+                }
+            }),
+        )
+        .with_state(());
+
+    let router = mcp::router_multi(Arc::clone(&manager), api_key.clone(), Some(launcher)).merge(admin);
+
+    let server = mcp::serve_router(router, options.bind)
+        .await
+        .map_err(|error| format!("cannot bind {}: {error}", options.bind))?;
+
+    let url = format!("http://{}/mcp", server.local_addr);
+    *mcp_url.write() = url.clone();
+
+    print_global_config(&url, &api_key, &options.data_dir);
+
+    tokio::signal::ctrl_c()
+        .await
+        .map_err(|error| format!("cannot wait for ctrl-c: {error}"))?;
+
+    println!("shutting down");
+
+    server.shutdown().await;
+
+    Ok(())
+}
+
+/// Prints the set-once global MCP config for the Claude Code UI.
+fn print_global_config(mcp_url: &str, api_key: &str, data_dir: &std::path::Path) {
+    let config = serde_json::json!({
+        "mcpServers": {
+            "conseqa": {
+                "type": "http",
+                "url": mcp_url,
+                "headers": { "Authorization": format!("Bearer {api_key}") },
+            }
+        }
+    });
+
+    let pretty = serde_json::to_string_pretty(&config).unwrap_or_default();
+
+    println!(
+        "conseqa-confluence global server\n  mcp:      {mcp_url}\n  projects: {}\n\n\
+         Register this ONCE in Claude Code (user scope, so it is global):\n\n\
+         Option A — the GUI: Settings → Connectors → Add → HTTP, URL `{mcp_url}`,\n\
+         header `Authorization: Bearer {api_key}`.\n\n\
+         Option B — the config file `~/.claude.json` (top-level `mcpServers`):\n\n{pretty}\n\n\
+         Then, in any project, ask Claude to `list_projects`, `open_project`, or \n\
+         `create_project` — each project is its own isolated model. Keep this server\n\
+         running; the API key is stable across restarts.\n",
+        data_dir.display(),
+    );
+}
+
 fn build_backend(backend: Backend, program: Option<String>) -> Arc<dyn AgentBackend> {
     match backend {
         Backend::Claude => {
@@ -302,10 +505,9 @@ struct DesignState {
 }
 
 /// The daemon's implementation of the MCP `request_design` trigger:
-/// runs the harness workflow against this daemon's shared engine, with
-/// workers connecting back to its own MCP endpoint.
+/// runs the harness workflow against the caller's project engine, with
+/// workers connecting back to this daemon's MCP endpoint.
 struct DaemonDesignLauncher {
-    engine: ConfluenceEngine,
     backend: Arc<dyn AgentBackend>,
     mcp_url: Arc<RwLock<String>>,
     out_dir: PathBuf,
@@ -314,10 +516,13 @@ struct DaemonDesignLauncher {
 }
 
 impl DesignLauncher for DaemonDesignLauncher {
-    fn launch(&self, objective: Option<String>) -> Result<serde_json::Value, String> {
-        // One workflow at a time: the workers share the engine, and a
-        // second overlapping run would just contend for the same
-        // operations.
+    fn launch(
+        &self,
+        engine: ConfluenceEngine,
+        objective: Option<String>,
+    ) -> Result<serde_json::Value, String> {
+        // One workflow at a time across the server: overlapping runs
+        // would just contend for the same operations.
         if self
             .state
             .running
@@ -338,7 +543,7 @@ impl DesignLauncher for DaemonDesignLauncher {
         let work_dir = self.out_dir.join("work");
 
         let supervisor = Supervisor::new(
-            self.engine.clone(),
+            engine.clone(),
             Arc::clone(&self.backend),
             mcp_url,
             None,
@@ -346,7 +551,7 @@ impl DesignLauncher for DaemonDesignLauncher {
         );
 
         let scheduler = Scheduler::new(
-            self.engine.clone(),
+            engine.clone(),
             supervisor,
             SchedulerPolicy {
                 max_concurrent_agents: self.max_agents,
@@ -367,7 +572,7 @@ impl DesignLauncher for DaemonDesignLauncher {
             },
         );
 
-        let started_revision = self.engine.head_revision().0;
+        let started_revision = engine.head_revision().0;
         let state = Arc::clone(&self.state);
 
         tokio::spawn(async move {
@@ -494,7 +699,7 @@ async fn admin_create_session(State(state): State<AdminState>) -> Json<serde_jso
 /// Launches the concurrent design workflow from a terminal trigger, the
 /// same one `request_design` uses from the UI.
 async fn admin_create_design(State(state): State<AdminState>) -> Json<serde_json::Value> {
-    match state.launcher.launch(None) {
+    match state.launcher.launch(state.engine.clone(), None) {
         Ok(value) => Json(value),
         Err(error) => Json(serde_json::json!({ "launched": false, "error": error })),
     }

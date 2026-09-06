@@ -36,6 +36,7 @@ pub mod summary;
 pub mod symbol;
 pub mod task;
 pub mod workspace;
+pub mod workspace_manager;
 
 pub use analysis::*;
 pub use auth::*;
@@ -53,3 +54,4 @@ pub use summary::*;
 pub use symbol::*;
 pub use task::*;
 pub use workspace::*;
+pub use workspace_manager::*;

@@ -277,6 +277,115 @@ async fn shared_skeleton_put_service_commits_over_mcp() {
 }
 
 #[tokio::test]
+async fn a_multi_project_server_isolates_projects_behind_one_api_key() {
+    use std::sync::Arc;
+
+    // One global server, a stable API key, two projects. Each connection
+    // selects a project and its edits are isolated to that project.
+    let dir = std::env::temp_dir().join(format!("conseqa-multi-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).expect("data dir");
+
+    let manager = Arc::new(conseqa::confluence::WorkspaceManager::new(&dir));
+    let api_key = "test-api-key-xyz".to_string();
+
+    let server = mcp::serve_router(
+        mcp::router_multi(Arc::clone(&manager), api_key.clone(), None),
+        "127.0.0.1:0".parse().expect("addr"),
+    )
+    .await
+    .expect("server binds");
+
+    let url = format!("http://{}/mcp", server.local_addr);
+
+    // Client A: create and work on project "checkout".
+    let mut a = McpClient::connect(&url, &api_key).await;
+
+    // Before opening a project, architecture tools guide the agent.
+    let (early, is_error) = a.call("task_context", serde_json::json!({})).await;
+    assert!(is_error);
+    assert!(
+        early["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("no project is open"),
+        "{early}"
+    );
+
+    let (created, is_error) = a
+        .call(
+            "create_project",
+            serde_json::json!({"project": "checkout", "prompt": "A checkout system."}),
+        )
+        .await;
+    assert!(!is_error, "{created}");
+    assert_eq!(created["created"], true);
+
+    // The project's prompt is grounded in task_context.
+    let (context, _) = a.call("task_context", serde_json::json!({})).await;
+    assert_eq!(context["prompt_evidence"][0]["excerpt"], "A checkout system.");
+
+    // A commits a service into "checkout".
+    let (committed, is_error) = a
+        .call(
+            "submit_patch",
+            serde_json::json!({"patch": {"mutations": [
+                {"kind": "put_service", "id": "service.checkout", "value": {"kind": "backend"}}
+            ]}}),
+        )
+        .await;
+    assert!(!is_error, "{committed}");
+    assert_eq!(committed["committed"], true);
+
+    // Client B: a separate connection, same API key, opens a different
+    // project "billing".
+    let mut b = McpClient::connect(&url, &api_key).await;
+
+    let (_opened, is_error) = b
+        .call("open_project", serde_json::json!({"project": "billing"}))
+        .await;
+    assert!(!is_error);
+
+    // B's project is empty — A's service is not visible here.
+    let (search, _) = b
+        .call("search_symbols", serde_json::json!({"kind": "service"}))
+        .await;
+    assert_eq!(
+        search["symbols"].as_array().map(|a| a.len()),
+        Some(0),
+        "billing is isolated from checkout: {search}"
+    );
+
+    // list_projects sees both.
+    let (list, _) = a.call("list_projects", serde_json::json!({})).await;
+    let names: Vec<&str> = list["projects"]
+        .as_array()
+        .expect("projects")
+        .iter()
+        .filter_map(|p| p["name"].as_str())
+        .collect();
+    assert!(names.contains(&"checkout"), "{list}");
+    assert!(names.contains(&"billing"), "{list}");
+
+    // A wrong API key is refused.
+    let mut intruder = McpClient::connect(&url, "wrong-key").await;
+    let refused = intruder
+        .rpc(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 500,
+            "method": "tools/call",
+            "params": {"name": "list_projects", "arguments": {}},
+        }))
+        .await;
+    assert!(
+        refused.get("error").is_some(),
+        "a wrong API key is refused: {refused}"
+    );
+
+    server.shutdown().await;
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test]
 async fn request_design_invokes_the_injected_launcher() {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -289,7 +398,11 @@ async fn request_design_invokes_the_injected_launcher() {
     }
 
     impl mcp::DesignLauncher for MockLauncher {
-        fn launch(&self, _objective: Option<String>) -> Result<serde_json::Value, String> {
+        fn launch(
+            &self,
+            _engine: ConfluenceEngine,
+            _objective: Option<String>,
+        ) -> Result<serde_json::Value, String> {
             self.calls.fetch_add(1, Ordering::SeqCst);
 
             Ok(serde_json::json!({ "launched": true, "backend": "mock" }))
