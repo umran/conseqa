@@ -817,3 +817,103 @@ async fn an_unknown_capability_is_refused() {
 
     server.shutdown().await;
 }
+
+/// The interactive authoring loop's feedback and delivery surface:
+/// spec_status reports the checker's verdict on the head, export_spec
+/// writes the canonical YAML, the verification report, and the
+/// self-contained visualization, and dsl_guide serves the semantics —
+/// so an agent never needs the crate's source to author or deliver.
+#[tokio::test]
+async fn status_export_and_guide_serve_the_authoring_loop() {
+    let engine = ConfluenceEngine::in_memory(fixture_workspace()).expect("engine starts");
+
+    let server = mcp::serve(engine.clone(), "127.0.0.1:0".parse().expect("bind addr"))
+        .await
+        .expect("the mcp server binds");
+
+    let url = format!("http://{}/mcp", server.local_addr);
+    let handle = task(&engine, "operation.create_order");
+    let mut client = McpClient::connect(&url, &handle.token.0).await;
+
+    // The status call reports the fixture's real standing: a complete,
+    // validated model with declared obligations, some of them open.
+    let (status, is_error) = client.call("spec_status", serde_json::json!({})).await;
+
+    assert!(!is_error, "spec_status succeeds: {status}");
+    assert_eq!(status["inventory"]["operations"], 6, "{status}");
+    assert_eq!(
+        status["inventory"]["operations_without_programs"]
+            .as_array()
+            .map(Vec::len),
+        Some(0),
+        "{status}"
+    );
+    assert_eq!(status["analysis"]["state"], "validated", "{status}");
+
+    let total = status["analysis"]["obligations"]["total"]
+        .as_u64()
+        .expect("total");
+    let proven = status["analysis"]["obligations"]["proven"]
+        .as_u64()
+        .expect("proven");
+    let open = status["analysis"]["obligations"]["open"]
+        .as_array()
+        .expect("open")
+        .len() as u64;
+
+    assert!(total > 0, "the fixture declares obligations: {status}");
+    assert_eq!(proven + open, total, "{status}");
+
+    // Export writes all three artifacts; the YAML round-trips through
+    // the standalone parser and the visualization is self-contained.
+    let dir = std::env::temp_dir().join(format!("conseqa-export-{}", uuid::Uuid::new_v4()));
+
+    let (exported, is_error) = client
+        .call(
+            "export_spec",
+            serde_json::json!({"dir": dir.display().to_string()}),
+        )
+        .await;
+
+    assert!(!is_error, "export_spec succeeds: {exported}");
+    assert_eq!(exported["exported"], true, "{exported}");
+    assert_eq!(
+        exported["artifacts"].as_array().map(Vec::len),
+        Some(3),
+        "{exported}"
+    );
+
+    let yaml = std::fs::read_to_string(dir.join("conseqa.yaml")).expect("yaml written");
+    let model = conseqa::parser::yaml::parse(&yaml).expect("exported model parses");
+
+    assert!(conseqa::analyzer::validate(&model).is_empty());
+
+    let report = std::fs::read_to_string(dir.join("verification-report.json"))
+        .expect("report written");
+
+    assert!(report.contains("obligations"), "{report}");
+
+    let html = std::fs::read_to_string(dir.join("spec.html")).expect("visualization written");
+
+    assert!(html.contains("window.CONSEQA"), "the page data is injected");
+    assert!(
+        html.contains("operation.create_order"),
+        "the model is embedded"
+    );
+
+    // The guide answers a semantics question without any project state.
+    let (guide, is_error) = client
+        .call("dsl_guide", serde_json::json!({"topic": "effect intents"}))
+        .await;
+
+    assert!(!is_error);
+    assert!(
+        guide
+            .as_str()
+            .is_some_and(|text| text.contains("EstablishEffectIntent")),
+        "{guide}"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+    server.shutdown().await;
+}

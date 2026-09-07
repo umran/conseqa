@@ -11,14 +11,12 @@
 //! obligations proven, disproven, or unknown. The front end itself is
 //! the React application in `viz/`, embedded as a built bundle.
 
-mod graph;
-mod render;
-mod report;
-
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+use conseqa::analyzer::report;
 use conseqa::analyzer::{Diagnostic, Severity};
+use conseqa::viz::render;
 
 struct Args {
     model: PathBuf,

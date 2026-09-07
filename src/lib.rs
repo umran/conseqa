@@ -5,3 +5,4 @@ pub mod confluence;
 pub mod harness;
 pub mod parser;
 pub mod spec;
+pub mod viz;

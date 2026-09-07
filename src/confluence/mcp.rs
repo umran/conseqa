@@ -11,7 +11,9 @@
 //! the shapes compactly for agents.
 
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use rmcp::{
     ErrorData as McpError, RoleServer, ServerHandler,
@@ -26,6 +28,7 @@ use uuid::Uuid;
 
 use crate::spec::{Id, Revision};
 
+use super::analysis::AnalysisState;
 use super::commit::{CommitRejection, CommitRequest};
 use super::engine::{ConfluenceEngine, EngineError, OperationReadMode};
 use super::graph_query::GraphQuery;
@@ -38,7 +41,9 @@ use super::workspace_manager::WorkspaceManager;
 
 /// The invariants every architecture agent operates under (§89),
 /// served as the MCP server's instructions.
-const INSTRUCTIONS: &str = "\
+/// The contract served to harness worker agents (`Single` backing):
+/// one scoped task, one patch, restart on invalidation.
+const WORKER_INSTRUCTIONS: &str = "\
 Conseqa shared architecture state. Invariants:
 1. Shared Conseqa state is available only through these tools.
 2. Do not infer that your snapshot is current after invalidation.
@@ -50,8 +55,42 @@ Conseqa shared architecture state. Invariants:
 8. Prefer unknown/unresolved over inventing an unsupported guarantee.
 9. Finish by committing one patch, filing a dependency request, or \
 reporting unresolved.
-Call dsl_reference for the JSON shapes of symbols, queries, and \
-patches.";
+Call dsl_guide for DSL semantics by topic, and dsl_reference for the \
+JSON shapes of symbols, queries, and patches.";
+
+/// The brief served to interactive clients (`Local` stdio and `Multi`
+/// http backings): the authoring loop, stated up front, so an agent
+/// asked to design a system with Conseqa knows exactly how to work
+/// instead of reverse-engineering the crate.
+const INTERACTIVE_INSTRUCTIONS: &str = "\
+Conseqa architecture authoring. You design a system as a Conseqa model \
+— services, schemas, data models, topics, state machines, and \
+operations with explicit causal programs — and a deterministic checker \
+validates it and proves or refuses its correctness obligations. Model \
+state lives in this server, never in files you edit.
+
+The authoring loop:
+1. create_project or open_project selects the model you are building.
+2. Learn the DSL from this server, not from source code: dsl_guide \
+explains the semantics by topic; dsl_reference gives the exact JSON \
+shapes plus a worked program example.
+3. Build incrementally with submit_patch — many small typed patches \
+are normal. The commit gate rejects a structurally broken patch with \
+precise diagnostics; fix the patch and resubmit in the same session.
+4. spec_status is your feedback loop: it reports assembly gaps while \
+drafting, validation errors, or the verification verdict with exactly \
+which obligations are proven and which are not.
+5. export_spec delivers the result: the canonical YAML, the \
+verification report, and a self-contained interactive HTML \
+visualization, written to a directory you choose — show these to the \
+user.
+6. request_design fans out concurrent coding agents to build or \
+repair a large model in the background.
+
+Invariants: requirements are obligations, not guarantees; never \
+weaken or remove a requirement to make verification pass; prefer \
+unknown/unspecified over inventing a guarantee the design does not \
+support. Correctness verdicts come only from the checker.";
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ReadSymbolParams {
@@ -562,6 +601,32 @@ fn id_from(text: &str) -> Id {
     Id(text.to_string())
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct DslGuideParams {
+    /// A topic from the guide's table of contents — a section name or a
+    /// few words of it, e.g. "effect intents", "subscription",
+    /// "idempotency keys", "value references". Omit for the table of
+    /// contents.
+    #[serde(default)]
+    pub topic: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ExportSpecParams {
+    /// Directory to write the artifacts into, created if missing. Use
+    /// an absolute path in the user's project so the files land where
+    /// they expect them.
+    pub dir: String,
+
+    /// Also render the interactive HTML visualization (default true).
+    #[serde(default)]
+    pub render: Option<bool>,
+
+    /// Page title for the visualization. Defaults to the project name.
+    #[serde(default)]
+    pub title: Option<String>,
+}
+
 #[tool_router]
 impl ConseqaMcp {
     #[tool(
@@ -583,7 +648,9 @@ impl ConseqaMcp {
 
     #[tool(
         description = "Your task's current state: running, invalidated, committed, or \
-                       cancelled. If invalidated, stop — the harness restarts the task."
+                       cancelled. A harness worker whose task is invalidated must stop — \
+                       the harness restarts it. An interactive session rolls forward on \
+                       each commit and stays running."
     )]
     async fn task_status(
         &self,
@@ -924,10 +991,12 @@ impl ConseqaMcp {
                 "project": info.name,
                 "opened": true,
                 "revision": info.revision.map(|revision| revision.0),
-                "note": "This is now the active project. Use task_context and the read \
-                         tools to explore it, submit_patch to change it, and request_design \
-                         to fan out concurrent agents. Opening another project switches the \
-                         active one.",
+                "note": "This is now the active project. Explore it with task_context and \
+                         the read tools, learn the DSL with dsl_guide, change it with \
+                         submit_patch, check spec_status for the checker's verdict, and \
+                         export_spec to deliver YAML, report, and visualization. \
+                         request_design fans out concurrent agents. Opening another \
+                         project switches the active one.",
             })),
 
             Err(error) => json_error(serde_json::json!({
@@ -968,8 +1037,10 @@ impl ConseqaMcp {
                 "project": info.name,
                 "created": true,
                 "note": "New project created and now active. Its prompt is in task_context. \
-                         Build it with submit_patch, or call request_design to fan out \
-                         concurrent agents.",
+                         Learn the DSL with dsl_guide and dsl_reference, build \
+                         incrementally with submit_patch, check spec_status as you go, and \
+                         export_spec to deliver — or call request_design to fan out \
+                         concurrent agents instead.",
             })),
 
             Err(error) => json_error(serde_json::json!({
@@ -988,6 +1059,311 @@ impl ConseqaMcp {
             "{DSL_REFERENCE}{PROGRAM_EXAMPLE_PREAMBLE}\n{PROGRAM_EXAMPLE_JSON}\n"
         ))]))
     }
+
+    #[tool(
+        description = "The Conseqa DSL semantics, by topic: what services, schemas, data \
+                       models, topics, state machines, operations, programs, transactions, \
+                       effects, effect intents, value references, and requirements mean and \
+                       how they compose. Call with no topic for the table of contents, then \
+                       with a topic — a section name or a few words of it — for the full \
+                       section. Use this instead of reading Conseqa's source code."
+    )]
+    async fn dsl_guide(
+        &self,
+        params: Parameters<DslGuideParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let text = match params.0.topic.as_deref() {
+            None => guide_toc(),
+            Some(topic) => guide_lookup(topic),
+        };
+
+        Ok(CallToolResult::success(vec![ContentBlock::text(text)]))
+    }
+
+    #[tool(
+        description = "Where the active model stands right now: revision, an inventory of \
+                       its symbols, which operations still lack programs, and the checker's \
+                       verdict — assembly gaps while drafting, validation errors, or the \
+                       verification result with every open obligation. Call it after \
+                       committing to steer your next step."
+    )]
+    async fn spec_status(
+        &self,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        let resolved = resolved!(self, context);
+        let engine = resolved.engine;
+
+        let head = engine.head_snapshot();
+        let workspace = &head.workspace;
+
+        let unfinished: Vec<String> = workspace
+            .operations
+            .iter()
+            .filter(|(_, draft)| draft.program.is_none() || draft.execution.is_none())
+            .map(|(id, _)| id.to_string())
+            .collect();
+
+        let prompt_obligations: serde_json::Map<String, serde_json::Value> = workspace
+            .prompt_obligations
+            .iter()
+            .map(|(id, obligation)| {
+                (
+                    id.0.clone(),
+                    serde_json::Value::String(obligation_status_label(&obligation.status)),
+                )
+            })
+            .collect();
+
+        let analysis = settled_analysis(&engine, head.revision).await;
+
+        json_result(serde_json::json!({
+            "revision": head.revision.0,
+            "inventory": {
+                "services": workspace.services.len(),
+                "schemas": workspace.schemas.len(),
+                "data_models": workspace.data_models.len(),
+                "topics": workspace.topics.len(),
+                "state_machines": workspace.state_machines.len(),
+                "operations": workspace.operations.len(),
+                "operations_without_programs": unfinished,
+            },
+            "prompt_obligations": prompt_obligations,
+            "analysis": analysis_json(&analysis),
+        }))
+    }
+
+    #[tool(
+        description = "Export the active model for delivery: writes conseqa.yaml (the \
+                       canonical model), verification-report.json (the checker's obligation \
+                       report), and by default spec.html — a self-contained interactive \
+                       visualization with the report overlaid — into the directory you \
+                       name, returning absolute paths. Show spec.html to the user. Requires \
+                       every operation to have a program; spec_status lists what is missing."
+    )]
+    async fn export_spec(
+        &self,
+        params: Parameters<ExportSpecParams>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        let resolved = resolved!(self, context);
+        let engine = resolved.engine;
+        let params = params.0;
+
+        let head = engine.head_snapshot();
+
+        let model = match head.workspace.assemble_model() {
+            Ok(model) => model,
+
+            Err(error) => {
+                return json_error(serde_json::json!({
+                    "exported": false,
+                    "error": "the model is not assemblable yet",
+                    "assembly_gaps": error
+                        .gaps
+                        .iter()
+                        .map(|gap| gap.to_string())
+                        .collect::<Vec<_>>(),
+                    "guidance": "Give every operation a program and execution facts — \
+                                 spec_status shows the same gaps — then export again.",
+                }));
+            }
+        };
+
+        let dir = PathBuf::from(&params.dir);
+
+        if let Err(error) = std::fs::create_dir_all(&dir) {
+            return json_error(serde_json::json!({
+                "exported": false,
+                "error": format!("cannot create {}: {error}", dir.display()),
+            }));
+        }
+
+        let dir = dir.canonicalize().unwrap_or(dir);
+        let mut artifacts = Vec::new();
+
+        let yaml = match serde_yaml::to_string(&model) {
+            Ok(yaml) => yaml,
+            Err(error) => {
+                return json_error(serde_json::json!({
+                    "exported": false,
+                    "error": format!("cannot serialize the model: {error}"),
+                }));
+            }
+        };
+
+        if let Some(result) = write_artifact(&dir.join("conseqa.yaml"), &yaml, &mut artifacts) {
+            return result;
+        }
+
+        let analysis = settled_analysis(&engine, head.revision).await;
+
+        let report = match &analysis {
+            AnalysisState::Ready(analysis) => Some(&analysis.obligations),
+            _ => None,
+        };
+
+        if let Some(report) = report {
+            let json = serde_json::to_string_pretty(report)
+                .unwrap_or_else(|_| "{}".to_string());
+
+            if let Some(result) = write_artifact(
+                &dir.join("verification-report.json"),
+                &format!("{json}\n"),
+                &mut artifacts,
+            ) {
+                return result;
+            }
+        }
+
+        if params.render.unwrap_or(true) {
+            let title = params
+                .title
+                .clone()
+                .unwrap_or_else(|| head.workspace.run_meta.run.0.clone());
+
+            match crate::viz::render(&model, report, &title) {
+                Ok(html) => {
+                    if let Some(result) =
+                        write_artifact(&dir.join("spec.html"), &html, &mut artifacts)
+                    {
+                        return result;
+                    }
+                }
+
+                Err(error) => {
+                    return json_error(serde_json::json!({
+                        "exported": false,
+                        "error": format!("cannot render the visualization: {error}"),
+                        "artifacts": artifacts,
+                    }));
+                }
+            }
+        }
+
+        json_result(serde_json::json!({
+            "exported": true,
+            "revision": head.revision.0,
+            "artifacts": artifacts,
+            "analysis": analysis_json(&analysis),
+            "note": "spec.html is self-contained — open it in a browser or hand it to \
+                     the user. conseqa.yaml is the canonical model, consumable by the \
+                     `conseqa` checker and `conseqa-viz`.",
+        }))
+    }
+}
+
+/// Waits a bounded moment for the head revision's analysis, so a status
+/// call right after a commit reports the verdict rather than
+/// "analyzing".
+async fn settled_analysis(engine: &ConfluenceEngine, revision: Revision) -> AnalysisState {
+    let state = engine.analysis_state(revision);
+
+    if state.is_terminal() {
+        return state;
+    }
+
+    tokio::time::timeout(Duration::from_secs(15), engine.analysis_ready(revision))
+        .await
+        .unwrap_or_else(|_| engine.analysis_state(revision))
+}
+
+/// The checker's verdict in a shape an authoring agent can act on.
+fn analysis_json(state: &AnalysisState) -> serde_json::Value {
+    match state {
+        AnalysisState::NotAssemblable { gaps } => serde_json::json!({
+            "state": "draft",
+            "assembly_gaps": gaps.iter().map(|gap| gap.to_string()).collect::<Vec<_>>(),
+            "guidance": "The model is still a draft: the listed operations need programs \
+                         and execution facts before the validator can run.",
+        }),
+
+        AnalysisState::ValidationFailed { errors } => serde_json::json!({
+            "state": "invalid",
+            "errors": errors,
+            "guidance": "Fix the listed structural errors with submit_patch, then check \
+                         spec_status again.",
+        }),
+
+        AnalysisState::Ready(analysis) => {
+            let mut proven = 0usize;
+            let mut open = Vec::new();
+
+            for obligation in &analysis.obligations.obligations {
+                if obligation.status == crate::analyzer::report::Status::Proven {
+                    proven += 1;
+                } else {
+                    open.push(
+                        serde_json::to_value(obligation).unwrap_or_else(|_| {
+                            serde_json::Value::String(obligation.id.clone())
+                        }),
+                    );
+                }
+            }
+
+            let total = analysis.obligations.obligations.len();
+
+            serde_json::json!({
+                "state": "validated",
+                "obligations": {
+                    "total": total,
+                    "proven": proven,
+                    "open": open,
+                },
+                "guidance": if total == 0 {
+                    "The model validates and declares no requirements yet; discover and \
+                     declare its correctness obligations, or export as is."
+                } else if proven == total {
+                    "The model validates and every obligation is proven."
+                } else {
+                    "The model validates; each open obligation's evidence names the \
+                     missing fact. requirement_report gives per-operation detail."
+                },
+            })
+        }
+
+        other => serde_json::json!({
+            "state": "analyzing",
+            "detail": other.label(),
+            "guidance": "Analysis is still running; check spec_status again shortly.",
+        }),
+    }
+}
+
+fn obligation_status_label(status: &super::workspace::PromptObligationStatus) -> String {
+    use super::workspace::PromptObligationStatus;
+
+    match status {
+        PromptObligationStatus::Unmapped => "unmapped".to_string(),
+        PromptObligationStatus::Mapped { requirements } => {
+            format!("mapped ({} requirements)", requirements.len())
+        }
+        PromptObligationStatus::UnsupportedByCurrentDsl { reason } => {
+            format!("unsupported: {reason}")
+        }
+        PromptObligationStatus::ExplicitlyWaivedByUser => "waived".to_string(),
+    }
+}
+
+/// Writes one export artifact, recording its path; on failure returns
+/// the error result to hand straight back to the caller.
+fn write_artifact(
+    path: &std::path::Path,
+    contents: &str,
+    artifacts: &mut Vec<String>,
+) -> Option<Result<CallToolResult, McpError>> {
+    match std::fs::write(path, contents) {
+        Ok(()) => {
+            artifacts.push(path.display().to_string());
+            None
+        }
+
+        Err(error) => Some(json_error(serde_json::json!({
+            "exported": false,
+            "error": format!("cannot write {}: {error}", path.display()),
+            "artifacts": artifacts,
+        }))),
+    }
 }
 
 fn rejection_body(rejection: &CommitRejection) -> serde_json::Value {
@@ -1001,7 +1377,16 @@ impl ServerHandler for ConseqaMcp {
     fn get_info(&self) -> ServerInfo {
         let mut info = ServerInfo::new(ServerCapabilities::builder().enable_tools().build());
 
-        info.instructions = Some(INSTRUCTIONS.to_string());
+        // The worker daemon serves the task contract; interactive
+        // backings (the stdio and multi-project servers) serve the
+        // authoring loop.
+        info.instructions = Some(
+            match &self.backing {
+                Backing::Single(_) => WORKER_INSTRUCTIONS,
+                Backing::Multi { .. } | Backing::Local(_) => INTERACTIVE_INSTRUCTIONS,
+            }
+            .to_string(),
+        );
 
         info
     }
@@ -1223,6 +1608,119 @@ const PROGRAM_EXAMPLE_JSON: &str = r#"{"steps":[
               "from":[{"source":"transaction_output:output.example","path":"id"}]}}}
 ]}"#;
 
+/// The canonical DSL semantics document, embedded so `dsl_guide` can
+/// teach an agent the language from the server itself — instead of the
+/// agent reverse-engineering the crate's source, which it cannot see
+/// from its own project anyway.
+const DSL_SEMANTICS: &str = include_str!("../../CONSEQA_DSL_SEMANTICS.md");
+
+/// The `##` sections of the semantics document: header line and full
+/// body, subsections included. Fence-aware, so a `##` inside a code
+/// block never starts a section.
+fn guide_sections() -> Vec<(&'static str, &'static str)> {
+    let doc = DSL_SEMANTICS;
+
+    let mut starts: Vec<usize> = Vec::new();
+    let mut in_fence = false;
+    let mut offset = 0;
+
+    for line in doc.split_inclusive('\n') {
+        let trimmed = line.trim_end();
+
+        if trimmed.starts_with("```") {
+            in_fence = !in_fence;
+        } else if !in_fence && trimmed.starts_with("## ") {
+            starts.push(offset);
+        }
+
+        offset += line.len();
+    }
+
+    starts
+        .iter()
+        .enumerate()
+        .map(|(index, start)| {
+            let end = starts.get(index + 1).copied().unwrap_or(doc.len());
+            let section = &doc[*start..end];
+            let header = section.lines().next().unwrap_or_default();
+
+            (header, section)
+        })
+        .collect()
+}
+
+/// The guide's table of contents: every section and subsection header,
+/// with the usage hint.
+fn guide_toc() -> String {
+    let mut toc = String::from(
+        "The Conseqa DSL semantics guide. Call dsl_guide again with a topic — a \
+         section name or a few words of it — to read that section in full.\n\nSections:\n",
+    );
+
+    let mut in_fence = false;
+
+    for line in DSL_SEMANTICS.lines() {
+        if line.trim_end().starts_with("```") {
+            in_fence = !in_fence;
+            continue;
+        }
+
+        if in_fence {
+            continue;
+        }
+
+        if let Some(header) = line.strip_prefix("## ") {
+            toc.push_str(&format!("- {header}\n"));
+        } else if let Some(header) = line.strip_prefix("### ") {
+            toc.push_str(&format!("    - {header}\n"));
+        }
+    }
+
+    toc
+}
+
+/// Sections whose header — or any subsection header within — contains
+/// the query, case-insensitively. An unmatched or over-broad query
+/// falls back to headers so the caller can narrow.
+fn guide_lookup(topic: &str) -> String {
+    let query = topic.trim().to_lowercase();
+
+    if query.is_empty() {
+        return guide_toc();
+    }
+
+    let matched: Vec<(&str, &str)> = guide_sections()
+        .into_iter()
+        .filter(|(header, body)| {
+            header.to_lowercase().contains(&query)
+                || body.lines().any(|line| {
+                    line.starts_with("### ") && line.to_lowercase().contains(&query)
+                })
+        })
+        .collect();
+
+    if matched.is_empty() {
+        return format!("No section matches `{topic}`.\n\n{}", guide_toc());
+    }
+
+    let total: usize = matched.iter().map(|(_, body)| body.len()).sum();
+
+    if total > 40_000 {
+        let headers: Vec<&str> = matched.iter().map(|(header, _)| *header).collect();
+
+        return format!(
+            "`{topic}` matches several sections; narrow to one of:\n{}",
+            headers.join("\n")
+        );
+    }
+
+    matched
+        .into_iter()
+        .map(|(_, body)| body)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -1273,6 +1771,58 @@ mod tests {
             diagnostics.is_empty(),
             "the worked example must be internally valid, but the program-local \
              check reported:\n{diagnostics:#?}"
+        );
+    }
+
+    // The guide serves the embedded semantics document: the table of
+    // contents lists every section, a topic returns its full section,
+    // and an unmatched topic falls back to the listing — so an agent
+    // can always navigate to the semantics it needs without reading
+    // crate source.
+
+    #[test]
+    fn the_guide_toc_lists_the_semantics_sections() {
+        let toc = super::guide_toc();
+
+        for expected in [
+            "Interpretation model",
+            "Operations",
+            "Effect intents",
+            "Value references",
+            "Operation requirements",
+        ] {
+            assert!(toc.contains(expected), "toc lacks `{expected}`:\n{toc}");
+        }
+    }
+
+    #[test]
+    fn a_topic_returns_its_full_section() {
+        let section = super::guide_lookup("effect intents");
+
+        assert!(
+            section.contains("EstablishEffectIntent")
+                && section.contains("ExecuteEffectIntent"),
+            "the effect-intents section should explain both sides of the wiring:\n{section}"
+        );
+    }
+
+    #[test]
+    fn a_subsection_topic_returns_its_enclosing_section() {
+        let section = super::guide_lookup("dispatch routing");
+
+        assert!(
+            section.contains("Dispatch routing"),
+            "a `###` header match should return its section:\n{section}"
+        );
+    }
+
+    #[test]
+    fn an_unmatched_topic_falls_back_to_the_listing() {
+        let fallback = super::guide_lookup("zzz-not-a-topic");
+
+        assert!(
+            fallback.contains("No section matches") && fallback.contains("Sections:"),
+            "{fallback}"
         );
     }
 }
