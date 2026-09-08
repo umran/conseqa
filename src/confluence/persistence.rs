@@ -37,7 +37,14 @@ const HEAD_KEY: &str = "head";
 const FORMAT_KEY: &str = "format";
 const EVENT_SEQ_KEY: &str = "task_event_seq";
 
-const FORMAT: u64 = 1;
+/// The stored-workspace schema version.
+///
+/// Bumped to 2 when operations lost their execution facts and the L1
+/// runtime model arrived: `DraftOperation` and `WorkspaceState` both
+/// carry `deny_unknown_fields`, so a database written by format 1
+/// cannot be deserialized at all. Refusing it by version gives that a
+/// name, rather than surfacing a schema change as a corrupt value.
+const FORMAT: u64 = 2;
 
 #[derive(Debug, thiserror::Error)]
 pub enum PersistenceError {
@@ -47,7 +54,11 @@ pub enum PersistenceError {
     #[error("stored value does not deserialize: {0}")]
     Corrupt(#[from] serde_json::Error),
 
-    #[error("database format {found} is newer than this build understands ({FORMAT})")]
+    #[error(
+        "database is format {found}, but this build reads format {FORMAT}; the stored \
+         workspace schema changed and cannot be migrated automatically \
+         — start a new run against a fresh database"
+    )]
     FormatMismatch { found: u64 },
 }
 
@@ -143,8 +154,12 @@ impl Persistence {
             let found = meta.get(FORMAT_KEY)?.map(|value| value.value());
 
             match found {
+                // Both directions are refused. An older database holds
+                // a workspace shape this build cannot deserialize, and
+                // reporting that as a corrupt value would send a reader
+                // looking for disk damage.
                 Some(found) => {
-                    if found > FORMAT {
+                    if found != FORMAT {
                         return Err(PersistenceError::FormatMismatch { found });
                     }
                 }

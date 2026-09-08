@@ -587,6 +587,8 @@ That request inputs have none is worth stating plainly: a router keyed exactly l
 
 The mechanism is the §10 composition, and it is the serialization argument plus a precedence: the requirement key is established to be the effective grouping key for every admitted schema, `key: grouping_key` routes by that same domain, `MemberAssignment` gives it one active owning member, and `member_concurrency = bounded(1)` stops a later invocation overtaking an earlier one.
 
+Every leg is interrogated, not merely cited. The routing key is matched exhaustively, the member assignment is checked to give a domain one active owning member, and the pool's concurrency is checked to be `bounded(1)` — so a future routing key or assignment with weaker guarantees cannot be carried into a proof as though it were the one this rule was written for. Where a boundary is routed two ways, or a topic and its subscription both declare transport semantics, there is no single set of facts to reason from and the verifier refuses rather than reading whichever half it finds first.
+
 Both precedence sources require that same grouping identity, and for the same reason: a precedence only reaches execution if same-key deliveries stay together. `within_group` needs it because its guarantee is *about* the group. `global` needs it because an order over everything is still lost the moment two same-key deliveries land on different members. So the grouping evidence is established once and cited by either — serialization proves on the grouping alone, and ordering is that argument with a precedence added.
 
 This is why an ordering proof is strictly stronger than a serialization one over the same key, and why dispatch alone can never supply it: dispatch preserves precedence, it does not create any (§10.3.1). Dispatch additionally carries the order-preservation obligation of §10.3, so redelivery cannot invert the precedence: a failure-driven redelivery cannot be overtaken by a later message of its domain, and a duplicate of an already completed message is a repeated attempt at a logical invocation that took effect in order — what that attempt does is the idempotency requirement's obligation, not ordering's, and the proof records which requirement answers for it or that none does. Vacuously discharged: a subscription admitting no message schemas.
@@ -807,7 +809,8 @@ ordering: within_group
 
 | | Meaning |
 |---|---|
-| omitted, or `none` | No usable transport precedence guarantee exists. |
+| omitted | No precedence is declared at this scope, and the scope stays open. |
+| `none` | An explicit "this transport orders nothing" — a declaration, so it claims the scope like any other. |
 | `global` | One precedence relation across every message in scope. Stronger than per-group order, and it needs no grouping key of its own. |
 | `within_group` | Precedence among messages of the same declared grouping domain. Requires a grouping at the same scope, since otherwise there is no domain the guarantee could be interpreted over. |
 
@@ -841,7 +844,9 @@ Topic-scoped is the shape of a runtime that imposes one domain on the topic as a
 
 Subscription-scoped is the shape of a publication that fans out into independently configured queues or transport paths. Two subscribers of one logical channel may then group differently — one by `account_id`, another by `region_id` — where a topic-wide declaration would be false of both.
 
-The two are not a default and an override. They are different declaration modes, and validation rejects a model that uses both for one topic. Splitting the pair across scopes is not rejected so much as unwritable: each fact is its own presence or absence, so a subscription that declares anything is already in subscription-scoped mode, and a topic that declares anything forbids that. There is deliberately **no inheritance, no override, and no fallback chain**, because each of those would make the effective semantics depend on implicit precedence between declarations, allow partial overrides, let grouping and ordering come from different scopes, and turn proof provenance into something a reader has to reconstruct. A model validates into one mode before analysis begins, so §10.3's resolution is a lookup and not a decision.
+The two are not a default and an override. They are different declaration modes, and validation rejects a model that uses both for one topic. That is why omitting `ordering` and writing `ordering: none` differ: the first declares nothing and leaves the scope open, the second is an explicit negative and claims the scope. Collapsing them would let a subscription say "I have no precedence" and silently inherit the topic's — exactly the override this model exists to prevent.
+
+A topic-scoped grouping serves every subscription of the topic, so it must place every carried message in a group. A subscription-scoped one only has to cover what its own `MessageSelector` admits: requiring more would be unsatisfiable on a heterogeneous topic where a filtered-out schema has no comparable field. There is deliberately **no inheritance, no override, and no fallback chain**, because each of those would make the effective semantics depend on implicit precedence between declarations, allow partial overrides, let grouping and ordering come from different scopes, and turn proof provenance into something a reader has to reconstruct. A model validates into one mode before analysis begins, so §10.3's resolution is a lookup and not a decision.
 
 The two fields stay flat on their owning object rather than inside a `TransportSemantics` wrapper: the wrapper would carry no independent meaning, and the scope owner already says the facts belong together.
 

@@ -1,4 +1,5 @@
 import type { Id } from "../types/model";
+import { REPORT_FORMAT } from "../types/report";
 import type { Obligation, ProverReport, Status, Subject } from "../types/report";
 
 export const STATUS_ORDER: Record<Status, number> = { disproven: 0, unknown: 1, proven: 2 };
@@ -25,6 +26,18 @@ export type ObligationIndex = Map<string, Obligation[]>;
 export function buildObligationIndex(report: ProverReport | null): ObligationIndex {
   const index: ObligationIndex = new Map();
   if (!report) return index;
+
+  // A report from another format carries assumptions written in a
+  // vocabulary that may no longer describe the model. Rendering it
+  // would explain a verdict in terms the checker no longer uses.
+  if (report.format !== REPORT_FORMAT) {
+    console.warn(
+      `report format ${report.format} is not ${REPORT_FORMAT}; obligations not rendered`,
+    );
+
+    return index;
+  }
+
   for (const ob of report.obligations) {
     for (const key of subjectKeys(ob.subject)) {
       const list = index.get(key);

@@ -25,10 +25,11 @@
 //! here a runtime model is valid whenever its references resolve, its
 //! keys are well-formed, and its transport semantics have one scope.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::spec::{
-    GroupingKey, Id, Input, Model, OrderingSemantics, RuntimeModel, SubscriptionRoutingKey,
+    GroupingKey, Id, Input, MessageSelector, Model, OrderingSemantics, RuntimeModel,
+    SubscriptionRoutingKey,
 };
 
 use super::InputKind;
@@ -64,6 +65,14 @@ fn validate_topic_runtimes(
     for (topic_id, topic_runtime) in &runtime.topics {
         super::expect_reference(index, topic_id, topic_id, ReferenceKind::Topic, errors);
 
+        // A topic-scoped grouping serves every subscription of the
+        // topic, so it must cover every message the topic carries.
+        let carried: BTreeSet<&Id> = model
+            .topics
+            .get(topic_id)
+            .map(|topic| topic.messages.iter().collect())
+            .unwrap_or_default();
+
         validate_grouping(
             model,
             index,
@@ -71,6 +80,7 @@ fn validate_topic_runtimes(
             topic_id,
             topic_runtime.grouping.as_ref(),
             topic_runtime.ordering,
+            &carried,
             errors,
         );
     }
@@ -83,18 +93,25 @@ fn validate_topic_runtimes(
 /// depending on the scope. `topic_id` is the topic whose carried
 /// schemas the mapping is judged against, which is the same topic
 /// either way.
+#[allow(clippy::too_many_arguments)]
 fn validate_grouping(
     model: &Model,
     index: &ReferenceIndex<'_>,
     subject: &Id,
     topic_id: &Id,
     grouping: Option<&GroupingKey>,
-    ordering: OrderingSemantics,
+    ordering: Option<OrderingSemantics>,
+    // The schemas this scope actually receives. A topic-scoped grouping
+    // serves every subscription, so it must cover the whole topic; a
+    // subscription-scoped one only has to group what its own selector
+    // admits, and requiring more can be impossible on a heterogeneous
+    // topic where the filtered-out schema has no comparable field.
+    covers: &BTreeSet<&Id>,
     errors: &mut Vec<ValidationError>,
 ) {
     // `within_group` names the domain a grouping declares. Without one
     // there is nothing for the guarantee to be interpreted over.
-    if ordering == OrderingSemantics::WithinGroup && grouping.is_none() {
+    if ordering == Some(OrderingSemantics::WithinGroup) && grouping.is_none() {
         errors.push(ValidationError::WithinGroupWithoutGrouping {
             subject: subject.clone(),
         });
@@ -122,14 +139,14 @@ fn validate_grouping(
         }
     }
 
-    // A grouping key must place every carried message in some group:
-    // an unmapped schema would have no group at all.
-    for schema in &topic.messages {
-        if !key.mapping.contains_key(schema) {
+    // Every message this scope receives must land in some group; an
+    // unmapped one would belong to none.
+    for schema in covers {
+        if !key.mapping.contains_key(*schema) {
             errors.push(ValidationError::GroupingKeyMissingSchema {
                 subject: subject.clone(),
                 topic: topic_id.clone(),
-                schema: schema.clone(),
+                schema: (*schema).clone(),
             });
         }
     }
@@ -270,6 +287,18 @@ fn validate_subscription_runtimes(
 
             expect_pool(model, input_id, &subscription_runtime.dispatch.pool, errors);
 
+            // A subscription-scoped grouping only has to cover what
+            // this subscription admits.
+            let admitted: BTreeSet<&Id> = match &subscription.messages {
+                MessageSelector::Only(schemas) => schemas.iter().collect(),
+
+                MessageSelector::All => model
+                    .topics
+                    .get(&subscription.topic)
+                    .map(|topic| topic.messages.iter().collect())
+                    .unwrap_or_default(),
+            };
+
             validate_grouping(
                 model,
                 index,
@@ -277,6 +306,7 @@ fn validate_subscription_runtimes(
                 &subscription.topic,
                 subscription_runtime.grouping.as_ref(),
                 subscription_runtime.ordering,
+                &admitted,
                 errors,
             );
 

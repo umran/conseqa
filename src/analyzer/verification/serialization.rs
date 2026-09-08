@@ -273,6 +273,25 @@ pub enum SerializationObstacle {
     /// router serves, so no runtime fact says where they execute.
     NoRouter { input: Id },
 
+    /// More than one router serves the boundary. The declarations may
+    /// contradict, so there is no single set of routing facts to reason
+    /// from; validation rejects the shape and verification declines to
+    /// pick one.
+    AmbiguousRouter { input: Id, routers: Vec<Id> },
+
+    /// Both the topic and the subscription declare transport
+    /// semantics. The two scopes are exclusive, so the declarations may
+    /// contradict and neither can be read as the effective one.
+    TransportSemanticsAtBothScopes { input: Id, topic: Id },
+
+    /// A declared routing key names no domain, because its tuple is
+    /// empty.
+    EmptyRoutingKey { input: Id, router: Id },
+
+    /// A declared grouping key names no domain for a schema, because
+    /// its tuple is empty.
+    EmptyGroupingKey { input: Id, topic: Id, schema: Id },
+
     /// Key-bearing deliveries arrive through a subscription input with
     /// no declared runtime, so no runtime fact says where they
     /// execute.
@@ -285,9 +304,7 @@ pub enum SerializationObstacle {
 
     /// A component of the routing key is not established to carry the
     /// same logical value as the serialization key, so same-key
-    /// invocations may fall into different routing domains. An empty
-    /// routing key — which validation rejects — reports an empty
-    /// component here rather than proving vacuously.
+    /// invocations may fall into different routing domains.
     RoutingKeyNotEquivalent {
         input: Id,
         router: Id,
@@ -325,6 +342,13 @@ pub enum SerializationObstacle {
     /// The target execution pool is not declared, so its member
     /// concurrency is unknown.
     PoolUndeclared { input: Id, pool: Id },
+
+    /// The declared member assignment does not give a routing domain
+    /// one active owning member.
+    MemberAssignmentNotExclusive {
+        input: Id,
+        declared: MemberAssignment,
+    },
 
     /// The pool's declared member concurrency does not bound one
     /// member to one simultaneously active invocation.
@@ -405,12 +429,27 @@ fn request_route(
     schema: &Id,
     key: &FieldPath,
 ) -> SerializationVerdict {
-    let Some((router_id, router)) = model.router_for(operation_id, input_id) else {
-        return SerializationVerdict::Unproven {
-            obstacles: vec![SerializationObstacle::NoRouter {
-                input: input_id.clone(),
-            }],
-        };
+    let routers = model.routers_for(operation_id, input_id);
+
+    let (router_id, router) = match routers.as_slice() {
+        [single] => *single,
+
+        [] => {
+            return SerializationVerdict::Unproven {
+                obstacles: vec![SerializationObstacle::NoRouter {
+                    input: input_id.clone(),
+                }],
+            };
+        }
+
+        several => {
+            return SerializationVerdict::Unproven {
+                obstacles: vec![SerializationObstacle::AmbiguousRouter {
+                    input: input_id.clone(),
+                    routers: several.iter().map(|(id, _)| (*id).clone()).collect(),
+                }],
+            };
+        }
     };
 
     let mut obstacles = Vec::new();
@@ -440,8 +479,19 @@ fn request_route(
 
     let serial = pool_is_serial(model, input_id, &router.pool, &mut obstacles);
 
+    let exclusive = routing_key
+        .as_ref()
+        .is_none_or(|(_, assignment)| assignment_owns_one_member(*assignment));
+
+    if !exclusive && let Some((_, declared)) = &routing_key {
+        obstacles.push(SerializationObstacle::MemberAssignmentNotExclusive {
+            input: input_id.clone(),
+            declared: *declared,
+        });
+    }
+
     match routing_key {
-        Some((routing_key, member_assignment)) if serial => {
+        Some((routing_key, member_assignment)) if serial && exclusive => {
             SerializationVerdict::proven(SerializationProof::RequestRouted {
                 input: input_id.clone(),
                 router: router_id.clone(),
@@ -509,8 +559,19 @@ fn subscription_route(
 
     let serial = pool_is_serial(model, input_id, &runtime.dispatch.pool, &mut obstacles);
 
+    let exclusive = routed
+        .as_ref()
+        .is_none_or(|(_, assignment)| assignment_owns_one_member(*assignment));
+
+    if !exclusive && let Some((_, declared)) = &routed {
+        obstacles.push(SerializationObstacle::MemberAssignmentNotExclusive {
+            input: input_id.clone(),
+            declared: *declared,
+        });
+    }
+
     match routed {
-        Some((facts, member_assignment)) if serial => {
+        Some((facts, member_assignment)) if serial && exclusive => {
             SerializationVerdict::proven(SerializationProof::SubscriptionRouted {
                 input: input_id.clone(),
                 topic: facts.topic,
@@ -522,6 +583,20 @@ fn subscription_route(
         }
 
         _ => SerializationVerdict::Unproven { obstacles },
+    }
+}
+
+/// Whether a member assignment gives one routing domain one active
+/// owning member, which is the ownership leg of every routed proof.
+///
+/// Matched exhaustively on purpose. The other three legs of the chain
+/// are each guarded — routing keys by an exhaustive match, member
+/// concurrency by `is_serial` being false for anything new — and this
+/// one must be too, so a future assignment with weaker ownership
+/// cannot be copied into a proof as though it were `consistent_hash`.
+pub(super) fn assignment_owns_one_member(assignment: MemberAssignment) -> bool {
+    match assignment {
+        MemberAssignment::ConsistentHash => true,
     }
 }
 
@@ -596,10 +671,9 @@ fn routing_key_facts(
     // component to constrain them, all invocations would appear to
     // share a domain.
     if routing_key.is_empty() {
-        return Err(vec![SerializationObstacle::RoutingKeyNotEquivalent {
+        return Err(vec![SerializationObstacle::EmptyRoutingKey {
             input: input_id.clone(),
             router: router_id.clone(),
-            component: FieldPath(Vec::new()),
         }]);
     }
 
@@ -662,6 +736,24 @@ pub(super) fn grouping_facts(
 ) -> Result<GroupingFacts, Vec<SerializationObstacle>> {
     let topic_id = subscription.topic.clone();
 
+    // The two declaration scopes are exclusive. When both declare, the
+    // facts may contradict — one grouping by order_id and the other by
+    // event_id put the same delivery in different groups — so there is
+    // no effective grouping to read. Validation rejects the shape;
+    // verification refuses it too rather than proving from whichever
+    // half `effective_grouping` happens to return.
+    let both_scopes = model.topic_scoped_transport(&topic_id)
+        && model
+            .subscription_runtime(operation_id, input_id)
+            .is_some_and(|runtime| runtime.declares_transport_semantics());
+
+    if both_scopes {
+        return Err(vec![SerializationObstacle::TransportSemanticsAtBothScopes {
+            input: input_id.clone(),
+            topic: topic_id,
+        }]);
+    }
+
     let grouping = model.effective_grouping(operation_id, input_id, &topic_id);
 
     let (Some(grouping_key), Some(topic)) = (grouping.as_ref(), model.topics.get(&topic_id)) else {
@@ -707,7 +799,7 @@ pub(super) fn grouping_facts(
         // deliveries across groups, so equality of the requirement key
         // would no longer imply a common group.
         if mapped.is_empty() {
-            obstacles.push(SerializationObstacle::GroupingKeyMappingMissing {
+            obstacles.push(SerializationObstacle::EmptyGroupingKey {
                 input: input_id.clone(),
                 topic: topic_id.clone(),
                 schema: schema.clone(),
@@ -810,6 +902,54 @@ impl SerializationObstacle {
                 ),
             },
 
+            Self::AmbiguousRouter { input, routers } => Evidence {
+                subject: Some(input.clone()),
+                message: format!(
+                    "`{input}` is served by more than one router ({}). Their \
+                     declarations may contradict, so there is no single routing \
+                     fact to reason from.",
+                    routers
+                        .iter()
+                        .map(Id::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            },
+
+            Self::TransportSemanticsAtBothScopes { input, topic } => Evidence {
+                subject: Some(input.clone()),
+                message: format!(
+                    "`{topic}` declares transport semantics for all its \
+                     subscriptions and `{input}` declares its own. The two scopes \
+                     are exclusive, so neither can be read as the effective one."
+                ),
+            },
+
+            Self::EmptyRoutingKey { router, .. } => Evidence {
+                subject: Some(router.clone()),
+                message: format!(
+                    "`{router}` declares an empty routing key, which names no \
+                     routing domain."
+                ),
+            },
+
+            Self::MemberAssignmentNotExclusive { input, .. } => Evidence {
+                subject: Some(input.clone()),
+                message: format!(
+                    "The member assignment declared for `{input}` does not give a \
+                     routing domain one active owning member, so same-key \
+                     invocations may execute on different members."
+                ),
+            },
+
+            Self::EmptyGroupingKey { topic, schema, .. } => Evidence {
+                subject: Some(schema.clone()),
+                message: format!(
+                    "The grouping in effect for `{topic}` maps `{schema}` to an \
+                     empty tuple, which names no group."
+                ),
+            },
+
             Self::NoRouter { input } => Evidence {
                 subject: Some(input.clone()),
                 message: format!(
@@ -835,16 +975,6 @@ impl SerializationObstacle {
                     "`{input}` is assigned to `{pool}` but declares no routing: \
                      the target execution population is known, and no fact \
                      relates same-key invocations to a common member."
-                ),
-            },
-
-            Self::RoutingKeyNotEquivalent {
-                router, component, ..
-            } if component.0.is_empty() => Evidence {
-                subject: Some(router.clone()),
-                message: format!(
-                    "`{router}` declares an empty routing key, which names no \
-                     routing domain."
                 ),
             },
 

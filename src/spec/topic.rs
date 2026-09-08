@@ -52,7 +52,18 @@ pub enum MessageIdentity {
     /// cover a subset of the carried schemas — identity is meaningful
     /// knowledge per schema, unlike the ordering key, which must route
     /// every carried message.
-    Keyed {
-        mapping: BTreeMap<Id, Vec<FieldPath>>,
-    },
+    Keyed(MessageIdentityKey),
+}
+
+/// The per-schema identity mapping.
+///
+/// A named struct rather than an inline variant body so that
+/// `deny_unknown_fields` applies: serde cannot enforce it on an
+/// internally tagged enum, and without it a field removed from `Topic`
+/// — `ordering` was this one's sibling — is silently swallowed when an
+/// author nests it here while migrating.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MessageIdentityKey {
+    pub mapping: BTreeMap<Id, Vec<FieldPath>>,
 }

@@ -296,7 +296,7 @@ impl Workflow {
             .iter()
             .map(|operation| LogicalTask {
                 kind: TaskKind::OperationSynthesis,
-                objective: format!("Synthesize the program and execution facts of {operation}."),
+                objective: format!("Synthesize the program of {operation}."),
                 write_scope: WriteScope::operation_synthesis(operation.clone()),
                 bundle: BundleSpec {
                     operation: Some(operation.clone()),

@@ -107,7 +107,7 @@ fn parses_minimal_model() {
         .topic_runtime(&Id("order_events".into()))
         .expect("the fixture declares a topic runtime");
 
-    assert_eq!(runtime.ordering, OrderingSemantics::None);
+    assert_eq!(runtime.ordering, None);
     assert!(runtime.grouping.is_none());
 }
 
@@ -184,7 +184,7 @@ fn parses_keyed_topic_model() {
         .topic_runtime(&Id("order_events".into()))
         .expect("the fixture declares a topic runtime");
 
-    assert_eq!(runtime.ordering, OrderingSemantics::WithinGroup);
+    assert_eq!(runtime.ordering, Some(OrderingSemantics::WithinGroup));
 
     let key = runtime
         .grouping
@@ -201,11 +201,12 @@ fn parses_keyed_topic_model() {
     // The grouping key and the message identity are separate
     // declarations: order_id groups events for an order, event_id
     // identifies one logical message.
-    let MessageIdentity::Keyed { mapping } = &topic.message_identity else {
+    let MessageIdentity::Keyed(identity) = &topic.message_identity else {
         panic!("order_events should declare a keyed message identity");
     };
 
-    let order_event_identity = mapping
+    let order_event_identity = identity
+        .mapping
         .get(&Id("OrderEvent".into()))
         .expect("OrderEvent should define its message identity");
 
@@ -231,28 +232,28 @@ fn flash_checkout_parses_stimulus_identities() {
         panic!("create_order input should be a request");
     };
 
-    let RequestIdentity::Keyed { fields } = &request.identity else {
+    let RequestIdentity::Keyed(identity) = &request.identity else {
         panic!("create_order request should declare a keyed identity");
     };
 
-    assert_eq!(fields.len(), 1);
-    assert_eq!(fields[0].0, vec!["idempotency_key".to_string()]);
+    assert_eq!(identity.fields.len(), 1);
+    assert_eq!(identity.fields[0].0, vec!["idempotency_key".to_string()]);
 
     let topic = model
         .topics
         .get(&Id("topic.order_events".into()))
         .expect("order_events topic should exist");
 
-    let MessageIdentity::Keyed { mapping } = &topic.message_identity else {
+    let MessageIdentity::Keyed(identity) = &topic.message_identity else {
         panic!("order_events should declare a keyed message identity");
     };
 
     // Every carried schema is identified by its event_id.
-    assert_eq!(mapping.len(), 6);
+    assert_eq!(identity.mapping.len(), 6);
 
-    for identity in mapping.values() {
-        assert_eq!(identity.len(), 1);
-        assert_eq!(identity[0].0, vec!["event_id".to_string()]);
+    for tuple in identity.mapping.values() {
+        assert_eq!(tuple.len(), 1);
+        assert_eq!(tuple[0].0, vec!["event_id".to_string()]);
     }
 }
 
@@ -1942,7 +1943,7 @@ runtime:
         )
         .expect("a subscription runtime");
 
-    assert_eq!(accounts.ordering, OrderingSemantics::WithinGroup);
+    assert_eq!(accounts.ordering, Some(OrderingSemantics::WithinGroup));
 
     // Grouping and ordering are independent: one subscriber orders
     // within its groups, the other only groups.
@@ -1950,7 +1951,7 @@ runtime:
         .subscription_runtime(&Id("op.process_regions".into()), &Id("input.events".into()))
         .expect("a subscription runtime");
 
-    assert_eq!(regions.ordering, OrderingSemantics::None);
+    assert_eq!(regions.ordering, None);
 
     assert!(
         regions.grouping.is_some(),

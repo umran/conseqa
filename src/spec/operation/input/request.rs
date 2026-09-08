@@ -46,5 +46,13 @@ pub enum RequestIdentity {
     /// enough to stand in a proof. A rejected conflicting request is
     /// not an admitted invocation, so rejection preserves the
     /// guarantee.
-    Keyed { fields: Vec<FieldPath> },
+    Keyed(RequestIdentityKey),
+}
+
+/// The identity fields of a keyed request boundary, named so that
+/// `deny_unknown_fields` applies through the tagged enum.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RequestIdentityKey {
+    pub fields: Vec<FieldPath>,
 }

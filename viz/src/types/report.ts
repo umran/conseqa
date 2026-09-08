@@ -55,6 +55,11 @@ export interface ProverReport {
   notes?: EvidenceItem[];
 }
 
+/** The report format this build understands. A report from another
+ *  format carries assumptions in a vocabulary that may no longer
+ *  correspond to the model, so it is refused rather than rendered. */
+export const REPORT_FORMAT = 3;
+
 export function propertyName(property: Property): string {
   return property.kind === "custom" ? property.name : property.kind;
 }

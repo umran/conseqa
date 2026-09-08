@@ -153,9 +153,9 @@ fn ping_interface() -> OperationInterfaceDraft {
             id("input.ping.request"),
             Input::Request(RequestInput {
                 schema: id("schema.PingRequest"),
-                identity: RequestIdentity::Keyed {
+                identity: RequestIdentity::Keyed(conseqa::spec::RequestIdentityKey {
                     fields: vec![path("id")],
-                },
+                }),
                 result: ResultType {
                     ok: id("schema.PingResponse"),
                     err: ErrorResultType {

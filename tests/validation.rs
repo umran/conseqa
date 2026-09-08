@@ -1457,7 +1457,9 @@ fn rejects_empty_request_identity() {
         panic!("create_order input should be a request");
     };
 
-    request.identity = RequestIdentity::Keyed { fields: Vec::new() };
+    request.identity = RequestIdentity::Keyed(conseqa::spec::RequestIdentityKey {
+        fields: Vec::new(),
+    });
 
     let errors = validation::validate(&model);
 
@@ -1483,9 +1485,9 @@ fn rejects_unresolvable_request_identity_field() {
         panic!("create_order input should be a request");
     };
 
-    request.identity = RequestIdentity::Keyed {
+    request.identity = RequestIdentity::Keyed(conseqa::spec::RequestIdentityKey {
         fields: vec![FieldPath(vec!["does_not_exist".to_owned()])],
-    };
+    });
 
     let errors = validation::validate(&model);
 
@@ -1504,11 +1506,11 @@ fn order_events_message_identity(
 ) -> &mut std::collections::BTreeMap<Id, Vec<FieldPath>> {
     let topic = model.topics.get_mut(&id("topic.order_events")).unwrap();
 
-    let MessageIdentity::Keyed { mapping } = &mut topic.message_identity else {
+    let MessageIdentity::Keyed(identity) = &mut topic.message_identity else {
         panic!("order_events should declare a keyed message identity");
     };
 
-    mapping
+    &mut identity.mapping
 }
 
 #[test]
@@ -2798,7 +2800,7 @@ fn an_unordered_transport_may_still_group() {
         .topics
         .get_mut(&id("topic.order_events"))
         .unwrap()
-        .ordering = OrderingSemantics::None;
+        .ordering = Some(OrderingSemantics::None);
 
     assert!(
         validation::validate(&model).is_empty(),
@@ -2816,7 +2818,7 @@ fn within_group_requires_a_grouping_at_the_same_scope() {
         .unwrap();
 
     topic.grouping = None;
-    topic.ordering = OrderingSemantics::WithinGroup;
+    topic.ordering = Some(OrderingSemantics::WithinGroup);
 
     assert!(
         validation::validate(&model).iter().any(|error| matches!(
@@ -2840,7 +2842,7 @@ fn transport_semantics_may_not_be_declared_at_both_scopes() {
         .and_then(|inputs| inputs.get_mut(&id("input.reserve_inventory.created")))
         .expect("the fixture declares it");
 
-    subscription.ordering = OrderingSemantics::Global;
+    subscription.ordering = Some(OrderingSemantics::Global);
 
     assert!(
         validation::validate(&model).iter().any(|error| matches!(
@@ -2865,7 +2867,7 @@ fn grouping_and_ordering_are_each_present_or_absent() {
         .get_mut(&id("topic.order_events"))
         .unwrap();
 
-    topic.ordering = OrderingSemantics::None;
+    topic.ordering = Some(OrderingSemantics::None);
 
     assert!(validation::validate(&model).is_empty());
 
@@ -2877,7 +2879,7 @@ fn grouping_and_ordering_are_each_present_or_absent() {
         .unwrap();
 
     topic.grouping = None;
-    topic.ordering = OrderingSemantics::Global;
+    topic.ordering = Some(OrderingSemantics::Global);
 
     // Only the routing declaration objects, because `grouping_key`
     // routing has lost the domain it names — not the transport
@@ -3011,7 +3013,7 @@ fn a_subscription_runtime_must_name_a_subscription_boundary() {
             conseqa::spec::SubscriptionRuntime {
                 delivery: conseqa::spec::DeliverySemantics::AtLeastOnce,
                 grouping: None,
-                ordering: conseqa::spec::OrderingSemantics::None,
+                ordering: None,
                 dispatch,
             },
         );
@@ -3022,6 +3024,73 @@ fn a_subscription_runtime_must_name_a_subscription_boundary() {
             ValidationError::InvalidInputKind { input, .. }
                 if input == &id("input.create_order.request")
         ))
+    );
+}
+
+#[test]
+fn a_subscription_groups_only_the_schemas_it_admits() {
+    // Regression. The topic-scope coverage rule was applied at
+    // subscription scope, forcing a subscription to map a schema its
+    // own selector filters out — impossible on a heterogeneous topic
+    // where that schema has no comparable field.
+    let mut model = load_flash_checkout();
+
+    let topic = runtime(&mut model)
+        .topics
+        .get_mut(&id("topic.order_events"))
+        .unwrap();
+
+    topic.grouping = None;
+    topic.ordering = None;
+
+    let everything = conseqa::spec::GroupingKey {
+        mapping: [
+            "schema.InventoryReserved",
+            "schema.OrderCancelled",
+            "schema.OrderCreated",
+            "schema.OrderPaid",
+            "schema.PaymentCaptured",
+            "schema.PaymentFailed",
+        ]
+        .into_iter()
+        .map(|schema| (id(schema), vec![path(&["order_id"])]))
+        .collect(),
+    };
+
+    for (operation, input) in [
+        ("operation.charge_payment", "input.charge_payment.reserved"),
+        ("operation.apply_payment", "input.apply_payment.captured"),
+    ] {
+        let subscription = runtime(&mut model)
+            .subscriptions
+            .get_mut(&id(operation))
+            .and_then(|inputs| inputs.get_mut(&id(input)))
+            .expect("the fixture declares it");
+
+        subscription.grouping = Some(everything.clone());
+        subscription.ordering = Some(OrderingSemantics::WithinGroup);
+    }
+
+    // reserve_inventory admits only OrderCreated, so that is all its
+    // grouping has to place in a group.
+    let subscription = runtime(&mut model)
+        .subscriptions
+        .get_mut(&id("operation.reserve_inventory"))
+        .and_then(|inputs| inputs.get_mut(&id("input.reserve_inventory.created")))
+        .expect("the fixture declares it");
+
+    subscription.grouping = Some(conseqa::spec::GroupingKey {
+        mapping: [(id("schema.OrderCreated"), vec![path(&["order_id"])])]
+            .into_iter()
+            .collect(),
+    });
+
+    subscription.ordering = Some(OrderingSemantics::WithinGroup);
+
+    assert!(
+        validation::validate(&model).is_empty(),
+        "{:#?}",
+        validation::validate(&model)
     );
 }
 

@@ -86,12 +86,12 @@ impl Model {
         if self.topic_scoped_transport(topic) {
             return self
                 .topic_runtime(topic)
-                .map(|runtime| runtime.ordering)
+                .and_then(|runtime| runtime.ordering)
                 .unwrap_or_default();
         }
 
         self.subscription_runtime(operation, input)
-            .map(|runtime| runtime.ordering)
+            .and_then(|runtime| runtime.ordering)
             .unwrap_or_default()
     }
 
@@ -114,14 +114,24 @@ impl Model {
             .unwrap_or(DeliverySemantics::Unspecified)
     }
 
-    /// The router serving one request boundary, with its ID.
+    /// Every router serving one request boundary, with its ID.
     ///
-    /// Validation admits at most one router per boundary, so the first
-    /// match in canonical order is the only one.
-    pub fn router_for(&self, operation: &Id, input: &Id) -> Option<(&Id, &Router)> {
-        self.runtime.as_ref()?.routers.iter().find(|(_, router)| {
-            &router.boundary.operation == operation && &router.boundary.input == input
-        })
+    /// Validation admits at most one, but this returns them all rather
+    /// than picking: a boundary routed two ways has no single set of
+    /// routing facts, and silently choosing one would let an analysis
+    /// prove from half a contradictory declaration.
+    pub fn routers_for(&self, operation: &Id, input: &Id) -> Vec<(&Id, &Router)> {
+        let Some(runtime) = self.runtime.as_ref() else {
+            return Vec::new();
+        };
+
+        runtime
+            .routers
+            .iter()
+            .filter(|(_, router)| {
+                &router.boundary.operation == operation && &router.boundary.input == input
+            })
+            .collect()
     }
 
     /// The named execution pool, if declared.

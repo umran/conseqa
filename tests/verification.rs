@@ -864,6 +864,140 @@ fn serialization_key_diverging_from_topic_key_is_unproven() {
 }
 
 #[test]
+fn two_routers_on_one_boundary_prove_nothing() {
+    // Regression. `router_for` took the first match, so a boundary
+    // routed two ways proved from whichever router sorted first — while
+    // the other sent the same invocations to an unbounded pool with no
+    // affinity. Verification stays sound over a model validation
+    // refuses.
+    let mut model = load_flash_checkout();
+
+    model
+        .operations
+        .get_mut(&id("operation.transfer_stock"))
+        .unwrap()
+        .requirements
+        .serialization
+        .push(SerializationRequirement {
+            key: input_key("input.transfer_stock.request", &["sku"]),
+        });
+
+    pool_mut(&mut model, "pool.inventory_api").member_concurrency = bounded(1);
+
+    put_router(
+        &mut model,
+        "router.aaa_transfer_stock",
+        "operation.transfer_stock",
+        "input.transfer_stock.request",
+        "pool.inventory_api",
+        Some(consistent_hash(&[&["sku"]])),
+    );
+
+    runtime_mut(&mut model).routers.insert(
+        id("router.zzz_transfer_stock_fallback"),
+        conseqa::spec::Router {
+            boundary: OperationInputRef {
+                operation: id("operation.transfer_stock"),
+                input: id("input.transfer_stock.request"),
+            },
+            pool: id("pool.checkout_api"),
+            routing: None,
+        },
+    );
+
+    assert!(!validation::validate(&model).is_empty());
+
+    let verdict = serialization_verdict(&model, "operation.transfer_stock", 0);
+
+    assert!(
+        matches!(
+            obstacles(&verdict),
+            [SerializationObstacle::AmbiguousRouter { .. }]
+        ),
+        "{verdict:?}"
+    );
+}
+
+#[test]
+fn declaring_transport_semantics_at_both_scopes_proves_nothing() {
+    // Regression. `effective_grouping` reads the winning scope, so a
+    // contradicting subscription declaration was dropped and the
+    // topic's half proved on its own.
+    let mut model = load_flash_checkout();
+
+    let subscription = subscription_runtime_mut(
+        &mut model,
+        "operation.apply_payment",
+        "input.apply_payment.captured",
+    );
+
+    // The topic groups by order_id; this says event_id, under which
+    // same-order_id deliveries land in different groups.
+    subscription.grouping = Some(conseqa::spec::GroupingKey {
+        mapping: [(id("schema.PaymentCaptured"), vec![path(&["event_id"])])]
+            .into_iter()
+            .collect(),
+    });
+
+    subscription.ordering = Some(OrderingSemantics::Global);
+
+    assert!(!validation::validate(&model).is_empty());
+
+    let verdict = serialization_verdict(&model, "operation.apply_payment", 0);
+
+    assert!(
+        matches!(
+            obstacles(&verdict),
+            [SerializationObstacle::TransportSemanticsAtBothScopes { .. }]
+        ),
+        "{verdict:?}"
+    );
+
+    // Ordering consumes the same grouping evidence, so it refuses for
+    // the same reason rather than reading the topic's half.
+    let verdict = ordering_verdict(&model, "operation.apply_payment", 0);
+
+    assert!(
+        matches!(
+            &verdict,
+            verification::OrderingVerdict::Unproven { obstacles }
+                if obstacles.iter().any(|obstacle| matches!(
+                    obstacle,
+                    verification::OrderingObstacle::TransportSemanticsAtBothScopes { .. }
+                ))
+        ),
+        "{verdict:?}"
+    );
+}
+
+#[test]
+fn an_explicit_ordering_none_claims_its_scope() {
+    // Regression. `ordering: none` used to serialize identically to
+    // omission, so an explicit negative at the subscription scope read
+    // as "declares nothing" and silently inherited the topic's
+    // precedence — proving an ordering requirement the author had just
+    // declared they had no basis for.
+    let mut model = load_flash_checkout();
+
+    subscription_runtime_mut(
+        &mut model,
+        "operation.apply_payment",
+        "input.apply_payment.captured",
+    )
+    .ordering = Some(OrderingSemantics::None);
+
+    let errors = validation::validate(&model);
+
+    assert!(
+        errors.iter().any(|error| matches!(
+            error,
+            conseqa::analyzer::ValidationError::TransportSemanticsAtBothScopes { .. }
+        )),
+        "an explicit `none` is a declaration and claims the scope: {errors:#?}"
+    );
+}
+
+#[test]
 fn a_transport_without_grouping_is_rejected_before_verification() {
     // `key: grouping_key` names the effective grouping domain, so
     // validation refuses the pair when no such domain exists.
@@ -901,7 +1035,7 @@ fn serialization_consumes_grouping_and_never_ordering() {
     // ordering guarantee it does not have in order to say so.
     let mut model = load_flash_checkout();
 
-    topic_runtime_mut(&mut model, "topic.order_events").ordering = OrderingSemantics::None;
+    topic_runtime_mut(&mut model, "topic.order_events").ordering = Some(OrderingSemantics::None);
 
     assert!(
         validation::validate(&model).is_empty(),
@@ -2720,11 +2854,11 @@ fn recoverability_key_mixing_sources_is_inadmissible() {
 fn order_events_message_identity(model: &mut Model) -> &mut BTreeMap<Id, Vec<FieldPath>> {
     let topic = model.topics.get_mut(&id("topic.order_events")).unwrap();
 
-    let MessageIdentity::Keyed { mapping } = &mut topic.message_identity else {
+    let MessageIdentity::Keyed(identity) = &mut topic.message_identity else {
         panic!("order_events should declare a keyed message identity");
     };
 
-    mapping
+    &mut identity.mapping
 }
 
 fn idempotency_verdict(model: &Model, operation: &str, requirement: usize) -> IdempotencyVerdict {
@@ -4190,7 +4324,7 @@ fn a_global_transport_orders_any_key_the_grouping_keeps_together() {
     // `global` usable — it no longer has to carry a key of its own.
     let mut model = load_flash_checkout();
 
-    topic_runtime_mut(&mut model, "topic.order_events").ordering = OrderingSemantics::Global;
+    topic_runtime_mut(&mut model, "topic.order_events").ordering = Some(OrderingSemantics::Global);
 
     assert!(validation::validate(&model).is_empty());
 
@@ -4216,7 +4350,7 @@ fn a_global_transport_still_needs_the_grouping_to_reach_execution() {
     // does, whichever precedence supplied the order.
     let mut model = load_flash_checkout();
 
-    topic_runtime_mut(&mut model, "topic.order_events").ordering = OrderingSemantics::Global;
+    topic_runtime_mut(&mut model, "topic.order_events").ordering = Some(OrderingSemantics::Global);
 
     model
         .operations
@@ -4248,7 +4382,7 @@ fn a_global_transport_still_needs_the_grouping_to_reach_execution() {
 fn a_transport_with_no_precedence_provides_none() {
     let mut model = load_flash_checkout();
 
-    topic_runtime_mut(&mut model, "topic.order_events").ordering = OrderingSemantics::None;
+    topic_runtime_mut(&mut model, "topic.order_events").ordering = Some(OrderingSemantics::None);
 
     let verdict = ordering_verdict(&model, "operation.apply_payment", 0);
 
@@ -4300,8 +4434,10 @@ fn subscription_scoped_transport_semantics_prove_the_same_way() {
 
     let topic = topic_runtime_mut(&mut model, "topic.order_events");
 
+    // Clearing the scope means declaring nothing — not declaring an
+    // explicit `none`, which would itself claim the topic scope.
     topic.grouping = None;
-    topic.ordering = OrderingSemantics::None;
+    topic.ordering = None;
 
     let by_order_id = conseqa::spec::GroupingKey {
         mapping: [
@@ -4325,7 +4461,7 @@ fn subscription_scoped_transport_semantics_prove_the_same_way() {
         let subscription = subscription_runtime_mut(&mut model, operation, input);
 
         subscription.grouping = Some(by_order_id.clone());
-        subscription.ordering = OrderingSemantics::WithinGroup;
+        subscription.ordering = Some(OrderingSemantics::WithinGroup);
     }
 
     assert!(

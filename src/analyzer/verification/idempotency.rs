@@ -63,7 +63,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::analyzer::{Diagnostic, DiagnosticCode, Evidence, Severity, VerificationCode};
 use crate::spec::{
-    DeliverySemantics, FieldPath, Id, IdempotencyGuarantee, IdempotencyKey, Input, MessageIdentity,
+    DeliverySemantics, FieldPath, Id, IdempotencyGuarantee, IdempotencyKey, Input,
+    MessageIdentity, MessageIdentityKey,
     MessageSelector, Model, Operation, ValueSource,
 };
 
@@ -661,7 +662,7 @@ fn lineage(scope: &Scope<'_>, operation: &Operation, key: &IdempotencyKey) -> Ve
         return Vec::new();
     };
 
-    let MessageIdentity::Keyed { mapping } = &topic.message_identity else {
+    let MessageIdentity::Keyed(MessageIdentityKey { mapping }) = &topic.message_identity else {
         return Vec::new();
     };
 
@@ -1075,7 +1076,7 @@ fn contract_safety(
                     .topics
                     .get(topic)
                     .is_some_and(|topic| match &topic.message_identity {
-                        MessageIdentity::Keyed { mapping } => mapping.contains_key(schema),
+                        MessageIdentity::Keyed(MessageIdentityKey { mapping }) => mapping.contains_key(schema),
                         MessageIdentity::Unspecified => false,
                     });
 

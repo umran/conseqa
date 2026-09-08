@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::analyzer::report::{Property, Subject};
-use crate::spec::{Id, Revision};
+use crate::spec::{Id, Input, Revision};
 
 use super::analysis::{AnalysisHub, AnalysisPin, AnalysisState};
 use super::auth::{TaskToken, TokenMap};
@@ -707,20 +707,28 @@ impl ConfluenceEngine {
     }
 
     /// Records conservative observations of an operation's summary
-    /// inputs: interface, program, and requirements (§41).
+    /// inputs: interface, program, requirements, and the L1 topology
+    /// its verdicts rest on (§41).
     ///
-    /// The runtime symbols an operation's proofs may consume are not
-    /// listed here. A summary read is invalidated through the symbols
-    /// it names, and runtime topology is shared architecture that any
-    /// task may read explicitly.
+    /// The runtime symbols are not optional extras. A summary carries
+    /// each input's delivery — which now lives in `SubscriptionRuntime`
+    /// rather than the interface — and proof verdicts that this model
+    /// marks `RuntimeDependent`, discharged from grouping, ordering and
+    /// member concurrency. A reader that observed only the three
+    /// operation symbols would survive a topology change that
+    /// invalidated the very proof it relied on.
     fn record_operation_inputs(&self, entry: &Arc<TaskEntry>, operation: &Id) {
         let mut read_set = entry.read_set.lock();
 
-        for key in [
+        let inputs = [
             SymbolKey::OperationInterface(operation.clone()),
             SymbolKey::OperationProgram(operation.clone()),
             SymbolKey::OperationRequirements(operation.clone()),
-        ] {
+        ]
+        .into_iter()
+        .chain(runtime_inputs_of(&entry.snapshot.workspace, operation));
+
+        for key in inputs {
             if let Some(node) = entry.snapshot.graph.node(&key) {
                 read_set.record_symbol(
                     key,
@@ -1703,7 +1711,70 @@ fn slice_shared_symbols(snapshot: &WorkspaceSnapshot, operation: &Id) -> Vec<Sym
         }
     }
 
+    // The L1 topology an operation executes under is shared, so it is
+    // never an outgoing edge of an operation-owned node — runtime
+    // symbols link *into* the operation's inputs. Walking edges alone
+    // would hand a synthesis worker a bundle with no delivery fact and
+    // no member concurrency, which is exactly what its idempotency and
+    // serialization reasoning needs.
+    if let SymbolOwner::Operation(operation) = &owner {
+        shared.extend(runtime_inputs_of(&snapshot.workspace, operation));
+    }
+
     shared.into_iter().collect()
+}
+
+/// The L1 symbols one operation's behaviour and proofs depend on: the
+/// runtime of each subscription it declares, the transport runtime of
+/// each topic it consumes, the router of each request boundary, and
+/// every execution pool those reach.
+///
+/// Deliberately conservative — it names a symbol whether or not the
+/// declaration exists yet, so a task is invalidated when one appears.
+pub(crate) fn runtime_inputs_of(
+    workspace: &WorkspaceState,
+    operation: &Id,
+) -> Vec<SymbolKey> {
+    let Some(draft) = workspace.operations.get(operation) else {
+        return Vec::new();
+    };
+
+    let mut keys = Vec::new();
+
+    for (input_id, input) in &draft.inputs {
+        match input {
+            Input::Subscription(subscription) => {
+                keys.push(SymbolKey::SubscriptionRuntime {
+                    operation: operation.clone(),
+                    input: input_id.clone(),
+                });
+
+                keys.push(SymbolKey::TopicRuntime(subscription.topic.clone()));
+
+                if let Some(runtime) = workspace
+                    .runtime
+                    .subscriptions
+                    .get(operation)
+                    .and_then(|inputs| inputs.get(input_id))
+                {
+                    keys.push(SymbolKey::ExecutionPool(runtime.dispatch.pool.clone()));
+                }
+            }
+
+            Input::Request(_) => {
+                for (router_id, router) in &workspace.runtime.routers {
+                    if &router.boundary.operation == operation
+                        && &router.boundary.input == input_id
+                    {
+                        keys.push(SymbolKey::Router(router_id.clone()));
+                        keys.push(SymbolKey::ExecutionPool(router.pool.clone()));
+                    }
+                }
+            }
+        }
+    }
+
+    keys
 }
 
 pub(crate) fn now_unix_ms() -> u64 {

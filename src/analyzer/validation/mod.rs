@@ -550,7 +550,7 @@ fn validate_topics(model: &Model) -> Vec<ValidationError> {
 
 fn validate_message_identity_shape(model: &Model, errors: &mut Vec<ValidationError>) {
     for (topic_id, topic) in &model.topics {
-        let MessageIdentity::Keyed { mapping } = &topic.message_identity else {
+        let MessageIdentity::Keyed(MessageIdentityKey { mapping }) = &topic.message_identity else {
             continue;
         };
 
@@ -604,7 +604,7 @@ fn validate_request_identity_shape(model: &Model) -> Vec<ValidationError> {
                 continue;
             };
 
-            let RequestIdentity::Keyed { fields } = &request.identity else {
+            let RequestIdentity::Keyed(RequestIdentityKey { fields }) = &request.identity else {
                 continue;
             };
 
@@ -798,7 +798,7 @@ fn validate_field_paths(model: &Model, index: &ReferenceIndex<'_>) -> Vec<Valida
 
     // Topic message-identity fields.
     for (topic_id, topic) in &model.topics {
-        let MessageIdentity::Keyed { mapping } = &topic.message_identity else {
+        let MessageIdentity::Keyed(MessageIdentityKey { mapping }) = &topic.message_identity else {
             continue;
         };
 
@@ -825,7 +825,7 @@ fn validate_field_paths(model: &Model, index: &ReferenceIndex<'_>) -> Vec<Valida
                 continue;
             };
 
-            let RequestIdentity::Keyed { fields } = &request.identity else {
+            let RequestIdentity::Keyed(RequestIdentityKey { fields }) = &request.identity else {
                 continue;
             };
 
@@ -1555,7 +1555,7 @@ fn validate_topic_references(
             expect_reference(index, topic_id, schema, ReferenceKind::Schema, errors);
         }
 
-        if let MessageIdentity::Keyed { mapping } = &topic.message_identity {
+        if let MessageIdentity::Keyed(MessageIdentityKey { mapping }) = &topic.message_identity {
             for schema in mapping.keys() {
                 expect_reference(index, topic_id, schema, ReferenceKind::Schema, errors);
             }

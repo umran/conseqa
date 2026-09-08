@@ -73,8 +73,8 @@ use super::ProofScope;
 use super::describe::describe_value_ref;
 use super::idempotency::{IdempotencyCheck, IdempotencyVerdict};
 use super::serialization::{
-    GroupingScope, MessageKeyFact, SerializationObstacle, admits_no_messages, grouping_facts,
-    pool_is_serial,
+    GroupingScope, MessageKeyFact, SerializationObstacle, admits_no_messages,
+    assignment_owns_one_member, grouping_facts, pool_is_serial,
 };
 
 /// The verdict for one declared ordering requirement.
@@ -225,6 +225,22 @@ pub enum OrderingObstacle {
     /// deliveries are not established to share a runtime group — and
     /// a precedence that execution cannot keep together is no proof.
     NoGroupingDomain { input: Id, topic: Id },
+
+    /// Both the topic and the subscription declare transport
+    /// semantics, so neither can be read as the effective one.
+    TransportSemanticsAtBothScopes { input: Id, topic: Id },
+
+    /// A declared grouping key maps a schema to an empty tuple, which
+    /// names no group.
+    EmptyGroupingKey { input: Id, topic: Id, schema: Id },
+
+    /// The declared member assignment does not give a routing domain
+    /// one active owning member, so the precedence cannot survive into
+    /// execution.
+    MemberAssignmentNotExclusive {
+        input: Id,
+        declared: MemberAssignment,
+    },
 
     /// The grouping declares no key mapping for an admitted schema.
     GroupingKeyMappingMissing { input: Id, topic: Id, schema: Id },
@@ -383,6 +399,20 @@ fn check_requirement(
                         schema,
                     },
 
+                    SerializationObstacle::TransportSemanticsAtBothScopes { input, topic } => {
+                        OrderingObstacle::TransportSemanticsAtBothScopes { input, topic }
+                    }
+
+                    SerializationObstacle::EmptyGroupingKey {
+                        input,
+                        topic,
+                        schema,
+                    } => OrderingObstacle::EmptyGroupingKey {
+                        input,
+                        topic,
+                        schema,
+                    },
+
                     SerializationObstacle::KeyIdentityUnestablished {
                         input,
                         topic,
@@ -437,6 +467,17 @@ fn check_requirement(
             SubscriptionRoutingKey::GroupingKey => Some((routing.key, routing.member_assignment)),
         },
     };
+
+    // The ownership leg, interrogated rather than copied — same rule as
+    // the serialization side.
+    if let Some((_, declared)) = &assignment
+        && !assignment_owns_one_member(*declared)
+    {
+        obstacles.push(OrderingObstacle::MemberAssignmentNotExclusive {
+            input: input_id.clone(),
+            declared: *declared,
+        });
+    }
 
     let mut serialization_obstacles = Vec::new();
     let serial = pool_is_serial(model, input_id, &pool_id, &mut serialization_obstacles);
@@ -570,6 +611,33 @@ impl OrderingObstacle {
                 message: format!(
                     "Neither `{topic}` nor `{input}` declares a transport precedence, \
                      so there is no order for the execution topology to preserve."
+                ),
+            },
+
+            Self::TransportSemanticsAtBothScopes { input, topic } => Evidence {
+                subject: Some(input.clone()),
+                message: format!(
+                    "`{topic}` declares transport semantics for all its \
+                     subscriptions and `{input}` declares its own. The two scopes \
+                     are exclusive, so neither can be read as the effective one."
+                ),
+            },
+
+            Self::EmptyGroupingKey { topic, schema, .. } => Evidence {
+                subject: Some(schema.clone()),
+                message: format!(
+                    "The grouping in effect for `{topic}` maps `{schema}` to an \
+                     empty tuple, which names no group."
+                ),
+            },
+
+            Self::MemberAssignmentNotExclusive { input, .. } => Evidence {
+                subject: Some(input.clone()),
+                message: format!(
+                    "The member assignment declared for `{input}` does not give a \
+                     routing domain one active owning member, so a later \
+                     invocation may execute on a different member and overtake an \
+                     earlier one."
                 ),
             },
 

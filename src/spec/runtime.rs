@@ -108,23 +108,28 @@ pub struct TopicRuntime {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub grouping: Option<GroupingKey>,
 
-    #[serde(default, skip_serializing_if = "OrderingSemantics::is_none")]
-    pub ordering: OrderingSemantics,
+    /// `Some(None)` is an explicit "this transport orders nothing",
+    /// which *is* a declaration and so selects the scope; absent is no
+    /// declaration at all. Collapsing the two would make an explicit
+    /// negative at one scope silently inherit the other scope's
+    /// precedence, which is the override this model forbids.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ordering: Option<OrderingSemantics>,
 }
 
 impl TopicRuntime {
     /// Whether this runtime declares any transport fact at all, which
     /// is what puts the topic in topic-scoped mode.
     pub fn declares_transport_semantics(&self) -> bool {
-        declares_transport_semantics(&self.grouping, self.ordering)
+        declares_transport_semantics(&self.grouping, &self.ordering)
     }
 }
 
 fn declares_transport_semantics(
     grouping: &Option<GroupingKey>,
-    ordering: OrderingSemantics,
+    ordering: &Option<OrderingSemantics>,
 ) -> bool {
-    grouping.is_some() || ordering != OrderingSemantics::None
+    grouping.is_some() || ordering.is_some()
 }
 
 /// Where a runtime grouping key lives in each grouped message schema.
@@ -163,8 +168,10 @@ pub struct GroupingKey {
 /// The precedence a transport establishes among messages, independent
 /// of how it groups them.
 ///
-/// Absent is `none`: a transport that says nothing about order gives no
-/// precedence, and there is no third epistemic state to distinguish.
+/// Written as a bare value — `ordering: within_group`. Omitting the
+/// field entirely is not the same as writing `none`: the first declares
+/// nothing and leaves the scope open, the second is an explicit
+/// negative that claims the scope.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OrderingSemantics {
@@ -186,11 +193,7 @@ pub enum OrderingSemantics {
     WithinGroup,
 }
 
-impl OrderingSemantics {
-    pub fn is_none(&self) -> bool {
-        *self == Self::None
-    }
-}
+
 
 // ---------------------------------------------------------------------
 // Subscription transport and dispatch
@@ -216,9 +219,10 @@ pub struct SubscriptionRuntime {
     pub grouping: Option<GroupingKey>,
 
     /// Transport precedence for this subscription, in the same mode
-    /// and under the same rule.
-    #[serde(default, skip_serializing_if = "OrderingSemantics::is_none")]
-    pub ordering: OrderingSemantics,
+    /// and under the same rule. As on a topic runtime, an explicit
+    /// `none` is a declaration and absent is not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ordering: Option<OrderingSemantics>,
 
     /// Where deliveries execute.
     pub dispatch: SubscriptionDispatch,
@@ -228,7 +232,7 @@ impl SubscriptionRuntime {
     /// Whether this runtime declares transport semantics of its own,
     /// which is only valid when the topic declares none.
     pub fn declares_transport_semantics(&self) -> bool {
-        declares_transport_semantics(&self.grouping, self.ordering)
+        declares_transport_semantics(&self.grouping, &self.ordering)
     }
 }
 

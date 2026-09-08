@@ -1720,7 +1720,9 @@ L1 RUNTIME TOPOLOGY (all shared-skeleton writes; L1 is optional):
   {"kind":"put_topic_runtime","topic":"topic.x",
    "value":{"grouping":{"schema.Event":[["order_id"]]},"ordering":"within_group"}}
     (grouping: a per-schema key mapping, or omitted for no grouping;
-     ordering: "global" | "within_group", or omitted for none.
+     ordering: "none" | "global" | "within_group", or omitted.
+     Omitting `ordering` declares nothing and leaves the scope open;
+     writing "none" is an explicit negative and claims the scope.
      Grouping and ordering are INDEPENDENT facts sharing one declaration
      scope. A topic declaring either supplies both to every subscription
      of it, and no subscription of that topic may declare its own; a topic

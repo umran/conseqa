@@ -523,7 +523,8 @@ pub fn extract(model: &Model) -> Graph {
             id: id.clone(),
             ordering: model
                 .topic_runtime(id)
-                .map(|runtime| ordering_label(runtime.ordering))
+                .and_then(|runtime| runtime.ordering)
+                .map(ordering_label)
                 .unwrap_or_else(|| "none".to_string()),
             grouping: model
                 .topic_runtime(id)

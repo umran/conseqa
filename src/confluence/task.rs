@@ -123,7 +123,9 @@ impl fmt::Display for TaskState {
 
 /// The semantic write capabilities of one task. A scope is a set of
 /// grants because typical assignments pair them — operation synthesis
-/// holds the program and the execution facts of its operation.
+/// holds the program of its operation. Runtime topology is not its
+/// to write: where an invocation executes is an architectural
+/// decision about the whole system.
 ///
 /// The scheduler creates scopes; an agent can never select its own.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]

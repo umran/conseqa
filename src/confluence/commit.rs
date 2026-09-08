@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::spec::{
-    Effect, Id, Input, MessageSelector, Model, Operation,
+    Effect, Id, Input, MessageSelector, Model, Operation, TopicRuntime,
     OperationStep, Revision, Schema, StateMachineSubject, TransactionStep, TransitionSideEffect,
     TypeRef, ValueSource,
 };
@@ -219,6 +219,49 @@ pub fn skeleton_diagnostics(workspace: &WorkspaceState) -> Vec<DraftDiagnostic> 
         });
     }
 
+    // The runtime topology belongs to the skeleton too. Whole-model
+    // validation cannot reach it until every operation has a program,
+    // so without this the L1 declarations go unchecked for the entire
+    // fan-out window — and a broken one is a mistake every concurrent
+    // worker inherits at once.
+    for (topic, value) in &workspace.runtime.topics {
+        mutations.push(Mutation::PutTopicRuntime {
+            topic: topic.clone(),
+            value: value.clone(),
+        });
+    }
+
+    for (id, value) in &workspace.runtime.execution_pools {
+        mutations.push(Mutation::PutExecutionPool {
+            id: id.clone(),
+            value: value.clone(),
+        });
+    }
+
+    for (operation, inputs) in &workspace.runtime.subscriptions {
+        for (input, value) in inputs {
+            mutations.push(Mutation::PutSubscriptionRuntime {
+                operation: operation.clone(),
+                input: input.clone(),
+                value: value.clone(),
+            });
+        }
+    }
+
+    for (id, value) in &workspace.runtime.routers {
+        mutations.push(Mutation::PutRouter {
+            id: id.clone(),
+            value: value.clone(),
+        });
+    }
+
+    for (id, value) in &workspace.runtime.storage_layouts {
+        mutations.push(Mutation::PutStorageLayout {
+            id: id.clone(),
+            value: value.clone(),
+        });
+    }
+
     let mut diagnostics = check_patch(workspace, &SpecPatch { mutations });
 
     for (operation, draft) in &workspace.operations {
@@ -385,12 +428,25 @@ fn apply_mutation(
 
                 SymbolKey::TopicRuntime(id) => workspace.runtime.topics.remove(id).is_some(),
 
-                SymbolKey::SubscriptionRuntime { operation, input } => workspace
-                    .runtime
-                    .subscriptions
-                    .get_mut(operation)
-                    .and_then(|inputs| inputs.remove(input))
-                    .is_some(),
+                SymbolKey::SubscriptionRuntime { operation, input } => {
+                    let removed = workspace
+                        .runtime
+                        .subscriptions
+                        .get_mut(operation)
+                        .and_then(|inputs| inputs.remove(input))
+                        .is_some();
+
+                    // An empty per-operation map would keep
+                    // `RuntimeModel::is_empty` false, so a workspace
+                    // that now declares no runtime facts would still
+                    // assemble and export a `runtime:` block.
+                    workspace
+                        .runtime
+                        .subscriptions
+                        .retain(|_, inputs| !inputs.is_empty());
+
+                    removed
+                }
 
                 SymbolKey::ExecutionPool(id) => {
                     workspace.runtime.execution_pools.remove(id).is_some()
@@ -674,6 +730,14 @@ fn check_patch(candidate: &WorkspaceState, patch: &SpecPatch) -> Vec<DraftDiagno
                 value,
             } => {
                 check_subscription_runtime(candidate, operation, input, value, &mut diagnostics);
+            }
+
+            Mutation::PutTopicRuntime { topic, value } => {
+                check_topic_runtime(candidate, topic, value, &mut diagnostics);
+            }
+
+            Mutation::PutStorageLayout { id, value } => {
+                check_storage_layout(candidate, id, value, &mut diagnostics);
             }
 
             _ => {}
@@ -1238,7 +1302,133 @@ fn check_subscription_runtime(
         diagnostics,
     );
 
-    check_pool(candidate, subject, &value.dispatch.pool, diagnostics);
+    check_pool(candidate, subject.clone(), &value.dispatch.pool, diagnostics);
+
+    // The scope invariant, checked here rather than left to
+    // whole-model validation: a violation committed during fan-out
+    // poisons the head for every task, and the agent that caused it has
+    // already finished by the time analysis reports.
+    if !value.declares_transport_semantics() {
+        return;
+    }
+
+    let Some(Input::Subscription(subscription)) = candidate
+        .operations
+        .get(operation)
+        .and_then(|draft| draft.inputs.get(input))
+    else {
+        return;
+    };
+
+    if candidate
+        .runtime
+        .topics
+        .get(&subscription.topic)
+        .is_some_and(TopicRuntime::declares_transport_semantics)
+    {
+        diagnostics.push(DraftDiagnostic::new(
+            Some(subject),
+            format!(
+                "{} already declares transport semantics for every subscription of it, \
+                 so this one may not declare its own",
+                subscription.topic
+            ),
+        ));
+    }
+}
+
+/// A topic runtime's grouping must be well formed, and it may not
+/// claim the topic scope while subscriptions of that topic hold it.
+fn check_topic_runtime(
+    candidate: &WorkspaceState,
+    topic: &Id,
+    value: &TopicRuntime,
+    diagnostics: &mut Vec<DraftDiagnostic>,
+) {
+    let subject = SymbolKey::TopicRuntime(topic.clone());
+
+    if !candidate.topics.contains_key(topic) {
+        diagnostics.push(DraftDiagnostic::new(
+            Some(subject.clone()),
+            format!("topic {topic} is not declared"),
+        ));
+
+        return;
+    }
+
+    if value.ordering == Some(crate::spec::OrderingSemantics::WithinGroup)
+        && value.grouping.is_none()
+    {
+        diagnostics.push(DraftDiagnostic::new(
+            Some(subject.clone()),
+            "ordering `within_group` needs a grouping at the same scope to be \
+             interpreted over"
+                .to_string(),
+        ));
+    }
+
+    if !value.declares_transport_semantics() {
+        return;
+    }
+
+    for (operation, inputs) in &candidate.runtime.subscriptions {
+        for (input, runtime) in inputs {
+            if !runtime.declares_transport_semantics() {
+                continue;
+            }
+
+            let Some(Input::Subscription(subscription)) = candidate
+                .operations
+                .get(operation)
+                .and_then(|draft| draft.inputs.get(input))
+            else {
+                continue;
+            };
+
+            if &subscription.topic == topic {
+                diagnostics.push(DraftDiagnostic::new(
+                    Some(subject.clone()),
+                    format!(
+                        "{input} of {operation} already declares its own transport \
+                         semantics for {topic}, so the topic may not declare them for \
+                         every subscription"
+                    ),
+                ));
+            }
+        }
+    }
+}
+
+/// A storage layout must name a declared object and carry a key.
+fn check_storage_layout(
+    candidate: &WorkspaceState,
+    layout: &Id,
+    value: &crate::spec::StorageLayout,
+    diagnostics: &mut Vec<DraftDiagnostic>,
+) {
+    let subject = SymbolKey::StorageLayout(layout.clone());
+
+    if value.partition_key.is_empty() {
+        diagnostics.push(DraftDiagnostic::new(
+            Some(subject.clone()),
+            "a partition key must name at least one field".to_string(),
+        ));
+    }
+
+    let declared = candidate
+        .data_models
+        .get(&value.object.data_model)
+        .is_some_and(|data_model| data_model.objects.contains_key(&value.object.object));
+
+    if !declared {
+        diagnostics.push(DraftDiagnostic::new(
+            Some(subject),
+            format!(
+                "data object {}/{} is not declared",
+                value.object.data_model, value.object.object
+            ),
+        ));
+    }
 }
 
 #[derive(Clone, Copy)]
