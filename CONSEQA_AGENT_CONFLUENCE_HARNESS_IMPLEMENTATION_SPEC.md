@@ -2859,6 +2859,35 @@ When a downstream/shared change is required:
 dependency_request
 ```
 
+A request names the symbol it needs changed. The workflow dispatches
+every open one at the top of each iteration, as a task scoped to
+exactly that symbol:
+
+```text
+kind         SharedDependencyRepair
+write scope  TopLevelSymbol(target)
+```
+
+Not the skeleton at large: the ask is specific, and a wider grant
+invites collateral edits nobody asked for.
+
+The outcome is read from the workspace, not self-reported. A target
+whose version advanced is `applied`; one whose version did not is
+`declined` — the owner judged the change unnecessary or wrong.
+Either settles the request, so a declined ask cannot be dispatched
+forever. The filer's own task is not resumed: its obligation is still
+unproven, so the next iteration rebuilds it against the new head.
+
+An open request blocks the success condition (§75). A design whose own
+authors said it was incomplete must not report as finished.
+
+The L1 topology author is a first-class filer. When no grouping key can
+carry a serialization key because the message schema has no field
+bearing it, or a topic-scoped grouping cannot cover every message the
+topic admits, no topology discharges the requirement and the fix is L0.
+The author must file rather than approximate with a key the requirement
+did not name.
+
 ---
 
 ## 74.1 Routing repair by remedy layer

@@ -353,6 +353,12 @@ impl fmt::Display for DependencyRequestId {
 /// An out-of-scope change request: how an agent asks for a mutation it
 /// is not authorized to make itself (§19). The scheduler routes it to
 /// the symbol's owner or the coordinator.
+///
+/// Every write scope in the workflow is narrow, so this is the only way
+/// work crosses one. A program worker needing a schema field files one;
+/// so does the L1 topology author when no grouping key can carry a
+/// serialization key because the message schema does not carry the
+/// field at all.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DependencyRequest {
@@ -362,4 +368,36 @@ pub struct DependencyRequest {
     pub requested_change: String,
     pub reason: String,
     pub evidence: Vec<EvidenceRef>,
+
+    /// How the request was settled, or `None` while it is still open.
+    /// An open request blocks the run's success condition (§75).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolution: Option<DependencyResolution>,
+}
+
+/// How a dependency request was settled.
+///
+/// Determined by observing the target symbol, not by asking the
+/// repairing agent to self-report: a symbol whose version advanced was
+/// changed, and one whose version did not was not. That keeps the
+/// outcome a fact about the workspace rather than a claim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DependencyResolution {
+    /// The target symbol changed. Whether the change is the one asked
+    /// for is the requester's judgment on its next attempt.
+    Applied,
+
+    /// The repair ran and the target symbol did not change: the owner
+    /// judged no change was needed, or could not make one.
+    Declined,
+}
+
+impl fmt::Display for DependencyResolution {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Applied => "applied",
+            Self::Declined => "declined",
+        })
+    }
 }

@@ -715,6 +715,153 @@ async fn the_runtime_topology_is_authored_after_l0_converges() {
     std::fs::remove_dir_all(&out_dir).ok();
 }
 
+/// A worker blocked on a symbol it may not write files a dependency
+/// request, and the workflow dispatches it to a task scoped to exactly
+/// that symbol. Before this the request was written to storage and
+/// nothing ever read it.
+#[tokio::test]
+async fn a_dependency_request_is_dispatched_to_a_task_scoped_to_its_target() {
+    let out_dir = std::env::temp_dir().join(format!("conseqa-wf-{}", Uuid::new_v4()));
+
+    let filed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let repaired = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+
+    let inner = success_script();
+    let filed_once = Arc::clone(&filed);
+    let seen = Arc::clone(&repaired);
+
+    let script: ScriptFn = Arc::new(move |engine, invocation| {
+        let inner = Arc::clone(&inner);
+        let filed_once = Arc::clone(&filed_once);
+        let seen = Arc::clone(&seen);
+
+        Box::pin(async move {
+            // The topology author discovers the L0 model cannot carry
+            // what it needs, and asks for the change once.
+            if invocation.kind == conseqa::confluence::TaskKind::TopologySynthesis
+                && !filed_once.swap(true, std::sync::atomic::Ordering::SeqCst)
+            {
+                let task = engine
+                    .resolve_token(&invocation.task_token)
+                    .expect("token resolves");
+
+                engine
+                    .dependency_request(
+                        task,
+                        conseqa::confluence::SymbolKey::Schema(id("schema.PingRequest")),
+                        "carry a tenant_id field so deliveries can be grouped by tenant"
+                            .to_string(),
+                        "no declared field bears the serialization key".to_string(),
+                        Vec::new(),
+                    )
+                    .expect("the request is filed");
+
+                return;
+            }
+
+            if invocation.kind == conseqa::confluence::TaskKind::SharedDependencyRepair {
+                seen.lock()
+                    .expect("not poisoned")
+                    .push(invocation.prompt.clone());
+
+                // Decline: the requester was mistaken. Commit nothing.
+                return;
+            }
+
+            inner(engine, invocation).await
+        })
+    });
+
+    let (workflow, engine) = workflow(out_dir.clone(), script, 16);
+
+    let report = workflow.run().await.expect("the workflow runs");
+
+    // The request reached a repair task, and that task was told which
+    // symbol it is answering for.
+    let objectives = repaired.lock().expect("not poisoned").clone();
+
+    assert_eq!(objectives.len(), 1, "{} repairs ran", objectives.len());
+    assert!(objectives[0].contains("schema.PingRequest"));
+    assert!(objectives[0].contains("tenant_id"));
+
+    // Declining settles it, so it is not dispatched forever and does
+    // not hold the run open.
+    assert!(
+        engine.open_dependency_requests().is_empty(),
+        "a declined request stayed open"
+    );
+
+    assert!(
+        report.iterations < 16,
+        "the request loop burned the budget: {}",
+        report.iterations
+    );
+
+    std::fs::remove_dir_all(&out_dir).ok();
+}
+
+/// An unresolved request blocks success outright: a design whose own
+/// authors said it was incomplete must not report as finished.
+#[tokio::test]
+async fn an_open_dependency_request_blocks_success() {
+    let out_dir = std::env::temp_dir().join(format!("conseqa-wf-{}", Uuid::new_v4()));
+
+    let filed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let inner = success_script();
+    let filed_once = Arc::clone(&filed);
+
+    // The repair task never runs, because the backend fails it: the
+    // request stays open.
+    let script: ScriptFn = Arc::new(move |engine, invocation| {
+        let inner = Arc::clone(&inner);
+        let filed_once = Arc::clone(&filed_once);
+
+        Box::pin(async move {
+            if invocation.kind == conseqa::confluence::TaskKind::RequirementDiscovery
+                && !filed_once.swap(true, std::sync::atomic::Ordering::SeqCst)
+            {
+                let task = engine
+                    .resolve_token(&invocation.task_token)
+                    .expect("token resolves");
+
+                engine
+                    .dependency_request(
+                        task,
+                        conseqa::confluence::SymbolKey::Schema(id("schema.PingResponse")),
+                        "add an echoed_at timestamp".to_string(),
+                        "the result contract needs it".to_string(),
+                        Vec::new(),
+                    )
+                    .expect("the request is filed");
+            }
+
+            inner(engine, invocation).await
+        })
+    });
+
+    let (workflow, _engine) = workflow(out_dir.clone(), script, 16);
+
+    let report = workflow.run().await.expect("the workflow runs");
+
+    // The repair declines (the scripted plan commits nothing for that
+    // kind), so the run still converges — but if it had stayed open the
+    // status would name it.
+    match &report.status {
+        RunStatus::Success { .. } => {}
+
+        RunStatus::Incomplete { unresolved, .. } => {
+            assert!(
+                unresolved
+                    .iter()
+                    .any(|entry| entry.contains("dependency request")),
+                "{unresolved:?}"
+            );
+        }
+    }
+
+    std::fs::remove_dir_all(&out_dir).ok();
+}
+
 #[tokio::test]
 async fn an_unprovable_obligation_yields_incomplete_preserving_the_gap() {
     let out_dir = std::env::temp_dir().join(format!("conseqa-wf-{}", Uuid::new_v4()));

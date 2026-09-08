@@ -36,7 +36,8 @@ use super::snapshot::{Head, WorkspaceSnapshot};
 use super::summary::OperationSummary;
 use super::symbol::{SymbolKey, SymbolKind, SymbolOwner, SymbolVersion};
 use super::task::{
-    DependencyRequest, DependencyRequestId, PromptEvidence, TaskBudget, TaskCompletionGate,
+    DependencyRequest, DependencyRequestId, DependencyResolution, PromptEvidence, TaskBudget,
+    TaskCompletionGate,
     TaskId, TaskKind, TaskSpec, TaskState, WriteScope,
 };
 use super::workspace::{EvidenceRef, WorkspaceState};
@@ -827,6 +828,7 @@ impl ConfluenceEngine {
             requested_change,
             reason,
             evidence,
+            resolution: None,
         };
 
         self.inner.persistence.record_dependency_request(&request)?;
@@ -838,6 +840,57 @@ impl ConfluenceEngine {
             });
 
         Ok(request.id)
+    }
+
+    /// Every dependency request still awaiting an outcome.
+    ///
+    /// These are the run's open cross-scope asks: each one is a worker
+    /// blocked on a symbol it may not write. A run with any of these
+    /// outstanding has not converged (§75).
+    pub fn open_dependency_requests(&self) -> Vec<DependencyRequest> {
+        self.inner
+            .persistence
+            .load_dependency_requests()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|request| request.resolution.is_none())
+            .collect()
+    }
+
+    /// Settles a dependency request. Idempotent: settling an already
+    /// settled request leaves the first outcome in place, so a repeated
+    /// dispatch cannot rewrite history.
+    pub fn resolve_dependency_request(
+        &self,
+        id: DependencyRequestId,
+        resolution: DependencyResolution,
+    ) -> Result<(), EngineError> {
+        let Some(mut request) = self
+            .inner
+            .persistence
+            .load_dependency_requests()?
+            .into_iter()
+            .find(|request| request.id == id)
+        else {
+            return Ok(());
+        };
+
+        if request.resolution.is_some() {
+            return Ok(());
+        }
+
+        request.resolution = Some(resolution);
+
+        self.inner.persistence.record_dependency_request(&request)?;
+
+        Ok(())
+    }
+
+    /// The current version of a symbol at head, or `None` when the
+    /// symbol does not exist. Used to observe whether a dependency
+    /// repair actually changed what it was asked to.
+    pub fn symbol_version(&self, key: &SymbolKey) -> Option<SymbolVersion> {
+        self.head_snapshot().graph.node(key).map(|node| node.version)
     }
 
     /// Cancels a task: its authority ends and its token is revoked.

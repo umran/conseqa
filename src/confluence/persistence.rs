@@ -330,6 +330,26 @@ impl Persistence {
         Ok(())
     }
 
+    /// Every dependency request ever filed, in id order.
+    pub fn load_dependency_requests(&self) -> Result<Vec<DependencyRequest>, PersistenceError> {
+        let txn = self.db.begin_read()?;
+
+        let requests = match txn.open_table(DEPENDENCY_REQUESTS) {
+            Ok(table) => table,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+            Err(error) => return Err(error.into()),
+        };
+
+        let mut loaded = Vec::new();
+
+        for entry in requests.iter()? {
+            let (_, value) = entry?;
+            loaded.push(serde_json::from_slice(value.value())?);
+        }
+
+        Ok(loaded)
+    }
+
     pub fn load_tasks(&self) -> Result<Vec<TaskRecord>, PersistenceError> {
         let txn = self.db.begin_read()?;
         let tasks = txn.open_table(TASKS)?;

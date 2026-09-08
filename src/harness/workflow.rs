@@ -16,8 +16,9 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use crate::confluence::{
-    AnalysisState, BundleSpec, ConfluenceEngine, EvidenceRef, PromptEvidence,
-    PromptObligationStatus, RequirementFamily, TaskKind, WriteScope,
+    AnalysisState, BundleSpec, ConfluenceEngine, DependencyResolution, EvidenceRef,
+    PromptEvidence, PromptObligationStatus, RequirementFamily, SymbolVersion, TaskKind,
+    WriteGrant, WriteScope,
 };
 use crate::analyzer::verification::RemedyLayer;
 use crate::spec::{Id, Model, Revision};
@@ -131,6 +132,19 @@ impl Workflow {
                 return self.finalize(iterations - 1, None).await;
             }
 
+            // Cross-scope asks come first. A filed request means a
+            // worker is blocked on a symbol it may not write, and every
+            // phase below would reproduce that block — the topology
+            // author included, when no grouping key can carry a
+            // serialization key because the schema lacks the field.
+            //
+            // Always reconverge afterwards: an applied change moves the
+            // head, and a declined one still settles the request, so
+            // this cannot repeat.
+            if self.dispatch_dependency_requests().await? > 0 {
+                continue;
+            }
+
             // Phase 4: assembly and structural convergence.
             let revision = self.engine().head_revision();
             let analysis = self.await_analysis(revision).await?;
@@ -226,16 +240,23 @@ impl Workflow {
                         return self.finalize(iterations, Some(revision)).await;
                     }
 
-                    if self.engine().head_revision() == before {
-                        // Repair ran and committed nothing at all. The
-                        // next iteration would build the same tasks
-                        // from the same snapshot and reach the same
-                        // place, so the obstacle is stuck: finalize now
-                        // with the gaps preserved rather than spending
-                        // the rest of the iteration budget on identical
-                        // work. Per-task nondeterminism is the
-                        // scheduler's retry policy to absorb, not the
-                        // fixpoint loop's.
+                    if self.engine().head_revision() == before
+                        && self.engine().open_dependency_requests().is_empty()
+                    {
+                        // Repair ran, committed nothing, and asked for
+                        // nothing. The next iteration would build the
+                        // same tasks from the same snapshot and reach
+                        // the same place, so the obstacle is stuck:
+                        // finalize with the gaps preserved rather than
+                        // spending the budget on identical work.
+                        // Per-task nondeterminism is the scheduler's
+                        // retry policy to absorb, not the fixpoint
+                        // loop's.
+                        //
+                        // A filed dependency request is progress even
+                        // with no commit behind it: the next iteration
+                        // dispatches it, and that may unblock the
+                        // repair that could not proceed here.
                         return self.finalize(iterations, Some(revision)).await;
                     }
                 }
@@ -387,6 +408,73 @@ impl Workflow {
         let ran = tasks.len() as u32;
 
         self.scheduler.run_many(tasks).await?;
+
+        Ok(ran)
+    }
+
+    /// Dispatches every open dependency request, concurrently.
+    ///
+    /// A request is how work crosses a write scope: the filer named a
+    /// symbol it may not write and said what it needs. Each becomes one
+    /// task scoped to exactly that symbol — not to the skeleton at
+    /// large, since the ask is specific and a wider grant invites
+    /// collateral edits nobody asked for.
+    ///
+    /// The outcome is read from the workspace rather than from the
+    /// agent: a target whose version advanced was changed, one whose
+    /// version did not was not. Either way the request is settled, so a
+    /// declined ask cannot be dispatched forever. The filer's own work
+    /// is not resumed here — its obligation is still unproven, so the
+    /// next iteration rebuilds that task against the new head.
+    ///
+    /// Returns how many ran.
+    async fn dispatch_dependency_requests(&self) -> Result<u32, WorkflowError> {
+        let open = self.engine().open_dependency_requests();
+
+        if open.is_empty() {
+            return Ok(0);
+        }
+
+        let before: Vec<Option<SymbolVersion>> = open
+            .iter()
+            .map(|request| self.engine().symbol_version(&request.target))
+            .collect();
+
+        let tasks: Vec<LogicalTask> = open
+            .iter()
+            .map(|request| LogicalTask {
+                kind: TaskKind::SharedDependencyRepair,
+                objective: format!(
+                    "Apply this change to {}, or determine that it is not needed and \
+                     commit nothing:\n\n{}\n\nWhy it was asked for: {}",
+                    request.target, request.requested_change, request.reason
+                ),
+                write_scope: WriteScope::of([WriteGrant::TopLevelSymbol(request.target.clone())]),
+                bundle: BundleSpec {
+                    operation: None,
+                    requirement: None,
+                    include: vec![request.target.clone()],
+                },
+                prompt_evidence: self.prompt_evidence(),
+                interactive: false,
+            })
+            .collect();
+
+        let ran = tasks.len() as u32;
+
+        self.scheduler.run_many(tasks).await?;
+
+        for (request, before) in open.iter().zip(before) {
+            let resolution = if self.engine().symbol_version(&request.target) == before {
+                DependencyResolution::Declined
+            } else {
+                DependencyResolution::Applied
+            };
+
+            self.engine()
+                .resolve_dependency_request(request.id, resolution)
+                .map_err(WorkflowError::Engine)?;
+        }
 
         Ok(ran)
     }
@@ -741,6 +829,7 @@ impl Workflow {
 
         let unmapped = self.unmapped_obligations();
         let all_proven = analysis.verification.all_proven();
+        let open_requests = self.engine().open_dependency_requests();
 
         let head = self.engine().head_snapshot();
 
@@ -763,23 +852,26 @@ impl Workflow {
                     .to_string(),
                 unresolved: vec!["the model has no operations".to_string()],
             }
-        } else if all_proven && unmapped.is_empty() {
+        } else if all_proven && unmapped.is_empty() && open_requests.is_empty() {
             RunStatus::Success {
                 revision: revision.0,
             }
         } else {
-            let mut unresolved = self.unproven_labels(revision);
-
-            unresolved.extend(unmapped);
+            let reason = if !all_proven {
+                "not every adopted obligation is proven".to_string()
+            } else if !unmapped.is_empty() {
+                "explicit prompt obligations remain unmapped".to_string()
+            } else {
+                // Proven and mapped, but a worker asked for a change
+                // nobody made. Reporting success here would present a
+                // design whose own authors said it was incomplete.
+                "dependency requests remain unresolved".to_string()
+            };
 
             RunStatus::Incomplete {
                 revision: revision.0,
-                reason: if all_proven {
-                    "explicit prompt obligations remain unmapped".to_string()
-                } else {
-                    "not every adopted obligation is proven".to_string()
-                },
-                unresolved,
+                reason,
+                unresolved: self.unresolved_labels(revision),
             }
         };
 
@@ -900,6 +992,16 @@ impl Workflow {
         let mut labels = self.unproven_labels(revision);
 
         labels.extend(self.unmapped_obligations());
+
+        // An open cross-scope ask is unfinished work by definition:
+        // some worker needed a change it could not make, and nothing
+        // has settled it (§75).
+        labels.extend(self.engine().open_dependency_requests().iter().map(|request| {
+            format!(
+                "unresolved dependency request on {}: {}",
+                request.target, request.requested_change
+            )
+        }));
 
         labels
     }
