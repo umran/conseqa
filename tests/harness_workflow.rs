@@ -650,6 +650,71 @@ async fn prompt_to_validated_model_with_all_requirements_proven() {
     std::fs::remove_dir_all(&out_dir).ok();
 }
 
+/// The phase order the two-layer model requires: the fanout writes L0
+/// programs, requirement discovery says what must hold, and only then
+/// does a single agent author the runtime topology that discharges it.
+///
+/// L1 cannot come earlier. It exists to make specific requirements
+/// provable, and before discovery has run there are none to aim at —
+/// which is why the decomposer no longer holds the grant.
+#[tokio::test]
+async fn the_runtime_topology_is_authored_after_l0_converges() {
+    let out_dir = std::env::temp_dir().join(format!("conseqa-wf-{}", Uuid::new_v4()));
+
+    let seen: Arc<std::sync::Mutex<Vec<conseqa::confluence::TaskKind>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+
+    let inner = success_script();
+    let recorder = Arc::clone(&seen);
+
+    let script: ScriptFn = Arc::new(move |engine, invocation| {
+        recorder.lock().expect("not poisoned").push(invocation.kind);
+
+        inner(engine, invocation)
+    });
+
+    let (workflow, _engine) = workflow(out_dir.clone(), script, 8);
+
+    let report = workflow.run().await.expect("the workflow runs");
+
+    assert!(
+        matches!(report.status, RunStatus::Success { .. }),
+        "{:?}",
+        report.status
+    );
+
+    let kinds = seen.lock().expect("not poisoned").clone();
+
+    let first = |kind: conseqa::confluence::TaskKind| {
+        kinds
+            .iter()
+            .position(|seen| *seen == kind)
+            .unwrap_or_else(|| panic!("no {kind} task ran: {kinds:?}"))
+    };
+
+    let decompose = first(conseqa::confluence::TaskKind::Decompose);
+    let synthesis = first(conseqa::confluence::TaskKind::OperationSynthesis);
+    let discovery = first(conseqa::confluence::TaskKind::RequirementDiscovery);
+    let topology = first(conseqa::confluence::TaskKind::TopologySynthesis);
+
+    assert!(decompose < synthesis, "{kinds:?}");
+    assert!(synthesis < discovery, "{kinds:?}");
+    assert!(discovery < topology, "{kinds:?}");
+
+    // Exactly one L1 author, and it never shares the phase: the runtime
+    // model is one decision, not one per operation.
+    assert_eq!(
+        kinds
+            .iter()
+            .filter(|kind| **kind == conseqa::confluence::TaskKind::TopologySynthesis)
+            .count(),
+        1,
+        "{kinds:?}"
+    );
+
+    std::fs::remove_dir_all(&out_dir).ok();
+}
+
 #[tokio::test]
 async fn an_unprovable_obligation_yields_incomplete_preserving_the_gap() {
     let out_dir = std::env::temp_dir().join(format!("conseqa-wf-{}", Uuid::new_v4()));

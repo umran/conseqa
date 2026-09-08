@@ -511,9 +511,16 @@ impl Workflow {
     /// its router and the pool it terminates at are one decision.
     /// Everything else fans out per operation as before.
     ///
-    /// The two run in sequence, topology first, so that when a program
-    /// repair and a topology change would touch the same obligation the
-    /// program worker reads a settled runtime rather than racing it.
+    /// Topology goes first, and a topology commit ends the round: it
+    /// moves the head, which leaves both the unproven set and its
+    /// remedy classification stale. An obligation classified
+    /// `application` because one of its obstacles was an L0 one may
+    /// have had its runtime obstacles cleared in passing, or not — and
+    /// a repair task created now would pin a snapshot whose analysis
+    /// has not run, so it would carry no obstacle evidence either.
+    /// Re-verifying first costs one loop iteration and repairs against
+    /// facts that are actually current.
+    ///
     /// Returns how many tasks ran.
     async fn repair_unproven(&self, revision: Revision) -> Result<u32, WorkflowError> {
         let (runtime, application): (Vec<RepairTarget>, Vec<RepairTarget>) = self
@@ -524,7 +531,18 @@ impl Workflow {
         let mut ran = 0;
 
         if !runtime.is_empty() {
+            let before = self.engine().head_revision();
+
             ran += self.synthesize_topology(&runtime).await?;
+
+            if self.engine().head_revision() != before {
+                return Ok(ran);
+            }
+
+            // The author declined to change anything. Fall through:
+            // the application repairs may still make progress, and
+            // without them a run whose topology is genuinely finished
+            // would stop at the no-progress check with L0 work left.
         }
 
         let tasks: Vec<LogicalTask> = application
