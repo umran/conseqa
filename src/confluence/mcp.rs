@@ -1737,8 +1737,11 @@ L1 RUNTIME TOPOLOGY (all shared-skeleton writes; L1 is optional):
             "pool":"pool.x",
             "routing":{"key":["order_id"],
                        "member_assignment":{"kind":"consistent_hash"}}}}
-    (omit "routing" entirely to assign the boundary to a pool and declare
-     no member affinity; there is no `unspecified` routing variant)
+    (member_assignment: consistent_hash | round_robin. Omit "routing"
+     entirely to assign the boundary to a pool and declare no member
+     affinity; that is not the same as round_robin, which states that
+     affinity is known NOT to exist. Neither proves serialization or
+     ordering, but they are different facts.)
   {"kind":"put_subscription_runtime","operation":"operation.x","input":"input.x.events",
    "value":{"delivery":"at_least_once",
             "dispatch":{"pool":"pool.x",

@@ -1963,3 +1963,46 @@ runtime:
 
     assert_eq!(model, round_tripped);
 }
+
+/// Both member assignments are on the wire, and the enum stays tagged
+/// so a third stays additive.
+#[test]
+fn member_assignments_round_trip() {
+    for (spelling, expected) in [
+        ("consistent_hash", MemberAssignment::ConsistentHash),
+        ("round_robin", MemberAssignment::RoundRobin),
+    ] {
+        let source = format!(
+            "
+revision: 1
+
+runtime:
+  execution_pools:
+    pool.p:
+      member_concurrency: {{ kind: bounded, value: 1 }}
+
+  routers:
+    router.r:
+      boundary: {{ operation: op.x, input: input.request }}
+      pool: pool.p
+      routing:
+        key: [order_id]
+        member_assignment: {{ kind: {spelling} }}
+"
+        );
+
+        let model = yaml::parse(&source).expect("parses");
+
+        let router = &model.runtime.as_ref().expect("a runtime").routers[&Id("router.r".into())];
+
+        assert_eq!(
+            router.routing.as_ref().expect("routing").member_assignment,
+            expected
+        );
+
+        let round_tripped =
+            yaml::parse(&yaml::serialize(&model).expect("serializes")).expect("re-parses");
+
+        assert_eq!(model, round_tripped);
+    }
+}

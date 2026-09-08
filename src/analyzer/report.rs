@@ -624,6 +624,15 @@ fn member_assignment_assumption(assignment: &MemberAssignment) -> String {
              domain one owning pool member at a time, and transfers that ownership safely \
              when membership changes"
             .to_string(),
+
+        // Unreachable through a well-formed proof: the verifiers gate
+        // both routed routes on `assignment_owns_one_member`, which is
+        // false here. Rendered rather than panicked, and worded so that
+        // it reads as obviously wrong inside a proof if that gate is
+        // ever lost.
+        MemberAssignment::RoundRobin => "round_robin assignment gives no routing domain an \
+             owning pool member, so this proof cites a fact that does not support it"
+            .to_string(),
     }
 }
 

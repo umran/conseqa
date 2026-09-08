@@ -631,14 +631,24 @@ impl OrderingObstacle {
                 ),
             },
 
-            Self::MemberAssignmentNotExclusive { input, .. } => Evidence {
+            Self::MemberAssignmentNotExclusive { input, declared } => Evidence {
                 subject: Some(input.clone()),
-                message: format!(
-                    "The member assignment declared for `{input}` does not give a \
-                     routing domain one active owning member, so a later \
-                     invocation may execute on a different member and overtake an \
-                     earlier one."
-                ),
+                message: match declared {
+                    MemberAssignment::RoundRobin => format!(
+                        "`{input}` declares `round_robin` member assignment, which \
+                         rotates through members irrespective of routing domain, so \
+                         the transport's order does not survive into execution: a \
+                         later delivery may run on another member and overtake an \
+                         earlier one."
+                    ),
+
+                    _ => format!(
+                        "The member assignment declared for `{input}` does not give \
+                         a routing domain one active owning member, so a later \
+                         invocation may execute on a different member and overtake \
+                         an earlier one."
+                    ),
+                },
             },
 
             Self::NoGroupingDomain { input, topic } => Evidence {

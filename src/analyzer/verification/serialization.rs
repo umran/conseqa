@@ -597,6 +597,11 @@ fn subscription_route(
 pub(super) fn assignment_owns_one_member(assignment: MemberAssignment) -> bool {
     match assignment {
         MemberAssignment::ConsistentHash => true,
+
+        // Rotation ignores the routing domain, so two invocations of
+        // one domain land on different members and may run at once,
+        // whatever the pool's member concurrency.
+        MemberAssignment::RoundRobin => false,
     }
 }
 
@@ -933,13 +938,22 @@ impl SerializationObstacle {
                 ),
             },
 
-            Self::MemberAssignmentNotExclusive { input, .. } => Evidence {
+            Self::MemberAssignmentNotExclusive { input, declared } => Evidence {
                 subject: Some(input.clone()),
-                message: format!(
-                    "The member assignment declared for `{input}` does not give a \
-                     routing domain one active owning member, so same-key \
-                     invocations may execute on different members."
-                ),
+                message: match declared {
+                    MemberAssignment::RoundRobin => format!(
+                        "`{input}` declares `round_robin` member assignment, which \
+                         rotates through members irrespective of routing domain: \
+                         same-key invocations land on different members and may \
+                         execute at once."
+                    ),
+
+                    _ => format!(
+                        "The member assignment declared for `{input}` does not give \
+                         a routing domain one active owning member, so same-key \
+                         invocations may execute on different members."
+                    ),
+                },
             },
 
             Self::EmptyGroupingKey { topic, schema, .. } => Evidence {

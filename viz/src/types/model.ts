@@ -360,7 +360,7 @@ export interface RequestRouting {
   member_assignment: MemberAssignment;
 }
 
-export type MemberAssignment = { kind: "consistent_hash" };
+export type MemberAssignment = { kind: "consistent_hash" } | { kind: "round_robin" };
 
 /** A logical population of interchangeable runtime members. Carries no
  *  cardinality: member counts are external scenario inputs. */

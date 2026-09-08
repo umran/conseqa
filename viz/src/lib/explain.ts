@@ -180,15 +180,17 @@ export function subscriptionRouting(key: SubscriptionRoutingKey | null | undefin
       tone: "warning",
       summary:
         "Deliveries execute within the target pool, and nothing relates same-key deliveries to a " +
-        "common member. No round-robin, no random, no single member — simply no fact.",
+        "common member. Not a claim that assignment is arbitrary — that is what a round-robin " +
+        "member assignment states — simply no fact.",
     };
   }
 
   return {
-    label: "routed by topic key",
+    label: "routed by grouping key",
     tone: "info",
     summary:
-      "Deliveries sharing the topic's key belong to one semantic routing domain. The member " +
+      "Deliveries sharing the effective grouping key — declared on the topic runtime or on this " +
+      "subscription, whichever holds the scope — belong to one routing domain. The member " +
       "assignment maps that domain onto a pool member; the pool's member concurrency decides " +
       "whether invocations there can overlap.",
   };
@@ -205,6 +207,16 @@ export function memberAssignment(value: MemberAssignment): Explanation {
           "Equal routing domains are owned by the same pool member during a stable ownership " +
           "epoch, and ownership transfers safely when membership changes. Different domains may " +
           "share a member.",
+      };
+    case "round_robin":
+      return {
+        label: "round-robin assignment",
+        tone: "warning",
+        summary:
+          "Each invocation goes to the next member in rotation, irrespective of routing domain. " +
+          "Affinity is known not to exist here — a stronger statement than declaring no routing " +
+          "at all — so same-key invocations land on different members and no serialization or " +
+          "ordering proof can rest on it.",
       };
   }
 }

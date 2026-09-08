@@ -383,6 +383,31 @@ pub enum MemberAssignment {
     /// prescribes no hash function, virtual-node count, or membership
     /// discovery mechanism.
     ConsistentHash,
+
+    /// Each invocation goes to the next member in rotation,
+    /// irrespective of which routing domain it belongs to.
+    ///
+    /// No correctness proof consumes this, and it belongs here anyway.
+    /// The analyzer is not L1's only reader: an external scenario
+    /// evaluates the same declarations for hot members, routing skew
+    /// and contention, and there this is decisive. Under a skewed key
+    /// distribution consistent-hash concentrates load on the members
+    /// owning the hot domains, while rotation spreads it evenly and
+    /// gives up locality — same pool, same cardinality, different
+    /// answer. A model that could not tell the two apart would hand
+    /// that analysis a coin flip.
+    ///
+    /// It is also a *known arbitrary* assignment, which is not the same
+    /// statement as declaring no routing at all. Omitting the routing
+    /// block says nothing is known about member affinity; this says
+    /// affinity is known not to exist, so a serialization or ordering
+    /// requirement over the boundary is refused with a reason rather
+    /// than for want of a declaration nobody has made.
+    ///
+    /// A routing key declared alongside it still names domains, and
+    /// those domains still have their own identity; this assignment
+    /// simply does not respect them.
+    RoundRobin,
 }
 
 // ---------------------------------------------------------------------

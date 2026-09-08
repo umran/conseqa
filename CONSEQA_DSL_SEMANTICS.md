@@ -750,6 +750,16 @@ runtime:
 
 Every L1 identifier lives in the one global namespace L0 identifiers do: a pool may not take a topic's id.
 
+### What makes a fact worth declaring in L1
+
+Not "some proof consumes it". L1 has two consumers, and the analyzer is only the first.
+
+The second is the external quantitative layer (§10.9): a scenario supplies member counts, traffic rates, key-frequency distributions and service times, and evaluates the architecture for hot members, hot partitions, routing skew, shared-pool contention and queue growth. That analysis reads the same declarations the verifier does, and it reads some the verifier ignores entirely.
+
+So a realization fact belongs in L1 when it **changes what the realization does** and is **qualitative rather than a number**. `member_assignment: round_robin` (§10.6) is the clearest case: no correctness proof consumes it, and a simulator cannot proceed without it. The numbers stay outside — that boundary is §10.5 and §10.9, and it does not move.
+
+The corollary matters as much: correctness-inertness is not a reason to leave a fact out, and neither is proof-relevance a reason to let a *number* in.
+
 An operation declares **no** execution concurrency of its own. There is no `OperationRuntime`, no execution-lane abstraction, and no lane concurrency anywhere. All runtime execution concurrency is declared in exactly one place: `ExecutionPool.member_concurrency` (§10.5).
 
 ### 10.1 The two things routing is, and the many things it is not
@@ -994,6 +1004,20 @@ A member assignment describes how a routing domain is assigned to a member of an
 
 Different routing domains may be assigned to the same member. Conseqa prescribes no hash function, virtual-node count, membership-discovery mechanism, or choice between Ketama and rendezvous hashing. The declaration specifies semantic assignment behaviour, not implementation mechanics.
 
+#### `round_robin`
+
+> Each invocation goes to the next member in rotation, irrespective of routing domain.
+
+No correctness proof consumes it. It earns its place anyway, for two reasons.
+
+The first is that it is a **primary input to the external analysis** L1 exists to feed (§10.9). Consistent-hash and round-robin over one pool, at one cardinality, under one workload, behave completely differently: hashing a skewed key distribution concentrates load on the members owning the hot domains, while rotation spreads load evenly and destroys locality. Hot members and routing skew are exactly what a simulator is asked to find, and it cannot find them without knowing which assignment is in force. A model that could not distinguish the two would be handing that analysis a coin flip.
+
+The second is diagnostic. Omitting the routing block says *nothing is known* about member affinity; `round_robin` says *affinity is known not to exist*. A serialization or ordering requirement over such a boundary is then refused with a reason — "rotation puts same-key invocations on different members" — rather than for want of a declaration nobody has made. An author reading the first is told to go and find out; reading the second, to change the architecture.
+
+A routing key declared alongside it still names domains, and those domains keep their own identity. This assignment simply does not respect them.
+
+This is the "explicit negative routing guarantee" the initial model deferred (§27), admitted now that there is a use for the distinction. It is emphatically *not* the `unconstrained` routing variant that model declined: routing keys still have exactly two components, and absence still means absence. What changed is that the *assignment* dimension gained a second ordinary value.
+
 #### Safe ownership transfer is normative
 
 Any member assignment used to establish keyed serialization **must preserve exclusive ownership through reassignment**. If routing domain `K` moves from member A to member B, a conforming runtime must not permit A and B to execute `K` in a manner that violates the declared one-owner semantics.
@@ -1033,6 +1057,32 @@ A layout implies nothing about database vendor, node count, replication factor, 
 A service is an L0 grouping. No inference may be made that same service implies same pool, same process, same deployment, same runtime member, or that different services imply execution isolation.
 
 Same-service operations may target different pools. Different-service operations may share one pool. Until `Service` acquires stronger normative semantics, it remains independent of runtime placement.
+
+### 10.9 The external analysis boundary
+
+L1 describes semantic topology, qualitatively. Everything countable stays outside it, supplied by a scenario evaluated *against* a Conseqa architecture:
+
+```text
+pool member counts          service-time distributions
+traffic and message rates   storage node counts
+key-frequency distributions replication factors
+capacity, queueing, latency failure probabilities
+```
+
+Given those, a simulator can evaluate hot execution members, hot storage partitions, routing skew, shared-pool contention, pool scaling, alternative routing keys, alternative partition keys, queue growth, latency, and request amplification — none of which become Conseqa semantics.
+
+The division works because the declarations are qualitative and the scenario is quantitative. One architecture:
+
+```text
+Router GetMessages:  routing key = channel_id, member_assignment = consistent_hash
+                     pool = MessageReads
+ExecutionPool MessageReads:  member_concurrency = bounded(32)
+StorageLayout Message:       partition_key = (channel_id, bucket)
+```
+
+can be run against `MessageReads.members = 16` or `= 128`, against a uniform `channel_id` or a Zipf one, without a word of it changing. And when the scenario moves `channel_id` domain X from member 17 to member 31, the routing domain keeps its identity — that is §10.1's point, and it is what lets the same declarations serve both consumers.
+
+This is also why L1 carries facts no proof reads. A member assignment is inert to the verifier and decisive to the simulator: under a skewed key distribution, consistent-hash concentrates load on the members owning the hot domains while round-robin spreads it and gives up locality. Same pool, same cardinality, different answer.
 
 ---
 
@@ -2422,7 +2472,7 @@ What the DSL deliberately does not yet decide. Every entry is scoped so that res
 - **Object-history requirements.** No object-level history requirement (such as linearizability) exists; §5 states the scope rule and what its absence does not weaken. To be reconsidered as a coherent family when Conseqa models distributed persistence and availability.
 - **Process completion.** Recoverability's `guaranteed` obliges one operation to reach its terminal. That a multi-operation process — a saga across the trigger graph — reaches its end state is a distinct liveness property with no declaration; it needs new surface (the trigger graph is its natural consumer), not a stronger reading of `guaranteed`.
 - **Retry execution.** `ErrorDisposition::retryable` states that another attempt is semantically admitted (§8.1); nothing models the mechanism that performs one — no retry policy, loop, attempt count, backoff, or timeout. A retry-execution revision may consume the disposition.
-- **Performance overlay.** The correctness vocabulary deliberately exposes distinctions a future probabilistic layer could consume — terminal versus retryable outcomes, attempt populations, member concurrency, routing skew — but no performance semantics exist in the model. L1 is qualitative by design: pool cardinality, traffic rates, key-frequency distributions, service-time distributions, storage-node counts, replication factors, capacity, queueing, and latency belong to an external simulation scenario evaluated *against* a Conseqa architecture, never inside it.
-- **Explicit negative routing.** There is no `unconstrained` routing variant: absence of a routing block already expresses that no member-affinity fact exists. One would be introduced only if an analyzer ever needs to distinguish *unknown routing behaviour* from *known arbitrary routing behaviour*. No V1 proof needs that distinction.
+- **Performance overlay.** The correctness vocabulary deliberately exposes distinctions a future probabilistic layer could consume — terminal versus retryable outcomes, attempt populations, member concurrency, member assignment, routing and partition keys — but no performance semantics exist in the model. L1 is qualitative by design: pool cardinality, traffic rates, key-frequency distributions, service-time distributions, storage-node counts, replication factors, capacity, queueing, and latency belong to an external simulation scenario evaluated *against* a Conseqa architecture, never inside it.
+- **Explicit negative routing** — *partly resolved.* There is still no `unconstrained` routing variant: absence of a routing block expresses that no member-affinity fact exists, and routing keeps exactly two components. The distinction between *unknown* and *known arbitrary* member behaviour is now carried where it belongs, on the assignment: `member_assignment: round_robin` (§10.6), admitted for the external analysis that needs it rather than for any proof. Still open is whether a routing *key* ever needs a comparable negative.
 - **Global execution gates.** Removing operation-level concurrency leaves no way to say "no two invocations of X overlap globally", independent of topology. If a genuine architectural need appears, it should be an explicit primitive — never hidden inside `Operation`, where it was detached from the execution topology that realizes it.
 - **Beyond the pool.** L1's execution abstraction stops at a population of interchangeable members. Physical database nodes, replica topology, consensus protocols, database lock-manager internals, hosts, containers, process ids, CPU, memory, availability zones, network links, queue capacities, and autoscaling policies are all outside it.

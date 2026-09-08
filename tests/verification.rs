@@ -864,6 +864,114 @@ fn serialization_key_diverging_from_topic_key_is_unproven() {
 }
 
 #[test]
+fn round_robin_assignment_proves_neither_serialization_nor_ordering() {
+    // The ownership leg, exercised rather than merely guarded. Every
+    // other fact is in place — a keyed grouping matching the
+    // requirement key, grouping_key routing, a pool bounded to one
+    // invocation per member — and the proof still fails, because
+    // rotation puts same-key deliveries on different members.
+    let mut model = load_flash_checkout();
+
+    subscription_runtime_mut(
+        &mut model,
+        "operation.apply_payment",
+        "input.apply_payment.captured",
+    )
+    .dispatch
+    .routing = Some(conseqa::spec::SubscriptionRouting {
+        key: SubscriptionRoutingKey::GroupingKey,
+        member_assignment: MemberAssignment::RoundRobin,
+    });
+
+    // A known-arbitrary assignment is a legitimate declaration, not a
+    // malformed one: the model stays valid.
+    assert!(
+        validation::validate(&model).is_empty(),
+        "{:#?}",
+        validation::validate(&model)
+    );
+
+    let verdict = serialization_verdict(&model, "operation.apply_payment", 0);
+
+    assert!(
+        matches!(
+            obstacles(&verdict),
+            [SerializationObstacle::MemberAssignmentNotExclusive {
+                declared: MemberAssignment::RoundRobin,
+                ..
+            }]
+        ),
+        "{verdict:?}"
+    );
+
+    let verdict = ordering_verdict(&model, "operation.apply_payment", 0);
+
+    assert!(
+        matches!(
+            &verdict,
+            verification::OrderingVerdict::Unproven { obstacles }
+                if obstacles.iter().any(|obstacle| matches!(
+                    obstacle,
+                    verification::OrderingObstacle::MemberAssignmentNotExclusive {
+                        declared: MemberAssignment::RoundRobin,
+                        ..
+                    }
+                ))
+        ),
+        "{verdict:?}"
+    );
+}
+
+#[test]
+fn round_robin_is_a_stronger_statement_than_declaring_no_routing() {
+    // The distinction the refactor spec deferred: unknown member
+    // behaviour versus known arbitrary member behaviour. Neither
+    // proves, but they are different facts and the obstacles say so.
+    let mut model = load_flash_checkout();
+
+    subscription_runtime_mut(
+        &mut model,
+        "operation.apply_payment",
+        "input.apply_payment.captured",
+    )
+    .dispatch
+    .routing = None;
+
+    let absent = serialization_verdict(&model, "operation.apply_payment", 0);
+
+    assert!(
+        matches!(
+            obstacles(&absent),
+            [SerializationObstacle::RoutingAbsent { .. }]
+        ),
+        "{absent:?}"
+    );
+
+    subscription_runtime_mut(
+        &mut model,
+        "operation.apply_payment",
+        "input.apply_payment.captured",
+    )
+    .dispatch
+    .routing = Some(conseqa::spec::SubscriptionRouting {
+        key: SubscriptionRoutingKey::GroupingKey,
+        member_assignment: MemberAssignment::RoundRobin,
+    });
+
+    let declared = serialization_verdict(&model, "operation.apply_payment", 0);
+
+    assert!(
+        matches!(
+            obstacles(&declared),
+            [SerializationObstacle::MemberAssignmentNotExclusive { .. }]
+        ),
+        "{declared:?}"
+    );
+
+    assert_ne!(obstacles(&absent), obstacles(&declared));
+}
+
+#[test]
 fn two_routers_on_one_boundary_prove_nothing() {
     // Regression. `router_for` took the first match, so a boundary
     // routed two ways proved from whichever router sorted first — while
