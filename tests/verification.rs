@@ -7,14 +7,14 @@ use std::{
 
 use conseqa::{
     analyzer::{
-        DiagnosticCode, Severity, VerificationCode, validation,
+        DiagnosticCode, Severity, VerificationCode, report, validation,
         verification::{
             self, ArtifactReplay, ConsumerCollapse, DecisionGap, DecisionRule, EffectRetrySafety,
             EffectSafety, GoverningKeyDefect, IdempotencyObstacle, IdempotencyProof,
             IdempotencyVerdict, KeyIdentity, PathRef, PayloadIdentityGap, RecoverabilityNote,
             RecoverabilityObstacle, RecoverabilityProof, RecoverabilityVerdict, ReplayGap,
             Resolution, ResultGap, ResultReplayObstacle, ResultReplayProof, ResultReplayVerdict,
-            ProofScope, RetryDriver, SerializationObstacle, SerializationProof,
+            ProofScope, RemedyLayer, RetryDriver, SerializationObstacle, SerializationProof,
             SerializationVerdict, StabilityGap, StabilityRule, StableRoot, TransactionResolution,
             canonical_value_path,
         },
@@ -505,6 +505,119 @@ fn an_empty_routing_key_never_proves_vacuously() {
         matches!(verdict, SerializationVerdict::Unproven { .. }),
         "{verdict:?}"
     );
+}
+
+/// A serialization requirement blocked only by absent topology is
+/// routed to the L1 author. This is the common case after the two-layer
+/// split: the program is correct and no edit to it can help.
+#[test]
+fn an_obligation_missing_only_runtime_facts_reports_a_runtime_remedy() {
+    let mut model = load_flash_checkout();
+
+    model
+        .operations
+        .get_mut(&id("operation.transfer_stock"))
+        .unwrap()
+        .requirements
+        .serialization
+        .push(SerializationRequirement {
+            key: input_key("input.transfer_stock.request", &["sku"]),
+        });
+
+    runtime_mut(&mut model)
+        .routers
+        .remove(&id("router.transfer_stock"));
+
+    let report = verification::verify(&model);
+
+    let check = report
+        .serialization
+        .iter()
+        .find(|check| {
+            check.operation == id("operation.transfer_stock") && check.requirement == 0
+        })
+        .expect("the added requirement is checked");
+
+    assert_eq!(check.remedy(), Some(RemedyLayer::Runtime));
+
+    let obligations = report::obligations(&model, &report);
+
+    let obligation = obligations
+        .obligations
+        .iter()
+        .find(|obligation| obligation.id == "oblig.operation.transfer_stock.serialization.0")
+        .expect("the obligation is reported");
+
+    assert_eq!(obligation.remedy, Some(RemedyLayer::Runtime));
+}
+
+/// A key no input carries selects a population no routing declaration
+/// can address, so the fix is L0 however the topology is written.
+#[test]
+fn a_key_not_sourced_from_an_input_reports_an_application_remedy() {
+    let mut model = load_flash_checkout();
+
+    model
+        .operations
+        .get_mut(&id("operation.apply_payment"))
+        .unwrap()
+        .requirements
+        .serialization = vec![SerializationRequirement {
+        key: ValueRef {
+            source: ValueSource::StateMachineSubject(id("machine.order_lifecycle")),
+            path: path(&["order_id"]),
+        },
+    }];
+
+    let report = verification::verify(&model);
+
+    let check = report
+        .serialization
+        .iter()
+        .find(|check| {
+            check.operation == id("operation.apply_payment") && check.requirement == 0
+        })
+        .expect("the added requirement is checked");
+
+    assert_eq!(
+        obstacles(&check.verdict)
+            .iter()
+            .map(SerializationObstacle::layer)
+            .collect::<Vec<_>>(),
+        vec![RemedyLayer::Application],
+    );
+
+    assert_eq!(check.remedy(), Some(RemedyLayer::Application));
+}
+
+/// Obstacles are conjunctive, so one application obstacle keeps the
+/// whole obligation on the application side: topology work alone cannot
+/// close it.
+#[test]
+fn a_mixed_obstacle_set_reports_the_application_remedy() {
+    assert_eq!(
+        RemedyLayer::joined([RemedyLayer::Runtime, RemedyLayer::Runtime]),
+        Some(RemedyLayer::Runtime),
+    );
+
+    assert_eq!(
+        RemedyLayer::joined([RemedyLayer::Runtime, RemedyLayer::Application]),
+        Some(RemedyLayer::Application),
+    );
+
+    assert_eq!(RemedyLayer::joined([]), None);
+}
+
+/// A proven obligation is waiting on nothing.
+#[test]
+fn a_proven_obligation_reports_no_remedy() {
+    let model = load_flash_checkout();
+    let report = verification::verify(&model);
+
+    for check in &report.serialization {
+        assert!(matches!(check.verdict, SerializationVerdict::Proven { .. }));
+        assert_eq!(check.remedy(), None);
+    }
 }
 
 #[test]

@@ -928,6 +928,53 @@ fn write_scope_violation_is_rejected_and_fixable() {
     assert_eq!(engine.task_status(a.id).unwrap(), TaskState::Running);
 }
 
+/// The L1 runtime topology has exactly one holder. Every other scope
+/// in the workflow — decomposition included — is refused, so a pool and
+/// the router that terminates at it can never be written by two
+/// concurrent workers with different pictures of the system.
+#[test]
+fn only_the_topology_scope_may_write_the_runtime_model() {
+    let engine = engine();
+
+    let pool = || Mutation::PutExecutionPool {
+        id: id("pool.probe"),
+        value: conseqa::spec::ExecutionPool {
+            member_concurrency: conseqa::spec::MemberConcurrency::Bounded(
+                std::num::NonZeroU32::new(1).expect("non-zero"),
+            ),
+        },
+    };
+
+    for scope in [
+        WriteScope::shared_skeleton(),
+        WriteScope::operation_synthesis(id("operation.create_order")),
+        WriteScope::requirement_repair(id("operation.create_order")),
+        WriteScope::requirement_discovery(id("operation.create_order")),
+    ] {
+        let denied = task(&engine, TaskKind::OperationSynthesis, scope.clone());
+
+        let rejection = submit(&engine, &denied, vec![pool()])
+            .expect_err("an L1 write outside the topology scope is rejected");
+
+        assert!(
+            matches!(
+                rejection,
+                CommitRejection::WriteScopeViolation { ref attempted }
+                    if *attempted == SymbolKey::ExecutionPool(id("pool.probe"))
+            ),
+            "{scope:?} accepted an L1 write: {rejection:?}"
+        );
+    }
+
+    let author = task(
+        &engine,
+        TaskKind::TopologySynthesis,
+        WriteScope::runtime_topology(),
+    );
+
+    submit(&engine, &author, vec![pool()]).expect("the topology scope may write L1");
+}
+
 #[test]
 fn draft_validation_failure_is_precise_and_fixable() {
     let engine = engine();

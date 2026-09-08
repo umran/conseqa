@@ -5,6 +5,7 @@ use std::{
 };
 
 use conseqa::{
+    analyzer::Diagnostic,
     analyzer::validation::{self, ProgramUse, ReferenceKind, ValidationError},
     parser::yaml,
     spec::{
@@ -2851,6 +2852,57 @@ fn transport_semantics_may_not_be_declared_at_both_scopes() {
                 if topic == &id("topic.order_events")
                     && input == &id("input.reserve_inventory.created")
         ))
+    );
+}
+
+/// A validation error against an L1 declaration is marked as one, so
+/// the coordinator routes it to the topology author. An L1 error names
+/// a topic, router, or pool rather than an operation, and without this
+/// flag it reaches no repair target at all.
+#[test]
+fn runtime_validation_errors_are_marked_as_runtime() {
+    let mut model = load_flash_checkout();
+
+    let subscription = runtime(&mut model)
+        .subscriptions
+        .get_mut(&id("operation.reserve_inventory"))
+        .and_then(|inputs| inputs.get_mut(&id("input.reserve_inventory.created")))
+        .expect("the fixture declares it");
+
+    subscription.ordering = Some(OrderingSemantics::Global);
+
+    let diagnostics = validation::validate(&model);
+
+    assert!(
+        !diagnostics.is_empty(),
+        "the both-scopes declaration is rejected"
+    );
+
+    assert!(
+        diagnostics
+            .iter()
+            .all(|error| Diagnostic::from(error.clone()).code.is_runtime()),
+        "{diagnostics:?}"
+    );
+}
+
+/// An L0 error is not marked as a runtime one: routing it to the
+/// topology author would hand it to a scope that cannot fix it.
+#[test]
+fn application_validation_errors_are_not_marked_as_runtime() {
+    let mut model = load_flash_checkout();
+
+    model.topics.remove(&id("topic.order_events"));
+
+    let diagnostics = validation::validate(&model);
+
+    assert!(!diagnostics.is_empty(), "the dangling topic is rejected");
+
+    assert!(
+        diagnostics
+            .iter()
+            .any(|error| !Diagnostic::from(error.clone()).code.is_runtime()),
+        "{diagnostics:?}"
     );
 }
 
