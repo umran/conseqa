@@ -4,6 +4,8 @@ const KIND_PREFIXES = new Set([
   "service", "operation", "topic", "schema", "machine", "state",
   "transition", "tx", "intent", "effect", "input", "result", "output",
   "object", "data", "read", "oblig",
+  // L1
+  "pool", "router", "layout",
 ]);
 
 /** Drops the conventional kind prefix: `operation.create_order` → `create_order`. */

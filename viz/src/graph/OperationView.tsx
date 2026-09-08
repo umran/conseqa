@@ -15,7 +15,9 @@ import {
   isolation,
   memberAssignment,
   memberConcurrency,
+  noRuntimeDeclared,
   requestIdentity,
+  requestRouting,
   subscriptionRouting,
 } from "../lib/explain";
 import { pathText, shortId } from "../lib/ids";
@@ -478,17 +480,46 @@ function RequirementsTable({ id, op }: { id: Id; op: Operation }) {
   );
 }
 
-/** The realization facts for one subscription boundary, drawn from L1.
- *  With no declared runtime there is nothing to say beyond the
- *  epistemic default. */
-function SubscriptionFacts({ opId, inputId }: { opId: Id; inputId: Id }) {
+/** How one boundary is realized: the pool that executes it, the member
+ *  affinity it declares, and what one member does at a time.
+ *
+ *  Requests and subscriptions are separate primitives with the same
+ *  shape — a routing key and a member assignment, terminating at a pool
+ *  — so they are shown the same way and in the same column, next to but
+ *  never mixed with the L0 contract they realize. */
+function Realization({ opId, inputId, kind }: { opId: Id; inputId: Id; kind: "request" | "subscription" }) {
   const { model } = useApp();
+
+  if (kind === "request") {
+    const routed = Object.entries(model.runtime?.routers ?? {}).find(
+      ([, r]) => r.boundary.operation === opId && r.boundary.input === inputId,
+    );
+    if (!routed) return <FactBadge fact={noRuntimeDeclared()} />;
+    const [routerId, router] = routed;
+    const pool = model.runtime?.execution_pools?.[router.pool];
+    return (
+      <>
+        <span className="inline-flex items-center gap-1 text-xs text-kumo-subtle">
+          router
+          <IdLink id={routerId}>{shortId(routerId)}</IdLink>
+        </span>
+        <FactBadge fact={requestRouting(router.routing?.key)} />
+        {router.routing && <FactBadge fact={memberAssignment(router.routing.member_assignment)} />}
+        {pool && <FactBadge fact={memberConcurrency(pool.member_concurrency)} />}
+      </>
+    );
+  }
+
   const runtime = model.runtime?.subscriptions?.[opId]?.[inputId];
-
-  if (!runtime) return <FactBadge fact={delivery("unspecified")} />;
-
+  if (!runtime) {
+    return (
+      <>
+        <FactBadge fact={noRuntimeDeclared()} />
+        <FactBadge fact={delivery("unspecified")} />
+      </>
+    );
+  }
   const pool = model.runtime?.execution_pools?.[runtime.dispatch.pool];
-
   return (
     <>
       <FactBadge fact={delivery(runtime.delivery)} />
@@ -514,7 +545,8 @@ function InputsTable({ opId, op }: { opId: Id; op: Operation }) {
           <Table.Head>input</Table.Head>
           <Table.Head>kind</Table.Head>
           <Table.Head>source</Table.Head>
-          <Table.Head>semantics</Table.Head>
+          <Table.Head>L0 contract</Table.Head>
+          <Table.Head>L1 realization</Table.Head>
         </Table.Row>
       </Table.Header>
       <Table.Body>
@@ -558,8 +590,17 @@ function InputsTable({ opId, op }: { opId: Id; op: Operation }) {
                       </span>
                     </>
                   ) : (
-                    <SubscriptionFacts opId={opId} inputId={inputId} />
+                    <Badge variant="neutral">
+                      {input.messages.kind === "all"
+                        ? "all topic messages"
+                        : input.messages.schemas.map(shortId).join(", ")}
+                    </Badge>
                   )}
+                </span>
+              </Table.Cell>
+              <Table.Cell>
+                <span className="flex flex-wrap items-center gap-1.5">
+                  <Realization opId={opId} inputId={inputId} kind={input.kind} />
                 </span>
               </Table.Cell>
             </Table.Row>

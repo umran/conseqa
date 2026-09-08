@@ -17,6 +17,17 @@ npm run build    # typecheck + single-file bundle → dist/index.html
 See `CONSEQA_VIZ.md` at the repository root for the views, panels, and
 report format.
 
+The system view draws two layers. L0 — the application machine — is
+always drawn; L1, the declared runtime realization, is a band beneath it
+that the top bar switches on and off. `src/lib/runtime.ts` derives what
+that band shows, `src/graph/layoutSystem.ts` places both planes, and
+`src/lib/citations.ts` resolves the declarations a verdict names so a
+runtime-dependent proof can be followed to the facts it rests on.
+
+`REPORT_FORMAT` in `src/types/report.ts` mirrors
+`conseqa::analyzer::report::FORMAT`; move it whenever that moves, or the
+app refuses the report the binary produces.
+
 `App` also takes an optional `theme` prop. Without it the app owns the
 colour mode — restoring the stored choice, setting `data-mode`, and
 offering a toggle — which is what the embedded build needs. With it,

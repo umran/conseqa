@@ -2,6 +2,7 @@ import { Badge } from "@cloudflare/kumo/components/badge";
 import { Breadcrumbs } from "@cloudflare/kumo/components/breadcrumbs";
 import { Button } from "@cloudflare/kumo/components/button";
 import { Input } from "@cloudflare/kumo/components/input";
+import { Switch } from "@cloudflare/kumo/components/switch";
 import { Tooltip } from "@cloudflare/kumo/components/tooltip";
 import { ListChecksIcon, MoonIcon, SunIcon } from "@phosphor-icons/react";
 
@@ -19,7 +20,10 @@ import { useApp } from "../state/AppState";
  *  reached is worse than one that is crowded. */
 export function TopBar() {
   const app = useApp();
-  const { data, model, report, route, search, obligationsOpen, theme, themeControllable } = app;
+  const {
+    data, model, report, reportIssue, route, search, obligationsOpen, runtime, showRuntime,
+    theme, themeControllable,
+  } = app;
   const counts = report ? statusCounts(report.obligations) : null;
   const tally = counts
     ? (["disproven", "unknown", "proven"] as const)
@@ -45,6 +49,19 @@ export function TopBar() {
           </span>
           {report && report.model_revision !== null && report.model_revision !== model.revision && (
             <Badge variant="warning">report @ rev {report.model_revision}</Badge>
+          )}
+          {/* A refused report is said out loud. Silently dropping it left
+              every verdict on the page reading indeterminate, which is
+              the one thing a proof view must never do. */}
+          {reportIssue && (
+            <Tooltip
+              content={`The loaded report is written in a vocabulary this build does not read (${reportIssue}). Regenerate it with this build of conseqa — no verdict is shown rather than one explained in terms the checker no longer uses.`}
+              render={
+                <span className="inline-flex shrink-0">
+                  <Badge variant="error">report not rendered</Badge>
+                </span>
+              }
+            />
           )}
         </div>
 
@@ -78,6 +95,40 @@ export function TopBar() {
               onChange={(e) => app.setSearch(e.target.value)}
               aria-label="Filter ids"
             />
+          )}
+          {/* The layer control. L0 has no switch: the application machine
+              is the model, not an overlay on it. */}
+          {route.view === "system" && (
+            <span className="flex shrink-0 items-center gap-2">
+              <Tooltip
+                content="L0 — the abstract application machine. Always drawn: it is what the model says exists."
+                render={
+                  <span className="inline-flex">
+                    <Badge variant="neutral">L0</Badge>
+                  </span>
+                }
+              />
+              <Tooltip
+                content={
+                  runtime.declared
+                    ? "L1 — one runtime realization of that machine: execution pools, routing, transport and storage topology. Hiding it hides the drawing, never the declaration."
+                    : "This model declares no L1 facts. Absence is the absence of a fact, not a realization without these properties."
+                }
+                render={
+                  <span className="inline-flex">
+                    <Switch
+                      size="sm"
+                      label="L1"
+                      controlFirst={false}
+                      checked={showRuntime && runtime.declared}
+                      disabled={!runtime.declared}
+                      onCheckedChange={app.setShowRuntime}
+                      aria-label="Draw the L1 runtime realization"
+                    />
+                  </span>
+                }
+              />
+            </span>
           )}
           {report && (
             <Button

@@ -21,22 +21,31 @@ export function subjectKeys(subject: Subject): string[] {
   }
 }
 
+/**
+ * Why a loaded report cannot be rendered, or null when it can.
+ *
+ * A report from another format carries assumptions written in a
+ * vocabulary that may no longer describe the model, so it is refused
+ * rather than rendered in terms the checker no longer uses. The refusal
+ * is a fact about the page, not a console line: a refused report that
+ * still counted its verdicts in the top bar while every ring, chip and
+ * requirement row read indeterminate is precisely how this failed
+ * before. `AppState` drops a refused report entirely and says so, so
+ * every surface agrees.
+ */
+export function reportRejection(report: ProverReport | null): string | null {
+  if (!report) return null;
+  if (report.format !== REPORT_FORMAT) {
+    return `report format ${report.format}, not ${REPORT_FORMAT}`;
+  }
+  return null;
+}
+
 export type ObligationIndex = Map<string, Obligation[]>;
 
 export function buildObligationIndex(report: ProverReport | null): ObligationIndex {
   const index: ObligationIndex = new Map();
-  if (!report) return index;
-
-  // A report from another format carries assumptions written in a
-  // vocabulary that may no longer describe the model. Rendering it
-  // would explain a verdict in terms the checker no longer uses.
-  if (report.format !== REPORT_FORMAT) {
-    console.warn(
-      `report format ${report.format} is not ${REPORT_FORMAT}; obligations not rendered`,
-    );
-
-    return index;
-  }
+  if (!report || reportRejection(report)) return index;
 
   for (const ob of report.obligations) {
     for (const key of subjectKeys(ob.subject)) {
@@ -110,4 +119,16 @@ export function propertyMatchesRequirement(property: Obligation["property"], kin
   if (property.kind === kind) return true;
   // result_replay obligations anchor to the idempotency requirement.
   return kind === "idempotency" && property.kind === "result_replay";
+}
+
+/** Which semantic layer an obligation implicates. A proven obligation
+ *  answers with the layers its proof consumed (`scope`); an unproven one
+ *  with the layer the missing facts belong to (`remedy`). An obligation
+ *  the checker classifies neither way answers `null`. */
+export type Layer = "l0" | "runtime";
+
+export function obligationLayer(ob: Obligation): Layer | null {
+  if (ob.scope) return ob.scope === "runtime_dependent" ? "runtime" : "l0";
+  if (ob.remedy) return ob.remedy === "runtime" ? "runtime" : "l0";
+  return null;
 }

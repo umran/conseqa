@@ -121,7 +121,10 @@ export function SvgCanvas({ children, legend, empty }: Props) {
           render={<Button variant="secondary" size="sm" shape="square" icon={ArrowsOutIcon} aria-label="Fit graph to view" onClick={app.requestFit} />}
         />
       </div>
-      <div className="pointer-events-none absolute bottom-4 left-4 flex flex-col gap-1 rounded-lg border border-kumo-hairline bg-kumo-base/90 px-3 py-2 text-xs text-kumo-subtle backdrop-blur">
+      {/* Top left, not bottom left: the foot of the canvas is where the
+          L1 band and its label sit, and a legend that covers the drawing
+          it explains is worse than no legend. */}
+      <div className="pointer-events-none absolute left-4 top-4 flex flex-col gap-1 rounded-lg border border-kumo-hairline bg-kumo-base/90 px-3 py-2 text-xs text-kumo-subtle backdrop-blur">
         {legend}
       </div>
       {empty ? (
@@ -158,6 +161,7 @@ function Defs() {
       {marker("arr-neutral", "var(--arch-text-subtle)")}
       {marker("arr-accent", "var(--arch-accent)")}
       {marker("arr-faint", "var(--arch-text-faint)")}
+      {marker("arr-l1", "var(--arch-l1)")}
     </defs>
   );
 }

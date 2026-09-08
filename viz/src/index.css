@@ -11,6 +11,12 @@
   --arch-edge-external: #e08a5a;
   --arch-edge-client: #58b884;
 
+  /* L1 reads as substrate: one hue, cooler than every L0 edge, used for
+     the band, its nodes, and the realization links. Two values, because
+     one teal cannot carry small text on both a white and a near-black
+     ground. */
+  --arch-l1: #2a8aa8;
+
   --arch-proven: var(--color-kumo-success);
   --arch-disproven: var(--color-kumo-danger);
   --arch-unknown: var(--color-kumo-warning);
@@ -21,6 +27,10 @@
   --arch-text: var(--text-color-kumo-default);
   --arch-text-subtle: var(--text-color-kumo-subtle);
   --arch-text-faint: var(--text-color-kumo-inactive);
+}
+
+[data-mode="dark"] {
+  --arch-l1: #7cc4d8;
 }
 
 html, body, #root { height: 100%; }
@@ -81,4 +91,63 @@ svg.arch-canvas text { font-size: 12px; fill: var(--arch-text); user-select: non
    reads top-down from the left edge like the rest of its sections. */
 .arch-flow [data-testid="flow-contents"] {
   margin-left: 0;
+}
+
+/* ---------- L1 — the runtime realization ---------- */
+
+.arch-plane .band {
+  fill: color-mix(in srgb, var(--arch-l1) 6%, transparent);
+  stroke: color-mix(in srgb, var(--arch-l1) 22%, transparent);
+  stroke-width: 1;
+}
+.arch-plane .divider {
+  stroke: color-mix(in srgb, var(--arch-l1) 40%, transparent);
+  stroke-width: 1;
+  stroke-dasharray: 2 6;
+}
+.arch-plane .plane-label {
+  font-size: 10.5px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  fill: var(--arch-text-faint);
+}
+.arch-plane .plane-label.below { fill: color-mix(in srgb, var(--arch-l1) 70%, var(--arch-text-faint)); }
+
+.arch-l1-node { cursor: pointer; transition: opacity 120ms ease; }
+.arch-l1-node.dimmed { opacity: 0.22; }
+.arch-l1-node .body {
+  fill: color-mix(in srgb, var(--arch-l1) 9%, var(--arch-node-fill));
+  stroke: color-mix(in srgb, var(--arch-l1) 55%, transparent);
+  stroke-width: 1.2;
+}
+.arch-l1-node.storage .body { stroke-dasharray: 5 3; }
+.arch-l1-node:hover .body { stroke: var(--arch-l1); }
+.arch-l1-node.selected .body { stroke: var(--arch-l1); stroke-width: 2; }
+.arch-l1-node .title { font-weight: 600; font-size: 12px; }
+.arch-l1-node .subtitle { fill: var(--arch-text-subtle); font-size: 10.5px; }
+.arch-l1-node .chip-body {
+  fill: color-mix(in srgb, var(--arch-l1) 14%, var(--color-kumo-base));
+  stroke: color-mix(in srgb, var(--arch-l1) 30%, transparent);
+}
+.arch-l1-node .chip:hover .chip-body { stroke: var(--arch-l1); }
+.arch-l1-node .chip-body.subscription { stroke-dasharray: 4 3; }
+.arch-l1-node .chip-text { font-size: 10.5px; }
+.arch-l1-node .chip-note { font-size: 9.5px; fill: var(--arch-text-faint); }
+
+/* The realization of one L0 vertex, drawn only while it is selected. */
+.arch-l1-link {
+  fill: none;
+  stroke: var(--arch-l1);
+  stroke-width: 1.6;
+  stroke-dasharray: 6 4;
+  opacity: 0.9;
+}
+.arch-l1-label { font-size: 10px; fill: color-mix(in srgb, var(--arch-l1) 75%, var(--arch-text-subtle)); }
+
+/* An L0 node's one-line note about the layer beneath it. */
+.arch-node .l1-mark,
+.arch-l1-node .l1-mark {
+  font-size: 9.5px;
+  fill: color-mix(in srgb, var(--arch-l1) 70%, var(--arch-text-faint));
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
 }

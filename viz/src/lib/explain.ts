@@ -196,6 +196,21 @@ export function subscriptionRouting(key: SubscriptionRoutingKey | null | undefin
   };
 }
 
+/** A boundary with no declared realization at all — no pool, no router,
+ *  no dispatch. Distinct from a realization that declares a pool and no
+ *  routing: that states an execution population and withholds affinity;
+ *  this states nothing. */
+export function noRuntimeDeclared(): Explanation {
+  return {
+    label: "no L1 facts",
+    tone: "neutral",
+    summary:
+      "This boundary declares no runtime realization: no execution pool, and so no member " +
+      "affinity and no member concurrency. Absence is the absence of a fact, not a realization " +
+      "that lacks these properties — and no proof may read it either way.",
+  };
+}
+
 /** How a routing domain is mapped onto a pool member. */
 export function memberAssignment(value: MemberAssignment): Explanation {
   switch (value.kind) {

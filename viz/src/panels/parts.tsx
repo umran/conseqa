@@ -7,6 +7,7 @@ import { Collapsible } from "@cloudflare/kumo/components/collapsible";
 import { Text } from "@cloudflare/kumo/components/text";
 import { useState, type ReactNode } from "react";
 
+import { splitCitations } from "../lib/citations";
 import { pathText, shortId } from "../lib/ids";
 import { STATUS_GLYPH, statusCounts } from "../lib/obligations";
 import { predicateText, typeText } from "../lib/text";
@@ -31,6 +32,30 @@ export function IdLink({ id, children }: { id: string; children?: ReactNode }) {
     >
       {children ?? id}
     </button>
+  );
+}
+
+/** Prose with the declarations it names made followable.
+ *
+ *  A verdict's reasoning already names its facts by id — that is what
+ *  §61 asks a proof to record. Rendering those names as links is the
+ *  difference between being told a proof rests on `pool.notifier_workers`
+ *  and being able to go and look at it. */
+export function CitedText({ text }: { text: string }) {
+  const { knownIds } = useApp();
+  const runs = splitCitations(text, knownIds);
+  return (
+    <>
+      {runs.map((run, i) =>
+        run.kind === "id" ? (
+          <IdLink key={i} id={run.id}>
+            {shortId(run.id)}
+          </IdLink>
+        ) : (
+          <span key={i}>{run.text}</span>
+        ),
+      )}
+    </>
   );
 }
 

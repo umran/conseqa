@@ -49,6 +49,33 @@ Click anything for a structured detail panel; double-click an
 operation to drill in. The top bar's filter box dims non-matching
 vertices, and a fit control in the canvas corner re-centres the graph.
 
+*Layout.* The graph is layered left to right along the flow of
+information: columns follow reachability, and everything that can happen
+in parallel stacks vertically inside a column, so a large architecture
+grows along both axes instead of into a strip. An edge to the
+neighbouring column crosses the gutter directly; a longer one, a return,
+or a hop within a column climbs a gutter into the channel reserved above
+its band and comes back down another, so no edge is ever drawn through a
+card. A drawing too wide to fit at a readable size wraps: its columns
+break into bands the way a paragraph breaks into lines, at whichever
+width leaves everything largest once fitted, and an edge that crosses
+bands travels outside them. Small graphs never wrap.
+
+*Layers.* L0 — the abstract application machine — is always drawn. L1,
+the declared runtime realization, is a band beneath it, switched from
+the top bar (`L0` is a label, not a control: the machine is the model,
+not an overlay on it). The band holds the execution pools, each naming
+the boundaries assigned to it, and the storage layouts, each naming the
+object it partitions; the switch is disabled for a model that declares
+no L1 facts. With L1 on, a topic also carries its transport facts and an
+operation the pool that runs it — with L1 off, neither appears, because
+those are facts of the layer that declares them and not of the topic or
+the operation. Selecting an operation or a pool draws the realization
+links between them, labelled with the member-affinity fact each declares,
+and dims everything else: the relation is named at all times and drawn
+when it is asked for, which keeps a diagram with fifty boundaries
+readable.
+
 **Operation view** (`#/op/<id>`). A page header (name, copyable id,
 description, and a fact strip: service, transaction and
 program-step counts, the state machines it drives, verdict tally),
@@ -56,11 +83,15 @@ then three sections as Kumo layer cards. **Requirements** is a table —
 one row per declared requirement with its key, its semantics
 (replay-consistent result, guaranteed completion) and, when a report
 is loaded, the verdict over its obligations; **Inputs** is a table of
-what starts an invocation (kind, source schema or topic, request
-identity and result contract, and — for a subscription with a declared
-runtime — its delivery, routing, member assignment and the target
-pool's member concurrency). The two sit side by side when the pane is
-wide enough and stack otherwise.
+what starts an invocation, split by layer: the **L0 contract** (request
+identity and result contract, or the messages a subscription consumes)
+and the **L1 realization** (for a request, the router, its routing key,
+member assignment and the target pool's member concurrency; for a
+subscription, its delivery, routing, member assignment and the same pool
+fact). A boundary with no declared realization says so, and says that
+absence is the absence of a fact rather than a realization lacking these
+properties. The two sit side by side when the pane is wide enough and
+stack otherwise.
 **Program** shows the operation's one program — there is exactly one,
 so there are no tabs and the route carries no query: `#/op/<id>` lands
 on it directly, and an old `?flow=` query is tolerated and ignored.
@@ -102,13 +133,23 @@ deep link or history navigation selects what the address bar names.
 **Detail panel.** Every model entity — service, operation, topic,
 schema, data object, state machine, state, transition, input, inline
 effect, intent binding, transaction-output binding, result binding,
-inline transaction, transaction step, program step, requirement, or
-graph edge — opens a detail panel organized into collapsible, counted
-sections (execution, inputs, inline effects, requirements,
-obligations, …) with key/value grids, typed badges, and clickable ids
-that open the referenced entity in place. The entities are resolved
-from the program, which is the source of truth for every
-operation-owned execution occurrence.
+inline transaction, transaction step, program step, requirement, graph
+edge, or L1 declaration (execution pool, router, storage layout) —
+opens a detail panel organized into collapsible, counted sections
+(execution, inputs, inline effects, requirements, obligations, …) with
+key/value grids, typed badges, and clickable ids that open the
+referenced entity in place. The entities are resolved from the program,
+which is the source of truth for every operation-owned execution
+occurrence.
+
+An L1 declaration's panel says what the fact does and, as importantly,
+what it does not: a pool carries no cardinality, sharing one relates
+execution populations and not routing domains, a partition key is
+neither an object identity nor a routing key. Each also lists **the
+proofs resting on it** — the obligations whose reasoning names it — so
+the verdicts a change to the topology would put back in question can be
+read off the declaration itself. Topics and inputs carry the same list,
+being where L1 facts attach to L0 entities.
 
 **Top bar.** Model name and revision, breadcrumbs for the current
 page, the id filter on the system view, and — when a report is loaded
@@ -131,11 +172,16 @@ keyed from it — appear at the top of the obligations panel.
 
 **Obligations panel.** The checker's obligations, grouped by the
 operation (or data model, machine, topic) they anchor to, with a
-segmented status filter (all / unknown / proven / disproven), a text
-filter, per-group status counts, and cards that expand to the declared
-facts a proof relies on, the checker's evidence, or a counterexample
-trace — each with a "focus subject" action that navigates to the
-entity. With a report loaded, vertices gain status rings and rollup
+segmented status filter (all / unknown / proven / disproven), a
+segmented layer filter (any / L0 / L1), a text filter, per-group status
+counts, and cards that expand to the declared facts a proof relies on,
+the checker's evidence, or a counterexample trace — each with a "focus
+subject" action that navigates to the entity. Every id a verdict names
+in its prose is a link to that declaration, which is what makes a
+proof's provenance followable rather than merely stated. The layer
+filter reads `scope` for a proven obligation and `remedy` for an
+unproven one; an obligation the checker classifies neither way appears
+only under "any layer". With a report loaded, vertices gain status rings and rollup
 chips (worst status wins: disproven > unknown > proven), requirement
 chips in the operation view are colored by their obligation status, and
 transitions in the machine view inherit theirs.
@@ -143,7 +189,7 @@ transitions in the machine view inherit theirs.
 ## The obligation report
 
 The report format is `conseqa::analyzer::report` (`ProverReport`,
-`format: 3`): one obligation per declared requirement — serialization,
+`format: 4`): one obligation per declared requirement — serialization,
 ordering, idempotency, result replay (the result half of an idempotency
 requirement declaring `result: replay_consistent`), recoverability —
 with status `proven`, `disproven`, or `unknown`. Format 2 replaced the
@@ -151,17 +197,29 @@ response-replay property with result replay, dropped object-history
 obligations and the flow subject, and made proofs cite the program
 paths and decisions they rest on; format 3 added proof `scope` and
 rebuilt the serialization and ordering arguments on the L1 runtime
-model. Unknown is epistemic: the checker could not establish the
+model; format 4 added `remedy` to unproven serialization and ordering
+obligations. Unknown is epistemic: the checker could not establish the
 property, typically because a required fact is `unspecified` or no V1
 verifier attempts that family. It is never evidence of a violation.
 
-Each obligation carries its `summary`, `subject`, `scope`,
+Each obligation carries its `summary`, `subject`, `scope`, `remedy`,
 `assumptions` (the declared facts a proof relies on — conditional, per
 §25 of the semantics contract), `evidence` (the checker's obstacles),
 and, for disproofs, a `counterexample` trace. `scope` is `l0_only` or
 `runtime_dependent`, and the card shows it as a badge: a
 runtime-dependent proof holds of the declared runtime topology and must
-be re-examined when that topology changes.
+be re-examined when that topology changes. `remedy` is its dual on an
+unproven obligation — `application` or `runtime`, the layer the facts it
+is waiting on belong to — and shows as "needs L0 fact" or "needs L1
+fact". It is a routing hint, not a promise that declaring one closes the
+argument.
+
+The front end refuses a report of any other format, and says so in the
+top bar rather than in the console: a report that is counted in one
+place and silently dropped everywhere else leaves proven obligations
+reading as indeterminate, which is the one thing a proof view must never
+do. `REPORT_FORMAT` in `viz/src/types/report.ts` mirrors
+`conseqa::analyzer::report::FORMAT` and has to move with it.
 
 ```
 conseqa model.yaml --report proof.json       # produce a report

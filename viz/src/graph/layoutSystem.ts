@@ -1,4 +1,6 @@
+import type { BoundaryLink, RuntimeFacts } from "../lib/runtime";
 import type { Edge, Graph } from "../types/graph";
+import type { Id } from "../types/model";
 
 export interface Box {
   x: number;
@@ -25,193 +27,265 @@ export interface EdgeGeometry {
   labelAt: Point;
 }
 
+/** A boundary a pool executes, named inside the pool that executes it.
+ *  Shared membership is the point: two boundaries in one pool share an
+ *  execution population and nothing else — not a routing domain. */
+export interface PoolChip extends Box {
+  id: string;
+  operation: Id;
+  input: Id;
+  kind: "request" | "subscription";
+  /** The member-affinity fact for this boundary, or null when none is
+   *  declared. */
+  routing: string | null;
+}
+
+export interface PoolBox extends Box {
+  id: string;
+  concurrency: string;
+  chips: PoolChip[];
+}
+
+export interface StorageBox extends Box {
+  id: string;
+  object: Id;
+  partitionKey: string;
+  operations: Id[];
+}
+
+/** A realization link, drawn only for the selection that asks for it:
+ *  every boundary at once is a thicket, and the question a reader has is
+ *  always about one operation or one pool. */
+export interface LinkGeometry {
+  id: string;
+  link: BoundaryLink;
+  d: string;
+  labelAt: Point;
+}
+
+export interface RuntimePlane {
+  pools: PoolBox[];
+  storage: StorageBox[];
+  links: LinkGeometry[];
+  /** The whole band, for its separator and label — null when the L1
+   *  declarations are all facts that live on L0 entities (a topic's
+   *  transport, say) and there is nothing of its own to place. A
+   *  divider under an empty band would announce a layer and then show
+   *  none of it. */
+  band: Box | null;
+}
+
 export interface SystemLayout {
   pos: Map<string, Box>;
   services: ServiceBox[];
   edges: EdgeGeometry[];
+  /** Null when the L1 plane is not drawn — because it is switched off, or
+   *  because the model declares no runtime facts. */
+  runtime: RuntimePlane | null;
+  /** The L0 plane's bounds, for the layer separator. */
+  l0: Box;
 }
 
 export const SYS = {
-  OP_W: 200, OP_H: 62, OP_HGAP: 18,
-  SVC_PAD: 16, SVC_TITLE: 34, SVC_GAP: 96,
-  TOPIC_W: 200, TOPIC_H: 48, TOPIC_BAND: 150, TOPIC_GAP: 60,
-  EXT_W: 200, EXT_H: 46, EXT_BAND: 150,
-  CLIENT_W: 160, CLIENT_H: 58, CLIENT_GAP: 170,
-  /** Routing channel above the service row, below the externals. */
-  CHANNEL_Y: -60, LANE: 12, CORNER: 18, PORT_INSET: 26,
+  OP_W: 210, OP_H: 64, OP_VGAP: 12,
+  SVC_PAD: 14, SVC_TITLE: 30,
+  /** Operations stack in one column, so every card keeps both flanks
+   *  clear for its edges; only a service larger than this wraps. */
+  SVC_MAX_ROWS: 8,
+  COL_GAP: 130, ROW_GAP: 48,
+  TOPIC_W: 220, TOPIC_H: 54,
+  EXT_W: 186, EXT_H: 50,
+  CLIENT_W: 150, CLIENT_H: 58,
+  PORT_INSET: 14, CORNER: 16, LANE: 13, CHANNEL_GAP: 56,
+  /** Vertical gap between two bands of columns, and the horizontal room
+   *  outside every band that a wrapping edge travels in. */
+  BAND_ROW_GAP: 110, OUTER_MARGIN: 70,
+  /** The shape of the canvas the drawing is fitted into, and what an
+   *  extra band has to earn back in size before it is worth taking. */
+  TARGET_ASPECT: 1.8, WRAP_COST: 1.2,
+  /** Below this width a drawing still fits at a readable size, so it is
+   *  left on one line however wide it looks. Roughly eight columns. */
+  WRAP_THRESHOLD: 2800,
+  BAND_GAP: 96, BAND_TITLE: 36,
+  POOL_GAP: 44, POOL_PAD: 12, POOL_TITLE: 42, POOL_MIN_W: 208,
+  CHIP_W: 196, CHIP_H: 30, CHIP_GAP: 8, CHIP_COLS: 2,
+  STORE_W: 210, STORE_H: 62, STORE_GAP: 32, STORE_ROW_GAP: 40,
 };
 
-/**
- * Service-level reachability order: requests directly, pub/sub through
- * topics. Entry services are those with client-facing inputs.
- */
-function serviceOrder(graph: Graph): string[] {
-  const ids = graph.services.map((s) => s.id);
-  const opService = new Map(graph.operations.map((o) => [o.id, o.service]));
-  const succ = new Map<string, Set<string>>(ids.map((id) => [id, new Set()]));
-  const pubs = new Map<string, Set<string>>();
-  const subs = new Map<string, Set<string>>();
-  const entries = new Set<string>();
+// ---------------------------------------------------------------------------
+// Layering
+// ---------------------------------------------------------------------------
 
-  const add = (map: Map<string, Set<string>>, key: string, value: string) => {
-    let set = map.get(key);
-    if (!set) {
-      set = new Set();
-      map.set(key, set);
+/** A vertex of the coarse graph the columns are computed over: a whole
+ *  service (its operations ride along inside it), a topic, an external
+ *  system, or the clients vertex. */
+interface Macro {
+  id: string;
+  kind: "service" | "topic" | "external" | "client";
+  w: number;
+  h: number;
+  rank: number;
+}
+
+function serviceSize(count: number): { w: number; h: number; cols: number; rows: number } {
+  const n = Math.max(1, count);
+  const cols = Math.ceil(n / SYS.SVC_MAX_ROWS);
+  const rows = Math.ceil(n / cols);
+  return {
+    cols,
+    rows,
+    w: SYS.SVC_PAD * 2 + cols * SYS.OP_W + (cols - 1) * SYS.SVC_PAD,
+    h: SYS.SVC_TITLE + SYS.SVC_PAD + rows * SYS.OP_H + (rows - 1) * SYS.OP_VGAP,
+  };
+}
+
+/** Where each column sits once the columns have been wrapped into bands. */
+interface BandGeometry {
+  /** Band index per column. */
+  of: number[];
+  /** Top of the band, where its edge channel begins. */
+  top: number[];
+  /** Top of the band's content, below its channel. */
+  contentTop: number[];
+  count: number;
+}
+
+/**
+ * How many columns go in one band.
+ *
+ * The measure is the size everything ends up drawn at. Fitting a drawing
+ * of width W and height H into a canvas of aspect A scales it by
+ * `1 / max(W, H·A)`, so that quantity — smaller is bigger — is what the
+ * choice minimises. It is the honest form of "use the canvas": a
+ * twenty-column strip is not bad because it is wide, it is bad because
+ * fitting it leaves every card too small to read.
+ *
+ * Wrapping costs a reader something too — an edge that leaves one band
+ * and re-enters the next has to be followed — so it is not considered at
+ * all until the drawing is wide enough to be unreadable when fitted, and
+ * then a band must still buy at least a fifth more size to be taken.
+ */
+function chooseBandWidth(columnWidth: number[], columnHeight: number[], target: number): number {
+  const n = columnWidth.length;
+  if (n <= 1) return Math.max(1, n);
+
+  const total = columnWidth.reduce((sum, w) => sum + w + SYS.COL_GAP, 0) - SYS.COL_GAP;
+  if (total <= SYS.WRAP_THRESHOLD) return n;
+
+  let best = n;
+  let bestCost = Infinity;
+  for (let perBand = n; perBand >= 1; perBand--) {
+    let width = 0;
+    let height = 0;
+    let count = 0;
+    for (let start = 0; start < n; start += perBand) {
+      let bandWidth = 0;
+      let bandHeight = 0;
+      for (let c = start; c < Math.min(start + perBand, n); c++) {
+        bandWidth += columnWidth[c] + SYS.COL_GAP;
+        bandHeight = Math.max(bandHeight, columnHeight[c]);
+      }
+      width = Math.max(width, bandWidth - SYS.COL_GAP);
+      height += bandHeight + SYS.BAND_ROW_GAP;
+      count++;
     }
-    set.add(value);
+    height -= SYS.BAND_ROW_GAP;
+    const cost = Math.max(width, height * target) * SYS.WRAP_COST ** (count - 1);
+    if (cost < bestCost) {
+      bestCost = cost;
+      best = perBand;
+    }
+  }
+  return best;
+}
+
+/**
+ * Ranks the coarse graph left to right by longest path, ignoring the
+ * edges that close a cycle.
+ *
+ * Cycles are ordinary here — a service publishing to the topic it also
+ * subscribes to is a pipeline, not a mistake — so they are broken for
+ * ranking only. The edges that were cut are still drawn; they become the
+ * arcs over the plane, which is what a return path looks like.
+ */
+function rankMacros(nodes: Map<string, Macro>, edges: [string, string][]): void {
+  const succ = new Map<string, string[]>();
+  for (const id of nodes.keys()) succ.set(id, []);
+  for (const [a, b] of edges) if (a !== b) succ.get(a)?.push(b);
+
+  // Depth-first walk marking back edges: an edge into a vertex still on
+  // the stack cannot be honoured by any left-to-right ordering.
+  const state = new Map<string, 0 | 1 | 2>();
+  const back = new Set<string>();
+  const visit = (id: string) => {
+    state.set(id, 1);
+    for (const next of succ.get(id) ?? []) {
+      const s = state.get(next) ?? 0;
+      if (s === 1) back.add(`${id} ${next}`);
+      else if (s === 0) visit(next);
+    }
+    state.set(id, 2);
   };
 
-  for (const e of graph.edges) {
-    if (e.kind === "request") {
-      const a = opService.get(e.operation);
-      const b = opService.get(e.to);
-      if (a && b && a !== b) succ.get(a)?.add(b);
-    } else if (e.kind === "publish") {
-      const a = opService.get(e.operation);
-      if (a) add(pubs, e.to, a);
-    } else if (e.kind === "subscribe") {
-      const b = opService.get(e.operation);
-      if (b) add(subs, e.from, b);
-    } else if (e.kind === "client") {
-      const b = opService.get(e.operation);
-      if (b) entries.add(b);
+  const indegree = new Map<string, number>([...nodes.keys()].map((id) => [id, 0]));
+  for (const [a, b] of edges) if (a !== b) indegree.set(b, (indegree.get(b) ?? 0) + 1);
+  const roots = [...nodes.keys()].filter((id) => !indegree.get(id));
+  for (const id of roots) if (!state.get(id)) visit(id);
+  for (const id of nodes.keys()) if (!state.get(id)) visit(id);
+
+  const forward = edges.filter(([a, b]) => a !== b && !back.has(`${a} ${b}`));
+
+  // Longest path by relaxation. The remaining edge set is acyclic, so the
+  // vertex count bounds the passes needed.
+  for (let pass = 0; pass < nodes.size; pass++) {
+    let changed = false;
+    for (const [a, b] of forward) {
+      const next = nodes.get(a)!.rank + 1;
+      if (nodes.get(b)!.rank < next) {
+        nodes.get(b)!.rank = next;
+        changed = true;
+      }
     }
+    if (!changed) break;
   }
-
-  for (const [topic, publishers] of pubs) {
-    for (const p of publishers) {
-      for (const s of subs.get(topic) ?? []) if (p !== s) succ.get(p)?.add(s);
-    }
-  }
-
-  let roots = [...entries];
-  if (!roots.length) {
-    const indeg = new Map(ids.map((id) => [id, 0]));
-    for (const [, targets] of succ) {
-      for (const s of targets) indeg.set(s, (indeg.get(s) ?? 0) + 1);
-    }
-    roots = ids.filter((id) => !indeg.get(id));
-  }
-  if (!roots.length) roots = ids.slice(0, 1);
-
-  const rank = new Map<string, number>();
-  const queue: [string, number][] = roots.map((id) => [id, 0]);
-  while (queue.length) {
-    const [id, d] = queue.shift()!;
-    if (rank.has(id)) continue;
-    rank.set(id, d);
-    for (const s of succ.get(id) ?? []) queue.push([s, d + 1]);
-  }
-  const maxRank = Math.max(0, ...rank.values());
-  for (const id of ids) if (!rank.has(id)) rank.set(id, maxRank + 1);
-
-  return [...ids].sort((a, b) => rank.get(a)! - rank.get(b)! || a.localeCompare(b));
 }
 
-/** Assigns ports along one side of a node for a set of edges. */
-function assignPorts(edges: Edge[], node: Box, side: "top" | "bottom", sortBy: (e: Edge) => number) {
-  const sorted = [...edges].sort((a, b) => sortBy(a) - sortBy(b));
-  const n = sorted.length;
-  const inset = Math.min(SYS.PORT_INSET, node.w / (n + 1));
-  const span = node.w - inset * 2;
-  const ports = new Map<string, Point>();
-  sorted.forEach((e, i) => {
-    const frac = n === 1 ? 0.5 : i / (n - 1);
-    ports.set(e.id, { x: node.x + inset + frac * span, y: side === "top" ? node.y : node.y + node.h });
-  });
-  return ports;
-}
+/** Orders each column by the mean position of its neighbours in the
+ *  neighbouring columns, sweeping both ways: the standard cheap remedy
+ *  for crossings, and enough for graphs of this size. */
+function orderColumns(columns: Macro[][], neighbours: Map<string, string[]>): void {
+  const indexOf = new Map<string, number>();
+  const reindex = () => {
+    for (const column of columns) column.forEach((m, i) => indexOf.set(m.id, i));
+  };
+  reindex();
 
-/**
- * Operations sit in one row inside their service, so every operation
- * has a clear vertical line to the topic band below and the externals
- * band above; nothing stacks under anything else.
- */
-export function layoutSystem(graph: Graph): SystemLayout {
-  const pos = new Map<string, Box>();
-  const services: ServiceBox[] = [];
-  const byService = new Map<string, Graph["operations"]>(graph.services.map((s) => [s.id, []]));
-  for (const op of graph.operations) {
-    if (!byService.has(op.service)) byService.set(op.service, []);
-    byService.get(op.service)!.push(op);
-  }
-  const clientFacing = new Set(graph.edges.filter((e) => e.kind === "client").map((e) => e.to));
-
-  let x = 0;
-  for (const svcId of serviceOrder(graph)) {
-    // Client-facing operations first, so the entry edge from the left
-    // reaches the row's first card without passing the others.
-    const ops = [...(byService.get(svcId) ?? [])].sort(
-      (a, b) => Number(clientFacing.has(b.id)) - Number(clientFacing.has(a.id)) || a.id.localeCompare(b.id),
-    );
-    const n = Math.max(1, ops.length);
-    const w = SYS.SVC_PAD * 2 + n * SYS.OP_W + (n - 1) * SYS.OP_HGAP;
-    const h = SYS.SVC_TITLE + SYS.SVC_PAD + SYS.OP_H;
-    services.push({ id: svcId, x, y: 0, w, h });
-    ops.forEach((op, i) => {
-      pos.set(op.id, { x: x + SYS.SVC_PAD + i * (SYS.OP_W + SYS.OP_HGAP), y: SYS.SVC_TITLE, w: SYS.OP_W, h: SYS.OP_H });
-    });
-    x += w + SYS.SVC_GAP;
-  }
-
-  const maxBottom = Math.max(80, ...services.map((b) => b.y + b.h));
-
-  // Band placement shared by topics and externals: desired x is the
-  // mean of connected operation centers; overlaps resolved in order.
-  function placeBand<T extends { id: string }>(
-    nodes: T[],
-    connectedOps: (node: T) => string[],
-    w: number,
-    gap: number,
-    y: number,
-    h: number,
-  ) {
-    const items = nodes
-      .map((n) => {
-        const ops = connectedOps(n).map((id) => pos.get(id)).filter((p): p is Box => !!p);
-        const cx = ops.length ? ops.reduce((a, p) => a + p.x + p.w / 2, 0) / ops.length : 0;
-        return { n, cx };
-      })
-      .sort((a, b) => a.cx - b.cx || a.n.id.localeCompare(b.n.id));
-    let cursor = -Infinity;
-    for (const item of items) {
-      const left = Math.max(item.cx - w / 2, cursor);
-      pos.set(item.n.id, { x: left, y, w, h });
-      cursor = left + w + gap;
+  const sweep = (order: number[]) => {
+    for (const c of order) {
+      const column = columns[c];
+      if (!column) continue;
+      const key = new Map<string, number>();
+      for (const m of column) {
+        const ns = (neighbours.get(m.id) ?? [])
+          .map((id) => indexOf.get(id))
+          .filter((i): i is number => i !== undefined);
+        key.set(m.id, ns.length ? ns.reduce((a, b) => a + b, 0) / ns.length : indexOf.get(m.id)!);
+      }
+      column.sort((a, b) => key.get(a.id)! - key.get(b.id)! || a.id.localeCompare(b.id));
+      reindex();
     }
+  };
+
+  const forward = columns.map((_, i) => i);
+  for (let pass = 0; pass < 3; pass++) {
+    sweep(forward);
+    sweep([...forward].reverse());
   }
-
-  placeBand(
-    graph.topics,
-    (t) =>
-      graph.edges
-        .filter((e) => (e.kind === "publish" && e.to === t.id) || (e.kind === "subscribe" && e.from === t.id))
-        .map((e) => (e.kind === "publish" || e.kind === "subscribe" ? e.operation : "")),
-    SYS.TOPIC_W, SYS.TOPIC_GAP, maxBottom + SYS.TOPIC_BAND, SYS.TOPIC_H,
-  );
-
-  placeBand(
-    graph.externals,
-    (ext) =>
-      graph.edges
-        .filter((e) => e.kind === "external" && e.to === ext.id)
-        .map((e) => (e.kind === "external" ? e.operation : "")),
-    SYS.EXT_W, SYS.TOPIC_GAP, -(SYS.EXT_BAND + SYS.EXT_H), SYS.EXT_H,
-  );
-
-  if (graph.client) {
-    const minX = Math.min(0, ...services.map((b) => b.x));
-    pos.set(graph.client.id, {
-      x: minX - SYS.CLIENT_GAP - SYS.CLIENT_W,
-      y: SYS.SVC_TITLE + SYS.OP_H / 2 - SYS.CLIENT_H / 2,
-      w: SYS.CLIENT_W,
-      h: SYS.CLIENT_H,
-    });
-  }
-
-  return { pos, services, edges: routeEdges(graph, pos, services) };
 }
+
+// ---------------------------------------------------------------------------
+// Paths
+// ---------------------------------------------------------------------------
 
 /** An axis-aligned polyline with rounded corners. */
 function roundedPolyline(points: Point[], radius: number): string {
@@ -236,130 +310,563 @@ function roundedPolyline(points: Point[], radius: number): string {
   return d;
 }
 
-function verticalCubic(p1: Point, p2: Point): string {
-  const dir = p2.y > p1.y ? 1 : -1;
-  const dy = Math.min(120, Math.max(36, Math.abs(p2.y - p1.y) * 0.4));
-  return `M${p1.x},${p1.y} C${p1.x},${p1.y + dir * dy} ${p2.x},${p2.y - dir * dy} ${p2.x},${p2.y}`;
-}
-
 function horizontalCubic(p1: Point, p2: Point): string {
-  const dx = Math.min(140, Math.max(40, Math.abs(p2.x - p1.x) * 0.35));
+  const dx = Math.min(160, Math.max(48, Math.abs(p2.x - p1.x) * 0.45));
   return `M${p1.x},${p1.y} C${p1.x + dx},${p1.y} ${p2.x - dx},${p2.y} ${p2.x},${p2.y}`;
 }
 
-function routeEdges(graph: Graph, pos: Map<string, Box>, services: ServiceBox[]): EdgeGeometry[] {
-  const portOf = new Map<string, { from?: Point; to?: Point }>();
-  const vertical = graph.edges.filter(
-    (e) => e.kind === "publish" || e.kind === "subscribe" || e.kind === "external",
+/** Ports spread along one side of a box, ordered by where the other end
+ *  of each edge sits, so incident edges arrive in the order they leave. */
+function assignPorts<T>(
+  items: T[],
+  box: Box,
+  side: "left" | "right",
+  sortBy: (item: T) => number,
+  keyOf: (item: T) => string,
+): Map<string, Point> {
+  const sorted = [...items].sort((a, b) => sortBy(a) - sortBy(b));
+  const ports = new Map<string, Point>();
+  const n = sorted.length;
+  const inset = Math.min(SYS.PORT_INSET, box.h / (n + 1));
+  const usable = box.h - inset * 2;
+  const x = side === "left" ? box.x : box.x + box.w;
+  sorted.forEach((item, i) => {
+    const frac = n === 1 ? 0.5 : i / (n - 1);
+    ports.set(keyOf(item), { x, y: box.y + inset + frac * usable });
+  });
+  return ports;
+}
+
+function boundsOf(boxes: Box[]): Box {
+  if (!boxes.length) return { x: 0, y: 0, w: 0, h: 0 };
+  const x = Math.min(...boxes.map((b) => b.x));
+  const y = Math.min(...boxes.map((b) => b.y));
+  const right = Math.max(...boxes.map((b) => b.x + b.w));
+  const bottom = Math.max(...boxes.map((b) => b.y + b.h));
+  return { x, y, w: right - x, h: bottom - y };
+}
+
+// ---------------------------------------------------------------------------
+// Layout
+// ---------------------------------------------------------------------------
+
+export interface LayoutOptions {
+  /** The declared runtime realization, when the L1 plane is drawn. */
+  runtime?: RuntimeFacts | null;
+  /** The shape the drawing should aim for — the canvas's, when it is
+   *  known. Columns wrap into bands to approach it. */
+  aspect?: number;
+}
+
+/**
+ * A layered left-to-right layout: columns follow the flow of information,
+ * and everything that can happen in parallel stacks vertically inside a
+ * column. A wide, one-row picture wastes the height of the canvas and
+ * shrinks every card when fitted; letting the graph grow along both axes
+ * is what keeps a large architecture readable.
+ *
+ * With the L1 plane on, the runtime realization is drawn as a band below
+ * the whole L0 plane — a substrate, not another region of the same
+ * drawing — because that is the relationship between the layers: L1 says
+ * how the machine above it is realized.
+ */
+export function layoutSystem(graph: Graph, options: LayoutOptions = {}): SystemLayout {
+  const runtime = options.runtime ?? null;
+  const pos = new Map<string, Box>();
+  const macros = new Map<string, Macro>();
+
+  const opService = new Map(graph.operations.map((o) => [o.id, o.service]));
+  const opsOf = new Map<string, string[]>(graph.services.map((s) => [s.id, []]));
+  for (const op of graph.operations) {
+    if (!opsOf.has(op.service)) opsOf.set(op.service, []);
+    opsOf.get(op.service)!.push(op.id);
+  }
+  for (const [, ops] of opsOf) ops.sort();
+
+  const macro = (vertex: string): string => opService.get(vertex) ?? vertex;
+
+  for (const svc of graph.services) {
+    const { w, h } = serviceSize(opsOf.get(svc.id)?.length ?? 0);
+    macros.set(svc.id, { id: svc.id, kind: "service", w, h, rank: 0 });
+  }
+  for (const t of graph.topics) {
+    macros.set(t.id, { id: t.id, kind: "topic", w: SYS.TOPIC_W, h: SYS.TOPIC_H, rank: 0 });
+  }
+  for (const e of graph.externals) {
+    macros.set(e.id, { id: e.id, kind: "external", w: SYS.EXT_W, h: SYS.EXT_H, rank: 0 });
+  }
+  if (graph.client) {
+    macros.set(graph.client.id, {
+      id: graph.client.id, kind: "client", w: SYS.CLIENT_W, h: SYS.CLIENT_H, rank: 0,
+    });
+  }
+
+  const macroEdges: [string, string][] = [];
+  const neighbours = new Map<string, string[]>([...macros.keys()].map((id) => [id, []]));
+  for (const e of graph.edges) {
+    const a = macro(e.from);
+    const b = macro(e.to);
+    if (!macros.has(a) || !macros.has(b) || a === b) continue;
+    macroEdges.push([a, b]);
+    neighbours.get(a)!.push(b);
+    neighbours.get(b)!.push(a);
+  }
+
+  rankMacros(macros, macroEdges);
+
+  const maxRank = Math.max(0, ...[...macros.values()].map((m) => m.rank));
+  const columns: Macro[][] = Array.from({ length: maxRank + 1 }, () => []);
+  for (const m of [...macros.values()].sort((a, b) => a.id.localeCompare(b.id))) columns[m.rank].push(m);
+  orderColumns(columns, neighbours);
+
+  // Columns are as wide as their widest member. A long pipeline makes
+  // many of them, and a picture twenty columns wide and three rows tall
+  // fits a 16:9 canvas by shrinking every card to nothing — so the
+  // columns wrap into bands, the way a paragraph wraps into lines.
+  const columnWidth = columns.map((column) => Math.max(0, ...column.map((m) => m.w)));
+  const columnHeight = columns.map(
+    (column) => column.reduce((sum, m) => sum + m.h, 0) + Math.max(0, column.length - 1) * SYS.ROW_GAP,
   );
-  const record = (id: string, side: "from" | "to", point: Point) => {
-    const rec = portOf.get(id) ?? {};
-    rec[side] = point;
-    portOf.set(id, rec);
+  const perBand = chooseBandWidth(columnWidth, columnHeight, options.aspect ?? SYS.TARGET_ASPECT);
+  const bandOf = columns.map((_, c) => Math.floor(c / perBand));
+  const bandCount = columns.length ? bandOf[columns.length - 1] + 1 : 1;
+
+  // Every band reserves a channel above it for the edges that do not
+  // simply cross one gutter, so those never run through a card.
+  const macroColumn = new Map<string, number>();
+  columns.forEach((column, c) => {
+    for (const m of column) macroColumn.set(m.id, c);
+  });
+  const columnFor = (vertex: string) => macroColumn.get(macro(vertex)) ?? 0;
+  const channelLanes = new Array<number>(bandCount).fill(0);
+  for (const e of graph.edges) {
+    if (!macros.has(macro(e.from)) || !macros.has(macro(e.to))) continue;
+    const a = columnFor(e.from);
+    const b = columnFor(e.to);
+    if (bandOf[a] === bandOf[b] && Math.abs(b - a) === 1) continue;
+    channelLanes[bandOf[a]]++;
+    if (bandOf[a] !== bandOf[b]) channelLanes[bandOf[b]]++;
+  }
+  const channelSpace = channelLanes.map((n) => (n ? SYS.CHANNEL_GAP + n * SYS.LANE : SYS.ROW_GAP));
+
+  const columnX: number[] = [];
+  const bandTop: number[] = [];
+  const bandContentTop: number[] = [];
+  let cursorX = 0;
+  let cursorY = 0;
+  for (let b = 0; b < bandCount; b++) {
+    const members = columns.map((_, c) => c).filter((c) => bandOf[c] === b);
+    cursorX = 0;
+    for (const c of members) {
+      columnX[c] = cursorX;
+      cursorX += columnWidth[c] + SYS.COL_GAP;
+    }
+    bandTop[b] = cursorY;
+    bandContentTop[b] = cursorY + channelSpace[b];
+    cursorY = bandContentTop[b] + Math.max(0, ...members.map((c) => columnHeight[c])) + SYS.BAND_ROW_GAP;
+  }
+
+  const columnOf = new Map<string, number>();
+  columns.forEach((column, c) => {
+    const band = bandOf[c];
+    const tallest = Math.max(
+      0,
+      ...columns.map((_, other) => (bandOf[other] === band ? columnHeight[other] : 0)),
+    );
+    // Centred within its band, so a short column reads as part of the
+    // same row as the tall one beside it.
+    let y = bandContentTop[band] + (tallest - columnHeight[c]) / 2;
+    for (const m of column) {
+      columnOf.set(m.id, c);
+      pos.set(m.id, { x: columnX[c] + (columnWidth[c] - m.w) / 2, y, w: m.w, h: m.h });
+      y += m.h + SYS.ROW_GAP;
+    }
+  });
+
+  const services: ServiceBox[] = [];
+  for (const svc of graph.services) {
+    const box = pos.get(svc.id);
+    if (!box) continue;
+    services.push({ id: svc.id, ...box });
+    const ops = opsOf.get(svc.id) ?? [];
+    const { rows } = serviceSize(ops.length);
+    ops.forEach((opId, i) => {
+      pos.set(opId, {
+        x: box.x + SYS.SVC_PAD + Math.floor(i / rows) * (SYS.OP_W + SYS.SVC_PAD),
+        y: box.y + SYS.SVC_TITLE + (i % rows) * (SYS.OP_H + SYS.OP_VGAP),
+        w: SYS.OP_W,
+        h: SYS.OP_H,
+      });
+    });
+  }
+
+  const bands: BandGeometry = { of: bandOf, top: bandTop, contentTop: bandContentTop, count: bandCount };
+
+  const l0 = boundsOf([...pos.values()]);
+  const edges = routeEdges(graph, pos, columnOf, macro, columnX, columnWidth, bands);
+  const plane = runtime
+    ? layoutRuntime(graph, runtime, pos, columnOf, macro, columnX, columnWidth, bands, l0)
+    : null;
+
+  return { pos, services, edges, runtime: plane, l0 };
+}
+
+/**
+ * Routes the information edges.
+ *
+ * An edge to the neighbouring column in the same band crosses the gutter
+ * directly, in either direction. A longer one — a leap over columns, a
+ * return to an earlier one, a hop within one — leaves through the side
+ * it is headed for, climbs a column gutter into the channel reserved
+ * above its band, and comes back down another gutter. An edge that
+ * crosses bands does the same and travels between them outside every
+ * band, which is the only column of space guaranteed to be empty.
+ *
+ * Risers stay in gutters and channels for the same reason: a line drawn
+ * straight from card to card would cross whatever lies between them, and
+ * a diagram whose edges pass through its nodes cannot be read.
+ */
+function routeEdges(
+  graph: Graph,
+  pos: Map<string, Box>,
+  columnOf: Map<string, number>,
+  macro: (vertex: string) => string,
+  columnX: number[],
+  columnWidth: number[],
+  bands: BandGeometry,
+): EdgeGeometry[] {
+  const columnFor = (vertex: string) => columnOf.get(macro(vertex)) ?? 0;
+  type Mode = "direct" | "channel" | "cross";
+  type Side = "left" | "right";
+
+  const plan = new Map<string, { mode: Mode; from: Side; to: Side; span: number }>();
+  for (const e of graph.edges) {
+    if (!pos.has(e.from) || !pos.has(e.to)) continue;
+    const a = columnFor(e.from);
+    const b = columnFor(e.to);
+    const forward = b > a;
+    if (bands.of[a] !== bands.of[b]) {
+      plan.set(e.id, {
+        mode: "cross",
+        from: forward ? "right" : "left",
+        to: forward ? "left" : "right",
+        span: Math.abs(b - a),
+      });
+    } else if (Math.abs(b - a) === 1) {
+      plan.set(e.id, { mode: "direct", from: forward ? "right" : "left", to: forward ? "left" : "right", span: 1 });
+    } else {
+      plan.set(e.id, {
+        mode: "channel",
+        from: forward ? "right" : "left",
+        to: forward ? "left" : "right",
+        span: Math.max(1, Math.abs(b - a)),
+      });
+    }
+  }
+
+  const centre = (vertex: string) => {
+    const box = pos.get(vertex);
+    return box ? box.y + box.h / 2 : 0;
   };
 
-  for (const op of graph.operations) {
-    const p = pos.get(op.id);
-    if (!p) continue;
-    const bottom = vertical.filter((e) => e.kind !== "external" && (e.from === op.id || e.to === op.id));
-    const bPorts = assignPorts(bottom, p, "bottom", (e) => {
-      const other = pos.get(e.kind === "publish" ? e.to : e.from);
-      return other ? other.x : 0;
-    });
-    for (const [id, pt] of bPorts) {
-      const e = graph.edges.find((x) => x.id === id)!;
-      record(id, e.kind === "publish" ? "from" : "to", pt);
+  const ports = new Map<string, Point>();
+  const bySide = new Map<string, { left: Edge[]; right: Edge[] }>();
+  const bucket = (id: string) => {
+    let b = bySide.get(id);
+    if (!b) {
+      b = { left: [], right: [] };
+      bySide.set(id, b);
     }
-    const top = vertical.filter((e) => e.kind === "external" && e.from === op.id);
-    const tPorts = assignPorts(top, p, "top", (e) => pos.get(e.to)?.x ?? 0);
-    for (const [id, pt] of tPorts) record(id, "from", pt);
-  }
-
-  for (const t of graph.topics) {
-    const p = pos.get(t.id);
-    if (!p) continue;
-    const es = vertical.filter((e) => e.from === t.id || e.to === t.id);
-    const ports = assignPorts(es, p, "top", (e) => {
-      const other = pos.get(e.kind === "publish" ? e.operation : e.to);
-      return other ? other.x : 0;
-    });
-    for (const [id, pt] of ports) {
-      const e = graph.edges.find((x) => x.id === id)!;
-      record(id, e.kind === "publish" ? "to" : "from", pt);
-    }
-  }
-
-  for (const ext of graph.externals) {
-    const p = pos.get(ext.id);
-    if (!p) continue;
-    const es = vertical.filter((e) => e.to === ext.id);
-    const ports = assignPorts(es, p, "bottom", (e) =>
-      e.kind === "external" ? (pos.get(e.operation)?.x ?? 0) : 0,
-    );
-    for (const [id, pt] of ports) record(id, "to", { x: pt.x, y: p.y + p.h });
-  }
-
-  const serviceIndex = new Map(services.map((s, i) => [s.id, i]));
-  const opService = new Map(graph.operations.map((o) => [o.id, o.service]));
-  const rowOf = (svc: string) => graph.operations.filter((o) => o.service === svc).map((o) => pos.get(o.id)!).filter(Boolean);
-  const isLeftmost = (box: Box, svc: string) => rowOf(svc).every((p) => p.x >= box.x);
-  const isRightmost = (box: Box, svc: string) => rowOf(svc).every((p) => p.x <= box.x);
-
-  const out: EdgeGeometry[] = [];
-  let channelLane = 0;
-
+    return b;
+  };
   for (const e of graph.edges) {
-    const rec = portOf.get(e.id) ?? {};
-    const a = pos.get(e.from);
-    const b = pos.get(e.to);
-    if (!a || !b) continue;
-
-    if (e.kind === "request") {
-      const sa = opService.get(e.operation);
-      const sb = opService.get(e.to);
-      const ia = sa !== undefined ? serviceIndex.get(sa) : undefined;
-      const ib = sb !== undefined ? serviceIndex.get(sb) : undefined;
-      const adjacentForward =
-        sa !== undefined && sb !== undefined && ia !== undefined && ib !== undefined &&
-        ib === ia + 1 && isRightmost(a, sa) && isLeftmost(b, sb);
-      if (adjacentForward) {
-        const p1 = { x: a.x + a.w, y: a.y + a.h / 2 };
-        const p2 = { x: b.x, y: b.y + b.h / 2 };
-        out.push({ edge: e, d: horizontalCubic(p1, p2), from: p1, to: p2, labelAt: { x: (p1.x + p2.x) / 2, y: (p1.y + p2.y) / 2 - 8 } });
-      } else {
-        // Over the top: up from the source, along the channel, down
-        // into the target. Every lane gets its own height so parallel
-        // routes stay distinguishable.
-        const lane = channelLane++;
-        const yc = SYS.CHANNEL_Y - lane * SYS.LANE;
-        const p1 = { x: a.x + a.w - SYS.PORT_INSET - 8, y: a.y };
-        const p2 = { x: b.x + SYS.PORT_INSET + 8, y: b.y };
-        const points = [p1, { x: p1.x, y: yc }, { x: p2.x, y: yc }, p2];
-        out.push({ edge: e, d: roundedPolyline(points, SYS.CORNER), from: p1, to: p2, labelAt: { x: (p1.x + p2.x) / 2, y: yc - 8 } });
-      }
-    } else if (e.kind === "client") {
-      const sb = opService.get(e.operation);
-      const first = services[0];
-      const direct = !!sb && first !== undefined && serviceIndex.get(sb) === 0 && isLeftmost(b, sb);
-      if (direct) {
-        const p1 = { x: a.x + a.w, y: a.y + a.h / 2 };
-        const p2 = { x: b.x, y: b.y + b.h / 2 };
-        out.push({ edge: e, d: horizontalCubic(p1, p2), from: p1, to: p2, labelAt: { x: (p1.x + p2.x) / 2, y: (p1.y + p2.y) / 2 - 8 } });
-      } else {
-        const lane = channelLane++;
-        const yc = SYS.CHANNEL_Y - lane * SYS.LANE;
-        const riser = a.x + a.w + 40 + lane * SYS.LANE;
-        const p1 = { x: a.x + a.w, y: a.y + a.h / 2 };
-        const p2 = { x: b.x + SYS.PORT_INSET + 8, y: b.y };
-        const points = [p1, { x: riser, y: p1.y }, { x: riser, y: yc }, { x: p2.x, y: yc }, p2];
-        out.push({ edge: e, d: roundedPolyline(points, SYS.CORNER), from: p1, to: p2, labelAt: { x: (riser + p2.x) / 2, y: yc - 8 } });
-      }
-    } else {
-      const p1 = rec.from;
-      const p2 = rec.to;
-      if (!p1 || !p2) continue;
-      out.push({ edge: e, d: verticalCubic(p1, p2), from: p1, to: p2, labelAt: { x: (p1.x + p2.x) / 2 + 8, y: (p1.y + p2.y) / 2 - 6 } });
+    const p = plan.get(e.id);
+    if (!p) continue;
+    bucket(e.from)[p.from].push(e);
+    bucket(e.to)[p.to].push(e);
+  }
+  for (const [id, sides] of bySide) {
+    const box = pos.get(id)!;
+    for (const side of ["left", "right"] as const) {
+      const assigned = assignPorts(
+        sides[side],
+        box,
+        side,
+        (e) => centre(e.from === id ? e.to : e.from),
+        (e) => `${e.id} ${id}`,
+      );
+      for (const [key, point] of assigned) ports.set(key, point);
     }
   }
-  return out;
+
+  // Risers share a gutter but never an x: each takes its own slot, spread
+  // outwards from the middle of the gap between two columns.
+  const used = new Map<string, number>();
+  const riserX = (column: number, side: Side) => {
+    const gutter =
+      side === "left"
+        ? columnX[column] - SYS.COL_GAP / 2
+        : columnX[column] + columnWidth[column] + SYS.COL_GAP / 2;
+    const key = `${bands.of[column]}:${gutter}`;
+    const n = used.get(key) ?? 0;
+    used.set(key, n + 1);
+    const step = Math.min(Math.ceil((n + 1) / 2) * 14, SYS.COL_GAP / 2 - 12);
+    return gutter + step * (n % 2 === 0 ? -1 : 1);
+  };
+
+  // Lanes within each band's channel, longest edges highest, so a leap
+  // across the drawing rides above the short returns rather than through
+  // them.
+  const laneUsed = new Array<number>(bands.count).fill(0);
+  const lane = new Map<string, number>();
+  const channelY = (band: number, key: string) => {
+    let n = lane.get(key);
+    if (n === undefined) {
+      n = laneUsed[band]++;
+      lane.set(key, n);
+    }
+    return bands.contentTop[band] - 24 - n * SYS.LANE;
+  };
+
+  const right = Math.max(...columnX.map((x, c) => x + columnWidth[c])) + SYS.OUTER_MARGIN;
+  const left = Math.min(...columnX) - SYS.OUTER_MARGIN;
+
+  const ordered = [...graph.edges].sort(
+    (a, b) => (plan.get(b.id)?.span ?? 0) - (plan.get(a.id)?.span ?? 0) || a.id.localeCompare(b.id),
+  );
+  const geometry = new Map<string, EdgeGeometry>();
+  for (const e of ordered) {
+    const p = plan.get(e.id);
+    const p1 = ports.get(`${e.id} ${e.from}`);
+    const p2 = ports.get(`${e.id} ${e.to}`);
+    if (!p || !p1 || !p2) continue;
+
+    if (p.mode === "direct") {
+      geometry.set(e.id, {
+        edge: e,
+        d: horizontalCubic(p1, p2),
+        from: p1,
+        to: p2,
+        labelAt: { x: (p1.x + p2.x) / 2, y: (p1.y + p2.y) / 2 - 8 },
+      });
+      continue;
+    }
+
+    const columnA = columnFor(e.from);
+    const columnB = columnFor(e.to);
+    const rise = riserX(columnA, p.from);
+    const fall = riserX(columnB, p.to);
+
+    if (p.mode === "channel") {
+      const yc = channelY(bands.of[columnA], `${e.id} c`);
+      geometry.set(e.id, {
+        edge: e,
+        d: roundedPolyline(
+          [p1, { x: rise, y: p1.y }, { x: rise, y: yc }, { x: fall, y: yc }, { x: fall, y: p2.y }, p2],
+          SYS.CORNER,
+        ),
+        from: p1,
+        to: p2,
+        labelAt: { x: (rise + fall) / 2, y: yc - 8 },
+      });
+      continue;
+    }
+
+    // Across bands: out through the band's channel, down the outside,
+    // back in through the target band's channel — the way a line of text
+    // wraps, and for the same reason.
+    const yA = channelY(bands.of[columnA], `${e.id} a`);
+    const yB = channelY(bands.of[columnB], `${e.id} b`);
+    const margin = p.from === "right" ? right : left;
+    geometry.set(e.id, {
+      edge: e,
+      d: roundedPolyline(
+        [
+          p1,
+          { x: rise, y: p1.y },
+          { x: rise, y: yA },
+          { x: margin, y: yA },
+          { x: margin, y: yB },
+          { x: fall, y: yB },
+          { x: fall, y: p2.y },
+          p2,
+        ],
+        SYS.CORNER,
+      ),
+      from: p1,
+      to: p2,
+      labelAt: { x: margin, y: (yA + yB) / 2 },
+    });
+  }
+
+  return graph.edges.map((e) => geometry.get(e.id)).filter((g): g is EdgeGeometry => !!g);
+}
+
+/**
+ * The L1 band: the execution populations that run the boundaries above,
+ * and the storage layouts that partition the objects those boundaries
+ * touch.
+ *
+ * A pool names the boundaries assigned to it rather than being wired to
+ * them. That is the fact — a shared pool is a shared execution
+ * population and nothing more — and a line from every boundary to its
+ * pool would cross the whole drawing to say it. The lines exist, but
+ * only for what is selected.
+ */
+function layoutRuntime(
+  graph: Graph,
+  runtime: RuntimeFacts,
+  pos: Map<string, Box>,
+  columnOf: Map<string, number>,
+  macro: (vertex: string) => string,
+  columnX: number[],
+  columnWidth: number[],
+  bands: BandGeometry,
+  l0: Box,
+): RuntimePlane {
+  const centre = l0.x + l0.w / 2;
+  const centreX = (id: string) => {
+    const b = pos.get(id);
+    return b ? b.x + b.w / 2 : centre;
+  };
+
+  const poolNodes = graph.runtime.execution_pools.map((pool) => {
+    const chips: PoolChip[] = pool.assigned.map((b) => {
+      const link = runtime.links.find((l) => l.operation === b.operation && l.input === b.input);
+      return {
+        id: `chip:${pool.id}:${b.operation}:${b.input}`,
+        operation: b.operation,
+        input: b.input,
+        kind: link?.kind ?? "request",
+        routing: link?.routingKey ?? null,
+        x: 0, y: 0, w: SYS.CHIP_W, h: SYS.CHIP_H,
+      };
+    });
+    const cols = Math.min(SYS.CHIP_COLS, Math.max(1, chips.length));
+    const rows = Math.max(1, Math.ceil(chips.length / cols));
+    return {
+      pool,
+      chips,
+      cols,
+      rows,
+      w: Math.max(SYS.POOL_MIN_W, SYS.POOL_PAD * 2 + cols * SYS.CHIP_W + (cols - 1) * SYS.CHIP_GAP),
+      h: SYS.POOL_TITLE + SYS.POOL_PAD + rows * SYS.CHIP_H + (rows - 1) * SYS.CHIP_GAP,
+      anchor: chips.length
+        ? chips.reduce((sum, c) => sum + centreX(c.operation), 0) / chips.length
+        : centre,
+    };
+  });
+
+  poolNodes.sort((a, b) => a.anchor - b.anchor || a.pool.id.localeCompare(b.pool.id));
+
+  const bandTop = l0.y + l0.h + SYS.BAND_GAP;
+  const poolTop = bandTop + SYS.BAND_TITLE;
+
+  // Placed under the mean of the boundaries they run, then pushed apart
+  // in that order — a pool sits beneath its own work wherever there is
+  // room — and wrapped once a row reaches the width of the plane above,
+  // so a model with twenty pools does not stretch the drawing back out.
+  const limit = Math.max(l0.x + l0.w, l0.x + SYS.WRAP_THRESHOLD);
+  const pools: PoolBox[] = [];
+  let cursor = l0.x;
+  let rowTop = poolTop;
+  let rowHeight = 0;
+  for (const node of poolNodes) {
+    let x = Math.max(node.anchor - node.w / 2, cursor);
+    if (x + node.w > limit && cursor > l0.x) {
+      rowTop += rowHeight + SYS.STORE_ROW_GAP;
+      rowHeight = 0;
+      cursor = l0.x;
+      x = l0.x;
+    }
+    cursor = x + node.w + SYS.POOL_GAP;
+    rowHeight = Math.max(rowHeight, node.h);
+    const top = rowTop;
+    const box: PoolBox = {
+      id: node.pool.id,
+      concurrency: node.pool.member_concurrency,
+      x, y: top, w: node.w, h: node.h,
+      chips: node.chips.map((chip, i) => ({
+        ...chip,
+        x: x + SYS.POOL_PAD + (i % node.cols) * (SYS.CHIP_W + SYS.CHIP_GAP),
+        y: top + SYS.POOL_TITLE + Math.floor(i / node.cols) * (SYS.CHIP_H + SYS.CHIP_GAP),
+      })),
+    };
+    pools.push(box);
+    pos.set(box.id, { x: box.x, y: box.y, w: box.w, h: box.h });
+    for (const chip of box.chips) pos.set(chip.id, { x: chip.x, y: chip.y, w: chip.w, h: chip.h });
+  }
+
+  const storageTop = (pools.length ? rowTop + rowHeight : poolTop) + SYS.STORE_ROW_GAP;
+  const storage: StorageBox[] = [];
+  const anchorOf = (ops: Id[]) =>
+    ops.length ? ops.reduce((sum, o) => sum + centreX(o), 0) / ops.length : centre;
+  cursor = l0.x;
+  rowTop = storageTop;
+  for (const layout of [...runtime.storage].sort(
+    (a, b) => anchorOf(a.operations) - anchorOf(b.operations) || a.id.localeCompare(b.id),
+  )) {
+    let x = Math.max(anchorOf(layout.operations) - SYS.STORE_W / 2, cursor);
+    if (x + SYS.STORE_W > limit && cursor > l0.x) {
+      rowTop += SYS.STORE_H + SYS.STORE_ROW_GAP;
+      cursor = l0.x;
+      x = l0.x;
+    }
+    cursor = x + SYS.STORE_W + SYS.STORE_GAP;
+    const box: StorageBox = {
+      id: layout.id,
+      object: layout.object,
+      partitionKey: layout.partitionKey,
+      operations: layout.operations,
+      x, y: rowTop, w: SYS.STORE_W, h: SYS.STORE_H,
+    };
+    storage.push(box);
+    pos.set(box.id, { x: box.x, y: box.y, w: box.w, h: box.h });
+  }
+
+  // A link leaves its operation sideways into the gutter beside it and
+  // travels to its pool just above the band. From the last band it can
+  // drop straight down; from any band above one, it goes out to the
+  // margin first, for the same reason a wrapping edge does — everything
+  // between is somebody else's drawing.
+  const links: LinkGeometry[] = [];
+  const margin = Math.max(...columnX.map((x, c) => x + columnWidth[c])) + SYS.OUTER_MARGIN;
+  runtime.links.forEach((link, i) => {
+    const op = pos.get(link.operation);
+    const pool = pools.find((p) => p.id === link.pool);
+    if (!op || !pool) return;
+    const column = columnOf.get(macro(link.operation)) ?? 0;
+    const band = bands.of[column];
+    const gutter = columnX[column] + columnWidth[column] + SYS.COL_GAP / 2;
+    const chip = pool.chips.find((c) => c.operation === link.operation && c.input === link.input);
+    const target = chip ? { x: chip.x + chip.w / 2, y: pool.y } : { x: pool.x + pool.w / 2, y: pool.y };
+    const y = l0.y + l0.h + 28 + i * SYS.LANE;
+    const start = { x: op.x + op.w, y: op.y + op.h * 0.66 };
+    const points: Point[] =
+      band === bands.count - 1
+        ? [start, { x: gutter, y: start.y }, { x: gutter, y }, { x: target.x, y }, target]
+        : [
+            start,
+            { x: gutter, y: start.y },
+            { x: gutter, y: bands.top[band + 1] - SYS.BAND_ROW_GAP / 2 },
+            { x: margin, y: bands.top[band + 1] - SYS.BAND_ROW_GAP / 2 },
+            { x: margin, y },
+            { x: target.x, y },
+            target,
+          ];
+    links.push({
+      id: link.id,
+      link,
+      d: roundedPolyline(points, SYS.CORNER),
+      labelAt: { x: (gutter + target.x) / 2, y: y - 6 },
+    });
+  });
+
+  const boxes: Box[] = [...pools, ...storage];
+  const content = boundsOf(boxes);
+  const band = boxes.length
+    ? { x: content.x, y: bandTop, w: content.w, h: content.y + content.h - bandTop }
+    : null;
+
+  return { pools, storage, links, band };
 }
