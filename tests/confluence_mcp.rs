@@ -177,12 +177,28 @@ impl McpClient {
     }
 }
 
-fn execution_patch(operation: &str, bound: u32) -> serde_json::Value {
+/// A small, always-valid, distinguishable write to one operation's
+/// program: a marker transaction that touches nothing, then a
+/// terminal. These tests are about the MCP commit path, not about
+/// program content.
+fn program_patch(operation: &str, marker: u32) -> serde_json::Value {
+    let short = operation.strip_prefix("operation.").unwrap_or(operation);
+
     serde_json::json!({
         "mutations": [{
-            "kind": "replace_operation_execution",
+            "kind": "replace_operation_program",
             "operation": operation,
-            "execution": {"concurrency": {"kind": "bounded", "value": bound}},
+            "program": {"steps": [
+                {
+                    "kind": "transaction",
+                    "id": format!("tx.{short}.probe{marker}"),
+                    "data_model": null,
+                    "isolation": "read_committed",
+                    "idempotency": {"kind": "not_deduplicated"},
+                    "steps": [],
+                },
+                {"kind": "complete"},
+            ]},
         }],
     })
 }
@@ -192,7 +208,7 @@ async fn shared_skeleton_put_service_commits_over_mcp() {
     // The exact path the live decomposer agent takes: an empty
     // workspace, a shared-skeleton task, and one put_service mutation
     // submitted through MCP. Existing tests only exercised
-    // replace_operation_execution, so this path was untested.
+    // operation-scoped writes, so this path was untested.
     let engine = ConfluenceEngine::in_memory(WorkspaceState::empty(RunMetadata::new(RunId(
         "skeleton".to_string(),
     ))))
@@ -680,12 +696,12 @@ async fn two_mcp_clients_read_pinned_snapshots_and_commit_safely() {
 
     assert!(!is_error);
 
-    // A commits an execution change for its own operation — the
-    // interface B read stays untouched, so B survives.
+    // A commits a program change for its own operation — the interface
+    // B read stays untouched, so B survives.
     let (committed, is_error) = client_a
         .call(
             "submit_patch",
-            serde_json::json!({"patch": execution_patch("operation.create_order", 2)}),
+            serde_json::json!({"patch": program_patch("operation.create_order", 2)}),
         )
         .await;
 
@@ -697,7 +713,7 @@ async fn two_mcp_clients_read_pinned_snapshots_and_commit_safely() {
     let (committed, is_error) = client_b
         .call(
             "submit_patch",
-            serde_json::json!({"patch": execution_patch("operation.transfer_stock", 3)}),
+            serde_json::json!({"patch": program_patch("operation.transfer_stock", 3)}),
         )
         .await;
 
@@ -724,12 +740,12 @@ async fn a_stale_client_is_rejected_with_restart_guidance() {
     let mut client_a = McpClient::connect(&url, &a.token.0).await;
     let mut client_b = McpClient::connect(&url, &b.token.0).await;
 
-    // A reads the execution facts B is about to replace.
+    // A reads the program B is about to replace.
     let (_, is_error) = client_a
         .call(
             "read_symbol",
             serde_json::json!({"symbol": {
-                "kind": "operation_execution",
+                "kind": "operation_program",
                 "value": "operation.create_order",
             }}),
         )
@@ -740,7 +756,7 @@ async fn a_stale_client_is_rejected_with_restart_guidance() {
     let (committed, is_error) = client_b
         .call(
             "submit_patch",
-            serde_json::json!({"patch": execution_patch("operation.create_order", 2)}),
+            serde_json::json!({"patch": program_patch("operation.create_order", 2)}),
         )
         .await;
 
@@ -754,7 +770,7 @@ async fn a_stale_client_is_rejected_with_restart_guidance() {
     let (rejection, is_error) = client_a
         .call(
             "submit_patch",
-            serde_json::json!({"patch": execution_patch("operation.transfer_stock", 4)}),
+            serde_json::json!({"patch": program_patch("operation.transfer_stock", 4)}),
         )
         .await;
 
@@ -777,7 +793,7 @@ async fn a_stale_client_is_rejected_with_restart_guidance() {
     let (committed, is_error) = replacement_client
         .call(
             "submit_patch",
-            serde_json::json!({"patch": execution_patch("operation.transfer_stock", 4)}),
+            serde_json::json!({"patch": program_patch("operation.transfer_stock", 4)}),
         )
         .await;
 

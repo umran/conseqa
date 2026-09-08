@@ -7,8 +7,15 @@ import { useState } from "react";
 import { shortId } from "../lib/ids";
 import { subjectText } from "../lib/obligations";
 import { useApp } from "../state/AppState";
-import { propertyName, type Obligation } from "../types/report";
+import { propertyName, type Obligation, type ProofScope } from "../types/report";
 import { IdLink, StatusBadge } from "./parts";
+
+/** A runtime-dependent proof holds of the declared topology and of no
+ *  other, so it is worth saying so on the card itself. */
+const SCOPE_LABEL: Record<ProofScope, string> = {
+  l0_only: "L0 only",
+  runtime_dependent: "runtime-dependent",
+};
 
 const STRIPE: Record<Obligation["status"], string> = {
   proven: "border-l-kumo-success",
@@ -30,7 +37,14 @@ export function ObligationCard({ ob, defaultOpen = false }: { ob: Obligation; de
               <CaretRightIcon size={12} className={`text-kumo-inactive transition-transform ${open ? "rotate-90" : ""}`} />
               <Badge variant="neutral">{propertyName(ob.property)}</Badge>
             </span>
-            <StatusBadge status={ob.status} />
+            <span className="flex items-center gap-1.5">
+              {ob.scope && (
+                <Badge variant={ob.scope === "runtime_dependent" ? "warning" : "neutral"}>
+                  {SCOPE_LABEL[ob.scope]}
+                </Badge>
+              )}
+              <StatusBadge status={ob.status} />
+            </span>
           </div>
           <div className="text-sm leading-snug text-kumo-default">{ob.summary}</div>
           <div className="font-mono text-[11px] text-kumo-inactive">{subjectText(ob.subject)}</div>
@@ -40,7 +54,9 @@ export function ObligationCard({ ob, defaultOpen = false }: { ob: Obligation; de
             {ob.assumptions.length > 0 && (
               <div>
                 <div className="mb-1 text-[11px] font-semibold uppercase tracking-wider text-kumo-subtle">
-                  relies on declared facts
+                  {ob.scope === "runtime_dependent"
+                    ? "relies on declared facts, runtime topology included"
+                    : "relies on declared facts"}
                 </div>
                 <ul className="list-disc space-y-1 pl-4 text-sm text-kumo-default">
                   {ob.assumptions.map((a, i) => (

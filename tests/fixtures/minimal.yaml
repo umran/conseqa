@@ -19,11 +19,18 @@ topics:
     order_events:
         messages:
             - OrderCreated
-        ordering:
-            kind: unordered
         message_identity:
             kind: unspecified
 
 state_machines: {}
 
 operations: {}
+
+# The transport fact the topic used to carry: an explicit negative
+# ordering guarantee, which is L1 because it describes the realization
+# rather than the logical channel.
+runtime:
+    topics:
+        order_events:
+            ordering:
+                kind: unordered

@@ -112,6 +112,46 @@ pub enum ValidationError {
         input: Id,
     },
 
+    /// A router declares a routing block whose key tuple is empty, so
+    /// it names no routing domain.
+    EmptyRoutingKey {
+        router: Id,
+    },
+
+    /// A subscription dispatch routes by `topic_key`, but the
+    /// subscribed topic's runtime declares no keyed ordering domain
+    /// for that key to name.
+    TopicKeyRoutingWithoutKeyDomain {
+        operation: Id,
+        input: Id,
+        topic: Id,
+    },
+
+    /// Two routers serve one request boundary. The initial model
+    /// admits at most one, so the assignment of a boundary to a pool
+    /// is unambiguous.
+    DuplicateRouterForBoundary {
+        first: Id,
+        second: Id,
+        operation: Id,
+        input: Id,
+    },
+
+    /// A storage layout declares an empty partition key, so it
+    /// identifies no partition.
+    EmptyPartitionKey {
+        layout: Id,
+    },
+
+    /// Two storage layouts map one data object. V1 admits at most one
+    /// primary layout per object.
+    DuplicateStorageLayoutForObject {
+        first: Id,
+        second: Id,
+        data_model: Id,
+        object: Id,
+    },
+
     TransactionObjectOutsideDataModel {
         transaction: Id,
         data_model: Id,
@@ -387,6 +427,104 @@ impl From<ValidationError> for Diagnostic {
                     }],
                 }
             }
+
+            ValidationError::EmptyRoutingKey { router } => Diagnostic {
+                code: DiagnosticCode::Validation(ValidationCode::EmptyRoutingKey),
+                severity: Severity::Error,
+                subject: Some(router.clone()),
+                message: format!(
+                    "`{router}` declares a routing block with an empty key, which \
+                     names no routing domain."
+                ),
+                evidence: vec![Evidence {
+                    subject: Some(router),
+                    message: "A routing key must name at least one field; omit the \
+                              routing block entirely to declare no member affinity."
+                        .to_string(),
+                }],
+            },
+
+            ValidationError::TopicKeyRoutingWithoutKeyDomain {
+                operation,
+                input,
+                topic,
+            } => Diagnostic {
+                code: DiagnosticCode::Validation(
+                    ValidationCode::TopicKeyRoutingWithoutKeyDomain,
+                ),
+                severity: Severity::Error,
+                subject: Some(input.clone()),
+                message: format!(
+                    "`{input}` of `{operation}` dispatches by `topic_key`, but the \
+                     runtime for `{topic}` declares no keyed ordering domain."
+                ),
+                evidence: vec![Evidence {
+                    subject: Some(topic),
+                    message: "Declare `ordering: keyed` for this topic's runtime, or \
+                              omit the routing block."
+                        .to_string(),
+                }],
+            },
+
+            ValidationError::DuplicateRouterForBoundary {
+                first,
+                second,
+                operation,
+                input,
+            } => Diagnostic {
+                code: DiagnosticCode::Validation(ValidationCode::DuplicateRouterForBoundary),
+                severity: Severity::Error,
+                subject: Some(second.clone()),
+                message: format!(
+                    "`{first}` and `{second}` both route the request boundary \
+                     `{operation}`/`{input}`."
+                ),
+                evidence: vec![Evidence {
+                    subject: Some(first),
+                    message: "One request boundary has at most one router, so its \
+                              execution-pool assignment is unambiguous."
+                        .to_string(),
+                }],
+            },
+
+            ValidationError::EmptyPartitionKey { layout } => Diagnostic {
+                code: DiagnosticCode::Validation(ValidationCode::EmptyPartitionKey),
+                severity: Severity::Error,
+                subject: Some(layout.clone()),
+                message: format!(
+                    "`{layout}` declares an empty partition key, which identifies no \
+                     physical partition."
+                ),
+                evidence: vec![Evidence {
+                    subject: Some(layout),
+                    message: "A partition key must name at least one field of the \
+                              object's schema."
+                        .to_string(),
+                }],
+            },
+
+            ValidationError::DuplicateStorageLayoutForObject {
+                first,
+                second,
+                data_model,
+                object,
+            } => Diagnostic {
+                code: DiagnosticCode::Validation(
+                    ValidationCode::DuplicateStorageLayoutForObject,
+                ),
+                severity: Severity::Error,
+                subject: Some(second.clone()),
+                message: format!(
+                    "`{first}` and `{second}` both declare a storage layout for \
+                     `{data_model}`/`{object}`."
+                ),
+                evidence: vec![Evidence {
+                    subject: Some(first),
+                    message: "V1 admits at most one primary storage layout per data \
+                              object."
+                        .to_string(),
+                }],
+            },
 
             ValidationError::InvalidFieldPath {
                 subject,

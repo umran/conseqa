@@ -36,11 +36,21 @@
 //!    violation (§1.2). An unproven verdict records exactly which
 //!    facts are missing or insufficient, preserving the distinction
 //!    between an explicitly negative declaration (`unbounded`,
-//!    `unconstrained`) and an absent one (`unspecified`).
+//!    `unordered`) and an absent one (`unspecified`, or an absent
+//!    runtime declaration).
 //!
 //! Every proof is conditional (§1.3, §25): it holds only if the
 //! concrete implementation conforms to the declarations it cites.
 //! Proofs therefore carry the facts they consumed.
+//!
+//! Requirements are L0 obligations, but the facts that discharge them
+//! may come from either layer, and most serialization and ordering
+//! proofs now rest on the L1 runtime model. Every proven verdict
+//! therefore carries a [`ProofScope`]: `RuntimeDependent` marks an
+//! argument that holds of the declared realization and must be
+//! re-examined when that realization changes. Removing L1 from a valid
+//! model makes such requirements unproven — never violated, and never
+//! a structural error.
 //!
 //! `verify` expects a model that `validation::validate` accepts. On a
 //! model that fails validation it stays total and conservative:
@@ -65,7 +75,7 @@ pub use idempotency::{
     ProducerRef, RetryRoute, TransactionRetrySafety,
 };
 pub use ordering::{
-    DuplicateCoverage, DuplicateHandling, LaneFact, OrderingCheck, OrderingObstacle, OrderingProof,
+    DuplicateCoverage, DuplicateHandling, OrderingCheck, OrderingObstacle, OrderingProof,
     OrderingVerdict, PrecedenceSource,
 };
 pub use paths::{DecisionTaken, PathRef};
@@ -83,8 +93,8 @@ pub use result_replay::{
     ResultReplayCheck, ResultReplayObstacle, ResultReplayProof, ResultReplayVerdict, ReturnedResult,
 };
 pub use serialization::{
-    KeyIdentity, MessageKeyFact, SerializationCheck, SerializationObstacle, SerializationProof,
-    SerializationVerdict,
+    KeyIdentity, MessageKeyFact, RoutingKeyFact, SerializationCheck, SerializationObstacle,
+    SerializationProof, SerializationVerdict,
 };
 pub use trigger::{
     Consumer, EffectContract, Producer, ProducerSite, TriggerGraph, collapses_duplicates,
@@ -94,6 +104,57 @@ pub use value_identity::{CanonicalValuePath, canonical_value_path};
 
 use crate::analyzer::{Diagnostic, DiagnosticCode, Severity, VerificationCode};
 use crate::spec::{DeliverySemantics, Id, Input, Model};
+
+/// Which semantic layers a successful proof consumed.
+///
+/// The analyzer reasons across every declared layer, so an L0
+/// obligation may well be discharged from L1 facts. What the scope
+/// records is the dependency: a `RuntimeDependent` proof holds of the
+/// declared runtime realization, and must be re-examined when that
+/// realization changes. The proof's own evidence names the exact
+/// declarations consumed.
+///
+/// `L0Only` does not mean implementation-free. A proof resting on
+/// `isolation: serializable` is L0-only, and still assumes the
+/// concrete database implements serializable execution. Scope
+/// identifies dependency on semantic layers, not the absence of
+/// conformance assumptions (§1.3, §25).
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum ProofScope {
+    /// No explicit L1 fact was required.
+    L0Only,
+
+    /// At least one L1 fact was necessary.
+    RuntimeDependent,
+}
+
+impl ProofScope {
+    /// The scope of a proof combining two arguments: runtime-dependent
+    /// if either leg was.
+    pub fn join(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::L0Only, Self::L0Only) => Self::L0Only,
+            _ => Self::RuntimeDependent,
+        }
+    }
+
+    /// The scope of a proof combining any number of arguments.
+    pub fn joined(scopes: impl IntoIterator<Item = Self>) -> Self {
+        scopes.into_iter().fold(Self::L0Only, Self::join)
+    }
+}
+
+impl std::fmt::Display for ProofScope {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::L0Only => "l0_only",
+            Self::RuntimeDependent => "runtime_dependent",
+        })
+    }
+}
 
 /// A model-wide observation raised next to the verdicts. Not an
 /// obligation — no declaration asks for it — but a gap no verdict
@@ -167,7 +228,9 @@ pub fn notes(model: &Model) -> Vec<ModelNote> {
                 continue;
             };
 
-            if subscription.delivery == DeliverySemantics::AtMostOnce {
+            let delivery = model.delivery(operation_id, input_id);
+
+            if delivery == DeliverySemantics::AtMostOnce {
                 continue;
             }
 
@@ -176,7 +239,7 @@ pub fn notes(model: &Model) -> Vec<ModelNote> {
                     operation: operation_id.clone(),
                     input: input_id.clone(),
                     topic: subscription.topic.clone(),
-                    delivery: subscription.delivery,
+                    delivery,
                 });
             }
         }

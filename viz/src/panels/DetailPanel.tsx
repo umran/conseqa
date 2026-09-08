@@ -6,8 +6,9 @@ import type { ReactNode } from "react";
 import { pathText, shortId } from "../lib/ids";
 import {
   artifactRetention, commitGuarantee, delivery, externalIdempotency, externalResult, inheritedResult,
-  isolation, laneConcurrency, messageIdentity, requestIdentity, requestResult, resultBinding,
-  routing, topicOrdering, transactionOutput,
+  isolation, messageIdentity, requestIdentity, requestResult, resultBinding,
+  memberAssignment, memberConcurrency, requestRouting, subscriptionRouting, topicOrdering,
+  transactionOutput,
 } from "../lib/explain";
 import {
   effectDef, effectResultType, effectSummary, findTransaction, intentExecutors, operationEffects,
@@ -15,7 +16,7 @@ import {
 } from "../lib/index";
 import { propertyMatchesRequirement } from "../lib/obligations";
 import { hashes } from "../lib/route";
-import { concurrencyText, conditionText } from "../lib/text";
+import { conditionText } from "../lib/text";
 import { useApp, useObligationsAt, type DetailTarget } from "../state/AppState";
 import { CLIENT_NODE_ID, EXTERNAL_PREFIX, type Edge } from "../types/graph";
 import type { Id, IdempotencyKeyPropagation, OperationBlock, RequirementKind, ResultType } from "../types/model";
@@ -298,9 +299,6 @@ function OperationDetail({ id }: { id: Id }) {
       <Button variant="secondary" size="xs" icon={ArrowSquareOutIcon} onClick={() => navigateTo(hashes.op(id))}>
         open operation page
       </Button>
-      <Section title="execution">
-        <KeyValue rows={[["concurrency", concurrencyText(op.execution.concurrency)]]} />
-      </Section>
       <Section title="program" count={walkProgram(op.program).length}>
         <div className="rounded-md border border-kumo-hairline bg-kumo-elevated/40 p-2.5">
           <ProgramSummary opId={id} block={op.program} />
@@ -341,18 +339,19 @@ function OperationDetail({ id }: { id: Id }) {
 function TopicDetail({ id }: { id: Id }) {
   const { model, graph } = useApp();
   const topic = model.topics[id];
+  const topicRuntime = model.runtime?.topics?.[id];
   const pubs = graph.edges.filter((e): e is Extract<Edge, { kind: "publish" }> => e.kind === "publish" && e.to === id);
   const subs = graph.edges.filter((e): e is Extract<Edge, { kind: "subscribe" }> => e.kind === "subscribe" && e.from === id);
   return (
     <Frame kind="topic" title={id} subtitle={<span>topic</span>}>
-      <FactNote fact={topicOrdering(topic.ordering)} />
+      <FactNote fact={topicOrdering(topicRuntime?.ordering ?? { kind: "unspecified" })} />
       <FactNote fact={messageIdentity(topic.message_identity)} />
       <Section title="message schemas" count={topic.messages.length}>
         <List items={topic.messages.map((s) => <IdLink key={s} id={s} />)} />
       </Section>
-      {topic.ordering.kind === "keyed" && (
-        <Section title="ordering key mapping">
-          <KeyValue rows={Object.entries(topic.ordering.mapping).map(([schema, path]) => [shortId(schema), <Mono key={schema}>{pathText(path)}</Mono>])} />
+      {topicRuntime?.ordering.kind === "keyed" && (
+        <Section title="transport ordering key mapping">
+          <KeyValue rows={Object.entries(topicRuntime.ordering.mapping).map(([schema, path]) => [shortId(schema), <Mono key={schema}>{pathText(path)}</Mono>])} />
         </Section>
       )}
       {topic.message_identity.kind === "keyed" && (
@@ -367,7 +366,7 @@ function TopicDetail({ id }: { id: Id }) {
       )}
       {subs.length > 0 && (
         <Section title="subscribers" count={subs.length}>
-          <List items={subs.map((e) => <span key={e.id} className="flex flex-wrap items-center gap-1.5"><IdLink id={e.operation} /><Tag>{e.delivery}</Tag><Tag>{e.routing}</Tag></span>)} />
+          <List items={subs.map((e) => <span key={e.id} className="flex flex-wrap items-center gap-1.5"><IdLink id={e.operation} /><Tag>{e.delivery}</Tag>{e.pool && <Tag>{shortId(e.pool)}</Tag>}</span>)} />
         </Section>
       )}
       <Obligations obKey={id} />
@@ -499,6 +498,10 @@ function InputDetail({ opId, id }: { opId: Id; id: Id }) {
   const { model } = useApp();
   const input = model.operations[opId].inputs[id];
   if (input.kind === "request") {
+    const routers = Object.entries(model.runtime?.routers ?? {});
+    const routed = routers.find(([, r]) => r.boundary.operation === opId && r.boundary.input === id);
+    const routerPool = routed ? model.runtime?.execution_pools?.[routed[1].pool] : undefined;
+
     return (
       <Frame kind="input" title={id} subtitle={<span>request input of <IdLink id={opId} /></span>}>
         <KeyValue rows={[
@@ -507,19 +510,45 @@ function InputDetail({ opId, id }: { opId: Id; id: Id }) {
         ]} />
         <FactNote fact={requestIdentity(input.identity)} />
         <FactNote fact={requestResult()} />
+        {routed && (
+          <Section title="runtime">
+            <KeyValue rows={[
+              ["router", <Mono key="r">{shortId(routed[0])}</Mono>],
+              ["pool", <IdLink key="p" id={routed[1].pool} />],
+            ]} />
+            <FactNote fact={requestRouting(routed[1].routing?.key)} />
+            {routed[1].routing && (
+              <FactNote fact={memberAssignment(routed[1].routing.member_assignment)} />
+            )}
+            {routerPool && <FactNote fact={memberConcurrency(routerPool.member_concurrency)} />}
+          </Section>
+        )}
       </Frame>
     );
   }
   const schemas = input.messages.kind === "all" ? null : input.messages.schemas;
+  const runtime = model.runtime?.subscriptions?.[opId]?.[id];
+  const pool = runtime ? model.runtime?.execution_pools?.[runtime.dispatch.pool] : undefined;
+
   return (
     <Frame kind="input" title={id} subtitle={<span>subscription of <IdLink id={opId} /></span>}>
       <KeyValue rows={[["topic", <IdLink key="t" id={input.topic} />]]} />
-      <FactNote fact={delivery(input.delivery)} />
-      <FactNote fact={routing(input.dispatch.routing)} />
-      <FactNote fact={laneConcurrency(input.dispatch.lane_concurrency)} />
       <Section title="consumed messages">
         {schemas ? <List items={schemas.map((s) => <IdLink key={s} id={s} />)} /> : <Tag>all topic messages</Tag>}
       </Section>
+      {runtime ? (
+        <Section title="runtime">
+          <KeyValue rows={[["pool", <IdLink key="p" id={runtime.dispatch.pool} />]]} />
+          <FactNote fact={delivery(runtime.delivery)} />
+          <FactNote fact={subscriptionRouting(runtime.dispatch.routing?.key)} />
+          {runtime.dispatch.routing && (
+            <FactNote fact={memberAssignment(runtime.dispatch.routing.member_assignment)} />
+          )}
+          {pool && <FactNote fact={memberConcurrency(pool.member_concurrency)} />}
+        </Section>
+      ) : (
+        <FactNote fact={delivery("unspecified")} />
+      )}
     </Frame>
   );
 }
@@ -878,7 +907,7 @@ function EdgeDetail({ edge: e }: { edge: Edge }) {
     case "subscribe":
       return (
         <Frame kind="subscription edge" title={<span><IdLink id={e.from} /> → <IdLink id={e.operation} /></span>}>
-          <KeyValue rows={[["input", <IdLink key="i" id={e.input} />], ["delivery", <Tag key="d">{e.delivery}</Tag>], ["routing", <Tag key="r">{e.routing}</Tag>], ["lane concurrency", e.lane_concurrency]]} />
+          <KeyValue rows={[["input", <IdLink key="i" id={e.input} />], ["delivery", <Tag key="d">{e.delivery}</Tag>], ["routing", <Tag key="r">{e.routing ?? "none"}</Tag>], ["pool", e.pool ? <IdLink key="p" id={e.pool} /> : "—"]]} />
           <Section title="consumed messages" count={e.schemas.length}><List items={e.schemas.map((s) => <IdLink key={s} id={s} />)} /></Section>
         </Frame>
       );

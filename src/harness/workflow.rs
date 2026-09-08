@@ -453,7 +453,7 @@ impl Workflow {
         head.workspace
             .operations
             .iter()
-            .filter(|(_, draft)| draft.program.is_none() || draft.execution.is_none())
+            .filter(|(_, draft)| draft.program.is_none())
             .map(|(id, _)| id.clone())
             .collect()
     }

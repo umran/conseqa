@@ -161,9 +161,14 @@ pub enum WriteGrant {
 
     OperationRequirements(Id),
 
-    OperationExecution(Id),
-
     OperationInterface(Id),
+
+    /// Authority over the L1 runtime topology: topic runtimes,
+    /// subscription runtimes, execution pools, routers, and storage
+    /// layouts. Held separately from the skeleton so a run may hand
+    /// topology to a dedicated authority, though the coordinator holds
+    /// both by default.
+    RuntimeTopology,
 }
 
 impl WriteScope {
@@ -177,19 +182,19 @@ impl WriteScope {
         }
     }
 
-    /// The decomposer's scope: the shared skeleton, interfaces
-    /// included.
+    /// The decomposer's scope: the shared skeleton, interfaces and
+    /// runtime topology included.
     pub fn shared_skeleton() -> Self {
-        Self::of([WriteGrant::SharedSkeleton])
+        Self::of([WriteGrant::SharedSkeleton, WriteGrant::RuntimeTopology])
     }
 
-    /// An operation-synthesis task's scope: the operation's program
-    /// and execution facts.
+    /// An operation-synthesis task's scope: the operation's program.
+    ///
+    /// Deliberately not the runtime topology. Where an invocation
+    /// executes is an architectural decision about the whole system,
+    /// and one operation's synthesis is the wrong place to make it.
     pub fn operation_synthesis(operation: Id) -> Self {
-        Self::of([
-            WriteGrant::OperationProgram(operation.clone()),
-            WriteGrant::OperationExecution(operation),
-        ])
+        Self::of([WriteGrant::OperationProgram(operation)])
     }
 
     pub fn requirement_discovery(operation: Id) -> Self {
@@ -231,6 +236,15 @@ fn grant_covers(grant: &WriteGrant, mutation: &Mutation) -> bool {
                 | Mutation::PutPromptObligation { .. }
         ),
 
+        WriteGrant::RuntimeTopology => matches!(
+            mutation,
+            Mutation::PutTopicRuntime { .. }
+                | Mutation::PutSubscriptionRuntime { .. }
+                | Mutation::PutExecutionPool { .. }
+                | Mutation::PutRouter { .. }
+                | Mutation::PutStorageLayout { .. }
+        ),
+
         WriteGrant::TopLevelSymbol(symbol) => match mutation {
             Mutation::DeleteTopLevel { symbol: target } => symbol == target,
             other => other.write_target() == *symbol,
@@ -239,7 +253,6 @@ fn grant_covers(grant: &WriteGrant, mutation: &Mutation) -> bool {
         WriteGrant::Operation(operation) => match mutation {
             Mutation::PutOperationInterface { operation: target, .. }
             | Mutation::ReplaceOperationProgram { operation: target, .. }
-            | Mutation::ReplaceOperationExecution { operation: target, .. }
             | Mutation::ReplaceOperationRequirements { operation: target, .. }
             | Mutation::ProposeRequirements { operation: target, .. } => operation == target,
             _ => false,
@@ -255,11 +268,6 @@ fn grant_covers(grant: &WriteGrant, mutation: &Mutation) -> bool {
             Mutation::ReplaceOperationRequirements { operation: target, .. }
                 | Mutation::ProposeRequirements { operation: target, .. }
                 if operation == target
-        ),
-
-        WriteGrant::OperationExecution(operation) => matches!(
-            mutation,
-            Mutation::ReplaceOperationExecution { operation: target, .. } if operation == target
         ),
 
         WriteGrant::OperationInterface(operation) => matches!(

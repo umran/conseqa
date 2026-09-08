@@ -50,15 +50,17 @@ operation to drill in. The top bar's filter box dims non-matching
 vertices, and a fit control in the canvas corner re-centres the graph.
 
 **Operation view** (`#/op/<id>`). A page header (name, copyable id,
-description, and a fact strip: service, concurrency, transaction and
+description, and a fact strip: service, transaction and
 program-step counts, the state machines it drives, verdict tally),
 then three sections as Kumo layer cards. **Requirements** is a table —
 one row per declared requirement with its key, its semantics
 (replay-consistent result, guaranteed completion) and, when a report
 is loaded, the verdict over its obligations; **Inputs** is a table of
-what starts an invocation (kind, source schema or topic, delivery and
-dispatch semantics, request identity and result contract). The two sit
-side by side when the pane is wide enough and stack otherwise.
+what starts an invocation (kind, source schema or topic, request
+identity and result contract, and — for a subscription with a declared
+runtime — its delivery, routing, member assignment and the target
+pool's member concurrency). The two sit side by side when the pane is
+wide enough and stack otherwise.
 **Program** shows the operation's one program — there is exactly one,
 so there are no tabs and the route carries no query: `#/op/<id>` lands
 on it directly, and an old `?flow=` query is tolerated and ignored.
@@ -141,21 +143,25 @@ transitions in the machine view inherit theirs.
 ## The obligation report
 
 The report format is `conseqa::analyzer::report` (`ProverReport`,
-`format: 2`): one obligation per declared requirement — serialization,
+`format: 3`): one obligation per declared requirement — serialization,
 ordering, idempotency, result replay (the result half of an idempotency
 requirement declaring `result: replay_consistent`), recoverability —
 with status `proven`, `disproven`, or `unknown`. Format 2 replaced the
 response-replay property with result replay, dropped object-history
 obligations and the flow subject, and made proofs cite the program
-paths and decisions they rest on. Unknown is epistemic: the
-checker could not establish the property, typically because a
-required fact is `unspecified` or no V1 verifier attempts that family.
-It is never evidence of a violation.
+paths and decisions they rest on; format 3 added proof `scope` and
+rebuilt the serialization and ordering arguments on the L1 runtime
+model. Unknown is epistemic: the checker could not establish the
+property, typically because a required fact is `unspecified` or no V1
+verifier attempts that family. It is never evidence of a violation.
 
-Each obligation carries its `summary`, `subject`, `assumptions` (the
-declared facts a proof relies on — conditional, per §25 of the
-semantics contract), `evidence` (the checker's obstacles), and, for
-disproofs, a `counterexample` trace.
+Each obligation carries its `summary`, `subject`, `scope`,
+`assumptions` (the declared facts a proof relies on — conditional, per
+§25 of the semantics contract), `evidence` (the checker's obstacles),
+and, for disproofs, a `counterexample` trace. `scope` is `l0_only` or
+`runtime_dependent`, and the card shows it as a badge: a
+runtime-dependent proof holds of the declared runtime topology and must
+be re-examined when that topology changes.
 
 ```
 conseqa model.yaml --report proof.json       # produce a report

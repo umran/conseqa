@@ -514,7 +514,6 @@ impl ConfluenceEngine {
                 SymbolKey::OperationInterface(operation.clone()),
                 SymbolKey::OperationProgram(operation.clone()),
                 SymbolKey::OperationRequirements(operation.clone()),
-                SymbolKey::OperationExecution(operation.clone()),
             ],
         };
 
@@ -708,7 +707,12 @@ impl ConfluenceEngine {
     }
 
     /// Records conservative observations of an operation's summary
-    /// inputs: interface, program, requirements, and execution (§41).
+    /// inputs: interface, program, and requirements (§41).
+    ///
+    /// The runtime symbols an operation's proofs may consume are not
+    /// listed here. A summary read is invalidated through the symbols
+    /// it names, and runtime topology is shared architecture that any
+    /// task may read explicitly.
     fn record_operation_inputs(&self, entry: &Arc<TaskEntry>, operation: &Id) {
         let mut read_set = entry.read_set.lock();
 
@@ -716,7 +720,6 @@ impl ConfluenceEngine {
             SymbolKey::OperationInterface(operation.clone()),
             SymbolKey::OperationProgram(operation.clone()),
             SymbolKey::OperationRequirements(operation.clone()),
-            SymbolKey::OperationExecution(operation.clone()),
         ] {
             if let Some(node) = entry.snapshot.graph.node(&key) {
                 read_set.record_symbol(
@@ -1536,8 +1539,20 @@ fn render_symbol(workspace: &WorkspaceState, key: &SymbolKey) -> Option<serde_js
             serde_json::to_value(&workspace.operations.get(id)?.requirements)
         }
 
-        SymbolKey::OperationExecution(id) => {
-            serde_json::to_value(&workspace.operations.get(id)?.execution)
+        SymbolKey::TopicRuntime(id) => serde_json::to_value(workspace.runtime.topics.get(id)?),
+
+        SymbolKey::SubscriptionRuntime { operation, input } => serde_json::to_value(
+            workspace.runtime.subscriptions.get(operation)?.get(input)?,
+        ),
+
+        SymbolKey::ExecutionPool(id) => {
+            serde_json::to_value(workspace.runtime.execution_pools.get(id)?)
+        }
+
+        SymbolKey::Router(id) => serde_json::to_value(workspace.runtime.routers.get(id)?),
+
+        SymbolKey::StorageLayout(id) => {
+            serde_json::to_value(workspace.runtime.storage_layouts.get(id)?)
         }
 
         SymbolKey::Input { operation, input } => {

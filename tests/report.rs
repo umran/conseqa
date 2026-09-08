@@ -34,7 +34,7 @@ fn scaffold_enumerates_requirement_obligations() {
     let report = report::scaffold(&model);
 
     assert_eq!(report.format, report::FORMAT);
-    assert_eq!(report.format, 2);
+    assert_eq!(report.format, 3);
     assert_eq!(report.model_revision, Some(1));
 
     // 3 serialization + 3 ordering + 4 idempotency + 1 result replay

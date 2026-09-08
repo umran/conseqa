@@ -19,9 +19,9 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::spec::{
-    DataModel, Effect, ExecutionSemantics, Id, Input, OperationBlock, OperationRequirements,
-    OperationStep, Schema, Service, StateMachine, Topic, TransactionStep, TransitionSideEffect,
-    ValueRef, ValueSource,
+    DataModel, Effect, ExecutionPool, Id, Input, OperationBlock, OperationRequirements,
+    OperationStep, Router, Schema, Service, StateMachine, StorageLayout, SubscriptionRuntime,
+    Topic, TopicRuntime, TransactionStep, TransitionSideEffect, ValueRef, ValueSource,
 };
 
 use super::symbol::SymbolKey;
@@ -91,14 +91,40 @@ pub enum Mutation {
         program: OperationBlock,
     },
 
-    ReplaceOperationExecution {
-        operation: Id,
-        execution: ExecutionSemantics,
-    },
-
     ReplaceOperationRequirements {
         operation: Id,
         requirements: OperationRequirements,
+    },
+
+    // ---- L1: runtime topology ----
+    //
+    // Each is a shared-skeleton write: runtime topology is an
+    // architectural decision, not part of any one operation's
+    // synthesis.
+    PutTopicRuntime {
+        topic: Id,
+        value: TopicRuntime,
+    },
+
+    PutSubscriptionRuntime {
+        operation: Id,
+        input: Id,
+        value: SubscriptionRuntime,
+    },
+
+    PutExecutionPool {
+        id: Id,
+        value: ExecutionPool,
+    },
+
+    PutRouter {
+        id: Id,
+        value: Router,
+    },
+
+    PutStorageLayout {
+        id: Id,
+        value: StorageLayout,
     },
 
     /// Requirement proposals with provenance. The gate records each on
@@ -148,9 +174,18 @@ impl Mutation {
                 SymbolKey::OperationProgram(operation.clone())
             }
 
-            Self::ReplaceOperationExecution { operation, .. } => {
-                SymbolKey::OperationExecution(operation.clone())
-            }
+            Self::PutTopicRuntime { topic, .. } => SymbolKey::TopicRuntime(topic.clone()),
+
+            Self::PutSubscriptionRuntime {
+                operation, input, ..
+            } => SymbolKey::SubscriptionRuntime {
+                operation: operation.clone(),
+                input: input.clone(),
+            },
+
+            Self::PutExecutionPool { id, .. } => SymbolKey::ExecutionPool(id.clone()),
+            Self::PutRouter { id, .. } => SymbolKey::Router(id.clone()),
+            Self::PutStorageLayout { id, .. } => SymbolKey::StorageLayout(id.clone()),
 
             Self::ReplaceOperationRequirements { operation, .. }
             | Self::ProposeRequirements { operation, .. } => {
@@ -168,9 +203,12 @@ impl Mutation {
         match self {
             Self::PutOperationInterface { operation, .. }
             | Self::ReplaceOperationProgram { operation, .. }
-            | Self::ReplaceOperationExecution { operation, .. }
             | Self::ReplaceOperationRequirements { operation, .. }
             | Self::ProposeRequirements { operation, .. } => Some(operation),
+
+            // A subscription runtime names an operation but is not part
+            // of its draft: the boundary it targets is an external
+            // reference the writer must have read.
             _ => None,
         }
     }
@@ -295,7 +333,45 @@ fn collect_references(mutation: &Mutation, out: &mut Vec<SymbolKey>) {
             collect_program_refs(operation, program, out);
         }
 
-        Mutation::ReplaceOperationExecution { .. } => {}
+        Mutation::PutTopicRuntime { topic, value } => {
+            out.push(SymbolKey::Topic(topic.clone()));
+
+            if let crate::spec::TopicOrdering::Keyed(key) = &value.ordering {
+                for schema in key.mapping.keys() {
+                    out.push(SymbolKey::Schema(schema.clone()));
+                }
+            }
+        }
+
+        Mutation::PutSubscriptionRuntime {
+            operation, value, ..
+        } => {
+            // The boundary belongs to another authority, so its
+            // interface is a genuine external reference — and reading
+            // the interface is what shows the input. So is the pool the
+            // dispatch terminates at.
+            out.push(SymbolKey::OperationInterface(operation.clone()));
+            out.push(SymbolKey::ExecutionPool(value.dispatch.pool.clone()));
+        }
+
+        Mutation::PutExecutionPool { .. } => {}
+
+        Mutation::PutRouter { value, .. } => {
+            out.push(SymbolKey::OperationInterface(
+                value.boundary.operation.clone(),
+            ));
+
+            out.push(SymbolKey::ExecutionPool(value.pool.clone()));
+        }
+
+        Mutation::PutStorageLayout { value, .. } => {
+            out.push(SymbolKey::DataModel(value.object.data_model.clone()));
+
+            out.push(SymbolKey::DataObject {
+                data_model: value.object.data_model.clone(),
+                object: value.object.object.clone(),
+            });
+        }
 
         Mutation::ReplaceOperationRequirements { .. } | Mutation::ProposeRequirements { .. } => {
             // Requirement keys reference the operation's own inputs

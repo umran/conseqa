@@ -6,11 +6,12 @@ use std::{
 use conseqa::{
     parser::yaml,
     spec::{
-        CompletionRequirement, Condition, Derivation, Effect, ErrorDisposition, ErrorResultType,
-        Field, FieldPath, Id, IdempotencyGuarantee, Input, LaneConcurrency, Literal,
-        MessageIdentity, Model, OperationStep, RequestIdentity, ResultOutcome, ResultVariant,
-        ScalarType, Schema, SchemaCompleteness, SelectorValue, ServiceKind, TopicOrdering,
-        Transaction, TransactionStep, TransitionSideEffect, TypeRef, ValueSource,
+        CompletionRequirement, Condition, DeliverySemantics, Derivation, Effect, ErrorDisposition,
+        ErrorResultType, Field, FieldPath, Id, IdempotencyGuarantee, Input, Literal,
+        MemberAssignment, MemberConcurrency, MessageIdentity, Model, OperationStep,
+        RequestIdentity, ResultOutcome, ResultVariant, ScalarType, Schema, SchemaCompleteness,
+        SelectorValue, ServiceKind, SubscriptionRoutingKey, TopicOrdering, Transaction,
+        TransactionStep, TransitionSideEffect, TypeRef, ValueSource,
     },
 };
 
@@ -100,7 +101,12 @@ fn parses_minimal_model() {
 
     assert!(order_events.messages.contains(&Id("OrderCreated".into())));
 
-    assert_eq!(order_events.ordering, TopicOrdering::Unordered);
+    // Transport ordering is L1: the logical channel says what it
+    // carries, the runtime says in what order.
+    assert_eq!(
+        model.topic_ordering(&Id("order_events".into())),
+        TopicOrdering::Unordered
+    );
 }
 
 #[test]
@@ -172,7 +178,7 @@ fn parses_keyed_topic_model() {
         [Id("OrderEvent".into())].into_iter().collect()
     );
 
-    let TopicOrdering::Keyed(key) = &topic.ordering else {
+    let TopicOrdering::Keyed(key) = model.topic_ordering(&Id("order_events".into())) else {
         panic!("order_events should use keyed ordering");
     };
 
@@ -357,8 +363,8 @@ fn flash_checkout_parses_nested_semantics() {
 
     let model = yaml::parse(&source).expect("flash checkout fixture should parse");
 
-    // Subscription + MessageSelector + DispatchSemantics +
-    // LaneConcurrency.
+    // The subscription input is purely logical: a topic and a message
+    // selector, nothing about delivery or dispatch.
     let reserve_inventory = model
         .operations
         .get(&Id("operation.reserve_inventory".into()))
@@ -373,8 +379,35 @@ fn flash_checkout_parses_nested_semantics() {
         panic!("reserve_inventory input should be a subscription");
     };
 
-    let LaneConcurrency::Bounded(concurrency) = subscription.dispatch.lane_concurrency else {
-        panic!("subscription lane concurrency should be bounded");
+    assert_eq!(subscription.topic, Id("topic.order_events".into()));
+
+    // Delivery and dispatch parse into the runtime model, addressed by
+    // the (operation, input) pair the L0 boundary already establishes.
+    let runtime = model
+        .subscription_runtime(
+            &Id("operation.reserve_inventory".into()),
+            &Id("input.reserve_inventory.created".into()),
+        )
+        .expect("reserve_inventory should declare a subscription runtime");
+
+    assert_eq!(runtime.delivery, DeliverySemantics::AtLeastOnce);
+    assert_eq!(runtime.dispatch.pool, Id("pool.order_workers".into()));
+
+    let routing = runtime
+        .dispatch
+        .routing
+        .as_ref()
+        .expect("the dispatch should declare routing");
+
+    assert_eq!(routing.key, SubscriptionRoutingKey::TopicKey);
+    assert_eq!(routing.member_assignment, MemberAssignment::ConsistentHash);
+
+    let pool = model
+        .execution_pool(&Id("pool.order_workers".into()))
+        .expect("the target pool should be declared");
+
+    let MemberConcurrency::Bounded(concurrency) = pool.member_concurrency else {
+        panic!("pool member concurrency should be bounded");
     };
 
     assert_eq!(concurrency.get(), 1);
@@ -998,9 +1031,6 @@ operations:
       ordering: []
       idempotency: []
       recoverability: []
-    execution:
-      concurrency:
-        kind: unspecified
 ",
     );
 
@@ -1691,4 +1721,145 @@ fn shorthand_selector_values_serialize_into_the_canonical_form() {
     let reparsed = yaml::parse(&serialized).expect("serialized model should parse");
 
     assert_eq!(model, reparsed);
+}
+
+// ---------------------------------------------------------------------------
+// The two canonical surfaces of the hierarchical model
+// ---------------------------------------------------------------------------
+
+/// An L0-only model is a complete Conseqa model: no runtime topology is
+/// required, and the collections a model does not use may be omitted.
+#[test]
+fn an_l0_only_model_parses_with_no_runtime_block() {
+    let source = "
+revision: 1
+
+topics:
+  topic.order_events:
+    messages:
+      - schema.OrderCreated
+    message_identity:
+      kind: keyed
+      mapping:
+        schema.OrderCreated:
+          - event_id
+";
+
+    let model = yaml::parse(source).expect("an L0-only model should parse");
+
+    assert!(model.runtime.is_none());
+    assert!(model.services.is_empty());
+    assert!(model.operations.is_empty());
+
+    // With no runtime, transport ordering is simply unknown — the same
+    // epistemic position an explicit `unspecified` states.
+    assert_eq!(
+        model.topic_ordering(&Id("topic.order_events".into())),
+        TopicOrdering::Unspecified
+    );
+}
+
+/// The canonical runtime-enriched surface: every L1 primitive in one
+/// block, in the exact serialized shape the semantics document
+/// documents and external tools must be able to read.
+#[test]
+fn the_canonical_runtime_block_parses_and_round_trips() {
+    let source = "
+revision: 1
+
+runtime:
+  topics:
+    topic.order_events:
+      ordering:
+        kind: keyed
+        mapping:
+          schema.OrderCreated: order_id
+
+  execution_pools:
+    pool.order_workers:
+      member_concurrency:
+        kind: bounded
+        value: 1
+    pool.message_reads:
+      member_concurrency:
+        kind: bounded
+        value: 32
+
+  subscriptions:
+    op.process_order:
+      input.events:
+        delivery: at_least_once
+        dispatch:
+          pool: pool.order_workers
+          routing:
+            key: topic_key
+            member_assignment:
+              kind: consistent_hash
+
+  routers:
+    router.get_messages:
+      boundary:
+        operation: op.get_messages
+        input: input.request
+      pool: pool.message_reads
+      routing:
+        key:
+          - channel_id
+        member_assignment:
+          kind: consistent_hash
+
+    router.health:
+      boundary:
+        operation: op.health
+        input: input.request
+      pool: pool.message_reads
+
+  storage_layouts:
+    layout.messages:
+      object:
+        data_model: data.chat
+        object: object.message
+      partition_key:
+        - channel_id
+        - bucket
+";
+
+    let model = yaml::parse(source).expect("the canonical runtime block should parse");
+
+    let runtime = model.runtime.as_ref().expect("a runtime model");
+
+    assert_eq!(runtime.execution_pools.len(), 2);
+    assert_eq!(runtime.routers.len(), 2);
+    assert_eq!(runtime.storage_layouts.len(), 1);
+
+    // Routing is optional, and absence is the whole statement: the
+    // health boundary names a pool and no member affinity.
+    assert!(runtime.routers[&Id("router.health".into())].routing.is_none());
+
+    let get_messages = runtime.routers[&Id("router.get_messages".into())]
+        .routing
+        .as_ref()
+        .expect("a routing declaration");
+
+    assert_eq!(get_messages.key, vec![FieldPath(vec!["channel_id".into()])]);
+    assert_eq!(get_messages.member_assignment, MemberAssignment::ConsistentHash);
+
+    // A routing key and a partition key may name the same field without
+    // becoming the same concept.
+    let layout = &runtime.storage_layouts[&Id("layout.messages".into())];
+
+    assert_eq!(
+        layout.partition_key,
+        vec![
+            FieldPath(vec!["channel_id".into()]),
+            FieldPath(vec!["bucket".into()]),
+        ]
+    );
+
+    // External tools read L1 from the serialized surface alone, so it
+    // must round-trip.
+    let round_tripped = yaml::parse(&yaml::serialize(&model).expect("serializes"))
+        .expect("re-parses");
+
+    assert_eq!(model, round_tripped);
 }

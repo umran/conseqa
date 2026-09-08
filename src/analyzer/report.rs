@@ -24,10 +24,13 @@ use crate::analyzer::verification::{
     StableRoot, VerificationReport,
 };
 use crate::analyzer::verification::{
-    DuplicateHandling, LaneFact, LineageFact, ModelNote, OrderingProof, OrderingVerdict,
-    PrecedenceSource,
+    DuplicateHandling, LineageFact, ModelNote, OrderingProof, OrderingVerdict, PrecedenceSource,
+    ProofScope,
 };
-use crate::spec::{CompletionRequirement, Id, Model, ResultReplayRequirement, ValueRef};
+use crate::spec::{
+    CompletionRequirement, Id, MemberAssignment, Model, ResultReplayRequirement,
+    SubscriptionRoutingKey, ValueRef,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -51,8 +54,12 @@ pub struct ProverReport {
 
 /// The current report format. Format 2 replaced the response-replay
 /// property with result replay, dropped object-history obligations and
-/// the flow subject, and made proofs cite program paths.
-pub const FORMAT: u32 = 2;
+/// the flow subject, and made proofs cite program paths. Format 3 added
+/// proof `scope` and rebuilt the serialization and ordering arguments
+/// on the L1 runtime model — routing domains, member assignment, and
+/// execution-pool member concurrency in place of dispatch lanes and
+/// operation-global concurrency.
+pub const FORMAT: u32 = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -66,6 +73,13 @@ pub struct Obligation {
 
     /// One-line human-readable statement of the obligation.
     pub summary: String,
+
+    /// Which semantic layers a proof consumed. `runtime_dependent`
+    /// means the argument rests on at least one declared L1 fact, so
+    /// it must be re-examined whenever the runtime realization
+    /// changes. Absent for an obligation that is not proven.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<ProofScope>,
 
     /// Declared model facts the verdict relies on. A proof is
     /// conditional on the implementation conforming to these.
@@ -192,6 +206,7 @@ pub fn scaffold(model: &Model) -> ProverReport {
             },
             status: Status::Unknown,
             summary,
+            scope: None,
             assumptions: Vec::new(),
             evidence: Vec::new(),
             counterexample: None,
@@ -255,6 +270,7 @@ pub fn scaffold(model: &Model) -> ProverReport {
                         "Every attempt at {op_id} sharing the declared key \
                          returns an equivalent result."
                     ),
+                    scope: None,
                     assumptions: Vec::new(),
                     evidence: Vec::new(),
                     counterexample: None,
@@ -298,7 +314,9 @@ pub fn obligations(model: &Model, verification: &VerificationReport) -> ProverRe
         let id = obligation_id(&check.operation, "serialization", check.requirement);
 
         patch(&mut report, &id, || match &check.verdict {
-            SerializationVerdict::Proven { proof } => Ok(serialization_assumptions(proof)),
+            SerializationVerdict::Proven { proof, scope } => {
+                Ok((*scope, serialization_assumptions(proof)))
+            }
             SerializationVerdict::Unproven { .. } => Err(check.diagnostic()),
         });
     }
@@ -307,7 +325,7 @@ pub fn obligations(model: &Model, verification: &VerificationReport) -> ProverRe
         let id = obligation_id(&check.operation, "ordering", check.requirement);
 
         patch(&mut report, &id, || match &check.verdict {
-            OrderingVerdict::Proven { proof } => Ok(ordering_assumptions(proof)),
+            OrderingVerdict::Proven { proof, scope } => Ok((*scope, ordering_assumptions(proof))),
             OrderingVerdict::Unproven { .. } => Err(check.diagnostic()),
         });
     }
@@ -316,7 +334,9 @@ pub fn obligations(model: &Model, verification: &VerificationReport) -> ProverRe
         let id = obligation_id(&check.operation, "idempotency", check.requirement);
 
         patch(&mut report, &id, || match &check.verdict {
-            IdempotencyVerdict::Proven { proof } => Ok(idempotency_assumptions(proof)),
+            IdempotencyVerdict::Proven { proof, scope } => {
+                Ok((*scope, idempotency_assumptions(proof)))
+            }
             IdempotencyVerdict::Unproven { .. } => Err(check.diagnostic()),
         });
 
@@ -396,7 +416,9 @@ pub fn obligations(model: &Model, verification: &VerificationReport) -> ProverRe
         let id = obligation_id(&check.operation, "result_replay", check.requirement);
 
         patch(&mut report, &id, || match &check.verdict {
-            ResultReplayVerdict::Proven { proof } => Ok(result_replay_assumptions(proof)),
+            ResultReplayVerdict::Proven { proof, scope } => {
+                Ok((*scope, result_replay_assumptions(proof)))
+            }
             ResultReplayVerdict::Unproven { .. } => Err(check.diagnostic()),
         });
 
@@ -416,7 +438,9 @@ pub fn obligations(model: &Model, verification: &VerificationReport) -> ProverRe
         let id = obligation_id(&check.operation, "recoverability", check.requirement);
 
         patch(&mut report, &id, || match &check.verdict {
-            RecoverabilityVerdict::Proven { proof } => Ok(recoverability_assumptions(proof)),
+            RecoverabilityVerdict::Proven { proof, scope } => {
+                Ok((*scope, recoverability_assumptions(proof)))
+            }
             RecoverabilityVerdict::Unproven { .. } => Err(check.diagnostic()),
         });
 
@@ -468,7 +492,7 @@ fn obligation_id(operation: &Id, slug: &str, requirement: usize) -> String {
 fn patch(
     report: &mut ProverReport,
     id: &str,
-    verdict: impl FnOnce() -> Result<Vec<String>, Option<crate::analyzer::Diagnostic>>,
+    verdict: impl FnOnce() -> Result<(ProofScope, Vec<String>), Option<crate::analyzer::Diagnostic>>,
 ) {
     let Some(obligation) = report
         .obligations
@@ -479,8 +503,9 @@ fn patch(
     };
 
     match verdict() {
-        Ok(assumptions) => {
+        Ok((scope, assumptions)) => {
             obligation.status = Status::Proven;
+            obligation.scope = Some(scope);
             obligation.assumptions = assumptions;
         }
 
@@ -518,30 +543,61 @@ fn value_ref_label(value: &ValueRef) -> String {
 
 fn serialization_assumptions(proof: &SerializationProof) -> Vec<String> {
     match proof {
-        SerializationProof::OperationSerial => vec![
-            "operation concurrency is bounded(1): no two invocations are \
-             simultaneously active"
-                .to_string(),
-        ],
-
         SerializationProof::NoAdmittedInvocations { input } => vec![format!(
             "{input} admits no message schemas; the requirement constrains no \
              invocations"
         )],
 
-        SerializationProof::SubscriptionSerial { input } => vec![
-            format!("every delivery of {input} enters one logical lane (single_lane)"),
-            "lane concurrency bounded(1) prevents overlap within the lane".to_string(),
-        ],
-
-        SerializationProof::KeyedLaneSerial {
+        SerializationProof::RequestRouted {
             input,
-            topic,
-            message_keys,
+            router,
+            pool,
+            routing_key,
+            member_assignment,
         } => {
             let mut assumptions = vec![format!(
-                "{topic} routes same-key deliveries of {input} onto one lane \
-                 (keyed ordering + by_topic_key dispatch)"
+                "{router} routes invocations of {input} into {pool} by a semantic \
+                 routing key"
+            )];
+
+            for component in routing_key {
+                assumptions.push(match &component.identity {
+                    KeyIdentity::SamePath => format!(
+                        "the routing-key component {} is the serialization key field, \
+                         so same-key invocations share one routing domain",
+                        component.path
+                    ),
+
+                    KeyIdentity::SameCanonicalValue { schema, path } => format!(
+                        "the routing-key component {} carries the serialization key's \
+                         value ({schema}.{path} via fragment aliasing), so same-key \
+                         invocations share one routing domain",
+                        component.path
+                    ),
+                });
+            }
+
+            assumptions.push(member_assignment_assumption(member_assignment));
+
+            assumptions.push(format!(
+                "{pool} bounds each member to one simultaneously active invocation, so \
+                 the owning member runs same-key invocations one at a time"
+            ));
+
+            assumptions
+        }
+
+        SerializationProof::SubscriptionRouted {
+            input,
+            topic,
+            pool,
+            message_keys,
+            member_assignment,
+        } => {
+            let mut assumptions = vec![format!(
+                "{topic} declares a keyed transport domain, and {input} dispatches \
+                 into {pool} by topic_key, so same-key deliveries share one routing \
+                 domain"
             )];
 
             for key in message_keys {
@@ -559,11 +615,27 @@ fn serialization_assumptions(proof: &SerializationProof) -> Vec<String> {
                 });
             }
 
-            assumptions
-                .push("lane concurrency bounded(1) prevents overlap within the lane".to_string());
+            assumptions.push(member_assignment_assumption(member_assignment));
+
+            assumptions.push(format!(
+                "{pool} bounds each member to one simultaneously active invocation, so \
+                 the owning member runs same-key invocations one at a time"
+            ));
 
             assumptions
         }
+    }
+}
+
+/// What a member assignment guarantees about domain ownership — the
+/// step that turns routing-domain equality into a single executing
+/// member.
+fn member_assignment_assumption(assignment: &MemberAssignment) -> String {
+    match assignment {
+        MemberAssignment::ConsistentHash => "consistent_hash assignment gives each routing \
+             domain one owning pool member at a time, and transfers that ownership safely \
+             when membership changes"
+            .to_string(),
     }
 }
 
@@ -574,11 +646,13 @@ fn ordering_assumptions(proof: &OrderingProof) -> Vec<String> {
              no precedence exists to preserve"
         )],
 
-        OrderingProof::LaneOrder {
+        OrderingProof::RoutedOrder {
             input,
             topic,
+            pool,
             precedence,
-            lane,
+            routing_key,
+            member_assignment,
             duplicates,
         } => {
             let mut assumptions = Vec::new();
@@ -586,8 +660,8 @@ fn ordering_assumptions(proof: &OrderingProof) -> Vec<String> {
             match precedence {
                 PrecedenceSource::KeyedTopic { message_keys } => {
                     assumptions.push(format!(
-                        "{topic} orders same-key messages (keyed ordering); that order \
-                         is the precedence"
+                        "{topic} orders same-key messages (keyed transport ordering); \
+                         that order is the precedence"
                     ));
 
                     for key in message_keys {
@@ -607,28 +681,24 @@ fn ordering_assumptions(proof: &OrderingProof) -> Vec<String> {
                 }
 
                 PrecedenceSource::GlobalTopic => assumptions.push(format!(
-                    "{topic} orders every message (global ordering); that order is \
-                     the precedence for any key"
+                    "{topic} orders every message (global transport ordering); that \
+                     order is the precedence for any key"
                 )),
             }
 
-            assumptions.push(match lane {
-                LaneFact::ByTopicKey => format!(
-                    "by_topic_key dispatch keeps same-key deliveries of {input} in one \
-                     lane, which dispatches them in delivery order"
-                ),
-
-                LaneFact::SingleLane => format!(
-                    "every delivery of {input} enters one lane (single_lane), which \
-                     dispatches them in delivery order"
+            assumptions.push(match routing_key {
+                SubscriptionRoutingKey::TopicKey => format!(
+                    "{input} dispatches by topic_key, so same-key deliveries belong to \
+                     one semantic routing domain"
                 ),
             });
 
-            assumptions.push(
-                "lane concurrency bounded(1) stops a later invocation overtaking an \
-                 earlier one"
-                    .to_string(),
-            );
+            assumptions.push(member_assignment_assumption(member_assignment));
+
+            assumptions.push(format!(
+                "{pool} bounds each member to one simultaneously active invocation, so a \
+                 later invocation cannot overtake an earlier one"
+            ));
 
             match duplicates {
                 DuplicateHandling::SingleDelivery => assumptions.push(format!(
@@ -636,10 +706,11 @@ fn ordering_assumptions(proof: &OrderingProof) -> Vec<String> {
                      redelivery nor a duplicate exists"
                 )),
 
-                DuplicateHandling::HeadOfLineRetry { idempotency } => {
+                DuplicateHandling::OrderPreservingRedelivery { idempotency } => {
                     assumptions.push(
-                        "a failed delivery is re-dispatched at the head of its lane, \
-                         so a redelivery precedes every later message"
+                        "dispatch preserves the transport's established same-key \
+                         precedence when admitting invocations, including across \
+                         failure-driven redelivery and ownership reassignment"
                             .to_string(),
                     );
 

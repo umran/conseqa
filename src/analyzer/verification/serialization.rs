@@ -18,48 +18,68 @@
 //! input has no value for the key, so it is not "an invocation with
 //! the same logical key" as any other and the requirement does not
 //! constrain it. For a key sourced from input `i`, the population is
-//! therefore the invocations triggered by `i`. For a key sourced from
-//! anything other than an input, no dispatch fact identifies which
-//! invocations share a key, so the population is conservatively every
-//! invocation of the operation, and only a global execution bound of
-//! one can serialize it.
+//! therefore the invocations triggered by `i`. A key sourced from
+//! anything other than an input selects no population any runtime
+//! fact can address, and nothing can serialize it.
 //!
 //! ## Accepted proof routes
 //!
-//! 1. **Operation-serial** (§10): `execution.concurrency = bounded(1)`
-//!    admits at most one simultaneously active invocation across the
-//!    operation, so no two invocations overlap at all.
-//! 2. **Vacuous population**: the key's subscription input admits no
+//! 1. **Vacuous population**: the key's subscription input admits no
 //!    message schemas, so the population is empty by declaration.
-//! 3. **Subscription-serial**: `single_lane` routing puts every
-//!    delivery of the key's subscription into one logical lane, and
-//!    lane concurrency `bounded(1)` prevents overlap within it, so no
-//!    two invocations from that input overlap.
-//! 4. **Keyed-lane-serial** (§8.2): the topic declares a keyed
-//!    ordering domain, `by_topic_key` routing sends same-topic-key
-//!    deliveries to one lane, lane concurrency `bounded(1)` prevents
-//!    overlap within a lane, and the serialization key is established
-//!    to carry the same logical value as the topic key for every
-//!    admitted message schema — so same-key invocations share a lane
-//!    and cannot overlap. Each declaration contributes a different
-//!    fact and none is silently substituted for another.
+//!    This is the only L0-only route.
+//! 2. **Request-routed**: an L1 `Router` serves the key's request
+//!    boundary; its semantic routing key is equivalent to the
+//!    serialization key, so same-key invocations share one routing
+//!    domain; its `MemberAssignment` gives that domain one active
+//!    owning member, including through handoff; and the target
+//!    `ExecutionPool` declares `member_concurrency = bounded(1)`, so
+//!    that member runs one invocation at a time.
+//! 3. **Subscription-routed**: the same argument on the delivery side.
+//!    The dispatch routes by `topic_key`, the topic runtime declares
+//!    the keyed domain that key names, and the serialization key is
+//!    established to carry the same logical value as the topic key for
+//!    every admitted message schema.
+//!
+//! Both runtime routes have the same shape, and it is the shape the
+//! whole model is built around:
+//!
+//! ```text
+//! semantic key equivalence
+//!     -> routing-domain equivalence
+//!     -> member ownership
+//!     -> member concurrency
+//! ```
+//!
+//! Every step is a distinct declared fact and none is substituted for
+//! another. A proof taking either runtime route is recorded as
+//! `RuntimeDependent`: it holds of the declared realization, and is
+//! invalidated when that realization changes.
 //!
 //! ## Routes deliberately not credited
 //!
+//! - **Shared pool identity alone**. Two boundaries assigned to one
+//!   pool share an execution population, not a routing domain. Even
+//!   equal-looking keys on two routers say nothing about common member
+//!   ownership.
+//! - **Routing absence**. A router or dispatch without a routing block
+//!   gives the target population and no member-affinity fact at all —
+//!   not round-robin, not random, not one member.
+//! - **A partial key match**. If the routing key is a tuple wider than
+//!   the serialization key, two same-key invocations differing in the
+//!   remaining components fall into different routing domains, so
+//!   equality of the serialization key implies nothing.
 //! - **Locks** (§21). A lock protects the object instances its
 //!   selector selects. Whether two same-key invocations conflict on a
 //!   common instance depends on such an instance existing at lock
 //!   time, which is runtime state the model cannot declare, and a
 //!   lock serializes only the span from acquisition to transaction
-//!   end, not the invocation's whole execution. Crediting a lock here
-//!   would rest a proof on unknown facts (§1.1).
+//!   end, not the invocation's whole execution.
 //! - **Serializable isolation** (§17). An equivalent serial commit
 //!   order does not prevent concurrent execution.
 //! - **Topic ordering alone** (§6). Delivery order does not serialize
-//!   consumer execution; the keyed-lane route uses the keyed
+//!   consumer execution; the subscription route uses the keyed
 //!   declaration only for the key domain that routing references.
-//! - **`bounded(n)` with `n > 1`** anywhere (§10): it permits
-//!   overlap.
+//! - **`bounded(n)` with `n > 1`**: it permits overlap.
 //!
 //! A requirement no route establishes is `Unproven`, never violated:
 //! concurrency declarations are upper bounds, and nothing in the
@@ -70,11 +90,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::analyzer::{Diagnostic, DiagnosticCode, Evidence, Severity, VerificationCode};
 use crate::spec::{
-    DispatchRouting, FieldPath, Id, Input, LaneConcurrency, MessageSelector, Model, Operation,
-    OperationConcurrency, SerializationRequirement, SubscriptionInput, TopicOrdering, ValueRef,
+    FieldPath, Id, Input, MemberAssignment, MemberConcurrency, MessageSelector, Model, Operation,
+    SerializationRequirement, SubscriptionInput, SubscriptionRoutingKey, TopicOrdering, ValueRef,
     ValueSource,
 };
 
+use super::ProofScope;
 use super::describe::{describe_value_ref, describe_value_source, value_source_id};
 use super::value_identity::canonical_value_path;
 
@@ -97,8 +118,13 @@ pub struct SerializationCheck {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SerializationVerdict {
     /// The requirement follows from the cited declared facts, subject
-    /// to implementation conformance with those facts (§1.3).
-    Proven { proof: SerializationProof },
+    /// to implementation conformance with those facts (§1.3), and —
+    /// for a `RuntimeDependent` scope — to the realization those facts
+    /// describe.
+    Proven {
+        proof: SerializationProof,
+        scope: ProofScope,
+    },
 
     /// The declared facts do not establish the requirement. This is
     /// epistemic: it records which facts are missing or insufficient,
@@ -108,39 +134,73 @@ pub enum SerializationVerdict {
     },
 }
 
+impl SerializationVerdict {
+    fn proven(proof: SerializationProof) -> Self {
+        Self::Proven {
+            scope: proof.scope(),
+            proof,
+        }
+    }
+}
+
 /// A successful serialization argument and the facts it consumed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SerializationProof {
-    /// `execution.concurrency = bounded(1)`: at most one invocation
-    /// of the operation is active at any time, so no two invocations
-    /// — same-key or otherwise — overlap (§10).
-    OperationSerial,
-
     /// The key's subscription input admits no message schemas, so no
     /// invocation can bear the key and the requirement constrains an
     /// empty population.
     NoAdmittedInvocations { input: Id },
 
-    /// `single_lane` routing plus lane concurrency `bounded(1)` on
-    /// the key's subscription input: every key-bearing invocation
-    /// passes through one lane admitting one active invocation.
-    SubscriptionSerial { input: Id },
+    /// A router assigns same-key requests to one owning member of a
+    /// pool whose members execute one invocation at a time.
+    RequestRouted {
+        input: Id,
+        router: Id,
+        pool: Id,
 
-    /// The §8.2 composition: same-key deliveries of the key's
-    /// subscription share a lane because the serialization key
-    /// carries the same logical value as the keyed topic's ordering
-    /// key for every admitted schema and routing is `by_topic_key`;
-    /// lane concurrency `bounded(1)` prevents overlap within the
-    /// lane.
-    KeyedLaneSerial {
+        /// The router's semantic routing key, and why each component
+        /// carries the same logical value as the serialization key.
+        routing_key: Vec<RoutingKeyFact>,
+
+        member_assignment: MemberAssignment,
+    },
+
+    /// The delivery-side counterpart: same-topic-key deliveries share
+    /// a routing domain, one member owns it, and that member executes
+    /// one invocation at a time.
+    SubscriptionRouted {
         input: Id,
         topic: Id,
+        pool: Id,
 
         /// Per admitted message schema, the fact identifying the
         /// topic key with the serialization key.
         message_keys: Vec<MessageKeyFact>,
+
+        member_assignment: MemberAssignment,
     },
+}
+
+impl SerializationProof {
+    pub fn scope(&self) -> ProofScope {
+        match self {
+            Self::NoAdmittedInvocations { .. } => ProofScope::L0Only,
+
+            Self::RequestRouted { .. } | Self::SubscriptionRouted { .. } => {
+                ProofScope::RuntimeDependent
+            }
+        }
+    }
+}
+
+/// For one component of a request routing key, why it denotes the same
+/// logical value as the serialization key.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RoutingKeyFact {
+    pub path: FieldPath,
+    pub identity: KeyIdentity,
 }
 
 /// For one admitted message schema, how the topic's ordering key was
@@ -156,8 +216,7 @@ pub struct MessageKeyFact {
     pub identity: KeyIdentity,
 }
 
-/// Why two field paths of one message schema denote the same logical
-/// value.
+/// Why two field paths of one schema denote the same logical value.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum KeyIdentity {
@@ -174,34 +233,53 @@ pub enum KeyIdentity {
 /// route.
 ///
 /// Obstacles preserve the declared value where one exists, so an
-/// explicitly negative declaration (`unbounded`, `unconstrained`) is
-/// distinguishable from an absent one (`unspecified`) (§1.2).
+/// explicitly negative declaration (`unbounded`) is distinguishable
+/// from an absent one (`unspecified`, or an absent runtime block)
+/// (§1.2).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SerializationObstacle {
-    /// The declared global operation concurrency does not bound
-    /// simultaneous invocations to one.
-    OperationConcurrencyNotSerial { declared: OperationConcurrency },
-
     /// The key is not sourced from an input declared by the
-    /// operation, so no dispatch or lane fact selects which
-    /// invocations share it.
+    /// operation, so no routing fact selects which invocations share
+    /// it.
     KeyNotFromInput { source: ValueSource },
 
-    /// Key-bearing invocations arrive through a request input, and
-    /// the DSL declares no request-side dispatch or concurrency
-    /// facts.
-    RequestInputHasNoDispatchFacts { input: Id },
+    /// Key-bearing invocations arrive through a request input that no
+    /// router serves, so no runtime fact says where they execute.
+    NoRouter { input: Id },
 
-    /// The subscription's routing provides no usable affinity between
-    /// same-key deliveries and lanes.
-    RoutingProvidesNoAffinity {
+    /// Key-bearing deliveries arrive through a subscription input with
+    /// no declared runtime, so no runtime fact says where they
+    /// execute.
+    NoSubscriptionRuntime { input: Id },
+
+    /// The boundary is assigned to a pool, but declares no routing:
+    /// the target execution population is known and no member-affinity
+    /// fact exists.
+    RoutingAbsent { input: Id, pool: Id },
+
+    /// A component of the routing key is not established to carry the
+    /// same logical value as the serialization key, so same-key
+    /// invocations may fall into different routing domains. An empty
+    /// routing key — which validation rejects — reports an empty
+    /// component here rather than proving vacuously.
+    RoutingKeyNotEquivalent {
         input: Id,
-        declared: DispatchRouting,
+        router: Id,
+        component: FieldPath,
     },
 
-    /// Routing is `by_topic_key`, but the subscribed topic declares
-    /// no keyed ordering domain to route by.
+    /// The routing key is a wider tuple than the serialization key:
+    /// same-key invocations differing in another component belong to
+    /// different routing domains.
+    RoutingKeyWiderThanRequirement {
+        input: Id,
+        router: Id,
+        key: Vec<FieldPath>,
+    },
+
+    /// Dispatch routes by `topic_key`, but the subscribed topic's
+    /// runtime declares no keyed ordering domain to route by.
     TopicNotKeyed { input: Id, topic: Id },
 
     /// The keyed topic declares no ordering-key mapping for an
@@ -211,7 +289,7 @@ pub enum SerializationObstacle {
 
     /// The topic's ordering key for this schema is not established to
     /// carry the same logical value as the serialization key, so
-    /// same-key deliveries may enter different lanes.
+    /// same-key deliveries may enter different routing domains.
     KeyIdentityUnestablished {
         input: Id,
         topic: Id,
@@ -219,11 +297,16 @@ pub enum SerializationObstacle {
         topic_key: FieldPath,
     },
 
-    /// The declared per-lane concurrency does not bound same-lane
-    /// invocations to one.
-    LaneConcurrencyNotSerial {
+    /// The target execution pool is not declared, so its member
+    /// concurrency is unknown.
+    PoolUndeclared { input: Id, pool: Id },
+
+    /// The pool's declared member concurrency does not bound one
+    /// member to one simultaneously active invocation.
+    MemberConcurrencyNotSerial {
         input: Id,
-        declared: LaneConcurrency,
+        pool: Id,
+        declared: MemberConcurrency,
     },
 }
 
@@ -237,7 +320,7 @@ pub fn check(model: &Model) -> Vec<SerializationCheck> {
                 operation: operation_id.clone(),
                 requirement: index,
                 key: requirement.key.clone(),
-                verdict: check_requirement(model, operation, requirement),
+                verdict: check_requirement(model, operation_id, operation, requirement),
             });
         }
     }
@@ -247,119 +330,205 @@ pub fn check(model: &Model) -> Vec<SerializationCheck> {
 
 fn check_requirement(
     model: &Model,
+    operation_id: &Id,
     operation: &Operation,
     requirement: &SerializationRequirement,
 ) -> SerializationVerdict {
-    // Route 1: a global execution bound of one serializes every pair
-    // of invocations, whatever population the key defines.
-    if is_serial_bound(operation.execution.concurrency) {
-        return SerializationVerdict::Proven {
-            proof: SerializationProof::OperationSerial,
-        };
-    }
-
-    let mut obstacles = vec![SerializationObstacle::OperationConcurrencyNotSerial {
-        declared: operation.execution.concurrency,
-    }];
-
-    // The remaining routes serialize the population of key-bearing
-    // invocations, which is defined by the key's source input.
+    // Every route serializes the population of key-bearing
+    // invocations, which the key's source input defines.
     let ValueSource::Input(input_id) = &requirement.key.source else {
-        obstacles.push(SerializationObstacle::KeyNotFromInput {
-            source: requirement.key.source.clone(),
-        });
-
-        return SerializationVerdict::Unproven { obstacles };
+        return SerializationVerdict::Unproven {
+            obstacles: vec![SerializationObstacle::KeyNotFromInput {
+                source: requirement.key.source.clone(),
+            }],
+        };
     };
 
     let Some(input) = operation.inputs.get(input_id) else {
-        obstacles.push(SerializationObstacle::KeyNotFromInput {
-            source: requirement.key.source.clone(),
-        });
-
-        return SerializationVerdict::Unproven { obstacles };
+        return SerializationVerdict::Unproven {
+            obstacles: vec![SerializationObstacle::KeyNotFromInput {
+                source: requirement.key.source.clone(),
+            }],
+        };
     };
 
-    let subscription = match input {
-        Input::Request(_) => {
-            obstacles.push(SerializationObstacle::RequestInputHasNoDispatchFacts {
+    match input {
+        Input::Request(request) => request_route(
+            model,
+            operation_id,
+            input_id,
+            &request.schema,
+            &requirement.key.path,
+        ),
+
+        Input::Subscription(subscription) => subscription_route(
+            model,
+            operation_id,
+            input_id,
+            subscription,
+            &requirement.key.path,
+        ),
+    }
+}
+
+/// The request-side route: router, routing-key equivalence, member
+/// assignment, member concurrency.
+fn request_route(
+    model: &Model,
+    operation_id: &Id,
+    input_id: &Id,
+    schema: &Id,
+    key: &FieldPath,
+) -> SerializationVerdict {
+    let Some((router_id, router)) = model.router_for(operation_id, input_id) else {
+        return SerializationVerdict::Unproven {
+            obstacles: vec![SerializationObstacle::NoRouter {
                 input: input_id.clone(),
+            }],
+        };
+    };
+
+    let mut obstacles = Vec::new();
+
+    let routing_key = match &router.routing {
+        None => {
+            obstacles.push(SerializationObstacle::RoutingAbsent {
+                input: input_id.clone(),
+                pool: router.pool.clone(),
             });
 
-            return SerializationVerdict::Unproven { obstacles };
+            None
         }
 
-        Input::Subscription(subscription) => subscription,
-    };
+        Some(routing) => {
+            match routing_key_facts(model, input_id, router_id, schema, &routing.key, key) {
+                Ok(facts) => Some((facts, routing.member_assignment)),
 
-    // Route 2: a population empty by declaration is serialized
-    // vacuously.
-    if admits_no_messages(model, subscription) {
-        return SerializationVerdict::Proven {
-            proof: SerializationProof::NoAdmittedInvocations {
-                input: input_id.clone(),
-            },
-        };
-    }
+                Err(routing_obstacles) => {
+                    obstacles.extend(routing_obstacles);
 
-    let lane_serial = is_serial_lane(subscription.dispatch.lane_concurrency);
-
-    match subscription.dispatch.routing {
-        // Route 3: one lane for every delivery of this subscription.
-        DispatchRouting::SingleLane => {
-            if lane_serial {
-                return SerializationVerdict::Proven {
-                    proof: SerializationProof::SubscriptionSerial {
-                        input: input_id.clone(),
-                    },
-                };
+                    None
+                }
             }
         }
+    };
 
-        // Route 4: same-key deliveries share a lane through the
-        // topic's key domain.
-        DispatchRouting::ByTopicKey => {
-            match keyed_lane_facts(model, input_id, subscription, &requirement.key.path) {
-                Ok((topic, message_keys)) => {
-                    if lane_serial {
-                        return SerializationVerdict::Proven {
-                            proof: SerializationProof::KeyedLaneSerial {
-                                input: input_id.clone(),
-                                topic,
-                                message_keys,
-                            },
-                        };
+    let serial = pool_is_serial(model, input_id, &router.pool, &mut obstacles);
+
+    match routing_key {
+        Some((routing_key, member_assignment)) if serial => {
+            SerializationVerdict::proven(SerializationProof::RequestRouted {
+                input: input_id.clone(),
+                router: router_id.clone(),
+                pool: router.pool.clone(),
+                routing_key,
+                member_assignment,
+            })
+        }
+
+        _ => SerializationVerdict::Unproven { obstacles },
+    }
+}
+
+/// The delivery-side route: dispatch, topic-key equivalence, member
+/// assignment, member concurrency.
+fn subscription_route(
+    model: &Model,
+    operation_id: &Id,
+    input_id: &Id,
+    subscription: &SubscriptionInput,
+    key: &FieldPath,
+) -> SerializationVerdict {
+    // A population empty by declaration is serialized vacuously, and
+    // needs no runtime fact at all.
+    if admits_no_messages(model, subscription) {
+        return SerializationVerdict::proven(SerializationProof::NoAdmittedInvocations {
+            input: input_id.clone(),
+        });
+    }
+
+    let Some(runtime) = model.subscription_runtime(operation_id, input_id) else {
+        return SerializationVerdict::Unproven {
+            obstacles: vec![SerializationObstacle::NoSubscriptionRuntime {
+                input: input_id.clone(),
+            }],
+        };
+    };
+
+    let mut obstacles = Vec::new();
+
+    let routed = match &runtime.dispatch.routing {
+        None => {
+            obstacles.push(SerializationObstacle::RoutingAbsent {
+                input: input_id.clone(),
+                pool: runtime.dispatch.pool.clone(),
+            });
+
+            None
+        }
+
+        Some(routing) => match routing.key {
+            SubscriptionRoutingKey::TopicKey => {
+                match topic_key_facts(model, input_id, subscription, key) {
+                    Ok((topic, message_keys)) => {
+                        Some((topic, message_keys, routing.member_assignment))
+                    }
+
+                    Err(routing_obstacles) => {
+                        obstacles.extend(routing_obstacles);
+
+                        None
                     }
                 }
-
-                Err(affinity_obstacles) => obstacles.extend(affinity_obstacles),
             }
-        }
+        },
+    };
 
-        DispatchRouting::Unspecified | DispatchRouting::Unconstrained => {
-            obstacles.push(SerializationObstacle::RoutingProvidesNoAffinity {
+    let serial = pool_is_serial(model, input_id, &runtime.dispatch.pool, &mut obstacles);
+
+    match routed {
+        Some((topic, message_keys, member_assignment)) if serial => {
+            SerializationVerdict::proven(SerializationProof::SubscriptionRouted {
                 input: input_id.clone(),
-                declared: subscription.dispatch.routing,
-            });
+                topic,
+                pool: runtime.dispatch.pool.clone(),
+                message_keys,
+                member_assignment,
+            })
         }
-    }
 
-    if !lane_serial {
-        obstacles.push(SerializationObstacle::LaneConcurrencyNotSerial {
+        _ => SerializationVerdict::Unproven { obstacles },
+    }
+}
+
+/// Whether the pool bounds one member to one active invocation,
+/// recording the obstacle when it does not.
+pub(super) fn pool_is_serial(
+    model: &Model,
+    input_id: &Id,
+    pool_id: &Id,
+    obstacles: &mut Vec<SerializationObstacle>,
+) -> bool {
+    let Some(pool) = model.execution_pool(pool_id) else {
+        obstacles.push(SerializationObstacle::PoolUndeclared {
             input: input_id.clone(),
-            declared: subscription.dispatch.lane_concurrency,
+            pool: pool_id.clone(),
         });
+
+        return false;
+    };
+
+    if pool.member_concurrency.is_serial() {
+        return true;
     }
 
-    SerializationVerdict::Unproven { obstacles }
-}
+    obstacles.push(SerializationObstacle::MemberConcurrencyNotSerial {
+        input: input_id.clone(),
+        pool: pool_id.clone(),
+        declared: pool.member_concurrency,
+    });
 
-fn is_serial_bound(concurrency: OperationConcurrency) -> bool {
-    matches!(concurrency, OperationConcurrency::Bounded(bound) if bound.get() == 1)
-}
-
-pub(super) fn is_serial_lane(concurrency: LaneConcurrency) -> bool {
-    matches!(concurrency, LaneConcurrency::Bounded(bound) if bound.get() == 1)
+    false
 }
 
 /// Whether the subscription's admitted message set is empty by
@@ -380,27 +549,90 @@ pub(super) fn admits_no_messages(model: &Model, subscription: &SubscriptionInput
     }
 }
 
-/// Establishes the affinity leg of the keyed-lane route: for every
-/// admitted message schema, the topic's ordering key must carry the
-/// same logical value as the serialization key.
-pub(super) fn keyed_lane_facts(
+/// Establishes routing-domain equivalence for a request routing key:
+/// every component must carry the same logical value as the
+/// requirement key.
+///
+/// Requiring *every* component is what makes the argument sound. A
+/// routing key of `(account_id, region)` partitions same-`account_id`
+/// invocations across routing domains by `region`, so equality of the
+/// serialization key would no longer imply a common domain. A
+/// degenerate repetition — `(account_id, account_id)` — is admitted
+/// because it partitions nothing.
+fn routing_key_facts(
+    model: &Model,
+    input_id: &Id,
+    router_id: &Id,
+    schema: &Id,
+    routing_key: &[FieldPath],
+    requirement_key: &FieldPath,
+) -> Result<Vec<RoutingKeyFact>, Vec<SerializationObstacle>> {
+    // An empty tuple names no domain. Validation rejects the shape, and
+    // verification must not turn it into a vacuous proof: with no
+    // component to constrain them, all invocations would appear to
+    // share a domain.
+    if routing_key.is_empty() {
+        return Err(vec![SerializationObstacle::RoutingKeyNotEquivalent {
+            input: input_id.clone(),
+            router: router_id.clone(),
+            component: FieldPath(Vec::new()),
+        }]);
+    }
+
+    let mut facts = Vec::new();
+    let mut obstacles = Vec::new();
+
+    for component in routing_key {
+        match key_identity(model, schema, component, requirement_key) {
+            Some(identity) => facts.push(RoutingKeyFact {
+                path: component.clone(),
+                identity,
+            }),
+
+            None => obstacles.push(SerializationObstacle::RoutingKeyNotEquivalent {
+                input: input_id.clone(),
+                router: router_id.clone(),
+                component: component.clone(),
+            }),
+        }
+    }
+
+    if obstacles.is_empty() {
+        return Ok(facts);
+    }
+
+    // A wider tuple is the common shape of this failure and deserves
+    // its own explanation, alongside the components themselves.
+    if facts.len() < routing_key.len() && !facts.is_empty() {
+        obstacles.push(SerializationObstacle::RoutingKeyWiderThanRequirement {
+            input: input_id.clone(),
+            router: router_id.clone(),
+            key: routing_key.to_vec(),
+        });
+    }
+
+    Err(obstacles)
+}
+
+/// Establishes routing-domain equivalence for `key: topic_key`: for
+/// every admitted message schema, the topic's ordering key must carry
+/// the same logical value as the requirement key.
+pub(super) fn topic_key_facts(
     model: &Model,
     input_id: &Id,
     subscription: &SubscriptionInput,
-    serialization_key: &FieldPath,
+    requirement_key: &FieldPath,
 ) -> Result<(Id, Vec<MessageKeyFact>), Vec<SerializationObstacle>> {
     let topic_id = subscription.topic.clone();
 
-    let keyed = model
-        .topics
-        .get(&topic_id)
-        .and_then(|topic| match &topic.ordering {
-            TopicOrdering::Keyed(key) => Some((topic, key)),
+    let TopicOrdering::Keyed(topic_key) = model.topic_ordering(&topic_id) else {
+        return Err(vec![SerializationObstacle::TopicNotKeyed {
+            input: input_id.clone(),
+            topic: topic_id,
+        }]);
+    };
 
-            TopicOrdering::Unspecified | TopicOrdering::Unordered | TopicOrdering::Global => None,
-        });
-
-    let Some((topic, topic_key)) = keyed else {
+    let Some(topic) = model.topics.get(&topic_id) else {
         return Err(vec![SerializationObstacle::TopicNotKeyed {
             input: input_id.clone(),
             topic: topic_id,
@@ -426,7 +658,7 @@ pub(super) fn keyed_lane_facts(
             continue;
         };
 
-        match key_identity(model, schema, mapped, serialization_key) {
+        match key_identity(model, schema, mapped, requirement_key) {
             Some(identity) => facts.push(MessageKeyFact {
                 schema: schema.clone(),
                 topic_key: mapped.clone(),
@@ -454,19 +686,19 @@ pub(super) fn keyed_lane_facts(
 fn key_identity(
     model: &Model,
     schema: &Id,
-    topic_key: &FieldPath,
-    serialization_key: &FieldPath,
+    declared: &FieldPath,
+    requirement_key: &FieldPath,
 ) -> Option<KeyIdentity> {
-    if topic_key == serialization_key {
+    if declared == requirement_key {
         return Some(KeyIdentity::SamePath);
     }
 
-    let topic_canonical = canonical_value_path(model, schema, topic_key)?;
-    let serialization_canonical = canonical_value_path(model, schema, serialization_key)?;
+    let declared_canonical = canonical_value_path(model, schema, declared)?;
+    let requirement_canonical = canonical_value_path(model, schema, requirement_key)?;
 
-    (topic_canonical == serialization_canonical).then_some(KeyIdentity::SameCanonicalValue {
-        schema: serialization_canonical.schema,
-        path: serialization_canonical.path,
+    (declared_canonical == requirement_canonical).then_some(KeyIdentity::SameCanonicalValue {
+        schema: requirement_canonical.schema,
+        path: requirement_canonical.path,
     })
 }
 
@@ -504,81 +736,95 @@ impl SerializationCheck {
 impl SerializationObstacle {
     fn evidence(&self, check: &SerializationCheck) -> Evidence {
         match self {
-            Self::OperationConcurrencyNotSerial { declared } => Evidence {
-                subject: Some(check.operation.clone()),
-                message: match declared {
-                    OperationConcurrency::Unspecified => {
-                        "No global operation concurrency fact is declared, so a \
-                         global execution bound of one cannot be inferred."
-                            .to_string()
-                    }
-
-                    OperationConcurrency::Unbounded => {
-                        "Operation concurrency is explicitly `unbounded`: no \
-                         finite global bound limits simultaneous invocations."
-                            .to_string()
-                    }
-
-                    OperationConcurrency::Bounded(bound) => format!(
-                        "Operation concurrency `bounded({bound})` permits \
-                         {bound} simultaneous invocations; only a bound of one \
-                         serializes all invocations."
-                    ),
-                },
-            },
-
             Self::KeyNotFromInput { source } => Evidence {
                 subject: value_source_id(source).cloned(),
                 message: format!(
                     "The serialization key is sourced from {}, not from an \
-                     input declared by the operation; no dispatch or lane fact \
-                     selects which invocations share such a key, so only a \
-                     global operation concurrency bound of one could serialize \
-                     them.",
+                     input declared by the operation; no routing fact selects \
+                     which invocations share such a key.",
                     describe_value_source(source)
                 ),
             },
 
-            Self::RequestInputHasNoDispatchFacts { input } => Evidence {
+            Self::NoRouter { input } => Evidence {
                 subject: Some(input.clone()),
                 message: format!(
                     "Key-bearing invocations arrive through request input \
-                     `{input}`, and the model declares no request-side dispatch \
-                     or concurrency fact that could serialize same-key \
-                     requests."
+                     `{input}`, and no router declares where they execute; \
+                     without an execution-pool assignment there is no member \
+                     concurrency to reason from."
                 ),
             },
 
-            Self::RoutingProvidesNoAffinity { input, declared } => Evidence {
+            Self::NoSubscriptionRuntime { input } => Evidence {
                 subject: Some(input.clone()),
-                message: match declared {
-                    DispatchRouting::Unspecified => format!(
-                        "No dispatch-routing fact is declared for `{input}`: \
-                         nothing routes same-key deliveries to one lane."
-                    ),
+                message: format!(
+                    "Subscription input `{input}` declares no runtime, so \
+                     nothing says where its deliveries execute or how many may \
+                     execute at once."
+                ),
+            },
 
-                    _ => format!(
-                        "Dispatch routing for `{input}` is explicitly \
-                         `unconstrained`: same-key deliveries are not \
-                         guaranteed to share a lane."
-                    ),
-                },
+            Self::RoutingAbsent { input, pool } => Evidence {
+                subject: Some(input.clone()),
+                message: format!(
+                    "`{input}` is assigned to `{pool}` but declares no routing: \
+                     the target execution population is known, and no fact \
+                     relates same-key invocations to a common member."
+                ),
+            },
+
+            Self::RoutingKeyNotEquivalent {
+                router, component, ..
+            } if component.0.is_empty() => Evidence {
+                subject: Some(router.clone()),
+                message: format!(
+                    "`{router}` declares an empty routing key, which names no \
+                     routing domain."
+                ),
+            },
+
+            Self::RoutingKeyNotEquivalent {
+                router, component, ..
+            } => Evidence {
+                subject: Some(router.clone()),
+                message: format!(
+                    "Routing-key component `{component}` of `{router}` is not \
+                     established to carry the same logical value as the \
+                     serialization key `{}`, so same-key invocations may fall \
+                     into different routing domains.",
+                    check.key.path
+                ),
+            },
+
+            Self::RoutingKeyWiderThanRequirement { router, key, .. } => Evidence {
+                subject: Some(router.clone()),
+                message: format!(
+                    "`{router}` routes by the tuple ({}), which partitions \
+                     same-`{}` invocations further; equal serialization keys \
+                     therefore need not share a routing domain.",
+                    key.iter()
+                        .map(FieldPath::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    check.key.path
+                ),
             },
 
             Self::TopicNotKeyed { input, topic } => Evidence {
                 subject: Some(topic.clone()),
                 message: format!(
-                    "Topic `{topic}` does not declare keyed ordering, so the \
-                     `by_topic_key` routing of `{input}` has no key domain to \
-                     route by."
+                    "The runtime for `{topic}` declares no keyed ordering, so \
+                     the `topic_key` routing of `{input}` has no semantic key \
+                     domain to route by."
                 ),
             },
 
             Self::TopicKeyMappingMissing { topic, schema, .. } => Evidence {
                 subject: Some(schema.clone()),
                 message: format!(
-                    "Keyed topic `{topic}` declares no ordering-key mapping \
-                     for admitted schema `{schema}`."
+                    "The keyed runtime ordering of `{topic}` declares no \
+                     key mapping for admitted schema `{schema}`."
                 ),
             },
 
@@ -590,28 +836,39 @@ impl SerializationObstacle {
                     "For messages of `{schema}`, the topic's ordering key \
                      `{topic_key}` is not established to carry the same \
                      logical value as the serialization key `{}`, so same-key \
-                     deliveries may enter different lanes.",
+                     deliveries may enter different routing domains.",
                     check.key.path
                 ),
             },
 
-            Self::LaneConcurrencyNotSerial { input, declared } => Evidence {
+            Self::PoolUndeclared { input, pool } => Evidence {
                 subject: Some(input.clone()),
+                message: format!(
+                    "`{input}` is assigned to execution pool `{pool}`, which \
+                     the runtime model does not declare, so its member \
+                     concurrency is unknown."
+                ),
+            },
+
+            Self::MemberConcurrencyNotSerial { pool, declared, .. } => Evidence {
+                subject: Some(pool.clone()),
                 message: match declared {
-                    LaneConcurrency::Unspecified => format!(
-                        "No per-lane concurrency fact is declared for \
-                         `{input}`."
+                    MemberConcurrency::Unspecified => format!(
+                        "Execution pool `{pool}` declares no member-concurrency \
+                         fact, so simultaneous execution on one member cannot \
+                         be excluded."
                     ),
 
-                    LaneConcurrency::Unbounded => format!(
-                        "Lane concurrency for `{input}` is explicitly \
-                         `unbounded`: same-lane invocations may overlap."
+                    MemberConcurrency::Unbounded => format!(
+                        "Execution pool `{pool}` declares `unbounded` member \
+                         concurrency: one member may run any number of \
+                         invocations at once."
                     ),
 
-                    LaneConcurrency::Bounded(bound) => format!(
-                        "Lane concurrency `bounded({bound})` for `{input}` \
-                         permits {bound} overlapping invocations per lane; \
-                         serialization needs a bound of one."
+                    MemberConcurrency::Bounded(bound) => format!(
+                        "Execution pool `{pool}` permits {bound} simultaneous \
+                         invocations per member; serialization needs a bound \
+                         of one."
                     ),
                 },
             },

@@ -620,9 +620,6 @@ pub struct DraftOperation {
     /// None until the operation synthesis task commits.
     pub program: Option<OperationBlock>,
 
-    /// None until operation synthesis determines execution facts.
-    pub execution: Option<ExecutionSemantics>,
-
     /// Requirements can be added later by the correctness phase.
     pub requirements: OperationRequirements,
 
@@ -749,7 +746,21 @@ pub enum SymbolKey {
     OperationInterface(Id),
     OperationProgram(Id),
     OperationRequirements(Id),
-    OperationExecution(Id),
+
+    // L1 runtime topology. Every one of these is shared: where an
+    // invocation executes, and how much may execute there, is a
+    // decision about the whole system rather than part of any one
+    // operation's synthesis. A subscription runtime therefore names an
+    // operation and an input without belonging to that operation's
+    // write authority.
+    TopicRuntime(Id),
+    SubscriptionRuntime {
+        operation: Id,
+        input: Id,
+    },
+    ExecutionPool(Id),
+    Router(Id),
+    StorageLayout(Id),
 
     Input {
         operation: Id,
@@ -1149,9 +1160,12 @@ pub enum WriteScope {
 
     OperationRequirements(Id),
 
-    OperationExecution(Id),
-
     OperationInterface(Id),
+
+    /// The L1 runtime topology, held separately from the skeleton so a
+    /// run may hand topology to a dedicated authority — though the
+    /// coordinator holds both by default.
+    RuntimeTopology,
 }
 ```
 
@@ -1159,11 +1173,10 @@ Typical assignments:
 
 ```text
 Decomposer
-    SharedSkeleton + operation interfaces
+    SharedSkeleton + operation interfaces + RuntimeTopology
 
 Operation synthesis agent
     OperationProgram(op)
-    OperationExecution(op)
 
 Requirement discovery agent
     OperationRequirements(op)
@@ -1464,14 +1477,36 @@ pub enum Mutation {
         program: OperationBlock,
     },
 
-    ReplaceOperationExecution {
-        operation: Id,
-        execution: ExecutionSemantics,
-    },
-
     ReplaceOperationRequirements {
         operation: Id,
         requirements: OperationRequirements,
+    },
+
+    // L1 runtime topology; all shared-skeleton writes.
+    PutTopicRuntime {
+        topic: Id,
+        value: TopicRuntime,
+    },
+
+    PutSubscriptionRuntime {
+        operation: Id,
+        input: Id,
+        value: SubscriptionRuntime,
+    },
+
+    PutExecutionPool {
+        id: Id,
+        value: ExecutionPool,
+    },
+
+    PutRouter {
+        id: Id,
+        value: Router,
+    },
+
+    PutStorageLayout {
+        id: Id,
+        value: StorageLayout,
     },
 
     DeleteTopLevel {
@@ -2550,8 +2585,11 @@ Default write scope:
 
 ```text
 OperationProgram(op)
-OperationExecution(op)
 ```
+
+Deliberately not the runtime topology: where an invocation executes is an
+architectural decision about the whole system, and one operation's
+synthesis is the wrong place to make it.
 
 Input bundle:
 
@@ -3360,8 +3398,10 @@ transactions
 effects
 bindings
 control
-execution facts
 ```
+
+Runtime topology is deliberately absent from that list: it belongs to the
+coordinator's shared-skeleton scope, not to any one operation's synthesis.
 
 The later requirement prompt focuses on:
 

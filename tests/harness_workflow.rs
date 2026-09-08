@@ -13,7 +13,6 @@
 #![allow(clippy::result_large_err)]
 
 use std::collections::BTreeMap;
-use std::num::NonZeroU32;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -34,8 +33,8 @@ use conseqa::harness::{
     RunStatus, Scheduler, SchedulerPolicy, Supervisor, Workflow, WorkflowConfig,
 };
 use conseqa::spec::{
-    CanonicalSchema, Derivation, ErrorDisposition, ErrorResultType, ExecutionSemantics, Field,
-    Id, IdempotencyKey, Input, OperationBlock, OperationConcurrency, OperationStep,
+    CanonicalSchema, Derivation, ErrorDisposition, ErrorResultType, Field,
+    Id, IdempotencyKey, Input, OperationBlock, OperationStep,
     RequestIdentity, RequestInput, ResultOutcome, ResultType, Return, ScalarType, Schema,
     SchemaCompleteness, SerializationRequirement, Service, ServiceKind, TypeRef, ValueRef,
     ValueSource,
@@ -185,12 +184,6 @@ fn ping_program() -> OperationBlock {
     }
 }
 
-fn bounded_one() -> ExecutionSemantics {
-    ExecutionSemantics {
-        concurrency: OperationConcurrency::Bounded(NonZeroU32::new(1).expect("non-zero")),
-    }
-}
-
 const OBLIGATION: &str = "obl.serialize-ping";
 
 /// The scripted plan that reaches success: decompose the skeleton,
@@ -231,6 +224,36 @@ fn success_script() -> ScriptFn {
                                 operation: id("operation.ping"),
                                 value: ping_interface(),
                             },
+                            // Runtime topology is part of the shared
+                            // skeleton: where an invocation executes,
+                            // and how much may execute there, is an
+                            // architectural decision, not part of the
+                            // operation's own synthesis. It is also
+                            // what the serialization obligation is
+                            // discharged from.
+                            Mutation::PutExecutionPool {
+                                id: id("pool.ping_workers"),
+                                value: conseqa::spec::ExecutionPool {
+                                    member_concurrency: conseqa::spec::MemberConcurrency::Bounded(
+                                        std::num::NonZeroU32::new(1).expect("non-zero"),
+                                    ),
+                                },
+                            },
+                            Mutation::PutRouter {
+                                id: id("router.ping"),
+                                value: conseqa::spec::Router {
+                                    boundary: conseqa::spec::OperationInputRef {
+                                        operation: id("operation.ping"),
+                                        input: id("input.ping.request"),
+                                    },
+                                    pool: id("pool.ping_workers"),
+                                    routing: Some(conseqa::spec::RequestRouting {
+                                        key: vec![path("id")],
+                                        member_assignment:
+                                            conseqa::spec::MemberAssignment::ConsistentHash,
+                                    }),
+                                },
+                            },
                             Mutation::PutPromptObligation {
                                 id: PromptObligationId(OBLIGATION.to_string()),
                                 value: PromptObligation {
@@ -261,10 +284,6 @@ fn success_script() -> ScriptFn {
                                 operation: id("operation.ping"),
                                 program: ping_program(),
                             },
-                            Mutation::ReplaceOperationExecution {
-                                operation: id("operation.ping"),
-                                execution: bounded_one(),
-                            },
                         ],
                     )
                     .await;
@@ -294,8 +313,8 @@ fn success_script() -> ScriptFn {
                     .await;
                 }
 
-                // No repair is needed: the requirement proves from
-                // bounded(1) concurrency.
+                // No repair is needed: the requirement proves from the
+                // router's semantic key and the pool's serial members.
                 _ => {}
             }
         })
@@ -337,6 +356,36 @@ fn incomplete_script() -> ScriptFn {
                                 operation: id("operation.ping"),
                                 value: ping_interface(),
                             },
+                            // Runtime topology is part of the shared
+                            // skeleton: where an invocation executes,
+                            // and how much may execute there, is an
+                            // architectural decision, not part of the
+                            // operation's own synthesis. It is also
+                            // what the serialization obligation is
+                            // discharged from.
+                            Mutation::PutExecutionPool {
+                                id: id("pool.ping_workers"),
+                                value: conseqa::spec::ExecutionPool {
+                                    member_concurrency: conseqa::spec::MemberConcurrency::Bounded(
+                                        std::num::NonZeroU32::new(1).expect("non-zero"),
+                                    ),
+                                },
+                            },
+                            Mutation::PutRouter {
+                                id: id("router.ping"),
+                                value: conseqa::spec::Router {
+                                    boundary: conseqa::spec::OperationInputRef {
+                                        operation: id("operation.ping"),
+                                        input: id("input.ping.request"),
+                                    },
+                                    pool: id("pool.ping_workers"),
+                                    routing: Some(conseqa::spec::RequestRouting {
+                                        key: vec![path("id")],
+                                        member_assignment:
+                                            conseqa::spec::MemberAssignment::ConsistentHash,
+                                    }),
+                                },
+                            },
                             Mutation::PutPromptObligation {
                                 id: PromptObligationId(OBLIGATION.to_string()),
                                 value: PromptObligation {
@@ -361,10 +410,6 @@ fn incomplete_script() -> ScriptFn {
                             Mutation::ReplaceOperationProgram {
                                 operation: id("operation.ping"),
                                 program: ping_program(),
-                            },
-                            Mutation::ReplaceOperationExecution {
-                                operation: id("operation.ping"),
-                                execution: bounded_one(),
                             },
                         ],
                     )
@@ -462,10 +507,6 @@ fn no_requirements_script() -> ScriptFn {
                             Mutation::ReplaceOperationProgram {
                                 operation: id("operation.ping"),
                                 program: ping_program(),
-                            },
-                            Mutation::ReplaceOperationExecution {
-                                operation: id("operation.ping"),
-                                execution: bounded_one(),
                             },
                         ],
                     )
@@ -661,8 +702,8 @@ async fn workers_that_build_nothing_yield_incomplete_not_false_success() {
 /// from.
 fn planned_workspace(count: usize) -> WorkspaceState {
     use conseqa::spec::{
-        DeliverySemantics, DispatchRouting, DispatchSemantics, LaneConcurrency, MessageSelector,
-        SubscriptionInput, Topic, TopicOrdering,
+        MessageSelector,
+        SubscriptionInput, Topic,
     };
 
     let mut workspace = WorkspaceState::empty(RunMetadata::new(RunId("fanout".to_string())));
@@ -682,7 +723,6 @@ fn planned_workspace(count: usize) -> WorkspaceState {
         id("topic.events"),
         Topic {
             messages: [id("schema.Event")].into_iter().collect(),
-            ordering: TopicOrdering::Unordered,
             message_identity: conseqa::spec::MessageIdentity::Unspecified,
         },
     );
@@ -703,13 +743,6 @@ fn planned_workspace(count: usize) -> WorkspaceState {
                         messages: MessageSelector::Only(
                             [id("schema.Event")].into_iter().collect(),
                         ),
-                        delivery: DeliverySemantics::AtLeastOnce,
-                        dispatch: DispatchSemantics {
-                            routing: DispatchRouting::ByTopicKey,
-                            lane_concurrency: LaneConcurrency::Bounded(
-                                NonZeroU32::new(1).expect("non-zero"),
-                            ),
-                        },
                     }),
                 )]),
             }),
@@ -774,14 +807,10 @@ async fn operation_fanout_runs_agents_concurrently() {
                     &invocation,
                     vec![
                         Mutation::ReplaceOperationProgram {
-                            operation: operation.clone(),
+                            operation,
                             program: OperationBlock {
                                 steps: vec![OperationStep::Complete],
                             },
-                        },
-                        Mutation::ReplaceOperationExecution {
-                            operation,
-                            execution: bounded_one(),
                         },
                     ],
                 )

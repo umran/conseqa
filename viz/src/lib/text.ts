@@ -1,7 +1,7 @@
 import type {
-  Concurrency,
   Condition,
   Derivation,
+  MemberConcurrency,
   SelectorPredicate,
   SelectorValue,
   TypeRef,
@@ -50,7 +50,7 @@ export function derivationText(d: Derivation): string {
   return d.kind === "deterministic" ? `deterministic from ${d.from.length} root(s)` : "unspecified";
 }
 
-export function concurrencyText(c: Concurrency): string {
+export function memberConcurrencyText(c: MemberConcurrency): string {
   return c.kind === "bounded" ? `bounded(${c.value})` : c.kind;
 }
 

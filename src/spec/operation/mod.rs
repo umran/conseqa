@@ -18,12 +18,16 @@ pub use transaction::*;
 pub use value::*;
 
 use std::collections::BTreeMap;
-use std::num::NonZeroU32;
 
 use super::Id;
 
 /// An operation: its invocation sources, one explicit causal program,
-/// requirements, and execution facts.
+/// and requirements.
+///
+/// An operation declares no execution-concurrency fact. Runtime
+/// concurrency is a property of the execution resource an invocation
+/// is assigned to, and is declared exclusively by
+/// [`ExecutionPool::member_concurrency`](crate::spec::ExecutionPool).
 ///
 /// Execution-local transactions, direct effects, transaction outputs,
 /// and effect intents are declared at the program or transaction site
@@ -42,7 +46,6 @@ pub struct Operation {
     pub program: OperationBlock,
 
     pub requirements: OperationRequirements,
-    pub execution: ExecutionSemantics,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -134,23 +137,4 @@ pub enum CompletionRequirement {
     /// triggering subscription or an inbound request effect that may
     /// repeat.
     Guaranteed,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ExecutionSemantics {
-    pub concurrency: OperationConcurrency,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
-pub enum OperationConcurrency {
-    Unspecified,
-
-    /// Maximum number of simultaneously active invocations
-    /// across the logical deployed operation.
-    Bounded(NonZeroU32),
-
-    /// No finite global concurrency bound is declared.
-    Unbounded,
 }

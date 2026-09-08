@@ -67,6 +67,7 @@ use crate::spec::{
     MessageSelector, Model, Operation, ValueSource,
 };
 
+use super::ProofScope;
 use super::describe::{
     decision_gap_sentence, describe_decision, describe_path, gap_sentences, governing_key_evidence,
     unstable_roots,
@@ -157,8 +158,22 @@ pub enum LineageFact {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum IdempotencyVerdict {
-    Proven { proof: IdempotencyProof },
-    Unproven { obstacles: Vec<IdempotencyObstacle> },
+    Proven {
+        proof: IdempotencyProof,
+        scope: ProofScope,
+    },
+    Unproven {
+        obstacles: Vec<IdempotencyObstacle>,
+    },
+}
+
+impl IdempotencyVerdict {
+    fn proven(proof: IdempotencyProof) -> Self {
+        Self::Proven {
+            scope: proof.scope(),
+            proof,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -179,6 +194,93 @@ pub enum IdempotencyProof {
 
     /// Every admitted path is retry-safe in all three legs.
     RetrySafePaths { paths: Vec<PathRetrySafety> },
+}
+
+impl IdempotencyProof {
+    /// The layers this proof consumed *directly*, before propagation
+    /// through the requirements it leans on.
+    pub fn direct_scope(&self) -> ProofScope {
+        match self {
+            Self::NoAdmittedInvocations { .. } | Self::NoAdmittedPaths { .. } => {
+                ProofScope::L0Only
+            }
+
+            // `at_most_once` is a delivery fact, and delivery is L1.
+            Self::SingleDelivery { .. } => ProofScope::RuntimeDependent,
+
+            Self::RetrySafePaths { paths } => ProofScope::joined(
+                paths
+                    .iter()
+                    .flat_map(|path| path.effects.iter())
+                    .map(|effect| effect.safety.direct_scope()),
+            ),
+        }
+    }
+
+    /// The scope this proof carries when nothing it leans on is
+    /// runtime-dependent. Propagation refines it in [`check`].
+    pub fn scope(&self) -> ProofScope {
+        self.direct_scope()
+    }
+
+    /// The idempotency requirements of *other* boundaries this proof
+    /// rests on, whose own scope propagates into this one.
+    ///
+    /// A duplicate collapsed by another operation's proven requirement
+    /// is only as L0 as that requirement's proof: if the callee proved
+    /// its idempotency from runtime topology, so did this caller.
+    pub fn dependencies(&self) -> Vec<(Id, Id)> {
+        let Self::RetrySafePaths { paths } = self else {
+            return Vec::new();
+        };
+
+        paths
+            .iter()
+            .flat_map(|path| path.effects.iter())
+            .flat_map(|effect| effect.safety.dependencies())
+            .collect()
+    }
+}
+
+impl EffectSafety {
+    fn direct_scope(&self) -> ProofScope {
+        match self {
+            Self::ExternallyDeduplicated { .. } | Self::DeduplicatedByTarget { .. } => {
+                ProofScope::L0Only
+            }
+
+            Self::SameLogicalMessage { consumers, .. } => ProofScope::joined(
+                consumers
+                    .iter()
+                    .map(|consumer| match consumer {
+                        // The consumer never sees a second delivery —
+                        // a fact about the realized transport.
+                        ConsumerCollapse::SingleDelivery { .. } => ProofScope::RuntimeDependent,
+                        ConsumerCollapse::ProvenRequirement { .. } => ProofScope::L0Only,
+                    }),
+            ),
+        }
+    }
+
+    fn dependencies(&self) -> Vec<(Id, Id)> {
+        match self {
+            Self::ExternallyDeduplicated { .. } => Vec::new(),
+
+            Self::DeduplicatedByTarget {
+                operation, input, ..
+            } => vec![(operation.clone(), input.clone())],
+
+            Self::SameLogicalMessage { consumers, .. } => consumers
+                .iter()
+                .filter_map(|consumer| match consumer {
+                    ConsumerCollapse::ProvenRequirement { operation, input } => {
+                        Some((operation.clone(), input.clone()))
+                    }
+                    ConsumerCollapse::SingleDelivery { .. } => None,
+                })
+                .collect(),
+        }
+    }
 }
 
 /// The retry-safety argument for one admitted path.
@@ -451,7 +553,59 @@ pub fn check(model: &Model, consistent: &BTreeSet<(Id, Id)>) -> Vec<IdempotencyC
         }
     }
 
+    propagate_scopes(&mut checks);
+
     checks
+}
+
+/// Widens proof scopes until they are stable.
+///
+/// A proof that collapses duplicates through another boundary's proven
+/// idempotency requirement inherits that requirement's dependence on
+/// the runtime realization: if the callee proved its idempotency from
+/// declared topology, the caller's proof is runtime-dependent too,
+/// however L0 its own facts look. Scopes only ever widen from `L0Only`
+/// to `RuntimeDependent`, so the iteration is monotone and terminates.
+fn propagate_scopes(checks: &mut [IdempotencyCheck]) {
+    loop {
+        let runtime_dependent: BTreeSet<(Id, Id)> = checks
+            .iter()
+            .filter_map(|check| match &check.verdict {
+                IdempotencyVerdict::Proven { scope, .. }
+                    if *scope == ProofScope::RuntimeDependent =>
+                {
+                    Some((check.operation.clone(), key_input(&check.key)?.clone()))
+                }
+
+                _ => None,
+            })
+            .collect();
+
+        let mut widened = false;
+
+        for check in checks.iter_mut() {
+            let IdempotencyVerdict::Proven { proof, scope } = &mut check.verdict else {
+                continue;
+            };
+
+            if *scope == ProofScope::RuntimeDependent {
+                continue;
+            }
+
+            if proof
+                .dependencies()
+                .iter()
+                .any(|dependency| runtime_dependent.contains(dependency))
+            {
+                *scope = ProofScope::RuntimeDependent;
+                widened = true;
+            }
+        }
+
+        if !widened {
+            return;
+        }
+    }
 }
 
 /// Iterates `run` from `assumed` until the proven set is stable. From
@@ -600,7 +754,7 @@ fn run(scope: &Scope<'_>) -> Vec<IdempotencyCheck> {
                 operation: operation_id.clone(),
                 requirement: index,
                 key: requirement.key.clone(),
-                verdict: check_requirement(scope, operation, &requirement.key),
+                verdict: check_requirement(scope, operation_id, operation, &requirement.key),
                 coinductive: false,
                 lineage: lineage(scope, operation, &requirement.key),
             });
@@ -612,6 +766,7 @@ fn run(scope: &Scope<'_>) -> Vec<IdempotencyCheck> {
 
 fn check_requirement(
     scope: &Scope<'_>,
+    operation_id: &Id,
     operation: &Operation,
     key: &IdempotencyKey,
 ) -> IdempotencyVerdict {
@@ -626,25 +781,23 @@ fn check_requirement(
     };
 
     if analysis.admits_no_attempts() {
-        return IdempotencyVerdict::Proven {
-            proof: IdempotencyProof::NoAdmittedInvocations {
+        return IdempotencyVerdict::proven(IdempotencyProof::NoAdmittedInvocations {
                 input: analysis.input().clone(),
             },
-        };
+        );
     }
 
     // The single-delivery vacuous route: at most one attempt per
     // class can exist.
     if let Some(Input::Subscription(subscription)) = operation.inputs.get(analysis.input())
-        && subscription.delivery == DeliverySemantics::AtMostOnce
+        && scope.model.delivery(operation_id, analysis.input()) == DeliverySemantics::AtMostOnce
         && analysis.payload_identified()
     {
-        return IdempotencyVerdict::Proven {
-            proof: IdempotencyProof::SingleDelivery {
+        return IdempotencyVerdict::proven(IdempotencyProof::SingleDelivery {
                 input: analysis.input().clone(),
                 topic: subscription.topic.clone(),
             },
-        };
+        );
     }
 
     let all = paths(&operation.program);
@@ -655,11 +808,10 @@ fn check_requirement(
         .collect();
 
     if admitted.is_empty() {
-        return IdempotencyVerdict::Proven {
-            proof: IdempotencyProof::NoAdmittedPaths {
+        return IdempotencyVerdict::proven(IdempotencyProof::NoAdmittedPaths {
                 input: analysis.input().clone(),
             },
-        };
+        );
     }
 
     let mut obstacles = Vec::new();
@@ -672,9 +824,7 @@ fn check_requirement(
     }
 
     if obstacles.is_empty() {
-        IdempotencyVerdict::Proven {
-            proof: IdempotencyProof::RetrySafePaths { paths: safe },
-        }
+        IdempotencyVerdict::proven(IdempotencyProof::RetrySafePaths { paths: safe })
     } else {
         IdempotencyVerdict::Unproven {
             obstacles: dedupe(obstacles, IdempotencyObstacle::site),
@@ -951,7 +1101,10 @@ fn contract_safety(
                 let operation = consumer.operation.clone();
                 let input = consumer.input.clone();
 
-                if identified && consumer.subscription.delivery == DeliverySemantics::AtMostOnce {
+                if identified
+                    && scope.model.delivery(consumer.operation, consumer.input)
+                        == DeliverySemantics::AtMostOnce
+                {
                     consumers.push(ConsumerCollapse::SingleDelivery { operation, input });
                 } else if !scope
                     .model

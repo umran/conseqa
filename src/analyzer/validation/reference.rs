@@ -24,6 +24,11 @@ pub enum ReferenceKind {
 
     /// A result binding declared by an effect-executing program step.
     EffectResult,
+
+    // L1 — runtime topology.
+    ExecutionPool,
+    Router,
+    StorageLayout,
 }
 
 impl fmt::Display for ReferenceKind {
@@ -49,6 +54,10 @@ impl fmt::Display for ReferenceKind {
             Self::Transaction => "transaction",
             Self::TransactionRead => "transaction read",
             Self::EffectResult => "effect result binding",
+
+            Self::ExecutionPool => "execution pool",
+            Self::Router => "router",
+            Self::StorageLayout => "storage layout",
         };
 
         f.write_str(name)

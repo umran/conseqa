@@ -30,11 +30,6 @@ topics:
         messages:
             - OrderEvent
 
-        ordering:
-            kind: keyed
-            mapping:
-                OrderEvent: order_id
-
         message_identity:
             kind: keyed
             mapping:
@@ -44,3 +39,11 @@ topics:
 state_machines: {}
 
 operations: {}
+
+runtime:
+    topics:
+        order_events:
+            ordering:
+                kind: keyed
+                mapping:
+                    OrderEvent: order_id

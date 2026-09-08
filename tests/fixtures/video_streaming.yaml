@@ -11,9 +11,13 @@
 # synchronous result: a rendered manifest completes the job, a rejected
 # source fails it.
 #
-# Scalability: operations run unbounded; same-video work is serialized
-# through the topic's video_id key and single-lane dispatch, while
-# different videos proceed in parallel.
+# Scalability: same-video work is serialized by the runtime topology —
+# the topic's video_id key names a routing domain, consistent-hash
+# assignment gives that domain one owning pool member, and the member
+# runs one invocation at a time — while different videos proceed in
+# parallel across the pool. Every serialization and ordering proof here
+# is therefore runtime-dependent: it holds of the topology declared at
+# the foot of this file and of no other.
 #
 # Every obligation proves. The engine deduplicates renders by
 # video_id, which fixes each video's one logical render and its
@@ -145,12 +149,6 @@ topics:
     - schema.TranscodeCompleted
     - schema.VideoPublished
     - schema.VideoUploaded
-    ordering:
-      kind: keyed
-      mapping:
-        schema.TranscodeCompleted: video_id
-        schema.VideoPublished: video_id
-        schema.VideoUploaded: video_id
     message_identity:
       kind: keyed
       mapping:
@@ -323,9 +321,6 @@ operations:
           - source: input:input.complete_upload.request
             path: upload_id
         completion: resumable
-    execution:
-      concurrency:
-        kind: unbounded
   operation.transcode_video:
     service: service.transcoder
     description: Claim the transcode job for an uploaded video and render its renditions through the transcoding engine; a rendered manifest completes the job, a rejected source fails it.
@@ -337,12 +332,6 @@ operations:
           kind: only
           schemas:
           - schema.VideoUploaded
-        delivery: at_least_once
-        dispatch:
-          routing: by_topic_key
-          lane_concurrency:
-            kind: bounded
-            value: 1
     program:
       steps:
       - kind: transaction
@@ -505,9 +494,6 @@ operations:
           - source: input:input.transcode_video.uploaded
             path: event_id
         completion: guaranteed
-    execution:
-      concurrency:
-        kind: unbounded
   operation.publish_video:
     service: service.catalog
     description: Record the manifest and advance the video to ready, announcing VideoPublished.
@@ -519,12 +505,6 @@ operations:
           kind: only
           schemas:
           - schema.TranscodeCompleted
-        delivery: at_least_once
-        dispatch:
-          routing: by_topic_key
-          lane_concurrency:
-            kind: bounded
-            value: 1
     program:
       steps:
       - kind: transaction
@@ -601,9 +581,6 @@ operations:
           - source: input:input.publish_video.completed
             path: event_id
         completion: guaranteed
-    execution:
-      concurrency:
-        kind: unbounded
   operation.notify_published:
     service: service.notifier
     description: Tell the owner their video is live, through a push gateway that deduplicates by notification id.
@@ -615,12 +592,6 @@ operations:
           kind: only
           schemas:
           - schema.VideoPublished
-        delivery: at_least_once
-        dispatch:
-          routing: by_topic_key
-          lane_concurrency:
-            kind: bounded
-            value: 1
     program:
       steps:
       - kind: execute_effect
@@ -661,9 +632,6 @@ operations:
           - source: input:input.notify_published.published
             path: event_id
         completion: guaranteed
-    execution:
-      concurrency:
-        kind: unbounded
   operation.get_playback:
     service: service.catalog
     description: Resolve a playable manifest. Read-only, so repeating it is harmless; its result is deliberately not declared replay-consistent, because the video's state may legitimately change between attempts.
@@ -735,6 +703,132 @@ operations:
             path: video_id
         result: unspecified
       recoverability: []
-    execution:
-      concurrency:
+
+# ---------------------------------------------------------------------
+# L1 — one runtime realization of the machine above.
+#
+# The model's serialization and ordering requirements are discharged
+# here, so every one of those proofs is runtime-dependent: it holds of
+# this topology and must be re-examined if the topology changes.
+#
+# The pipeline's shape is three keyed worker populations, one per
+# stage, each owning a video_id domain on a member that runs one
+# invocation at a time — and two request-facing pools that are
+# deliberately not serial, because nothing asks them to be.
+# ---------------------------------------------------------------------
+runtime:
+
+  topics:
+    # The transport keeps same-video events in order. This is the
+    # precedence every ordering proof in the model rests on, and the
+    # semantic key domain topic_key routing names.
+    topic.video_events:
+      ordering:
+        kind: keyed
+        mapping:
+          schema.TranscodeCompleted: video_id
+          schema.VideoPublished: video_id
+          schema.VideoUploaded: video_id
+
+  execution_pools:
+    # Serial members: one video's work does not overlap with itself.
+    # Different videos still proceed in parallel — pool cardinality is
+    # an external scenario input, not a Conseqa fact.
+    pool.transcode_workers:
+      member_concurrency:
+        kind: bounded
+        value: 1
+
+    pool.catalog_workers:
+      member_concurrency:
+        kind: bounded
+        value: 1
+
+    pool.notifier_workers:
+      member_concurrency:
+        kind: bounded
+        value: 1
+
+    # The upload boundary needs no member affinity: its idempotency
+    # and recoverability rest on the keyed commit, not on topology.
+    pool.ingest_api:
+      member_concurrency:
         kind: unbounded
+
+    # Playback reads are routed by video_id for cache locality, but
+    # the members are not serial. Affinity without a serial member
+    # proves no serialization, which is exactly right here: the model
+    # declares no serialization requirement for playback.
+    pool.playback_readers:
+      member_concurrency:
+        kind: bounded
+        value: 32
+
+  subscriptions:
+    operation.transcode_video:
+      input.transcode_video.uploaded:
+        delivery: at_least_once
+        dispatch:
+          pool: pool.transcode_workers
+          routing:
+            key: topic_key
+            member_assignment:
+              kind: consistent_hash
+
+    operation.publish_video:
+      input.publish_video.completed:
+        delivery: at_least_once
+        dispatch:
+          pool: pool.catalog_workers
+          routing:
+            key: topic_key
+            member_assignment:
+              kind: consistent_hash
+
+    operation.notify_published:
+      input.notify_published.published:
+        delivery: at_least_once
+        dispatch:
+          pool: pool.notifier_workers
+          routing:
+            key: topic_key
+            member_assignment:
+              kind: consistent_hash
+
+  routers:
+    # Pool assignment with no routing block: the analyzer knows the
+    # target execution population and nothing about member affinity.
+    router.complete_upload:
+      boundary:
+        operation: operation.complete_upload
+        input: input.complete_upload.request
+      pool: pool.ingest_api
+
+    router.get_playback:
+      boundary:
+        operation: operation.get_playback
+        input: input.get_playback.request
+      pool: pool.playback_readers
+      routing:
+        key:
+          - video_id
+        member_assignment:
+          kind: consistent_hash
+
+  storage_layouts:
+    # Object identity and partition identity coincide here; they are
+    # still distinct facts, and the analyzer never substitutes one for
+    # the other.
+    layout.video:
+      object:
+        data_model: data.videos
+        object: object.video
+      partition_key:
+        - video_id
+
+    layout.transcode_job:
+      object:
+        data_model: data.transcoder
+        object: object.job
+      partition_key:
+        - video_id

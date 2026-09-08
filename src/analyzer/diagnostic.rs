@@ -120,4 +120,11 @@ pub enum ValidationCode {
     EffectResultNotBound,
     EffectResultVariantOutOfScope,
     EffectHasNoResult,
+
+    // L1 — runtime topology.
+    EmptyRoutingKey,
+    TopicKeyRoutingWithoutKeyDomain,
+    DuplicateRouterForBoundary,
+    EmptyPartitionKey,
+    DuplicateStorageLayoutForObject,
 }

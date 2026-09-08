@@ -29,12 +29,19 @@ export interface TraceStep {
   description: string;
 }
 
+/** Which semantic layers a proof consumed. `runtime_dependent` means
+ *  the argument rests on at least one declared L1 fact, so it must be
+ *  re-examined whenever the runtime realization changes. */
+export type ProofScope = "l0_only" | "runtime_dependent";
+
 export interface Obligation {
   id: string;
   property: Property;
   subject: Subject;
   status: Status;
   summary: string;
+  /** Absent for an obligation that is not proven. */
+  scope?: ProofScope;
   assumptions: string[];
   evidence: EvidenceItem[];
   counterexample?: { trace: TraceStep[] };

@@ -143,7 +143,6 @@ fn operation_sub_symbols_version_separately() {
     let draft = workspace.operations.get_mut(&operation).unwrap();
 
     draft.program = None;
-    draft.execution = None;
 
     let second = build(&workspace, Some(&first));
 
@@ -478,6 +477,77 @@ fn reverse_references_are_recorded() {
         froms.contains(&&SymbolKey::OperationInterface(id(
             "operation.reserve_inventory"
         )))
+    );
+}
+
+#[test]
+fn runtime_declarations_are_tracked_symbols_with_their_references() {
+    // L1 is part of the symbol graph, not a blob beside it: each
+    // declaration is a versioned node, and each names what it depends
+    // on — so a query for what rests on a topic, an input, or a pool
+    // finds the runtime facts too.
+    let workspace = fixture_workspace();
+    let graph = build(&workspace, None);
+
+    for key in [
+        SymbolKey::TopicRuntime(id("topic.order_events")),
+        SymbolKey::ExecutionPool(id("pool.order_workers")),
+        SymbolKey::Router(id("router.create_order")),
+        SymbolKey::StorageLayout(id("layout.order")),
+        SymbolKey::SubscriptionRuntime {
+            operation: id("operation.reserve_inventory"),
+            input: id("input.reserve_inventory.created"),
+        },
+    ] {
+        assert!(graph.node(&key).is_some(), "{key} should be a tracked symbol");
+    }
+
+    let referrers = |symbol: SymbolKey| -> Vec<SymbolKey> {
+        run(&workspace, &graph, GraphQuery::ReferencesTo { symbol })
+            .iter()
+            .map(|row| match row {
+                QueryRow::Reference { from, .. } => from.clone(),
+                other => panic!("unexpected row {other:?}"),
+            })
+            .collect()
+    };
+
+    // The topic's transport ordering rests on the topic.
+    assert!(
+        referrers(SymbolKey::Topic(id("topic.order_events")))
+            .contains(&SymbolKey::TopicRuntime(id("topic.order_events")))
+    );
+
+    // A pool is referenced by every boundary assigned to it — the
+    // shared execution population, made queryable.
+    let pool_referrers = referrers(SymbolKey::ExecutionPool(id("pool.order_workers")));
+
+    assert!(pool_referrers.contains(&SymbolKey::SubscriptionRuntime {
+        operation: id("operation.reserve_inventory"),
+        input: id("input.reserve_inventory.created"),
+    }));
+
+    assert!(pool_referrers.contains(&SymbolKey::SubscriptionRuntime {
+        operation: id("operation.apply_payment"),
+        input: id("input.apply_payment.captured"),
+    }));
+
+    // A router rests on the request boundary it serves.
+    assert!(
+        referrers(SymbolKey::Input {
+            operation: id("operation.create_order"),
+            input: id("input.create_order.request"),
+        })
+        .contains(&SymbolKey::Router(id("router.create_order")))
+    );
+
+    // A storage layout rests on the object it partitions.
+    assert!(
+        referrers(SymbolKey::DataObject {
+            data_model: id("data.checkout"),
+            object: id("object.order"),
+        })
+        .contains(&SymbolKey::StorageLayout(id("layout.order")))
     );
 }
 

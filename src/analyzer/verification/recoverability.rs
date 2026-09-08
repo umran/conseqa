@@ -63,6 +63,7 @@ use crate::spec::{
     RetrySemantics, TransactionStep, TransitionSideEffect, ValueSource,
 };
 
+use super::ProofScope;
 use super::describe::{describe_path, gap_sentences, governing_key_evidence};
 use super::paths::{Path, PathRef, Terminal, paths};
 use super::replay::{
@@ -97,10 +98,20 @@ pub struct RecoverabilityCheck {
 pub enum RecoverabilityVerdict {
     Proven {
         proof: RecoverabilityProof,
+        scope: ProofScope,
     },
     Unproven {
         obstacles: Vec<RecoverabilityObstacle>,
     },
+}
+
+impl RecoverabilityVerdict {
+    fn proven(proof: RecoverabilityProof) -> Self {
+        Self::Proven {
+            scope: proof.scope(),
+            proof,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -119,6 +130,33 @@ pub enum RecoverabilityProof {
         driver: RetryDriver,
         paths: Vec<PathResumption>,
     },
+}
+
+impl RecoverabilityProof {
+    pub fn scope(&self) -> ProofScope {
+        match self {
+            // Resumability rests entirely on the program: transaction
+            // re-encounter resolution and artifact replay availability
+            // are L0 facts about the abstract machine.
+            Self::NoAdmittedInvocations { .. } | Self::Resumable { .. } => ProofScope::L0Only,
+
+            Self::Guaranteed { driver, .. } => driver.scope(),
+        }
+    }
+}
+
+impl RetryDriver {
+    fn scope(&self) -> ProofScope {
+        match self {
+            // Delivery is a realization fact.
+            Self::AtLeastOnceDelivery { .. } => ProofScope::RuntimeDependent,
+
+            // A caller's `retry: may_repeat` is an L0 guarantee about
+            // the request effect.
+            Self::InboundRepeatableRequest { .. }
+            | Self::InboundRepeatableTransitionEffect { .. } => ProofScope::L0Only,
+        }
+    }
 }
 
 /// The same-path continuation argument for one admitted path.
@@ -304,11 +342,9 @@ fn check_requirement(
 
     if analysis.admits_no_attempts() {
         return (
-            RecoverabilityVerdict::Proven {
-                proof: RecoverabilityProof::NoAdmittedInvocations {
-                    input: analysis.input().clone(),
-                },
-            },
+            RecoverabilityVerdict::proven(RecoverabilityProof::NoAdmittedInvocations {
+                input: analysis.input().clone(),
+            }),
             Vec::new(),
         );
     }
@@ -377,15 +413,13 @@ fn check_requirement(
     }
 
     (
-        RecoverabilityVerdict::Proven {
-            proof: match driver {
-                None => RecoverabilityProof::Resumable { paths: resumptions },
-                Some(driver) => RecoverabilityProof::Guaranteed {
-                    driver,
-                    paths: resumptions,
-                },
+        RecoverabilityVerdict::proven(match driver {
+            None => RecoverabilityProof::Resumable { paths: resumptions },
+            Some(driver) => RecoverabilityProof::Guaranteed {
+                driver,
+                paths: resumptions,
             },
-        },
+        }),
         notes,
     )
 }
@@ -608,13 +642,15 @@ fn find_driver(
 ) -> Result<RetryDriver, Option<DeliverySemantics>> {
     match operation.inputs.get(input) {
         Some(Input::Subscription(subscription)) => {
-            if subscription.delivery == DeliverySemantics::AtLeastOnce {
+            let delivery = model.delivery(operation_id, input);
+
+            if delivery == DeliverySemantics::AtLeastOnce {
                 Ok(RetryDriver::AtLeastOnceDelivery {
                     input: input.clone(),
                     topic: subscription.topic.clone(),
                 })
             } else {
-                Err(Some(subscription.delivery))
+                Err(Some(delivery))
             }
         }
 

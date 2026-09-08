@@ -42,20 +42,35 @@ schemas, data objects, topics, state machines, and one interface per \
 planned operation (id, service, inputs, request/subscription contracts). \
 Extract every explicit correctness statement in the prompt as a prompt \
 obligation. Do not implement operation programs — establish stable \
-interfaces callers can reason against. Commit one `submit_patch` that \
-creates all planned operation interfaces and prompt obligations.",
+interfaces callers can reason against.
+
+You also own the runtime topology (L1): topic transport ordering, \
+subscription delivery and dispatch, execution pools and their member \
+concurrency, request routers, and storage layouts. This is architecture, \
+not per-operation synthesis, which is why it is yours. L1 is optional — \
+declare only what the application genuinely realizes — but note that \
+serialization and ordering requirements are discharged from it: a keyed \
+routing domain owned by one pool member whose concurrency is bounded(1) \
+is what proves same-key invocations never overlap. Never invent \
+topology to make a proof pass; if the architecture genuinely does not \
+constrain execution that way, leave the requirement unproven.
+
+Commit one `submit_patch` that creates all planned operation interfaces, \
+any runtime topology, and the prompt obligations.",
 
         TaskKind::OperationSynthesis => "\
 ## Your task: operation synthesis
 
-Synthesize this operation's program and execution facts: inline \
-transactions, bindings, effects, branches/matches, returns or \
-completion, and the operation's concurrency. Reason about causal \
+Synthesize this operation's program: inline transactions, bindings, \
+effects, branches/matches, returns or completion. Reason about causal \
 behavior, state access, and control flow — not about proof \
-obligations, which come later. If a shared symbol (a schema field, a \
-callee contract, a topic, a transition) must change, file a \
-`dependency_request` rather than editing it. Commit one scoped \
-`submit_patch`.",
+obligations, which come later, and not about runtime topology, which is \
+the coordinator's. An operation declares no concurrency of its own: \
+where its invocations execute and how many run at once are facts about \
+the execution resource, declared in L1. If a shared symbol (a schema \
+field, a callee contract, a topic, a transition, an execution pool) \
+must change, file a `dependency_request` rather than editing it. Commit \
+one scoped `submit_patch`.",
 
         TaskKind::RequirementDiscovery => "\
 ## Your task: requirement discovery

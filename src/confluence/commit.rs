@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::spec::{
-    Effect, ExecutionSemantics, Id, Input, MessageSelector, Model, Operation, OperationConcurrency,
+    Effect, Id, Input, MessageSelector, Model, Operation,
     OperationStep, Revision, Schema, StateMachineSubject, TransactionStep, TransitionSideEffect,
     TypeRef, ValueSource,
 };
@@ -311,20 +311,40 @@ fn apply_mutation(
             }
         }
 
-        Mutation::ReplaceOperationExecution {
-            operation,
-            execution,
-        } => match workspace.operations.get_mut(operation) {
-            Some(draft) => {
-                draft.execution = Some(execution.clone());
-                draft.recompute_stage();
-            }
+        Mutation::PutTopicRuntime { topic, value } => {
+            workspace.runtime.topics.insert(topic.clone(), value.clone());
+        }
 
-            None => diagnostics.push(DraftDiagnostic::new(
-                Some(SymbolKey::Operation(operation.clone())),
-                format!("operation {operation} is not declared; plan its interface first"),
-            )),
-        },
+        Mutation::PutSubscriptionRuntime {
+            operation,
+            input,
+            value,
+        } => {
+            workspace
+                .runtime
+                .subscriptions
+                .entry(operation.clone())
+                .or_default()
+                .insert(input.clone(), value.clone());
+        }
+
+        Mutation::PutExecutionPool { id, value } => {
+            workspace
+                .runtime
+                .execution_pools
+                .insert(id.clone(), value.clone());
+        }
+
+        Mutation::PutRouter { id, value } => {
+            workspace.runtime.routers.insert(id.clone(), value.clone());
+        }
+
+        Mutation::PutStorageLayout { id, value } => {
+            workspace
+                .runtime
+                .storage_layouts
+                .insert(id.clone(), value.clone());
+        }
 
         Mutation::ReplaceOperationRequirements {
             operation,
@@ -362,6 +382,26 @@ fn apply_mutation(
                 SymbolKey::Topic(id) => workspace.topics.remove(id).is_some(),
                 SymbolKey::StateMachine(id) => workspace.state_machines.remove(id).is_some(),
                 SymbolKey::Operation(id) => workspace.operations.remove(id).is_some(),
+
+                SymbolKey::TopicRuntime(id) => workspace.runtime.topics.remove(id).is_some(),
+
+                SymbolKey::SubscriptionRuntime { operation, input } => workspace
+                    .runtime
+                    .subscriptions
+                    .get_mut(operation)
+                    .and_then(|inputs| inputs.remove(input))
+                    .is_some(),
+
+                SymbolKey::ExecutionPool(id) => {
+                    workspace.runtime.execution_pools.remove(id).is_some()
+                }
+
+                SymbolKey::Router(id) => workspace.runtime.routers.remove(id).is_some(),
+
+                SymbolKey::StorageLayout(id) => {
+                    workspace.runtime.storage_layouts.remove(id).is_some()
+                }
+
                 SymbolKey::PromptObligation(id) => {
                     workspace.prompt_obligations.remove(id).is_some()
                 }
@@ -624,6 +664,18 @@ fn check_patch(candidate: &WorkspaceState, patch: &SpecPatch) -> Vec<DraftDiagno
                 check_requirement_roots(candidate, operation, &mut diagnostics);
             }
 
+            Mutation::PutRouter { id, value } => {
+                check_router(candidate, id, value, &mut diagnostics);
+            }
+
+            Mutation::PutSubscriptionRuntime {
+                operation,
+                input,
+                value,
+            } => {
+                check_subscription_runtime(candidate, operation, input, value, &mut diagnostics);
+            }
+
             _ => {}
         }
     }
@@ -667,8 +719,8 @@ fn check_patch(candidate: &WorkspaceState, patch: &SpecPatch) -> Vec<DraftDiagno
 /// operation, whose program was just written. Sibling operations are
 /// omitted — the draft state is not assemblable mid-fanout — so only the
 /// operation-local diagnostics of [`program_local_diagnostics`] are
-/// sound over it. Execution facts, which the reference and dataflow
-/// passes never read, are stubbed when the draft has none yet.
+/// sound over it. The runtime model rides along unchanged: the
+/// program-local passes never read it, and carrying it costs nothing.
 fn probe_model(candidate: &WorkspaceState, operation: &Id) -> Option<Model> {
     let draft = candidate.operations.get(operation)?;
     let program = draft.program.clone()?;
@@ -679,9 +731,6 @@ fn probe_model(candidate: &WorkspaceState, operation: &Id) -> Option<Model> {
         inputs: draft.inputs.clone(),
         program,
         requirements: draft.requirements.clone(),
-        execution: draft.execution.clone().unwrap_or(ExecutionSemantics {
-            concurrency: OperationConcurrency::Unspecified,
-        }),
     };
 
     let mut operations = std::collections::BTreeMap::new();
@@ -695,6 +744,7 @@ fn probe_model(candidate: &WorkspaceState, operation: &Id) -> Option<Model> {
         topics: candidate.topics.clone(),
         state_machines: candidate.state_machines.clone(),
         operations,
+        runtime: (!candidate.runtime.is_empty()).then(|| candidate.runtime.clone()),
     })
 }
 
@@ -1135,6 +1185,132 @@ fn check_program(
                 ));
             }
         }
+    }
+}
+
+/// A router must name a request boundary that exists and a pool the
+/// runtime declares.
+///
+/// Whole-model validation would catch both asynchronously; catching
+/// them at the gate lets the authoring agent fix them in the same
+/// session, which is the point of the draft checks.
+fn check_router(
+    candidate: &WorkspaceState,
+    router: &Id,
+    value: &crate::spec::Router,
+    diagnostics: &mut Vec<DraftDiagnostic>,
+) {
+    check_boundary(
+        candidate,
+        SymbolKey::Router(router.clone()),
+        &value.boundary.operation,
+        &value.boundary.input,
+        BoundaryKind::Request,
+        diagnostics,
+    );
+
+    check_pool(
+        candidate,
+        SymbolKey::Router(router.clone()),
+        &value.pool,
+        diagnostics,
+    );
+}
+
+fn check_subscription_runtime(
+    candidate: &WorkspaceState,
+    operation: &Id,
+    input: &Id,
+    value: &crate::spec::SubscriptionRuntime,
+    diagnostics: &mut Vec<DraftDiagnostic>,
+) {
+    let subject = SymbolKey::SubscriptionRuntime {
+        operation: operation.clone(),
+        input: input.clone(),
+    };
+
+    check_boundary(
+        candidate,
+        subject.clone(),
+        operation,
+        input,
+        BoundaryKind::Subscription,
+        diagnostics,
+    );
+
+    check_pool(candidate, subject, &value.dispatch.pool, diagnostics);
+}
+
+#[derive(Clone, Copy)]
+enum BoundaryKind {
+    Request,
+    Subscription,
+}
+
+impl BoundaryKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Request => "request",
+            Self::Subscription => "subscription",
+        }
+    }
+
+    fn matches(self, input: &Input) -> bool {
+        matches!(
+            (self, input),
+            (Self::Request, Input::Request(_)) | (Self::Subscription, Input::Subscription(_))
+        )
+    }
+}
+
+fn check_boundary(
+    candidate: &WorkspaceState,
+    subject: SymbolKey,
+    operation: &Id,
+    input: &Id,
+    expected: BoundaryKind,
+    diagnostics: &mut Vec<DraftDiagnostic>,
+) {
+    let Some(draft) = candidate.operations.get(operation) else {
+        diagnostics.push(DraftDiagnostic::new(
+            Some(subject),
+            format!("operation {operation} is not declared; plan its interface first"),
+        ));
+
+        return;
+    };
+
+    let Some(declared) = draft.inputs.get(input) else {
+        diagnostics.push(DraftDiagnostic::new(
+            Some(subject),
+            format!("{operation} declares no input {input}"),
+        ));
+
+        return;
+    };
+
+    if !expected.matches(declared) {
+        diagnostics.push(DraftDiagnostic::new(
+            Some(subject),
+            format!(
+                "{input} of {operation} is not a {} input",
+                expected.label()
+            ),
+        ));
+    }
+}
+
+fn check_pool(
+    candidate: &WorkspaceState,
+    subject: SymbolKey,
+    pool: &Id,
+    diagnostics: &mut Vec<DraftDiagnostic>,
+) {
+    if !candidate.runtime.execution_pools.contains_key(pool) {
+        diagnostics.push(DraftDiagnostic::new(
+            Some(subject),
+            format!("execution pool {pool} is not declared"),
+        ));
     }
 }
 

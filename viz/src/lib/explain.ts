@@ -3,7 +3,17 @@
 // duplicates, and proofs. The DSL's enum names are precise but opaque;
 // these are what they mean (CONSEQA_DSL_SEMANTICS.md §8, §9, §13, §17).
 
-import type { Concurrency, IdempotencyGuarantee, Input, ResultType, Topic } from "../types/model";
+import type {
+  DeliverySemantics,
+  IdempotencyGuarantee,
+  Input,
+  MemberAssignment,
+  MemberConcurrency,
+  ResultType,
+  SubscriptionRoutingKey,
+  Topic,
+  TopicOrdering,
+} from "../types/model";
 import { pathText } from "./ids";
 
 export type Tone = "success" | "warning" | "neutral" | "info";
@@ -134,7 +144,7 @@ export function requestIdentity(identity: Extract<Input, { kind: "request" }>["i
   };
 }
 
-export function delivery(semantics: Extract<Input, { kind: "subscription" }>["delivery"]): Explanation {
+export function delivery(semantics: DeliverySemantics): Explanation {
   switch (semantics) {
     case "at_least_once":
       return {
@@ -159,65 +169,97 @@ export function delivery(semantics: Extract<Input, { kind: "subscription" }>["de
   }
 }
 
-export function routing(value: Extract<Input, { kind: "subscription" }>["dispatch"]["routing"]): Explanation {
-  switch (value) {
-    case "by_topic_key":
+/** How subscription deliveries are grouped into semantic routing
+ *  domains. Absence of the routing block is not a mode — it is the
+ *  absence of any member-affinity fact — so callers pass `null`. */
+export function subscriptionRouting(key: SubscriptionRoutingKey | null | undefined): Explanation {
+  if (!key) {
+    return {
+      label: "no member affinity",
+      tone: "warning",
+      summary:
+        "Deliveries execute within the target pool, and nothing relates same-key deliveries to a " +
+        "common member. No round-robin, no random, no single member — simply no fact.",
+    };
+  }
+
+  return {
+    label: "routed by topic key",
+    tone: "info",
+    summary:
+      "Deliveries sharing the topic's key belong to one semantic routing domain. The member " +
+      "assignment maps that domain onto a pool member; the pool's member concurrency decides " +
+      "whether invocations there can overlap.",
+  };
+}
+
+/** How a routing domain is mapped onto a pool member. */
+export function memberAssignment(value: MemberAssignment): Explanation {
+  switch (value.kind) {
+    case "consistent_hash":
       return {
-        label: "same-key deliveries share a lane",
-        tone: "info",
+        label: "consistent-hash assignment",
+        tone: "success",
         summary:
-          "Deliveries sharing the topic's key enter one logical lane, in delivery order. With a " +
-          "keyed topic this keeps same-key invocations together; the lane's concurrency decides " +
-          "whether they can overlap.",
+          "Equal routing domains are owned by the same pool member during a stable ownership " +
+          "epoch, and ownership transfers safely when membership changes. Different domains may " +
+          "share a member.",
       };
-    case "single_lane":
-      return {
-        label: "every delivery in one lane",
-        tone: "info",
-        summary: "All deliveries of this subscription enter one logical lane, in delivery order.",
-      };
-    case "unconstrained":
-      return {
-        label: "no lane affinity",
-        tone: "warning",
-        summary: "Related deliveries may be dispatched to different lanes, in any order.",
-      };
-    case "unspecified":
-      return { label: "routing unspecified", tone: "warning", summary: "No lane-affinity fact is available." };
   }
 }
 
-export function laneConcurrency(value: Concurrency): Explanation {
+/** Request routing: a semantic key evaluated against the request
+ *  payload, or nothing at all. */
+export function requestRouting(key: string[][] | null | undefined): Explanation {
+  if (!key || key.length === 0) {
+    return {
+      label: "no member affinity",
+      tone: "warning",
+      summary:
+        "Requests through this boundary execute within the target pool, and nothing relates " +
+        "same-key requests to a common member.",
+    };
+  }
+
+  return {
+    label: `routed by ${key.map((path) => path.join(".")).join(", ")}`,
+    tone: "info",
+    summary:
+      "Requests whose values at these fields are equal belong to one semantic routing domain. " +
+      "The key names a domain, never a worker, shard, host, or storage partition.",
+  };
+}
+
+export function memberConcurrency(value: MemberConcurrency): Explanation {
   switch (value.kind) {
     case "bounded":
       return value.value === 1
         ? {
-            label: "one invocation at a time per lane",
+            label: "one invocation at a time per member",
             tone: "success",
-            summary: "Invocations in one lane never overlap, so a later delivery cannot overtake an earlier one.",
+            summary:
+              "A pool member runs at most one invocation at once, across every workload assigned " +
+              "to it. With a routing key that matches, same-key invocations cannot overlap.",
           }
         : {
-            label: `up to ${value.value} at a time per lane`,
+            label: `up to ${value.value} at a time per member`,
             tone: "warning",
-            summary: "Invocations in one lane may overlap, so a later delivery may overtake an earlier one.",
+            summary:
+              "A pool member may run several invocations at once, so same-key invocations may " +
+              "overlap however they are routed.",
           };
     case "unbounded":
-      return { label: "unbounded lane concurrency", tone: "warning", summary: "Invocations in one lane may overlap without limit." };
+      return {
+        label: "unbounded member concurrency",
+        tone: "warning",
+        summary: "No finite member-level execution bound may be assumed.",
+      };
     case "unspecified":
-      return { label: "lane concurrency unspecified", tone: "warning", summary: "No per-lane concurrency fact is available." };
-  }
-}
-
-export function operationConcurrency(value: Concurrency): Explanation {
-  switch (value.kind) {
-    case "bounded":
-      return value.value === 1
-        ? { label: "one invocation at a time", tone: "success", summary: "At most one invocation of the operation is active at any moment, whatever triggered it." }
-        : { label: `up to ${value.value} concurrent invocations`, tone: "neutral", summary: "Invocations may overlap, up to the bound." };
-    case "unbounded":
-      return { label: "unbounded concurrency", tone: "neutral", summary: "No global limit on simultaneously active invocations." };
-    case "unspecified":
-      return { label: "concurrency unspecified", tone: "warning", summary: "No global concurrency fact is available." };
+      return {
+        label: "member concurrency unspecified",
+        tone: "warning",
+        summary: "No usable fact about simultaneous execution on one pool member.",
+      };
   }
 }
 
@@ -238,10 +280,10 @@ export function messageIdentity(identity: Topic["message_identity"]): Explanatio
   };
 }
 
-export function topicOrdering(ordering: Topic["ordering"]): Explanation {
+export function topicOrdering(ordering: TopicOrdering): Explanation {
   switch (ordering.kind) {
     case "keyed":
-      return { label: "ordered per key", tone: "success", summary: "Messages sharing the mapped key are delivered in publication order; different keys are unordered relative to each other." };
+      return { label: "ordered per key", tone: "success", summary: "The transport delivers messages sharing the mapped key in publication order; different keys are unordered relative to each other. This is a realization fact, not a property of the logical channel." };
     case "global":
       return { label: "globally ordered", tone: "success", summary: "Every message is part of one ordered sequence." };
     case "unordered":

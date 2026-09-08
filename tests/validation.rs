@@ -11,8 +11,10 @@ use conseqa::{
         Arm, Branch, Condition, Derivation, Effect, EstablishTransactionOutput, ExecuteEffect,
         FieldPath, Id, IdempotencyGuarantee, Input, Literal, MessageIdentity, MessageSelector,
         Model, OperationBlock, OperationStep, RequestEffect, RequestIdentity, RequestTarget,
-        ResultOutcome, ResultVariant, RetrySemantics, Return, Schema, SchemaFragment, SelectorValue,
-        StateTransition, StepHop, StepLocation, TopicOrdering, Transaction, TransactionIsolation,
+        DataObjectRef, ExecutionPool, MemberAssignment, MemberConcurrency, OperationInputRef,
+        RequestRouting, ResultOutcome, ResultVariant, RetrySemantics, Return, Router, RuntimeModel,
+        Schema, SchemaFragment, SelectorValue, StateTransition, StepHop, StepLocation,
+        StorageLayout, SubscriptionRoutingKey, TopicOrdering, Transaction, TransactionIsolation,
         TransactionStep, TransitionEffectIntent, ValueRef, ValueSource,
     },
 };
@@ -81,6 +83,18 @@ fn fixture_path(name: &str) -> PathBuf {
         .join("tests")
         .join("fixtures")
         .join(name)
+}
+
+/// The order-events topic's runtime, for tests that perturb the keyed
+/// transport domain.
+fn topic_runtime(model: &mut Model) -> &mut conseqa::spec::TopicRuntime {
+    model
+        .runtime
+        .as_mut()
+        .expect("the fixture declares a runtime model")
+        .topics
+        .get_mut(&id("topic.order_events"))
+        .expect("the order-events topic declares a runtime")
 }
 
 fn load_flash_checkout() -> Model {
@@ -375,9 +389,7 @@ fn rejects_publication_schema_not_carried_by_topic() {
 fn rejects_keyed_topic_missing_schema_mapping() {
     let mut model = load_flash_checkout();
 
-    let topic = model.topics.get_mut(&id("topic.order_events")).unwrap();
-
-    let TopicOrdering::Keyed(key) = &mut topic.ordering else {
+    let TopicOrdering::Keyed(key) = &mut topic_runtime(&mut model).ordering else {
         panic!("expected keyed topic");
     };
 
@@ -398,9 +410,7 @@ fn rejects_keyed_topic_missing_schema_mapping() {
 fn rejects_topic_key_for_schema_not_on_topic() {
     let mut model = load_flash_checkout();
 
-    let topic = model.topics.get_mut(&id("topic.order_events")).unwrap();
-
-    let TopicOrdering::Keyed(key) = &mut topic.ordering else {
+    let TopicOrdering::Keyed(key) = &mut topic_runtime(&mut model).ordering else {
         panic!("expected keyed topic");
     };
 
@@ -2613,4 +2623,310 @@ fn program_local_diagnostics_do_not_fault_a_request_to_an_absent_operation() {
                 && !diagnostic.message.contains("input.absent")),
         "cross-operation references must be left to the gate's other checks:\n{diagnostics:#?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// L1 — runtime topology
+//
+// Every L1 declaration hangs off an L0 one, and validation checks those
+// anchors, the pools routing terminates at, and the field paths keys
+// are written against. Whether the declared topology *proves* anything
+// is verification's judgment, never validation's.
+// ---------------------------------------------------------------------------
+
+fn runtime(model: &mut Model) -> &mut RuntimeModel {
+    model.runtime.as_mut().expect("the fixture declares a runtime")
+}
+
+#[test]
+fn an_l0_only_model_is_structurally_valid() {
+    // The refactor's first acceptance criterion: L0 stands alone.
+    let mut model = load_flash_checkout();
+
+    model.runtime = None;
+
+    assert!(validation::validate(&model).is_empty());
+}
+
+#[test]
+fn a_router_must_name_a_request_boundary() {
+    let mut model = load_flash_checkout();
+
+    runtime(&mut model).routers.insert(
+        id("router.wrong_kind"),
+        Router {
+            boundary: OperationInputRef {
+                operation: id("operation.reserve_inventory"),
+                input: id("input.reserve_inventory.created"),
+            },
+            pool: id("pool.checkout_api"),
+            routing: None,
+        },
+    );
+
+    let errors = validation::validate(&model);
+
+    assert!(
+        errors.iter().any(|error| matches!(
+            error,
+            ValidationError::InvalidInputKind { input, .. }
+                if input == &id("input.reserve_inventory.created")
+        )),
+        "{errors:#?}"
+    );
+}
+
+#[test]
+fn a_router_key_must_be_non_empty_and_resolve_against_the_request_schema() {
+    let mut model = load_flash_checkout();
+
+    runtime(&mut model)
+        .routers
+        .get_mut(&id("router.create_order"))
+        .expect("the fixture routes create_order")
+        .routing = Some(RequestRouting {
+        key: Vec::new(),
+        member_assignment: MemberAssignment::ConsistentHash,
+    });
+
+    assert!(
+        validation::validate(&model)
+            .iter()
+            .any(|error| matches!(error, ValidationError::EmptyRoutingKey { .. }))
+    );
+
+    runtime(&mut model)
+        .routers
+        .get_mut(&id("router.create_order"))
+        .unwrap()
+        .routing = Some(RequestRouting {
+        key: vec![path(&["not_a_field"])],
+        member_assignment: MemberAssignment::ConsistentHash,
+    });
+
+    assert!(
+        validation::validate(&model).iter().any(|error| matches!(
+            error,
+            ValidationError::InvalidFieldPath { subject, .. }
+                if subject == &id("router.create_order")
+        ))
+    );
+}
+
+#[test]
+fn one_request_boundary_admits_at_most_one_router() {
+    let mut model = load_flash_checkout();
+
+    runtime(&mut model).routers.insert(
+        id("router.create_order_again"),
+        Router {
+            boundary: OperationInputRef {
+                operation: id("operation.create_order"),
+                input: id("input.create_order.request"),
+            },
+            pool: id("pool.checkout_api"),
+            routing: None,
+        },
+    );
+
+    assert!(
+        validation::validate(&model).iter().any(|error| matches!(
+            error,
+            ValidationError::DuplicateRouterForBoundary { first, second, .. }
+                if first == &id("router.create_order")
+                    && second == &id("router.create_order_again")
+        ))
+    );
+}
+
+#[test]
+fn routing_must_terminate_at_a_declared_pool() {
+    let mut model = load_flash_checkout();
+
+    runtime(&mut model)
+        .routers
+        .get_mut(&id("router.create_order"))
+        .unwrap()
+        .pool = id("pool.missing");
+
+    assert!(
+        validation::validate(&model).iter().any(|error| matches!(
+            error,
+            ValidationError::UnknownReference { reference, expected, .. }
+                if reference == &id("pool.missing")
+                    && *expected == ReferenceKind::ExecutionPool
+        ))
+    );
+}
+
+#[test]
+fn topic_key_routing_requires_a_keyed_topic_domain() {
+    // `topic_key` names the domain the topic runtime establishes, so
+    // there has to be one. This is a validation error, not a silent
+    // unproven verdict, because the declaration would otherwise refer
+    // to nothing.
+    let mut model = load_flash_checkout();
+
+    runtime(&mut model)
+        .topics
+        .get_mut(&id("topic.order_events"))
+        .unwrap()
+        .ordering = TopicOrdering::Unordered;
+
+    assert!(
+        validation::validate(&model).iter().any(|error| matches!(
+            error,
+            ValidationError::TopicKeyRoutingWithoutKeyDomain { topic, .. }
+                if topic == &id("topic.order_events")
+        ))
+    );
+}
+
+#[test]
+fn a_storage_layout_must_name_an_object_and_carry_a_resolving_partition_key() {
+    let mut model = load_flash_checkout();
+
+    runtime(&mut model)
+        .storage_layouts
+        .get_mut(&id("layout.order"))
+        .expect("the fixture lays out the order object")
+        .partition_key = Vec::new();
+
+    assert!(
+        validation::validate(&model)
+            .iter()
+            .any(|error| matches!(error, ValidationError::EmptyPartitionKey { .. }))
+    );
+
+    runtime(&mut model)
+        .storage_layouts
+        .get_mut(&id("layout.order"))
+        .unwrap()
+        .partition_key = vec![path(&["not_a_field"])];
+
+    assert!(
+        validation::validate(&model).iter().any(|error| matches!(
+            error,
+            ValidationError::InvalidFieldPath { subject, .. } if subject == &id("layout.order")
+        ))
+    );
+
+    runtime(&mut model).storage_layouts.insert(
+        id("layout.absent"),
+        StorageLayout {
+            object: DataObjectRef {
+                data_model: id("data.checkout"),
+                object: id("object.missing"),
+            },
+            partition_key: vec![path(&["order_id"])],
+        },
+    );
+
+    assert!(
+        validation::validate(&model).iter().any(|error| matches!(
+            error,
+            ValidationError::UnknownReference { reference, expected, .. }
+                if reference == &id("object.missing")
+                    && *expected == ReferenceKind::DataObject
+        ))
+    );
+}
+
+#[test]
+fn one_data_object_admits_at_most_one_storage_layout() {
+    let mut model = load_flash_checkout();
+
+    runtime(&mut model).storage_layouts.insert(
+        id("layout.order_again"),
+        StorageLayout {
+            object: DataObjectRef {
+                data_model: id("data.checkout"),
+                object: id("object.order"),
+            },
+            partition_key: vec![path(&["order_id"])],
+        },
+    );
+
+    assert!(
+        validation::validate(&model).iter().any(|error| matches!(
+            error,
+            ValidationError::DuplicateStorageLayoutForObject { first, second, .. }
+                if first == &id("layout.order") && second == &id("layout.order_again")
+        ))
+    );
+}
+
+#[test]
+fn l1_identifiers_share_the_one_global_namespace() {
+    let mut model = load_flash_checkout();
+
+    let pool = runtime(&mut model)
+        .execution_pools
+        .remove(&id("pool.checkout_api"))
+        .expect("the fixture declares it");
+
+    // A pool taking a topic's ID collides, exactly as two topics would.
+    runtime(&mut model)
+        .execution_pools
+        .insert(id("topic.order_events"), pool);
+
+    assert!(
+        validation::validate(&model).iter().any(|error| matches!(
+            error,
+            ValidationError::DuplicateId { id: duplicate, .. }
+                if duplicate == &id("topic.order_events")
+        ))
+    );
+}
+
+#[test]
+fn a_subscription_runtime_must_name_a_subscription_boundary() {
+    let mut model = load_flash_checkout();
+
+    let dispatch = conseqa::spec::SubscriptionDispatch {
+        pool: id("pool.order_workers"),
+        routing: Some(conseqa::spec::SubscriptionRouting {
+            key: SubscriptionRoutingKey::TopicKey,
+            member_assignment: MemberAssignment::ConsistentHash,
+        }),
+    };
+
+    runtime(&mut model)
+        .subscriptions
+        .entry(id("operation.create_order"))
+        .or_default()
+        .insert(
+            id("input.create_order.request"),
+            conseqa::spec::SubscriptionRuntime {
+                delivery: conseqa::spec::DeliverySemantics::AtLeastOnce,
+                dispatch,
+            },
+        );
+
+    assert!(
+        validation::validate(&model).iter().any(|error| matches!(
+            error,
+            ValidationError::InvalidInputKind { input, .. }
+                if input == &id("input.create_order.request")
+        ))
+    );
+}
+
+#[test]
+fn a_bounded_member_concurrency_of_zero_is_unrepresentable() {
+    // `NonZeroU32` carries the rule; there is nothing for validation to
+    // check, and nothing an author can write that would need checking.
+    let json = serde_json::to_string(&ExecutionPool {
+        member_concurrency: MemberConcurrency::Bounded(
+            std::num::NonZeroU32::new(1).expect("non-zero"),
+        ),
+    })
+    .expect("serializes");
+
+    assert_eq!(json, r#"{"member_concurrency":{"kind":"bounded","value":1}}"#);
+
+    let zero: Result<ExecutionPool, _> =
+        serde_json::from_str(r#"{"member_concurrency":{"kind":"bounded","value":0}}"#);
+
+    assert!(zero.is_err(), "a bound of zero must not deserialize");
 }

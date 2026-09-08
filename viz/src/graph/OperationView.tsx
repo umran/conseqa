@@ -9,12 +9,20 @@ import { Text } from "@cloudflare/kumo/components/text";
 import { ArrowSquareOutIcon, CaretRightIcon, GraphIcon } from "@phosphor-icons/react";
 import type { CSSProperties, ComponentPropsWithRef, ReactElement, ReactNode } from "react";
 
-import { commitGuarantee, delivery, isolation, laneConcurrency, requestIdentity, routing } from "../lib/explain";
+import {
+  commitGuarantee,
+  delivery,
+  isolation,
+  memberAssignment,
+  memberConcurrency,
+  requestIdentity,
+  subscriptionRouting,
+} from "../lib/explain";
 import { pathText, shortId } from "../lib/ids";
 import { effectDef, effectSummary, locationLabel, operationTransactions, walkProgram, type StepHop } from "../lib/index";
 import { propertyMatchesRequirement, worstStatus } from "../lib/obligations";
 import { hashes } from "../lib/route";
-import { concurrencyText, conditionText, predicateText } from "../lib/text";
+import { conditionText, predicateText } from "../lib/text";
 import { useApp, type DetailContext } from "../state/AppState";
 import { Fact, FactBadge, IdLink, KeyComponents, Mono, Muted, RefText, SectionCard, StatusBadge, StatusChips, selectableRow } from "../panels/parts";
 import type { Effect, Id, Operation, OperationBlock, RequirementKind, TransactionStep, TransitionSideEffect } from "../types/model";
@@ -470,7 +478,30 @@ function RequirementsTable({ id, op }: { id: Id; op: Operation }) {
   );
 }
 
-function InputsTable({ op }: { op: Operation }) {
+/** The realization facts for one subscription boundary, drawn from L1.
+ *  With no declared runtime there is nothing to say beyond the
+ *  epistemic default. */
+function SubscriptionFacts({ opId, inputId }: { opId: Id; inputId: Id }) {
+  const { model } = useApp();
+  const runtime = model.runtime?.subscriptions?.[opId]?.[inputId];
+
+  if (!runtime) return <FactBadge fact={delivery("unspecified")} />;
+
+  const pool = model.runtime?.execution_pools?.[runtime.dispatch.pool];
+
+  return (
+    <>
+      <FactBadge fact={delivery(runtime.delivery)} />
+      <FactBadge fact={subscriptionRouting(runtime.dispatch.routing?.key)} />
+      {runtime.dispatch.routing && (
+        <FactBadge fact={memberAssignment(runtime.dispatch.routing.member_assignment)} />
+      )}
+      {pool && <FactBadge fact={memberConcurrency(pool.member_concurrency)} />}
+    </>
+  );
+}
+
+function InputsTable({ opId, op }: { opId: Id; op: Operation }) {
   const { selection, select } = useApp();
   const inputs = Object.entries(op.inputs);
 
@@ -527,11 +558,7 @@ function InputsTable({ op }: { op: Operation }) {
                       </span>
                     </>
                   ) : (
-                    <>
-                      <FactBadge fact={delivery(input.delivery)} />
-                      <FactBadge fact={routing(input.dispatch.routing)} />
-                      <FactBadge fact={laneConcurrency(input.dispatch.lane_concurrency)} />
-                    </>
+                    <SubscriptionFacts opId={opId} inputId={inputId} />
                   )}
                 </span>
               </Table.Cell>
@@ -580,7 +607,6 @@ export function OperationView({ id }: { id: string }) {
           {op.description && <p className="max-w-3xl text-sm leading-relaxed text-kumo-default">{op.description}</p>}
           <dl className="flex flex-wrap gap-x-8 gap-y-3">
             <Fact label="service"><IdLink id={op.service}>{shortId(op.service)}</IdLink></Fact>
-            <Fact label="concurrency"><Badge variant="neutral">{concurrencyText(op.execution.concurrency)}</Badge></Fact>
             <Fact label="transactions">{transactionCount}</Fact>
             <Fact label="program steps">{stepCount}</Fact>
             {machines.length > 0 && (
@@ -604,7 +630,7 @@ export function OperationView({ id }: { id: string }) {
 
         <SectionCard title="Inputs" count={inputCount} hint="what starts an invocation">
           <div className="overflow-x-auto">
-            <InputsTable op={op} />
+            <InputsTable opId={id} op={op} />
           </div>
         </SectionCard>
 

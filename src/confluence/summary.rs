@@ -118,11 +118,16 @@ pub fn derive_summaries(
     model
         .operations
         .iter()
-        .map(|(id, operation)| (id.clone(), derive_one(id, operation, verification)))
+        .map(|(id, operation)| (id.clone(), derive_one(model, id, operation, verification)))
         .collect()
 }
 
-fn derive_one(id: &Id, operation: &Operation, verification: &VerificationReport) -> OperationSummary {
+fn derive_one(
+    model: &Model,
+    id: &Id,
+    operation: &Operation,
+    verification: &VerificationReport,
+) -> OperationSummary {
     let interface_hash = SemanticHash::of(&OperationInterfaceDraft {
         service: operation.service.clone(),
         description: operation.description.clone(),
@@ -149,7 +154,7 @@ fn derive_one(id: &Id, operation: &Operation, verification: &VerificationReport)
 
                 Input::Subscription(subscription) => InputContract::Subscription {
                     topic: subscription.topic.clone(),
-                    delivery: subscription.delivery,
+                    delivery: model.delivery(id, input_id),
                 },
             };
 

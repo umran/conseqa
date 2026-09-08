@@ -7,12 +7,18 @@ export type FieldPath = string[];
 
 export interface Model {
   revision: number;
+
+  // L0 — the abstract application machine.
   services: Record<Id, Service>;
   schemas: Record<Id, Schema>;
   data_models: Record<Id, DataModel>;
   topics: Record<Id, Topic>;
   state_machines: Record<Id, StateMachine>;
   operations: Record<Id, Operation>;
+
+  // L1 — one runtime realization of it. Absent means no runtime facts
+  // are declared, never that the realization lacks these properties.
+  runtime?: RuntimeModel | null;
 }
 
 export interface Service {
@@ -66,9 +72,10 @@ export type MessageIdentity =
   | { kind: "unspecified" }
   | { kind: "keyed"; mapping: Record<Id, FieldPath[]> };
 
+/** A logical message channel. Transport ordering is a realization
+ *  fact and lives in `RuntimeModel.topics`. */
 export interface Topic {
   messages: Id[];
-  ordering: TopicOrdering;
   message_identity: MessageIdentity;
 }
 
@@ -173,11 +180,6 @@ export type Effect =
   | ({ kind: "request" } & RequestEffect)
   | ({ kind: "external" } & ExternalEffect);
 
-export type Concurrency =
-  | { kind: "unspecified" }
-  | { kind: "bounded"; value: number }
-  | { kind: "unbounded" };
-
 export type RequestIdentity =
   | { kind: "unspecified" }
   | { kind: "keyed"; fields: FieldPath[] };
@@ -186,21 +188,9 @@ export type MessageSelector = { kind: "all" } | { kind: "only"; schemas: Id[] };
 
 export type DeliverySemantics = "unspecified" | "at_most_once" | "at_least_once";
 
-export type DispatchRouting =
-  | "unspecified"
-  | "unconstrained"
-  | "single_lane"
-  | "by_topic_key";
-
 export type Input =
   | { kind: "request"; schema: Id; identity: RequestIdentity; result: ResultType }
-  | {
-      kind: "subscription";
-      topic: Id;
-      messages: MessageSelector;
-      delivery: DeliverySemantics;
-      dispatch: { routing: DispatchRouting; lane_concurrency: Concurrency };
-    };
+  | { kind: "subscription"; topic: Id; messages: MessageSelector };
 
 export type Literal =
   | { kind: "string"; value: string }
@@ -308,5 +298,68 @@ export interface Operation {
   inputs: Record<Id, Input>;
   program: OperationBlock;
   requirements: OperationRequirements;
-  execution: { concurrency: Concurrency };
+}
+
+// ---------------------------------------------------------------------
+// L1 — runtime topology and realization semantics
+// ---------------------------------------------------------------------
+
+export interface RuntimeModel {
+  topics?: Record<Id, TopicRuntime>;
+  subscriptions?: Record<Id, Record<Id, SubscriptionRuntime>>;
+  execution_pools?: Record<Id, ExecutionPool>;
+  routers?: Record<Id, Router>;
+  storage_layouts?: Record<Id, StorageLayout>;
+}
+
+export interface TopicRuntime {
+  ordering: TopicOrdering;
+}
+
+export interface SubscriptionRuntime {
+  delivery: DeliverySemantics;
+  dispatch: SubscriptionDispatch;
+}
+
+/** Absence of `routing` is not a routing mode: it is the absence of any
+ *  member-affinity fact. */
+export interface SubscriptionDispatch {
+  pool: Id;
+  routing?: SubscriptionRouting | null;
+}
+
+export interface SubscriptionRouting {
+  key: SubscriptionRoutingKey;
+  member_assignment: MemberAssignment;
+}
+
+export type SubscriptionRoutingKey = "topic_key";
+
+export interface Router {
+  boundary: { operation: Id; input: Id };
+  pool: Id;
+  routing?: RequestRouting | null;
+}
+
+export interface RequestRouting {
+  key: FieldPath[];
+  member_assignment: MemberAssignment;
+}
+
+export type MemberAssignment = { kind: "consistent_hash" };
+
+/** A logical population of interchangeable runtime members. Carries no
+ *  cardinality: member counts are external scenario inputs. */
+export interface ExecutionPool {
+  member_concurrency: MemberConcurrency;
+}
+
+export type MemberConcurrency =
+  | { kind: "unspecified" }
+  | { kind: "bounded"; value: number }
+  | { kind: "unbounded" };
+
+export interface StorageLayout {
+  object: { data_model: Id; object: Id };
+  partition_key: FieldPath[];
 }
