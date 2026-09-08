@@ -606,6 +606,7 @@ fn build_backend(backend: Backend, program: Option<String>) -> Arc<dyn AgentBack
 #[derive(Default)]
 struct DesignState {
     running: AtomicBool,
+    started_at_revision: Mutex<Option<u64>>,
     last_report: Mutex<Option<RunReport>>,
 }
 
@@ -680,11 +681,14 @@ impl DesignLauncher for DaemonDesignLauncher {
                 out_dir: run_out,
                 analysis_timeout: Duration::from_secs(180),
                 max_iterations: 8,
+                objective,
             },
         );
 
         let started_revision = engine.head_revision().0;
         let state = Arc::clone(&self.state);
+
+        *state.started_at_revision.lock() = Some(started_revision);
 
         tokio::spawn(async move {
             tracing::info!("concurrent design workflow started");
@@ -702,16 +706,31 @@ impl DesignLauncher for DaemonDesignLauncher {
             state.running.store(false, Ordering::SeqCst);
         });
 
-        let _ = objective;
-
         Ok(serde_json::json!({
             "launched": true,
             "backend": self.backend.name(),
             "max_agents": self.max_agents,
             "started_at_revision": started_revision,
-            "note": "Worker agents are running in the background against this shared model. \
-                     Watch the head advance with task_context and read the growing model \
-                     with the read tools; results also land in the design output directory.",
+            "note": "One worker per unfinished operation is now running in the background \
+                     against this shared model. Do not submit patches while the run is \
+                     active — poll spec_status, whose design block shows running and, when \
+                     finished, the run's report. Then call open_project again to refresh \
+                     your session to the new head before reading or patching.",
+        }))
+    }
+
+    fn status(&self) -> Option<serde_json::Value> {
+        let last_run = self
+            .state
+            .last_report
+            .lock()
+            .as_ref()
+            .and_then(|report| serde_json::to_value(report).ok());
+
+        Some(serde_json::json!({
+            "running": self.state.running.load(Ordering::SeqCst),
+            "started_at_revision": *self.state.started_at_revision.lock(),
+            "last_run": last_run,
         }))
     }
 }

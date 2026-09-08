@@ -74,23 +74,51 @@ The authoring loop:
 2. Learn the DSL from this server, not from source code: dsl_guide \
 explains the semantics by topic; dsl_reference gives the exact JSON \
 shapes plus a worked program example.
-3. Build incrementally with submit_patch — many small typed patches \
-are normal. The commit gate rejects a structurally broken patch with \
-precise diagnostics; fix the patch and resubmit in the same session.
-4. spec_status is your feedback loop: it reports assembly gaps while \
+3. Author the shared skeleton yourself with submit_patch: services, \
+schemas, data models, topics, state machines, and one interface per \
+planned operation (its id, service, inputs, and request or \
+subscription contracts). Many small typed patches are normal. The \
+commit gate rejects a structurally broken patch with precise \
+diagnostics; fix it and resubmit in the same session.
+4. Only once that skeleton is complete for the whole system, hand the \
+operation programs to request_design. It runs one coding agent per \
+operation still missing a program, concurrently, each committing \
+through the same gate. This is the intended division of labor: you \
+establish the interfaces callers reason against, the fanout writes the \
+program bodies in parallel. Do not synthesize operation programs one \
+at a time yourself when the system has several — that is what the \
+fanout is for, and it is far slower without it.
+
+Fan out at the right moment, which means neither early nor late. Every \
+worker writes its program against the skeleton as it stands when the \
+run starts, so a missing schema, topic, or operation interface is a \
+mistake made simultaneously by all of them, and one that costs a full \
+round of concurrent sessions to discover. Before calling, check \
+spec_status: `skeleton.ready_to_fan_out` must be true, and the \
+operations it lists must be the whole system you intend to build, not \
+the part you have gotten to so far. The server refuses a run whose \
+skeleton has unresolved references, but it cannot know which \
+operations you still mean to declare — that judgment is yours, so make \
+it deliberately.
+5. While a run is active, do not submit patches: poll spec_status, \
+whose design block reports running and then the finished run's report. \
+When it finishes, call open_project again to refresh your session to \
+the new head.
+6. spec_status is your feedback loop throughout: assembly gaps while \
 drafting, validation errors, or the verification verdict with exactly \
-which obligations are proven and which are not.
-5. export_spec delivers the result: the canonical YAML, the \
+which obligations are proven and which are not. Fix what it names — \
+narrowly, yourself, or with another request_design pass.
+7. export_spec delivers the result: the canonical YAML, the \
 verification report, and a self-contained interactive HTML \
 visualization, written to a directory you choose — show these to the \
 user.
-6. request_design fans out concurrent coding agents to build or \
-repair a large model in the background.
 
-Invariants: requirements are obligations, not guarantees; never \
-weaken or remove a requirement to make verification pass; prefer \
-unknown/unspecified over inventing a guarantee the design does not \
-support. Correctness verdicts come only from the checker.";
+Author an operation program yourself only for a one-off change, or \
+when a single operation remains. Invariants: requirements are \
+obligations, not guarantees; never weaken or remove a requirement to \
+make verification pass; prefer unknown/unspecified over inventing a \
+guarantee the design does not support. Correctness verdicts come only \
+from the checker.";
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ReadSymbolParams {
@@ -228,6 +256,13 @@ pub trait DesignLauncher: Send + Sync {
         engine: ConfluenceEngine,
         objective: Option<String>,
     ) -> Result<serde_json::Value, String>;
+
+    /// Whether a run is in flight and the last one's report, for
+    /// `spec_status` to surface. `None` when the orchestrator tracks no
+    /// such state.
+    fn status(&self) -> Option<serde_json::Value> {
+        None
+    }
 }
 
 /// The active project the API key is working on. Established by
@@ -910,13 +945,24 @@ impl ConseqaMcp {
     }
 
     #[tool(
-        description = "Launch the concurrent multi-agent design workflow against this shared \
-                       model: independent coding-agent sessions fan out to synthesize and \
-                       repair operations in parallel, each committing through the same gate. \
-                       Use this to build out or complete an architecture faster than editing \
-                       one operation at a time. Returns immediately; the workers run in the \
-                       background — watch the head advance (task_context) and read the growing \
-                       model with the read tools. One workflow runs at a time."
+        description = "Fan out concurrent coding agents to write the operation programs. \
+                       This is the normal way to build a system with more than one \
+                       operation, and is far faster than synthesizing them yourself one at \
+                       a time. Author the skeleton FIRST and completely — services, schemas, \
+                       data models, topics, machines, and an interface per planned \
+                       operation — then call this: it skips decomposition when interfaces \
+                       already exist and runs one agent per operation still missing a \
+                       program, concurrently, each committing through the same gate. It \
+                       also repairs operations the checker leaves unproven. Do not call it \
+                       early: workers write against the skeleton as it stands at launch, so \
+                       anything missing becomes every worker's mistake at once. A run whose \
+                       skeleton has unresolved references is refused; check \
+                       spec_status.skeleton.ready_to_fan_out first, and confirm the \
+                       operations it reports are the whole system you intend. Optionally \
+                       pass an objective to steer the workers. Returns immediately; poll \
+                       spec_status (its design block) rather than patching while it runs, \
+                       then call open_project to refresh your session to the new head. One \
+                       workflow runs at a time."
     )]
     async fn request_design(
         &self,
@@ -937,8 +983,69 @@ impl ConseqaMcp {
             }));
         };
 
+        // The skeleton is the contract every worker writes against, so
+        // an incoherent one is refused here rather than dispatched to
+        // all of them at once.
+        let head = engine.head_snapshot();
+        let gaps = super::commit::skeleton_diagnostics(&head.workspace);
+
+        if !gaps.is_empty() {
+            return json_error(serde_json::json!({
+                "launched": false,
+                "error": "the skeleton is not ready to fan out",
+                "skeleton_gaps": gaps,
+                "guidance": "Every worker writes its operation program against these \
+                             declarations, so fanning out now would send all of them at an \
+                             incoherent skeleton. Resolve each gap with submit_patch — \
+                             spec_status reports the same list under `skeleton` — then call \
+                             request_design again.",
+            }));
+        }
+
+        let no_interfaces = head.workspace.operations.is_empty();
+
+        let pending: Vec<String> = head
+            .workspace
+            .operations
+            .iter()
+            .filter(|(_, draft)| draft.program.is_none() || draft.execution.is_none())
+            .map(|(id, _)| id.to_string())
+            .collect();
+
         match launcher.launch(engine, params.0.objective) {
-            Ok(value) => json_result(value),
+            Ok(mut value) => {
+                // Naming the operations makes a premature fanout
+                // visible at once: a list short of the intended system
+                // means the skeleton was handed over half-built.
+                if let Some(object) = value.as_object_mut() {
+                    let (operations, check) = if no_interfaces {
+                        (
+                            serde_json::Value::Null,
+                            "No interfaces are declared, so this run decomposes the prompt \
+                             itself before synthesizing. To keep control of the contracts, \
+                             cancel and author the skeleton first.",
+                        )
+                    } else if pending.is_empty() {
+                        (
+                            serde_json::json!([]),
+                            "Every operation already has a program, so this run verifies and \
+                             repairs rather than synthesizing.",
+                        )
+                    } else {
+                        (
+                            serde_json::json!(pending),
+                            "These are the operations receiving a worker. If that is not the \
+                             whole system you intended, the skeleton went out too early.",
+                        )
+                    };
+
+                    object.insert("operations".to_string(), operations);
+                    object.insert("check".to_string(), serde_json::json!(check));
+                }
+
+                json_result(value)
+            }
+
             Err(error) => json_error(serde_json::json!({
                 "launched": false,
                 "error": error,
@@ -1037,10 +1144,13 @@ impl ConseqaMcp {
                 "project": info.name,
                 "created": true,
                 "note": "New project created and now active. Its prompt is in task_context. \
-                         Learn the DSL with dsl_guide and dsl_reference, build \
-                         incrementally with submit_patch, check spec_status as you go, and \
-                         export_spec to deliver — or call request_design to fan out \
-                         concurrent agents instead.",
+                         Learn the DSL with dsl_guide and dsl_reference, then author the \
+                         skeleton with submit_patch — services, schemas, data models, \
+                         topics, machines, and one interface per planned operation — and \
+                         call request_design to write the operation programs concurrently, \
+                         one agent per operation. (request_design on an empty project \
+                         decomposes as well, if you would rather hand it the whole build.) \
+                         Check spec_status as you go, and export_spec to deliver.",
             })),
 
             Err(error) => json_error(serde_json::json!({
@@ -1115,10 +1225,36 @@ impl ConseqaMcp {
             })
             .collect();
 
-        let analysis = settled_analysis(&engine, head.revision).await;
+        // A design run is reported before waiting on analysis: while
+        // workers are committing, the head moves under us and the
+        // caller's next step is to keep polling, not to read a verdict.
+        let design = self.launcher.as_ref().and_then(|launcher| launcher.status());
 
-        json_result(serde_json::json!({
+        let running = design
+            .as_ref()
+            .and_then(|status| status.get("running"))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+
+        let analysis = if running {
+            serde_json::json!({
+                "state": "design_running",
+                "guidance": "Worker agents are committing to this model right now. Wait for \
+                             the design run to finish before judging the verdict or \
+                             submitting patches of your own.",
+            })
+        } else {
+            analysis_json(&settled_analysis(&engine, head.revision).await)
+        };
+
+        let skeleton_gaps = super::commit::skeleton_diagnostics(workspace);
+
+        let mut body = serde_json::json!({
             "revision": head.revision.0,
+            "skeleton": {
+                "ready_to_fan_out": skeleton_gaps.is_empty(),
+                "gaps": skeleton_gaps,
+            },
             "inventory": {
                 "services": workspace.services.len(),
                 "schemas": workspace.schemas.len(),
@@ -1129,8 +1265,22 @@ impl ConseqaMcp {
                 "operations_without_programs": unfinished,
             },
             "prompt_obligations": prompt_obligations,
-            "analysis": analysis_json(&analysis),
-        }))
+            "analysis": analysis,
+        });
+
+        if let Some(design) = design {
+            body["design"] = design;
+
+            if !running {
+                body["note"] = serde_json::Value::String(
+                    "If a design run just finished, call open_project again to refresh your \
+                     session to the new head before reading or patching."
+                        .to_string(),
+                );
+            }
+        }
+
+        json_result(body)
     }
 
     #[tool(

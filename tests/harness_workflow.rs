@@ -484,6 +484,17 @@ fn workflow(
     script: ScriptFn,
     max_iterations: u32,
 ) -> (Workflow, ConfluenceEngine) {
+    workflow_with_objective(out_dir, script, max_iterations, None)
+}
+
+/// The same harness, with a run objective layered on as `request_design`
+/// supplies one.
+fn workflow_with_objective(
+    out_dir: PathBuf,
+    script: ScriptFn,
+    max_iterations: u32,
+    objective: Option<String>,
+) -> (Workflow, ConfluenceEngine) {
     let mut run_meta = RunMetadata::new(RunId("workflow-test".to_string()));
     run_meta.prompt = Some("A ping service.".to_string());
     run_meta.policy = RunPolicy {
@@ -515,6 +526,7 @@ fn workflow(
             out_dir,
             analysis_timeout: Duration::from_secs(20),
             max_iterations,
+            objective,
         },
     );
 
@@ -872,6 +884,55 @@ async fn a_requirement_free_model_finalizes_without_spinning() {
         report.iterations <= 2,
         "expected a prompt finalize, but the run took {} iterations",
         report.iterations
+    );
+
+    std::fs::remove_dir_all(&out_dir).ok();
+}
+
+/// `request_design`'s objective is layered onto the project prompt as
+/// task evidence, so every fanned-out worker sees the caller's steer.
+/// It used to be accepted and discarded.
+#[tokio::test]
+async fn a_run_objective_reaches_every_worker_prompt() {
+    let out_dir = std::env::temp_dir().join(format!("conseqa-wf-{}", Uuid::new_v4()));
+
+    let prompts: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let captured = Arc::clone(&prompts);
+
+    // Capture each worker's rendered prompt; commit nothing, so the run
+    // simply reaches its iteration bound.
+    let script: ScriptFn = Arc::new(move |_engine, invocation| {
+        let captured = Arc::clone(&captured);
+
+        Box::pin(async move {
+            captured
+                .lock()
+                .expect("prompt lock")
+                .push(invocation.prompt.clone());
+        })
+    });
+
+    let (workflow, _engine) = workflow_with_objective(
+        out_dir.clone(),
+        script,
+        1,
+        Some("prioritize the checkout path".to_string()),
+    );
+
+    workflow.run().await.expect("the workflow runs");
+
+    let prompts = prompts.lock().expect("prompt lock");
+
+    assert!(!prompts.is_empty(), "at least one worker ran");
+    assert!(
+        prompts
+            .iter()
+            .all(|prompt| prompt.contains("prioritize the checkout path")),
+        "every worker prompt carries the run objective: {prompts:#?}"
+    );
+    assert!(
+        prompts.iter().all(|prompt| prompt.contains("A ping service.")),
+        "the project prompt is still carried too: {prompts:#?}"
     );
 
     std::fs::remove_dir_all(&out_dir).ok();
