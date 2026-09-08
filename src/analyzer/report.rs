@@ -25,7 +25,7 @@ use crate::analyzer::verification::{
 };
 use crate::analyzer::verification::{
     DuplicateHandling, GroupingScope, LineageFact, MessageKeyFact, ModelNote, OrderingProof,
-    OrderingVerdict, PrecedenceSource, ProofScope,
+    OrderingVerdict, PrecedenceSource, ProofScope, RemedyLayer,
 };
 use crate::spec::{
     CompletionRequirement, Id, MemberAssignment, Model, ResultReplayRequirement,
@@ -58,8 +58,9 @@ pub struct ProverReport {
 /// proof `scope` and rebuilt the serialization and ordering arguments
 /// on the L1 runtime model — routing domains, member assignment, and
 /// execution-pool member concurrency in place of dispatch lanes and
-/// operation-global concurrency.
-pub const FORMAT: u32 = 3;
+/// operation-global concurrency. Format 4 added `remedy` to unproven
+/// serialization and ordering obligations.
+pub const FORMAT: u32 = 4;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -80,6 +81,14 @@ pub struct Obligation {
     /// changes. Absent for an obligation that is not proven.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scope: Option<ProofScope>,
+
+    /// Which semantic layer holds the facts an unproven obligation is
+    /// waiting on. The dual of `scope`: that records the layers a
+    /// proof consumed, this records the layer a missing proof needs.
+    /// Absent for a proven obligation, and for families whose
+    /// obstacles are not yet classified.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remedy: Option<RemedyLayer>,
 
     /// Declared model facts the verdict relies on. A proof is
     /// conditional on the implementation conforming to these.
@@ -207,6 +216,7 @@ pub fn scaffold(model: &Model) -> ProverReport {
             status: Status::Unknown,
             summary,
             scope: None,
+            remedy: None,
             assumptions: Vec::new(),
             evidence: Vec::new(),
             counterexample: None,
@@ -271,6 +281,7 @@ pub fn scaffold(model: &Model) -> ProverReport {
                          returns an equivalent result."
                     ),
                     scope: None,
+            remedy: None,
                     assumptions: Vec::new(),
                     evidence: Vec::new(),
                     counterexample: None,
@@ -319,6 +330,8 @@ pub fn obligations(model: &Model, verification: &VerificationReport) -> ProverRe
             }
             SerializationVerdict::Unproven { .. } => Err(check.diagnostic()),
         });
+
+        set_remedy(&mut report, &id, check.remedy());
     }
 
     for check in &verification.ordering {
@@ -328,6 +341,8 @@ pub fn obligations(model: &Model, verification: &VerificationReport) -> ProverRe
             OrderingVerdict::Proven { proof, scope } => Ok((*scope, ordering_assumptions(proof))),
             OrderingVerdict::Unproven { .. } => Err(check.diagnostic()),
         });
+
+        set_remedy(&mut report, &id, check.remedy());
     }
 
     for check in &verification.idempotency {
@@ -484,6 +499,21 @@ fn coinductive_note(through: &str) -> String {
 
 fn obligation_id(operation: &Id, slug: &str, requirement: usize) -> String {
     format!("oblig.{operation}.{slug}.{requirement}")
+}
+
+/// Records which layer an unproven obligation is waiting on.
+///
+/// Separate from `patch` because only the serialization and ordering
+/// families classify their obstacles today; the rest leave it absent,
+/// which a coordinator reads as the application layer.
+fn set_remedy(report: &mut ProverReport, id: &str, remedy: Option<RemedyLayer>) {
+    if let Some(obligation) = report
+        .obligations
+        .iter_mut()
+        .find(|obligation| obligation.id == id)
+    {
+        obligation.remedy = remedy;
+    }
 }
 
 /// Applies one check's verdict to its scaffolded obligation: proven

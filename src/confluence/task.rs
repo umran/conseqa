@@ -59,6 +59,7 @@ pub struct TaskSpec {
 #[serde(rename_all = "snake_case")]
 pub enum TaskKind {
     Decompose,
+    TopologySynthesis,
     OperationSynthesis,
     RequirementDiscovery,
     RequirementRepair,
@@ -70,6 +71,7 @@ impl fmt::Display for TaskKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
             Self::Decompose => "decompose",
+            Self::TopologySynthesis => "topology_synthesis",
             Self::OperationSynthesis => "operation_synthesis",
             Self::RequirementDiscovery => "requirement_discovery",
             Self::RequirementRepair => "requirement_repair",
@@ -184,10 +186,27 @@ impl WriteScope {
         }
     }
 
-    /// The decomposer's scope: the shared skeleton, interfaces and
-    /// runtime topology included.
+    /// The decomposer's scope: the L0 shared skeleton.
+    ///
+    /// Deliberately not the runtime topology. L1 exists to discharge
+    /// serialization and ordering requirements, and at decomposition
+    /// no requirement has been discovered yet — authoring topology
+    /// there is guessing at facts the run has not established.
+    /// [`Self::runtime_topology`] holds it instead, once the unproven
+    /// set says what the runtime has to achieve.
     pub fn shared_skeleton() -> Self {
-        Self::of([WriteGrant::SharedSkeleton, WriteGrant::RuntimeTopology])
+        Self::of([WriteGrant::SharedSkeleton])
+    }
+
+    /// The topology author's scope: the whole L1 runtime model, and
+    /// nothing else.
+    ///
+    /// Held by one task at a time. Where invocations execute, what
+    /// groups them, and how many run at once are facts about the
+    /// system as a whole; splitting them per operation would let two
+    /// workers declare contradictory halves of one pool.
+    pub fn runtime_topology() -> Self {
+        Self::of([WriteGrant::RuntimeTopology])
     }
 
     /// An operation-synthesis task's scope: the operation's program.

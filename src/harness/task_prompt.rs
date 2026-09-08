@@ -44,26 +44,44 @@ Extract every explicit correctness statement in the prompt as a prompt \
 obligation. Do not implement operation programs — establish stable \
 interfaces callers can reason against.
 
-You also own the runtime topology (L1): transport grouping and \
-ordering, subscription delivery and dispatch, execution pools and \
-their member concurrency, request routers, and storage layouts. \
-Grouping and ordering are independent facts sharing one exclusive \
-scope — declare them either on the topic runtime, for every \
-subscription of it, or on each subscription runtime, never both. This is architecture, \
-not per-operation synthesis, which is why it is yours. L1 is optional — \
-declare only what the application genuinely realizes — but note that \
-serialization and ordering requirements are discharged from it: a \
-grouping domain owned by one pool member whose concurrency is \
-bounded(1) is what proves same-key invocations never overlap, and a \
-transport ordering on top of that is what proves they take effect in \
-order. Serialization needs no ordering fact at all — declare \
-`ordering: none` where the transport genuinely orders nothing rather \
-than claiming an order to reach a grouping key. Never invent \
-topology to make a proof pass; if the architecture genuinely does not \
-constrain execution that way, leave the requirement unproven.
+This is the L0 application model only. The runtime topology (L1) — \
+transport grouping and ordering, subscription delivery and dispatch, \
+execution pools, request routers, storage layouts — is authored in a \
+later phase, once the run knows which requirements it has to \
+discharge. Do not declare any of it here, and do not shape an \
+interface around a topology you are imagining.
 
-Commit one `submit_patch` that creates all planned operation interfaces, \
-any runtime topology, and the prompt obligations.",
+Commit one `submit_patch` that creates all planned operation interfaces \
+and the prompt obligations.",
+
+        TaskKind::TopologySynthesis => "\
+## Your task: runtime topology
+
+You own the runtime topology (L1), and nothing else: transport \
+grouping and ordering, subscription delivery and dispatch, execution \
+pools and their member concurrency, request routers, and storage \
+layouts. The L0 application model is settled and not yours to change; \
+if it is genuinely wrong, file a `dependency_request` rather than \
+working around it.
+
+Your objective names the obligations the runtime has to discharge. \
+Read each one's `requirement_report`: its structured obstacle names \
+the exact missing fact. Serialization and ordering are proven from \
+this layer — a grouping domain owned by one pool member whose \
+concurrency is bounded(1) is what proves same-key invocations never \
+overlap, and a transport ordering on top of that is what proves they \
+take effect in order. Serialization needs no ordering fact at all: \
+declare `ordering: none` where the transport genuinely orders nothing \
+rather than claiming an order to reach a grouping key.
+
+Grouping and ordering are independent facts sharing one exclusive \
+scope — declare them either on the topic runtime, covering every \
+subscription of it, or on each subscription runtime, never both.
+
+L1 is optional, and an unproven requirement is an acceptable outcome. \
+Never invent topology to make a proof pass: if the architecture \
+genuinely does not constrain execution that way, leave it unproven and \
+say so. Commit one `submit_patch` for the whole layer.",
 
         TaskKind::OperationSynthesis => "\
 ## Your task: operation synthesis

@@ -1731,6 +1731,47 @@ fn slice_shared_symbols(snapshot: &WorkspaceSnapshot, operation: &Id) -> Vec<Sym
 ///
 /// Deliberately conservative — it names a symbol whether or not the
 /// declaration exists yet, so a task is invalidated when one appears.
+/// Every symbol the L1 author reads: the whole topic and boundary
+/// surface, plus whatever runtime facts already exist.
+///
+/// A topology task owns no operation, so it gets no slice from
+/// `slice_shared_symbols`. Enumerating the surface explicitly is what
+/// puts it in the task's read set — without this the author would work
+/// from untracked tool reads and its patch would survive an L0 change
+/// that invalidated it.
+///
+/// Interfaces rather than whole operations: the author needs each
+/// boundary's inputs and topic, never a program body.
+pub(crate) fn topology_symbols(workspace: &WorkspaceState) -> Vec<SymbolKey> {
+    let mut keys = Vec::new();
+
+    for topic in workspace.topics.keys() {
+        keys.push(SymbolKey::Topic(topic.clone()));
+        keys.push(SymbolKey::TopicRuntime(topic.clone()));
+    }
+
+    for operation in workspace.operations.keys() {
+        keys.push(SymbolKey::OperationInterface(operation.clone()));
+        keys.extend(runtime_inputs_of(workspace, operation));
+    }
+
+    for pool in workspace.runtime.execution_pools.keys() {
+        keys.push(SymbolKey::ExecutionPool(pool.clone()));
+    }
+
+    for router in workspace.runtime.routers.keys() {
+        keys.push(SymbolKey::Router(router.clone()));
+    }
+
+    for layout in workspace.runtime.storage_layouts.keys() {
+        keys.push(SymbolKey::StorageLayout(layout.clone()));
+    }
+
+    keys.sort();
+    keys.dedup();
+    keys
+}
+
 pub(crate) fn runtime_inputs_of(
     workspace: &WorkspaceState,
     operation: &Id,

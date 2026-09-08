@@ -75,6 +75,13 @@ pub struct AnalysisDiagnostic {
     pub subject: Option<String>,
 
     pub message: String,
+
+    /// True when the code identifies the faulty declaration as an L1
+    /// one, so the repair belongs to the topology author rather than
+    /// to any operation. False for codes raised from either layer —
+    /// the coordinator disambiguates those from the subject.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub runtime: bool,
 }
 
 impl From<Diagnostic> for AnalysisDiagnostic {
@@ -94,6 +101,7 @@ impl From<Diagnostic> for AnalysisDiagnostic {
         Self {
             subject: diagnostic.subject.map(|id| id.to_string()),
             message,
+            runtime: diagnostic.code.is_runtime(),
         }
     }
 }

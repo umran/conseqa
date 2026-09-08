@@ -133,3 +133,38 @@ pub enum ValidationCode {
     WithinGroupWithoutGrouping,
     TransportSemanticsAtBothScopes,
 }
+
+impl ValidationCode {
+    /// Whether the declaration at fault lives in the L1 runtime model.
+    ///
+    /// Only codes raised exclusively by runtime validation qualify. A
+    /// generic code — an unknown reference, an invalid field path —
+    /// can be raised from either layer and is not classified here; the
+    /// caller disambiguates those from the subject.
+    pub fn is_runtime(self) -> bool {
+        matches!(
+            self,
+            Self::EmptyRoutingKey
+                | Self::RoutingWithoutGrouping
+                | Self::DuplicateRouterForBoundary
+                | Self::EmptyPartitionKey
+                | Self::DuplicateStorageLayoutForObject
+                | Self::GroupingKeySchemaNotOnTopic
+                | Self::GroupingKeyMissingSchema
+                | Self::EmptyGroupingKey
+                | Self::GroupingKeyArityMismatch
+                | Self::WithinGroupWithoutGrouping
+                | Self::TransportSemanticsAtBothScopes
+        )
+    }
+}
+
+impl DiagnosticCode {
+    /// Whether the declaration at fault lives in the L1 runtime model.
+    pub fn is_runtime(self) -> bool {
+        match self {
+            Self::Validation(code) => code.is_runtime(),
+            Self::Verification(_) => false,
+        }
+    }
+}

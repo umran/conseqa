@@ -101,8 +101,8 @@ async fn commits_publish_before_analysis_finishes() {
 
     let a = task(
         &engine,
-        TaskKind::Decompose,
-        WriteScope::shared_skeleton(),
+        TaskKind::TopologySynthesis,
+        WriteScope::runtime_topology(),
     );
 
     let receipt = submit(&engine, &a, vec![put_pool("pool.spare", 2)])
@@ -134,8 +134,8 @@ async fn analysis_is_tagged_per_revision_and_summaries_abstract_implementations(
 
     let a = task(
         &engine,
-        TaskKind::Decompose,
-        WriteScope::shared_skeleton(),
+        TaskKind::TopologySynthesis,
+        WriteScope::runtime_topology(),
     );
 
     let receipt = submit(&engine, &a, vec![put_pool("pool.spare", 2)])

@@ -96,7 +96,7 @@ use crate::spec::{
     SerializationRequirement, SubscriptionInput, SubscriptionRoutingKey, ValueRef, ValueSource,
 };
 
-use super::ProofScope;
+use super::{ProofScope, RemedyLayer};
 use super::describe::{describe_value_ref, describe_value_source, value_source_id};
 use super::value_identity::canonical_value_path;
 
@@ -864,6 +864,16 @@ fn key_identity(
 }
 
 impl SerializationCheck {
+    /// Which layer holds the facts this check is waiting on, or
+    /// `None` when it is proven.
+    pub fn remedy(&self) -> Option<RemedyLayer> {
+        let SerializationVerdict::Unproven { obstacles } = &self.verdict else {
+            return None;
+        };
+
+        RemedyLayer::joined(obstacles.iter().map(SerializationObstacle::layer))
+    }
+
     /// The diagnostic for an unproven requirement.
     ///
     /// A proven requirement produces no diagnostic; its argument
@@ -895,6 +905,35 @@ impl SerializationCheck {
 }
 
 impl SerializationObstacle {
+    /// The semantic layer this obstacle's fix belongs to.
+    ///
+    /// Almost every serialization obstacle names an L1 fact, because
+    /// every proof route but the vacuous one rests on the runtime
+    /// realization. The exception is a key that no input carries: no
+    /// routing declaration can select a population that the
+    /// application model never exposes.
+    pub fn layer(&self) -> RemedyLayer {
+        match self {
+            Self::KeyNotFromInput { .. } => RemedyLayer::Application,
+
+            Self::NoRouter { .. }
+            | Self::AmbiguousRouter { .. }
+            | Self::TransportSemanticsAtBothScopes { .. }
+            | Self::EmptyRoutingKey { .. }
+            | Self::EmptyGroupingKey { .. }
+            | Self::NoSubscriptionRuntime { .. }
+            | Self::RoutingAbsent { .. }
+            | Self::RoutingKeyNotEquivalent { .. }
+            | Self::RoutingKeyWiderThanRequirement { .. }
+            | Self::NoGroupingDomain { .. }
+            | Self::GroupingKeyMappingMissing { .. }
+            | Self::KeyIdentityUnestablished { .. }
+            | Self::PoolUndeclared { .. }
+            | Self::MemberAssignmentNotExclusive { .. }
+            | Self::MemberConcurrencyNotSerial { .. } => RemedyLayer::Runtime,
+        }
+    }
+
     fn evidence(&self, check: &SerializationCheck) -> Evidence {
         match self {
             Self::KeyNotFromInput { source } => Evidence {

@@ -224,13 +224,31 @@ fn success_script() -> ScriptFn {
                                 operation: id("operation.ping"),
                                 value: ping_interface(),
                             },
-                            // Runtime topology is part of the shared
-                            // skeleton: where an invocation executes,
-                            // and how much may execute there, is an
-                            // architectural decision, not part of the
-                            // operation's own synthesis. It is also
-                            // what the serialization obligation is
-                            // discharged from.
+                            Mutation::PutPromptObligation {
+                                id: PromptObligationId(OBLIGATION.to_string()),
+                                value: PromptObligation {
+                                    source_span: Some(
+                                        "pings for the same id must never overlap".to_string(),
+                                    ),
+                                    normalized_intent: "serialize ping by id".to_string(),
+                                    targets: vec![id("operation.ping")],
+                                    status: PromptObligationStatus::Unmapped,
+                                },
+                            },
+                        ],
+                    )
+                    .await;
+                }
+
+                // The runtime topology is authored in its own phase,
+                // after L0 has converged and requirement discovery has
+                // said what the runtime must discharge. The decomposer
+                // cannot write it, and no operation-scoped task can.
+                conseqa::confluence::TaskKind::TopologySynthesis => {
+                    commit(
+                        &engine,
+                        &invocation,
+                        vec![
                             Mutation::PutExecutionPool {
                                 id: id("pool.ping_workers"),
                                 value: conseqa::spec::ExecutionPool {
@@ -252,17 +270,6 @@ fn success_script() -> ScriptFn {
                                         member_assignment:
                                             conseqa::spec::MemberAssignment::ConsistentHash,
                                     }),
-                                },
-                            },
-                            Mutation::PutPromptObligation {
-                                id: PromptObligationId(OBLIGATION.to_string()),
-                                value: PromptObligation {
-                                    source_span: Some(
-                                        "pings for the same id must never overlap".to_string(),
-                                    ),
-                                    normalized_intent: "serialize ping by id".to_string(),
-                                    targets: vec![id("operation.ping")],
-                                    status: PromptObligationStatus::Unmapped,
                                 },
                             },
                         ],
@@ -356,13 +363,31 @@ fn incomplete_script() -> ScriptFn {
                                 operation: id("operation.ping"),
                                 value: ping_interface(),
                             },
-                            // Runtime topology is part of the shared
-                            // skeleton: where an invocation executes,
-                            // and how much may execute there, is an
-                            // architectural decision, not part of the
-                            // operation's own synthesis. It is also
-                            // what the serialization obligation is
-                            // discharged from.
+                            Mutation::PutPromptObligation {
+                                id: PromptObligationId(OBLIGATION.to_string()),
+                                value: PromptObligation {
+                                    source_span: Some(
+                                        "duplicate pings must collapse".to_string(),
+                                    ),
+                                    normalized_intent: "ping is idempotent by id".to_string(),
+                                    targets: vec![id("operation.ping")],
+                                    status: PromptObligationStatus::Unmapped,
+                                },
+                            },
+                        ],
+                    )
+                    .await;
+                }
+
+                // The runtime topology is authored in its own phase,
+                // after L0 has converged and requirement discovery has
+                // said what the runtime must discharge. The decomposer
+                // cannot write it, and no operation-scoped task can.
+                conseqa::confluence::TaskKind::TopologySynthesis => {
+                    commit(
+                        &engine,
+                        &invocation,
+                        vec![
                             Mutation::PutExecutionPool {
                                 id: id("pool.ping_workers"),
                                 value: conseqa::spec::ExecutionPool {
@@ -384,17 +409,6 @@ fn incomplete_script() -> ScriptFn {
                                         member_assignment:
                                             conseqa::spec::MemberAssignment::ConsistentHash,
                                     }),
-                                },
-                            },
-                            Mutation::PutPromptObligation {
-                                id: PromptObligationId(OBLIGATION.to_string()),
-                                value: PromptObligation {
-                                    source_span: Some(
-                                        "duplicate pings must collapse".to_string(),
-                                    ),
-                                    normalized_intent: "ping is idempotent by id".to_string(),
-                                    targets: vec![id("operation.ping")],
-                                    status: PromptObligationStatus::Unmapped,
                                 },
                             },
                         ],

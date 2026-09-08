@@ -69,7 +69,7 @@ use crate::spec::{
 
 use crate::analyzer::{Diagnostic, DiagnosticCode, Evidence, Severity, VerificationCode};
 
-use super::ProofScope;
+use super::{ProofScope, RemedyLayer};
 use super::describe::describe_value_ref;
 use super::idempotency::{IdempotencyCheck, IdempotencyVerdict};
 use super::serialization::{
@@ -554,6 +554,16 @@ fn check_requirement(
 }
 
 impl OrderingCheck {
+    /// Which layer holds the facts this check is waiting on, or
+    /// `None` when it is proven.
+    pub fn remedy(&self) -> Option<RemedyLayer> {
+        let OrderingVerdict::Unproven { obstacles } = &self.verdict else {
+            return None;
+        };
+
+        RemedyLayer::joined(obstacles.iter().map(OrderingObstacle::layer))
+    }
+
     /// The diagnostic for an unproven requirement; a proven one
     /// produces none.
     pub fn diagnostic(&self) -> Option<Diagnostic> {
@@ -583,6 +593,32 @@ impl OrderingCheck {
 }
 
 impl OrderingObstacle {
+    /// The semantic layer this obstacle's fix belongs to.
+    ///
+    /// Two obstacles are application-layer. A key no input carries
+    /// selects no population, and a request boundary has no precedence
+    /// source at all — no runtime declaration invents one, so the fix
+    /// is the operation's interface, not its topology.
+    pub fn layer(&self) -> RemedyLayer {
+        match self {
+            Self::KeyNotFromInput { .. } | Self::RequestInputHasNoPrecedenceSource { .. } => {
+                RemedyLayer::Application
+            }
+
+            Self::NoTransportPrecedence { .. }
+            | Self::NoGroupingDomain { .. }
+            | Self::TransportSemanticsAtBothScopes { .. }
+            | Self::EmptyGroupingKey { .. }
+            | Self::MemberAssignmentNotExclusive { .. }
+            | Self::GroupingKeyMappingMissing { .. }
+            | Self::KeyIdentityUnestablished { .. }
+            | Self::NoSubscriptionRuntime { .. }
+            | Self::RoutingAbsent { .. }
+            | Self::PoolUndeclared { .. }
+            | Self::MemberConcurrencyNotSerial { .. } => RemedyLayer::Runtime,
+        }
+    }
+
     fn evidence(&self, check: &OrderingCheck) -> Evidence {
         match self {
             Self::KeyNotFromInput { source } => Evidence {

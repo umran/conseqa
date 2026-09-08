@@ -156,6 +156,61 @@ impl std::fmt::Display for ProofScope {
     }
 }
 
+/// Which semantic layer holds the facts an unproven obligation is
+/// waiting on.
+///
+/// The dual of [`ProofScope`]: scope records the layers a proof
+/// *consumed*, remedy records the layer a missing proof *needs*. It
+/// exists so a coordinator can tell an obligation blocked on the
+/// runtime realization from one blocked on the application model,
+/// without parsing prose.
+///
+/// This is a routing hint, not a verdict. It says where the next
+/// declaration must go, not that adding one there will close the
+/// proof.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum RemedyLayer {
+    /// At least one obstacle names an L0 fact: the operation's
+    /// program, its interface, or the requirement itself. An L1
+    /// declaration alone cannot discharge the obligation.
+    Application,
+
+    /// Every obstacle names an L1 fact: grouping, ordering, routing,
+    /// member assignment, or pool concurrency.
+    Runtime,
+}
+
+impl RemedyLayer {
+    /// The remedy for an obligation blocked by several obstacles.
+    ///
+    /// `Runtime` only when every obstacle is a runtime one. Obstacles
+    /// are conjunctive — each must clear for the proof to close — so a
+    /// single application obstacle means topology work alone cannot
+    /// finish, and the application fix is what to ask for first. Once
+    /// it lands the obligation re-reports, and what remains routes to
+    /// the runtime.
+    pub fn joined(layers: impl IntoIterator<Item = Self>) -> Option<Self> {
+        layers
+            .into_iter()
+            .reduce(|a, b| match (a, b) {
+                (Self::Runtime, Self::Runtime) => Self::Runtime,
+                _ => Self::Application,
+            })
+    }
+}
+
+impl std::fmt::Display for RemedyLayer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Application => "application",
+            Self::Runtime => "runtime",
+        })
+    }
+}
+
 /// A model-wide observation raised next to the verdicts. Not an
 /// obligation — no declaration asks for it — but a gap no verdict
 /// would otherwise point out.
