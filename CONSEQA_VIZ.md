@@ -62,19 +62,34 @@ width leaves everything largest once fitted, and an edge that crosses
 bands travels outside them. Small graphs never wrap.
 
 *Layers.* L0 — the abstract application machine — is always drawn. L1,
-the declared runtime realization, is a band beneath it, switched from
-the top bar (`L0` is a label, not a control: the machine is the model,
-not an overlay on it). The band holds the execution pools, each naming
-the boundaries assigned to it, and the storage layouts, each naming the
-object it partitions; the switch is disabled for a model that declares
-no L1 facts. With L1 on, a topic also carries its transport facts and an
-operation the pool that runs it — with L1 off, neither appears, because
-those are facts of the layer that declares them and not of the topic or
-the operation. Selecting an operation or a pool draws the realization
-links between them, labelled with the member-affinity fact each declares,
-and dims everything else: the relation is named at all times and drawn
-when it is asked for, which keeps a diagram with fifty boundaries
-readable.
+the declared runtime realization, is switched from the top bar (`L0` is
+a label, not a control: the machine is the model, not an overlay on it),
+and it is laid *onto* the machine rather than beside it, because every
+L1 fact is a fact about some L0 thing:
+
+- A **router** or a **subscription dispatch** realizes a boundary — the
+  way a caller or a topic enters an operation — so it is drawn as a tab
+  on that approach, in the gutter off the operation's input edge, marked
+  request (solid) or subscribe (dashed). The tab names the execution
+  pool and its member concurrency, and the routing/affinity fact. The
+  pool name is its own target: a pool is a shared population, and
+  selecting one lights every tab that names it — which is all "shared
+  pool" means (§52), with no pool node needed to say it.
+- A **storage layout** is a fact about an object, so the objects
+  operations persist to are drawn as a downstream data tier, wired to
+  the operations that touch them by always-visible access edges.
+  Partitioned objects (a layout is declared) are solid and spined and
+  name their partition key; unpartitioned ones (no layout) are drawn
+  open and dashed — absence of a fact, not a claim of no partitioning.
+- A **topic** carries its transport facts (grouping, ordering) on its
+  own node, since topic-scoped transport is a fact about the topic.
+
+The switch is disabled for a model that declares no L1 facts, and with
+L1 off none of the above appears — those are facts of the layer that
+declares them. Selecting an operation lights its realizations and the
+objects it persists to; selecting an object lights the operations that
+touch it. Nothing is a parallel graph joined by on-demand links: the
+realization annotates the paths and the entities it is about.
 
 **Operation view** (`#/op/<id>`). A page header (name, copyable id,
 description, and a fact strip: service, transaction and
@@ -145,11 +160,13 @@ occurrence.
 An L1 declaration's panel says what the fact does and, as importantly,
 what it does not: a pool carries no cardinality, sharing one relates
 execution populations and not routing domains, a partition key is
-neither an object identity nor a routing key. Each also lists **the
-proofs resting on it** — the obligations whose reasoning names it — so
-the verdicts a change to the topology would put back in question can be
-read off the declaration itself. Topics and inputs carry the same list,
-being where L1 facts attach to L0 entities.
+neither an object identity nor a routing key. A data object's panel
+carries its storage layout (or says none is declared) and the operations
+that access it. Each L1 declaration also lists **the proofs resting on
+it** — the obligations whose reasoning names it — so the verdicts a
+change to the topology would put back in question can be read off the
+declaration itself. Topics and inputs carry the same list, being where
+L1 facts attach to L0 entities.
 
 **Top bar.** Model name and revision, breadcrumbs for the current
 page, the id filter on the system view, and — when a report is loaded

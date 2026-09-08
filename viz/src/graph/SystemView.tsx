@@ -4,7 +4,7 @@ import { shortId, truncate } from "../lib/ids";
 import { hashes } from "../lib/route";
 import { useApp } from "../state/AppState";
 import type { Edge } from "../types/graph";
-import { layoutSystem, type Box, type PoolBox, type StorageBox, type SystemLayout } from "./layoutSystem";
+import { layoutSystem, type DataObjectBox, type RealizationBox } from "./layoutSystem";
 import { LegendChip, LegendLine, SvgCanvas, sel } from "./SvgCanvas";
 import { StatusChip, StatusRing } from "./status";
 
@@ -41,10 +41,10 @@ export function SystemView() {
   const matches = (id: string) =>
     !q || id.toLowerCase().includes(q) || shortId(id).toLowerCase().includes(q);
 
-  // What a selection keeps lit. Across the layer boundary too: selecting
-  // a pool lights the operations it runs, and selecting an operation
-  // lights the pool that runs it — the relation the band states in words
-  // is the one a reader wants to see.
+  // What a selection keeps lit, followed across the layer boundary: a
+  // pool lights every boundary it runs (that is all "shared pool" means),
+  // an operation lights its realizations and the objects it persists to,
+  // an object lights the operations that touch it.
   const related = useMemo(() => {
     const set = new Set<string>();
     if (!selection) return set;
@@ -66,12 +66,15 @@ export function SystemView() {
         set.add(link.operation);
       }
     }
-    for (const layoutNode of runtime.storage) {
-      if (selection === layoutNode.id) for (const op of layoutNode.operations) set.add(op);
-      if (layoutNode.operations.includes(selection)) set.add(layoutNode.id);
+    for (const access of plane?.access ?? []) {
+      if (set.has(access.operation) || selection === access.object || selection === access.id) {
+        set.add(access.id);
+        set.add(access.operation);
+        set.add(access.object);
+      }
     }
     return set;
-  }, [graph, runtime, selection]);
+  }, [graph, runtime, plane, selection]);
 
   const isDim = (key: string) => (q && !matches(key)) || (!!selection && !related.has(key));
 
@@ -85,7 +88,12 @@ export function SystemView() {
       {graph.externals.length > 0 && <LegendLine color="var(--arch-edge-external)" label="external effect" />}
       {graph.client && <LegendLine color="var(--arch-edge-client)" label="client request" />}
       <LegendLine color="var(--arch-text-subtle)" label="declared, unexecuted" dashed />
-      {drawRuntime && <LegendLine color="var(--arch-l1)" label="L1 realization" dashed />}
+      {drawRuntime && (
+        <>
+          <LegendChip color="var(--arch-l1)" label="L1 realization" />
+          <LegendLine color="var(--arch-l1)" label="data access" />
+        </>
+      )}
       {report && (
         <>
           <LegendChip color="var(--arch-proven)" label="proven" />
@@ -101,9 +109,26 @@ export function SystemView() {
 
   return (
     <SvgCanvas legend={legend} empty={empty}>
-      {plane?.band && (
-        <RuntimeBand layout={layout} plane={plane} band={plane.band} dim={isDim} selection={selection} />
+      {/* The data tier sits behind the machine and its access edges,
+          drawn first so operations and their wiring read on top of it. */}
+      {plane?.dataBand && (
+        <g className="arch-data-tier">
+          <text className="tier-label" x={plane.dataBand.x} y={plane.dataBand.y - 12}>
+            persistent data — objects these operations write, partitioned ones marked
+          </text>
+        </g>
       )}
+
+      {plane?.access.map((access) => {
+        const dimmed = selection ? !related.has(access.id) : false;
+        const classes = ["arch-access", access.partitioned ? "partitioned" : "plain"];
+        if (dimmed) classes.push("dimmed");
+        return <path key={access.id} className={classes.join(" ")} d={access.d} markerEnd="url(#arr-l1)" />;
+      })}
+
+      {plane?.dataObjects.map((obj) => (
+        <DataObject key={obj.object} obj={obj} dimmed={isDim(obj.object)} selected={selection === obj.object} />
+      ))}
 
       {layout.services.map((box) => {
         const svc = graph.services.find((s) => s.id === box.id);
@@ -141,21 +166,6 @@ export function SystemView() {
         );
       })}
 
-      {/* Realization links, only for what is selected: the relation is
-          named in the band at all times, and drawn when it is asked for. */}
-      {plane?.links.map(({ id, link, d, labelAt }) => {
-        if (!selection || !related.has(id)) return null;
-        const label = link.routingKey ? `routed by ${link.routingKey}` : "no member affinity";
-        return (
-          <g key={id}>
-            <path className="arch-l1-link" d={d} markerEnd="url(#arr-l1)" />
-            <text className="arch-l1-label" x={labelAt.x} y={labelAt.y} textAnchor="middle">
-              {label}
-            </text>
-          </g>
-        );
-      })}
-
       {graph.operations.map((op) => {
         const p = layout.pos.get(op.id);
         if (!p) return null;
@@ -169,9 +179,6 @@ export function SystemView() {
         const classes = ["arch-node", "operation"];
         if (isDim(op.id)) classes.push("dimmed");
         if (selection === op.id) classes.push("selected");
-        const pools = drawRuntime
-          ? [...new Set(runtime.links.filter((l) => l.operation === op.id).map((l) => l.pool))]
-          : [];
         return (
           <g key={op.id} className={classes.join(" ")} data-sel={sel({ key: op.id, id: op.id })} data-dbl={hashes.op(op.id)}>
             <StatusRing x={p.x} y={p.y} w={p.w} h={p.h} rx={8} obKey={op.id} />
@@ -185,16 +192,23 @@ export function SystemView() {
             <text className="badge-text" x={p.x + 10} y={p.y + 52}>
               {badges.join("  ")}
             </text>
-            {pools.length > 0 && (
-              <text className="l1-mark" x={p.x + p.w - 10} y={p.y + 36} textAnchor="end">
-                {truncate(pools.map(shortId).join(" · "), 18)}
-              </text>
-            )}
             <title>{op.id + (op.description ? `\n${op.description}` : "") + "\n(double-click to open the program)"}</title>
             <StatusChip x={p.x + p.w - 6} y={p.y} obKey={op.id} />
           </g>
         );
       })}
+
+      {/* Realization tabs last, so they read on top of the approach into
+          the operation they belong to. */}
+      {plane?.realizations.map((r) => (
+        <Realization
+          key={r.link.id}
+          r={r}
+          dimmed={isDim(r.link.id)}
+          selected={selection === r.link.id}
+          poolSelected={selection === r.link.pool}
+        />
+      ))}
 
       {graph.topics.map((t) => {
         const p = layout.pos.get(t.id);
@@ -272,107 +286,87 @@ export function SystemView() {
   );
 }
 
-/** The L1 plane, drawn beneath the machine it realizes. */
-function RuntimeBand({
-  layout,
-  plane,
-  band,
-  dim,
-  selection,
+/** One boundary's realization, on the approach into the operation it
+ *  realizes. The pool name is its own click target: selecting a pool
+ *  lights every tab that names it. */
+function Realization({
+  r,
+  dimmed,
+  selected,
+  poolSelected,
 }: {
-  layout: SystemLayout;
-  plane: NonNullable<SystemLayout["runtime"]>;
-  band: Box;
-  dim: (id: string) => boolean;
-  selection: string | null;
+  r: RealizationBox;
+  dimmed: boolean;
+  selected: boolean;
+  poolSelected: boolean;
 }) {
-  const left = Math.min(layout.l0.x, band.x) - 40;
-  const right = Math.max(layout.l0.x + layout.l0.w, band.x + band.w) + 40;
-  const dividerY = (layout.l0.y + layout.l0.h + band.y) / 2;
-  return (
-    <g className="arch-plane">
-      <rect
-        className="band"
-        x={left}
-        y={dividerY + 10}
-        width={right - left}
-        height={band.y + band.h - dividerY + 14}
-        rx={18}
-      />
-      <line className="divider" x1={left} y1={dividerY} x2={right} y2={dividerY} />
-      <text className="plane-label above" x={left + 4} y={dividerY - 10}>
-        L0 · application machine
-      </text>
-      <text className="plane-label below" x={left + 4} y={dividerY + 26}>
-        L1 · runtime realization — one way this machine is run
-      </text>
-
-      {plane.pools.map((pool) => (
-        <Pool key={pool.id} pool={pool} dimmed={dim(pool.id)} selected={selection === pool.id} />
-      ))}
-      {plane.storage.map((store) => (
-        <Storage key={store.id} store={store} dimmed={dim(store.id)} selected={selection === store.id} />
-      ))}
-    </g>
-  );
-}
-
-function Pool({ pool, dimmed, selected }: { pool: PoolBox; dimmed: boolean; selected: boolean }) {
-  const classes = ["arch-l1-node", "pool"];
+  const { link } = r;
+  const classes = ["arch-real", link.kind];
   if (dimmed) classes.push("dimmed");
-  if (selected) classes.push("selected");
+  if (selected || poolSelected) classes.push("selected");
+  const affinity = link.routingKey ? `keyed · ${concurrencyShort(link.concurrency)}` : concurrencyShort(link.concurrency);
+  const title =
+    `${link.kind === "request" ? "request boundary" : "subscription"} of ${link.operation} · ${link.input}\n` +
+    `pool ${link.pool} — ${link.concurrency} per member\n` +
+    (link.routingKey ? `routed by ${link.routingKey} (${link.memberAssignment})` : "no member-affinity fact declared");
   return (
     <g className={classes.join(" ")}>
-      <g data-sel={sel({ key: pool.id, id: pool.id })}>
-        <rect className="body" x={pool.x} y={pool.y} width={pool.w} height={pool.h} rx={12} />
-        <text className="title" x={pool.x + 12} y={pool.y + 20}>
-          {truncate(shortId(pool.id), 26)}
+      <path className="arch-real-arm" d={r.connector} />
+      <g data-sel={sel({ key: link.id, id: link.detail })}>
+        <rect className="body" x={r.x} y={r.y} width={r.w} height={r.h} rx={7} />
+        <text className="kind-mark" x={r.x + 8} y={r.y + 14}>
+          {link.kind === "request" ? "▸ request" : "◃ subscribe"}
         </text>
-        <text className="subtitle" x={pool.x + 12} y={pool.y + 34}>
-          {`execution pool · ${pool.concurrency} per member`}
+        <text className="affinity" x={r.x + r.w - 8} y={r.y + 14} textAnchor="end">
+          {affinity}
         </text>
-        <title>{`${pool.id}\nmember concurrency: ${pool.concurrency}\nruns ${pool.chips.length} boundar${pool.chips.length === 1 ? "y" : "ies"}`}</title>
+        <title>{title}</title>
       </g>
-      {pool.chips.map((chip) => (
-        <g key={chip.id} className="chip" data-sel={sel({ key: chip.input, id: chip.input })}>
-          <rect
-            className={`chip-body ${chip.kind}`}
-            x={chip.x}
-            y={chip.y}
-            width={chip.w}
-            height={chip.h}
-            rx={6}
-          />
-          <text className="chip-text" x={chip.x + 8} y={chip.y + 19}>
-            {truncate(shortId(chip.operation), 20)}
-          </text>
-          <text className="chip-note" x={chip.x + chip.w - 8} y={chip.y + 19} textAnchor="end">
-            {chip.routing ? "keyed" : chip.kind === "request" ? "request" : "subscription"}
-          </text>
-          <title>{`${chip.operation} · ${chip.input}\n${chip.routing ? `routed by ${chip.routing}` : "no member-affinity fact declared"}`}</title>
-        </g>
-      ))}
+      {/* The pool is a separate target, so a reader can pivot to
+          everything that shares it. */}
+      <text
+        className="pool"
+        x={r.x + 8}
+        y={r.y + 27}
+        data-sel={sel({ key: link.pool, id: link.pool })}
+      >
+        {truncate(shortId(link.pool), 22)}
+      </text>
     </g>
   );
 }
 
-function Storage({ store, dimmed, selected }: { store: StorageBox; dimmed: boolean; selected: boolean }) {
-  const classes = ["arch-l1-node", "storage"];
+/** Concurrency, compressed for a tab: "bounded(1)" → "1/mbr". */
+function concurrencyShort(concurrency: string): string {
+  const m = concurrency.match(/^bounded\((\d+)\)$/);
+  if (m) return `${m[1]}/mbr`;
+  if (concurrency === "unbounded") return "∞/mbr";
+  return "?/mbr";
+}
+
+/** A persistent object, drawn so a partitioned store is distinct on
+ *  sight from one with no declared layout. */
+function DataObject({ obj, dimmed, selected }: { obj: DataObjectBox; dimmed: boolean; selected: boolean }) {
+  const classes = ["arch-object", obj.partitioned ? "partitioned" : "plain"];
   if (dimmed) classes.push("dimmed");
   if (selected) classes.push("selected");
+  const title = obj.partitioned
+    ? `${obj.object}\npartitioned by ${obj.partitionKey}\nA partition key is not an object identity, and not a routing key.`
+    : `${obj.object}\nno storage layout declared — drawn unpartitioned because that is all the model says`;
   return (
-    <g className={classes.join(" ")} data-sel={sel({ key: store.id, id: store.id })}>
-      <rect className="body" x={store.x} y={store.y} width={store.w} height={store.h} rx={8} />
-      <text className="title" x={store.x + 12} y={store.y + 20}>
-        {truncate(shortId(store.object), 24)}
+    <g className={classes.join(" ")} data-sel={sel({ key: obj.object, id: obj.object })}>
+      <rect className="body" x={obj.x} y={obj.y} width={obj.w} height={obj.h} rx={8} />
+      {obj.partitioned && <rect className="spine" x={obj.x + 5} y={obj.y + 6} width={3} height={obj.h - 12} rx={1.5} />}
+      <text className="title" x={obj.x + 16} y={obj.y + 22}>
+        {truncate(shortId(obj.object), 20)}
       </text>
-      <text className="subtitle" x={store.x + 12} y={store.y + 35}>
-        {`partitioned by ${store.partitionKey}`}
+      <text className="subtitle" x={obj.x + 16} y={obj.y + 37}>
+        {obj.dataModel ? shortId(obj.dataModel) : "data object"}
       </text>
-      <text className="l1-mark" x={store.x + 12} y={store.y + 50}>
-        {`storage layout · ${store.operations.length} operation${store.operations.length === 1 ? "" : "s"}`}
+      <text className="l1-mark" x={obj.x + 16} y={obj.y + 51}>
+        {obj.partitioned ? `partitioned by ${obj.partitionKey}` : "unpartitioned"}
       </text>
-      <title>{`${store.id}\nobject ${store.object}\npartition key ${store.partitionKey}\nA partition key is not an object identity, and not a routing key.`}</title>
+      <title>{title}</title>
     </g>
   );
 }

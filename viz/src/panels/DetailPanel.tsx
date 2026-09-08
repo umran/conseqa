@@ -442,9 +442,39 @@ function DataModelDetail({ id }: { id: Id }) {
 function ObjectDetail({ dmId, id }: { dmId: Id; id: Id }) {
   const { model } = useApp();
   const obj = model.data_models[dmId].objects[id];
+  // A storage layout is L1: it says how this object is partitioned, which
+  // is neither its identity nor a routing key. Absent means no such fact.
+  const layout = Object.entries(model.runtime?.storage_layouts ?? {}).find(
+    ([, l]) => l.object.object === id,
+  );
+  const touchers = objectTouchers(model).get(id) ?? [];
   return (
     <Frame kind="data object" title={id} subtitle={<span>persistent object in <IdLink id={dmId} /></span>}>
       <KeyValue rows={[["schema", <IdLink key="s" id={obj.schema} />], ["identity", <Mono key="i">{obj.identity.map(pathText).join(", ")}</Mono>]]} />
+      <Section title="L1 · storage">
+        {layout ? (
+          <>
+            <KeyValue rows={[
+              ["layout", <IdLink key="l" id={layout[0]} />],
+              ["partition key", <Mono key="k">{layout[1].partition_key.map(pathText).join(", ")}</Mono>],
+            ]} />
+            <p className="text-xs leading-relaxed text-kumo-subtle">
+              Partitioned. A partition key says where rows live; it is not the object's identity and
+              not a routing key, and no serialization or ordering proof rests on it.
+            </p>
+          </>
+        ) : (
+          <p className="text-xs leading-relaxed text-kumo-subtle">
+            No storage layout declared. Drawn unpartitioned because that is all the model says — not
+            a claim that the store is unpartitioned.
+          </p>
+        )}
+      </Section>
+      {touchers.length > 0 && (
+        <Section title="accessed by" count={touchers.length}>
+          <List items={touchers.map((op) => <IdLink key={op} id={op} />)} />
+        </Section>
+      )}
       <Obligations obKey={`${dmId}/${id}`} />
     </Frame>
   );

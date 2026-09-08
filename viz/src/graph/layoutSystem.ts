@@ -27,52 +27,47 @@ export interface EdgeGeometry {
   labelAt: Point;
 }
 
-/** A boundary a pool executes, named inside the pool that executes it.
- *  Shared membership is the point: two boundaries in one pool share an
- *  execution population and nothing else — not a routing domain. */
-export interface PoolChip extends Box {
-  id: string;
-  operation: Id;
-  input: Id;
-  kind: "request" | "subscription";
-  /** The member-affinity fact for this boundary, or null when none is
-   *  declared. */
-  routing: string | null;
+/** One boundary's realization, drawn as a tab on the approach into the
+ *  operation it realizes — the request boundary or the subscribe edge —
+ *  with a short connector to the operation card. The pool it names is a
+ *  shared execution population: two boundaries naming one pool share
+ *  members and nothing else, which selecting the pool makes visible. */
+export interface RealizationBox extends Box {
+  link: BoundaryLink;
+  /** Connector from the tab to the operation's input edge. */
+  connector: string;
 }
 
-export interface PoolBox extends Box {
-  id: string;
-  concurrency: string;
-  chips: PoolChip[];
-}
-
-export interface StorageBox extends Box {
-  id: string;
+/** A persistent object drawn as a downstream node, with the operations
+ *  that touch it wired in. A storage layout marks it partitioned; the
+ *  distinction is the point of drawing it. */
+export interface DataObjectBox extends Box {
   object: Id;
-  partitionKey: string;
+  dataModel: Id;
+  partitioned: boolean;
+  partitionKey: string | null;
   operations: Id[];
 }
 
-/** A realization link, drawn only for the selection that asks for it:
- *  every boundary at once is a thicket, and the question a reader has is
- *  always about one operation or one pool. */
-export interface LinkGeometry {
+/** An operation → object access, always drawn: the data tier is wired
+ *  into the machine, not parked beside it. */
+export interface AccessEdge {
   id: string;
-  link: BoundaryLink;
+  operation: Id;
+  object: Id;
+  partitioned: boolean;
   d: string;
-  labelAt: Point;
+  from: Point;
+  to: Point;
 }
 
 export interface RuntimePlane {
-  pools: PoolBox[];
-  storage: StorageBox[];
-  links: LinkGeometry[];
-  /** The whole band, for its separator and label — null when the L1
-   *  declarations are all facts that live on L0 entities (a topic's
-   *  transport, say) and there is nothing of its own to place. A
-   *  divider under an empty band would announce a layer and then show
-   *  none of it. */
-  band: Box | null;
+  realizations: RealizationBox[];
+  dataObjects: DataObjectBox[];
+  access: AccessEdge[];
+  /** Bounds of the data tier, for its heading — null when no operation
+   *  touches a persistent object and there is nothing to place. */
+  dataBand: Box | null;
 }
 
 export interface SystemLayout {
@@ -106,10 +101,13 @@ export const SYS = {
   /** Below this width a drawing still fits at a readable size, so it is
    *  left on one line however wide it looks. Roughly eight columns. */
   WRAP_THRESHOLD: 2800,
-  BAND_GAP: 96, BAND_TITLE: 36,
-  POOL_GAP: 44, POOL_PAD: 12, POOL_TITLE: 42, POOL_MIN_W: 208,
-  CHIP_W: 196, CHIP_H: 30, CHIP_GAP: 8, CHIP_COLS: 2,
-  STORE_W: 210, STORE_H: 62, STORE_GAP: 32, STORE_ROW_GAP: 40,
+  /** A realization tab: a small pill in the gutter on the approach into
+   *  the operation, its right edge held this far off the card. */
+  REAL_W: 150, REAL_H: 34, REAL_VGAP: 8, REAL_OFFSET: 16,
+  /** The data tier below the machine: object nodes and the gap down to
+   *  them from the operations that persist to them. */
+  DATA_GAP: 104, DATA_TITLE: 30,
+  OBJ_W: 184, OBJ_H: 58, OBJ_GAP: 30, OBJ_ROW_GAP: 40,
 };
 
 // ---------------------------------------------------------------------------
@@ -505,7 +503,7 @@ export function layoutSystem(graph: Graph, options: LayoutOptions = {}): SystemL
   const l0 = boundsOf([...pos.values()]);
   const edges = routeEdges(graph, pos, columnOf, macro, columnX, columnWidth, bands);
   const plane = runtime
-    ? layoutRuntime(graph, runtime, pos, columnOf, macro, columnX, columnWidth, bands, l0)
+    ? layoutRuntime(runtime, pos, columnOf, macro, columnX, columnWidth, l0)
     : null;
 
   return { pos, services, edges, runtime: plane, l0 };
@@ -703,25 +701,27 @@ function routeEdges(
 }
 
 /**
- * The L1 band: the execution populations that run the boundaries above,
- * and the storage layouts that partition the objects those boundaries
- * touch.
+ * The realization, laid onto the machine it realizes.
  *
- * A pool names the boundaries assigned to it rather than being wired to
- * them. That is the fact — a shared pool is a shared execution
- * population and nothing more — and a line from every boundary to its
- * pool would cross the whole drawing to say it. The lines exist, but
- * only for what is selected.
+ * A router or a subscription dispatch is a fact about a boundary — the
+ * way a caller or a topic enters an operation — so it is drawn as a tab
+ * on that approach, in the gutter just off the operation's input edge,
+ * not parked in a plane of its own. The pool it names is written on the
+ * tab; a pool is a shared population, and selecting one lights every tab
+ * that names it, which is the whole of what "shared" means here.
+ *
+ * A storage layout is a fact about an object, so the objects operations
+ * persist to are drawn as a downstream tier and wired to the operations
+ * that touch them, the partitioned ones marked apart from the rest. The
+ * data is part of the machine, so it is connected to it.
  */
 function layoutRuntime(
-  graph: Graph,
   runtime: RuntimeFacts,
   pos: Map<string, Box>,
   columnOf: Map<string, number>,
   macro: (vertex: string) => string,
   columnX: number[],
   columnWidth: number[],
-  bands: BandGeometry,
   l0: Box,
 ): RuntimePlane {
   const centre = l0.x + l0.w / 2;
@@ -730,143 +730,103 @@ function layoutRuntime(
     return b ? b.x + b.w / 2 : centre;
   };
 
-  const poolNodes = graph.runtime.execution_pools.map((pool) => {
-    const chips: PoolChip[] = pool.assigned.map((b) => {
-      const link = runtime.links.find((l) => l.operation === b.operation && l.input === b.input);
-      return {
-        id: `chip:${pool.id}:${b.operation}:${b.input}`,
-        operation: b.operation,
-        input: b.input,
-        kind: link?.kind ?? "request",
-        routing: link?.routingKey ?? null,
-        x: 0, y: 0, w: SYS.CHIP_W, h: SYS.CHIP_H,
+  // Realization tabs: stacked on the operation's input edge, one per
+  // realized boundary, each connected to the card by a short arm.
+  const byOperation = new Map<Id, BoundaryLink[]>();
+  for (const link of runtime.links) {
+    const list = byOperation.get(link.operation);
+    if (list) list.push(link);
+    else byOperation.set(link.operation, [link]);
+  }
+  const realizations: RealizationBox[] = [];
+  for (const [opId, links] of byOperation) {
+    const op = pos.get(opId);
+    if (!op) continue;
+    links.sort((a, b) => a.input.localeCompare(b.input));
+    const n = links.length;
+    links.forEach((link, i) => {
+      const cy = op.y + (op.h * (i + 1)) / (n + 1);
+      const y = cy - SYS.REAL_H / 2;
+      const x = op.x - SYS.REAL_W - SYS.REAL_OFFSET;
+      const box: RealizationBox = {
+        link,
+        x, y, w: SYS.REAL_W, h: SYS.REAL_H,
+        connector: roundedPolyline(
+          [
+            { x: x + SYS.REAL_W, y: cy },
+            { x: op.x - 4, y: cy },
+            { x: op.x, y: cy },
+          ],
+          6,
+        ),
       };
+      realizations.push(box);
+      pos.set(link.id, { x, y, w: box.w, h: box.h });
     });
-    const cols = Math.min(SYS.CHIP_COLS, Math.max(1, chips.length));
-    const rows = Math.max(1, Math.ceil(chips.length / cols));
-    return {
-      pool,
-      chips,
-      cols,
-      rows,
-      w: Math.max(SYS.POOL_MIN_W, SYS.POOL_PAD * 2 + cols * SYS.CHIP_W + (cols - 1) * SYS.CHIP_GAP),
-      h: SYS.POOL_TITLE + SYS.POOL_PAD + rows * SYS.CHIP_H + (rows - 1) * SYS.CHIP_GAP,
-      anchor: chips.length
-        ? chips.reduce((sum, c) => sum + centreX(c.operation), 0) / chips.length
-        : centre,
-    };
-  });
-
-  poolNodes.sort((a, b) => a.anchor - b.anchor || a.pool.id.localeCompare(b.pool.id));
-
-  const bandTop = l0.y + l0.h + SYS.BAND_GAP;
-  const poolTop = bandTop + SYS.BAND_TITLE;
-
-  // Placed under the mean of the boundaries they run, then pushed apart
-  // in that order — a pool sits beneath its own work wherever there is
-  // room — and wrapped once a row reaches the width of the plane above,
-  // so a model with twenty pools does not stretch the drawing back out.
-  const limit = Math.max(l0.x + l0.w, l0.x + SYS.WRAP_THRESHOLD);
-  const pools: PoolBox[] = [];
-  let cursor = l0.x;
-  let rowTop = poolTop;
-  let rowHeight = 0;
-  for (const node of poolNodes) {
-    let x = Math.max(node.anchor - node.w / 2, cursor);
-    if (x + node.w > limit && cursor > l0.x) {
-      rowTop += rowHeight + SYS.STORE_ROW_GAP;
-      rowHeight = 0;
-      cursor = l0.x;
-      x = l0.x;
-    }
-    cursor = x + node.w + SYS.POOL_GAP;
-    rowHeight = Math.max(rowHeight, node.h);
-    const top = rowTop;
-    const box: PoolBox = {
-      id: node.pool.id,
-      concurrency: node.pool.member_concurrency,
-      x, y: top, w: node.w, h: node.h,
-      chips: node.chips.map((chip, i) => ({
-        ...chip,
-        x: x + SYS.POOL_PAD + (i % node.cols) * (SYS.CHIP_W + SYS.CHIP_GAP),
-        y: top + SYS.POOL_TITLE + Math.floor(i / node.cols) * (SYS.CHIP_H + SYS.CHIP_GAP),
-      })),
-    };
-    pools.push(box);
-    pos.set(box.id, { x: box.x, y: box.y, w: box.w, h: box.h });
-    for (const chip of box.chips) pos.set(chip.id, { x: chip.x, y: chip.y, w: chip.w, h: chip.h });
   }
 
-  const storageTop = (pools.length ? rowTop + rowHeight : poolTop) + SYS.STORE_ROW_GAP;
-  const storage: StorageBox[] = [];
+  // The data tier: object nodes below the machine, placed under the mean
+  // of the operations that touch them and pushed apart in that order,
+  // wrapped once a row reaches the width of the plane above.
   const anchorOf = (ops: Id[]) =>
     ops.length ? ops.reduce((sum, o) => sum + centreX(o), 0) / ops.length : centre;
-  cursor = l0.x;
-  rowTop = storageTop;
-  for (const layout of [...runtime.storage].sort(
-    (a, b) => anchorOf(a.operations) - anchorOf(b.operations) || a.id.localeCompare(b.id),
-  )) {
-    let x = Math.max(anchorOf(layout.operations) - SYS.STORE_W / 2, cursor);
-    if (x + SYS.STORE_W > limit && cursor > l0.x) {
-      rowTop += SYS.STORE_H + SYS.STORE_ROW_GAP;
+  const objects = [...runtime.dataObjects].sort(
+    (a, b) => anchorOf(a.operations) - anchorOf(b.operations) || a.object.localeCompare(b.object),
+  );
+  const limit = Math.max(l0.x + l0.w, l0.x + SYS.WRAP_THRESHOLD);
+  const dataTop = l0.y + l0.h + SYS.DATA_GAP + SYS.DATA_TITLE;
+  const dataObjects: DataObjectBox[] = [];
+  let cursor = l0.x;
+  let rowTop = dataTop;
+  for (const obj of objects) {
+    let x = Math.max(anchorOf(obj.operations) - SYS.OBJ_W / 2, cursor);
+    if (x + SYS.OBJ_W > limit && cursor > l0.x) {
+      rowTop += SYS.OBJ_H + SYS.OBJ_ROW_GAP;
       cursor = l0.x;
       x = l0.x;
     }
-    cursor = x + SYS.STORE_W + SYS.STORE_GAP;
-    const box: StorageBox = {
-      id: layout.id,
-      object: layout.object,
-      partitionKey: layout.partitionKey,
-      operations: layout.operations,
-      x, y: rowTop, w: SYS.STORE_W, h: SYS.STORE_H,
+    cursor = x + SYS.OBJ_W + SYS.OBJ_GAP;
+    const box: DataObjectBox = {
+      object: obj.object,
+      dataModel: obj.dataModel,
+      partitioned: obj.partitioned,
+      partitionKey: obj.partitionKey,
+      operations: obj.operations,
+      x, y: rowTop, w: SYS.OBJ_W, h: SYS.OBJ_H,
     };
-    storage.push(box);
-    pos.set(box.id, { x: box.x, y: box.y, w: box.w, h: box.h });
+    dataObjects.push(box);
+    pos.set(box.object, { x: box.x, y: box.y, w: box.w, h: box.h });
   }
 
-  // A link leaves its operation sideways into the gutter beside it and
-  // travels to its pool just above the band. From the last band it can
-  // drop straight down; from any band above one, it goes out to the
-  // margin first, for the same reason a wrapping edge does — everything
-  // between is somebody else's drawing.
-  const links: LinkGeometry[] = [];
-  const margin = Math.max(...columnX.map((x, c) => x + columnWidth[c])) + SYS.OUTER_MARGIN;
-  runtime.links.forEach((link, i) => {
-    const op = pos.get(link.operation);
-    const pool = pools.find((p) => p.id === link.pool);
-    if (!op || !pool) return;
-    const column = columnOf.get(macro(link.operation)) ?? 0;
-    const band = bands.of[column];
-    const gutter = columnX[column] + columnWidth[column] + SYS.COL_GAP / 2;
-    const chip = pool.chips.find((c) => c.operation === link.operation && c.input === link.input);
-    const target = chip ? { x: chip.x + chip.w / 2, y: pool.y } : { x: pool.x + pool.w / 2, y: pool.y };
-    const y = l0.y + l0.h + 28 + i * SYS.LANE;
-    const start = { x: op.x + op.w, y: op.y + op.h * 0.66 };
-    const points: Point[] =
-      band === bands.count - 1
-        ? [start, { x: gutter, y: start.y }, { x: gutter, y }, { x: target.x, y }, target]
-        : [
-            start,
-            { x: gutter, y: start.y },
-            { x: gutter, y: bands.top[band + 1] - SYS.BAND_ROW_GAP / 2 },
-            { x: margin, y: bands.top[band + 1] - SYS.BAND_ROW_GAP / 2 },
-            { x: margin, y },
-            { x: target.x, y },
-            target,
-          ];
-    links.push({
-      id: link.id,
-      link,
-      d: roundedPolyline(points, SYS.CORNER),
-      labelAt: { x: (gutter + target.x) / 2, y: y - 6 },
-    });
-  });
+  // Access edges leave the operation's foot, drop through the gutter
+  // beside its column to a trunk below the machine, and rise into the
+  // object — kept out of the cards between, the way every other long
+  // edge here is.
+  const trunkY = l0.y + l0.h + SYS.DATA_GAP - SYS.CORNER;
+  const access: AccessEdge[] = [];
+  for (const obj of dataObjects) {
+    for (const opId of obj.operations) {
+      const op = pos.get(opId);
+      if (!op) continue;
+      const column = columnOf.get(macro(opId)) ?? 0;
+      const gutter = columnX[column] + columnWidth[column] + SYS.COL_GAP / 2;
+      const from = { x: op.x + op.w * 0.5, y: op.y + op.h };
+      const to = { x: obj.x + obj.w / 2, y: obj.y };
+      access.push({
+        id: `ax:${opId}:${obj.object}`,
+        operation: opId,
+        object: obj.object,
+        partitioned: obj.partitioned,
+        from,
+        to,
+        d: roundedPolyline(
+          [from, { x: gutter, y: from.y }, { x: gutter, y: trunkY }, { x: to.x, y: trunkY }, to],
+          SYS.CORNER,
+        ),
+      });
+    }
+  }
 
-  const boxes: Box[] = [...pools, ...storage];
-  const content = boundsOf(boxes);
-  const band = boxes.length
-    ? { x: content.x, y: bandTop, w: content.w, h: content.y + content.h - bandTop }
-    : null;
-
-  return { pools, storage, links, band };
+  const dataBand = dataObjects.length ? boundsOf(dataObjects) : null;
+  return { realizations, dataObjects, access, dataBand };
 }
