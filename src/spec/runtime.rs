@@ -87,45 +87,109 @@ impl RuntimeModel {
 // Topic transport
 // ---------------------------------------------------------------------
 
-/// Runtime transport facts for one L0 topic.
+/// Runtime transport facts for one L0 topic, in topic-scoped mode.
 ///
 /// The logical channel — which messages the topic carries and what
 /// identifies one of them — stays in L0 [`Topic`](super::Topic). What
-/// moves here is the precedence the transport establishes among those
-/// messages, which is a property of the realization: the same logical
-/// channel may be realized with or without an ordering guarantee.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// lives here are two independent realization facts: the equivalence
+/// domains the transport groups messages into, and the precedence it
+/// establishes among them.
+///
+/// A topic runtime declaring either fact puts the topic in
+/// **topic-scoped** mode: every subscription of it observes these
+/// transport semantics, and none may declare its own. A topic runtime
+/// declaring neither leaves the topic in **subscription-scoped** mode,
+/// where each [`SubscriptionRuntime`] states its own. The two modes are
+/// exclusive — there is no inheritance, no override, and no fallback
+/// (see [`Model::effective_grouping`](super::Model::effective_grouping)).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TopicRuntime {
-    pub ordering: TopicOrdering,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grouping: Option<GroupingKey>,
+
+    #[serde(default, skip_serializing_if = "OrderingSemantics::is_none")]
+    pub ordering: OrderingSemantics,
 }
 
+impl TopicRuntime {
+    /// Whether this runtime declares any transport fact at all, which
+    /// is what puts the topic in topic-scoped mode.
+    pub fn declares_transport_semantics(&self) -> bool {
+        declares_transport_semantics(&self.grouping, self.ordering)
+    }
+}
+
+fn declares_transport_semantics(
+    grouping: &Option<GroupingKey>,
+    ordering: OrderingSemantics,
+) -> bool {
+    grouping.is_some() || ordering != OrderingSemantics::None
+}
+
+/// Where a runtime grouping key lives in each grouped message schema.
+///
+/// Its presence *is* the grouping declaration: a transport either
+/// groups by a key or it does not, so there is no separate "none"
+/// spelling to write, and no way to write half a declaration.
+///
+/// A keyed grouping means
+///
+/// ```text
+/// grouping_key(A) = grouping_key(B)  =>  runtime_group(A) = runtime_group(B)
+/// ```
+///
+/// and nothing further — not ordering, not serialization, not member
+/// assignment, not execution affinity, not uniqueness, not
+/// storage-partition identity. Each of those needs its own declared
+/// fact.
+///
+/// A grouping key's *fields* come from L0 message schemas, but the
+/// statement "this runtime groups traffic by these fields" is a
+/// realization fact, which is why grouping is L1. The key is semantic
+/// in value and runtime-semantic in use; it is never a worker id,
+/// partition number, shard id, host id, or storage-partition id.
+///
+/// Different schemas may map differently named fields into one domain,
+/// so the mapping is per schema. Tuple positions correspond across
+/// schemas, so every mapped tuple has the same arity — the rule
+/// [`MessageIdentity`](super::MessageIdentity) already uses.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum TopicOrdering {
-    /// The model does not provide enough information about ordering.
-    Unspecified,
+#[serde(transparent)]
+pub struct GroupingKey {
+    pub mapping: BTreeMap<Id, Vec<FieldPath>>,
+}
 
-    /// The topic provides no ordering guarantee.
-    Unordered,
+/// The precedence a transport establishes among messages, independent
+/// of how it groups them.
+///
+/// Absent is `none`: a transport that says nothing about order gives no
+/// precedence, and there is no third epistemic state to distinguish.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OrderingSemantics {
+    /// No usable transport precedence guarantee exists.
+    #[default]
+    None,
 
-    /// All messages published to the topic are observed in one
-    /// globally ordered sequence.
+    /// One precedence relation across all messages in this scope.
+    ///
+    /// Stronger than same-group precedence, and it needs no grouping
+    /// key of its own. It does not imply globally ordered *execution*:
+    /// the execution topology must still preserve the precedence.
     Global,
 
-    /// Messages sharing the same logical key are observed in order.
-    Keyed(TopicKey),
+    /// Precedence among messages belonging to the same declared
+    /// grouping domain. Requires a grouping declaration at the same
+    /// scope, since otherwise there is no domain the guarantee could
+    /// be interpreted over.
+    WithinGroup,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct TopicKey {
-    /// For each message schema carried by the topic, identifies the
-    /// field representing this topic's logical ordering key.
-    ///
-    /// Different schemas may use different field names while still
-    /// participating in the same logical key domain.
-    pub mapping: BTreeMap<Id, FieldPath>,
+impl OrderingSemantics {
+    pub fn is_none(&self) -> bool {
+        *self == Self::None
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -145,8 +209,27 @@ pub struct SubscriptionRuntime {
     /// Delivery semantics of the realized subscription.
     pub delivery: DeliverySemantics,
 
+    /// Transport grouping for this subscription, in subscription-scoped
+    /// mode only — absent when the subscribed topic declares
+    /// topic-scoped semantics, which validation enforces.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grouping: Option<GroupingKey>,
+
+    /// Transport precedence for this subscription, in the same mode
+    /// and under the same rule.
+    #[serde(default, skip_serializing_if = "OrderingSemantics::is_none")]
+    pub ordering: OrderingSemantics,
+
     /// Where deliveries execute.
     pub dispatch: SubscriptionDispatch,
+}
+
+impl SubscriptionRuntime {
+    /// Whether this runtime declares transport semantics of its own,
+    /// which is only valid when the topic declares none.
+    pub fn declares_transport_semantics(&self) -> bool {
+        declares_transport_semantics(&self.grouping, self.ordering)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -207,16 +290,14 @@ pub struct SubscriptionRouting {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SubscriptionRoutingKey {
-    /// Reuse the semantic keyed domain established by the topic's
-    /// runtime ordering: two messages with equal topic keys belong to
-    /// the same routing domain.
+    /// Route by the effective grouping key — whichever scope declared
+    /// it (§12).
     ///
-    /// In the initial model this requires a compatible keyed
-    /// [`TopicRuntime::ordering`] on the subscribed topic. Separating
-    /// topic-key identity from topic ordering is a later refactor, for
-    /// when keyed routing without a transport-ordering guarantee is
-    /// actually needed.
-    TopicKey,
+    /// Naming the grouping rather than restating its field mapping is
+    /// what gives the analyzer grouping/routing-domain identity for
+    /// free, and keeps the two from drifting apart. It requires a keyed
+    /// grouping to name.
+    GroupingKey,
 }
 
 // ---------------------------------------------------------------------

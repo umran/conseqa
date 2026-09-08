@@ -1485,7 +1485,7 @@ pub enum Mutation {
     // L1 runtime topology; all shared-skeleton writes.
     PutTopicRuntime {
         topic: Id,
-        value: TopicRuntime,
+        value: TopicRuntime,   // { grouping, ordering }
     },
 
     PutSubscriptionRuntime {

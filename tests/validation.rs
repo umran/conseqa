@@ -11,10 +11,11 @@ use conseqa::{
         Arm, Branch, Condition, Derivation, Effect, EstablishTransactionOutput, ExecuteEffect,
         FieldPath, Id, IdempotencyGuarantee, Input, Literal, MessageIdentity, MessageSelector,
         Model, OperationBlock, OperationStep, RequestEffect, RequestIdentity, RequestTarget,
-        DataObjectRef, ExecutionPool, MemberAssignment, MemberConcurrency, OperationInputRef,
+        DataObjectRef, ExecutionPool, MemberAssignment, MemberConcurrency,
+        OperationInputRef,
         RequestRouting, ResultOutcome, ResultVariant, RetrySemantics, Return, Router, RuntimeModel,
         Schema, SchemaFragment, SelectorValue, StateTransition, StepHop, StepLocation,
-        StorageLayout, SubscriptionRoutingKey, TopicOrdering, Transaction, TransactionIsolation,
+        StorageLayout, SubscriptionRoutingKey, OrderingSemantics, Transaction, TransactionIsolation,
         TransactionStep, TransitionEffectIntent, ValueRef, ValueSource,
     },
 };
@@ -85,8 +86,8 @@ fn fixture_path(name: &str) -> PathBuf {
         .join(name)
 }
 
-/// The order-events topic's runtime, for tests that perturb the keyed
-/// transport domain.
+/// The order-events topic's runtime, for tests that perturb the
+/// transport grouping domain.
 fn topic_runtime(model: &mut Model) -> &mut conseqa::spec::TopicRuntime {
     model
         .runtime
@@ -386,11 +387,11 @@ fn rejects_publication_schema_not_carried_by_topic() {
 }
 
 #[test]
-fn rejects_keyed_topic_missing_schema_mapping() {
+fn rejects_grouping_key_missing_schema_mapping() {
     let mut model = load_flash_checkout();
 
-    let TopicOrdering::Keyed(key) = &mut topic_runtime(&mut model).ordering else {
-        panic!("expected keyed topic");
+    let Some(key) = &mut topic_runtime(&mut model).grouping else {
+        panic!("expected a keyed grouping");
     };
 
     key.mapping.remove(&id("schema.PaymentCaptured"));
@@ -399,7 +400,8 @@ fn rejects_keyed_topic_missing_schema_mapping() {
 
     assert_eq!(
         errors,
-        vec![ValidationError::TopicKeyMissingSchema {
+        vec![ValidationError::GroupingKeyMissingSchema {
+            subject: id("topic.order_events"),
             topic: id("topic.order_events"),
             schema: id("schema.PaymentCaptured"),
         }]
@@ -407,23 +409,24 @@ fn rejects_keyed_topic_missing_schema_mapping() {
 }
 
 #[test]
-fn rejects_topic_key_for_schema_not_on_topic() {
+fn rejects_grouping_key_for_schema_not_on_topic() {
     let mut model = load_flash_checkout();
 
-    let TopicOrdering::Keyed(key) = &mut topic_runtime(&mut model).ordering else {
-        panic!("expected keyed topic");
+    let Some(key) = &mut topic_runtime(&mut model).grouping else {
+        panic!("expected a keyed grouping");
     };
 
     key.mapping.insert(
         id("schema.CancelOrderRequest"),
-        FieldPath(vec!["order_id".to_owned()]),
+        vec![FieldPath(vec!["order_id".to_owned()])],
     );
 
     let errors = validation::validate(&model);
 
     assert_eq!(
         errors,
-        vec![ValidationError::TopicKeySchemaNotOnTopic {
+        vec![ValidationError::GroupingKeySchemaNotOnTopic {
+            subject: id("topic.order_events"),
             topic: id("topic.order_events"),
             schema: id("schema.CancelOrderRequest"),
         }]
@@ -2760,25 +2763,133 @@ fn routing_must_terminate_at_a_declared_pool() {
 }
 
 #[test]
-fn topic_key_routing_requires_a_keyed_topic_domain() {
-    // `topic_key` names the domain the topic runtime establishes, so
-    // there has to be one. This is a validation error, not a silent
-    // unproven verdict, because the declaration would otherwise refer
-    // to nothing.
+fn grouping_key_routing_requires_a_grouping_domain() {
+    // `grouping_key` names the effective grouping domain, so one has
+    // to exist. A validation error rather than a silent unproven
+    // verdict, because the declaration would otherwise refer to
+    // nothing.
     let mut model = load_flash_checkout();
 
     runtime(&mut model)
         .topics
         .get_mut(&id("topic.order_events"))
         .unwrap()
-        .ordering = TopicOrdering::Unordered;
+        .grouping = None;
 
     assert!(
         validation::validate(&model).iter().any(|error| matches!(
             error,
-            ValidationError::TopicKeyRoutingWithoutKeyDomain { topic, .. }
+            ValidationError::RoutingWithoutGrouping { topic, .. }
                 if topic == &id("topic.order_events")
         ))
+    );
+}
+
+#[test]
+fn an_unordered_transport_may_still_group() {
+    // Grouping and ordering are independent facts. A transport that
+    // orders nothing may still group by a key — the shape of an
+    // unordered queue with consistent-hash workers — and that grouping
+    // is enough for serialization to reason about, with no ordering
+    // guarantee anywhere.
+    let mut model = load_flash_checkout();
+
+    runtime(&mut model)
+        .topics
+        .get_mut(&id("topic.order_events"))
+        .unwrap()
+        .ordering = OrderingSemantics::None;
+
+    assert!(
+        validation::validate(&model).is_empty(),
+        "grouping without ordering is a valid declaration"
+    );
+}
+
+#[test]
+fn within_group_requires_a_grouping_at_the_same_scope() {
+    let mut model = load_flash_checkout();
+
+    let topic = runtime(&mut model)
+        .topics
+        .get_mut(&id("topic.order_events"))
+        .unwrap();
+
+    topic.grouping = None;
+    topic.ordering = OrderingSemantics::WithinGroup;
+
+    assert!(
+        validation::validate(&model).iter().any(|error| matches!(
+            error,
+            ValidationError::WithinGroupWithoutGrouping { subject }
+                if subject == &id("topic.order_events")
+        ))
+    );
+}
+
+#[test]
+fn transport_semantics_may_not_be_declared_at_both_scopes() {
+    // The scopes are exclusive: a topic declaring transport semantics
+    // supplies them to every subscription, and none may declare its
+    // own. There is no override rule to resolve.
+    let mut model = load_flash_checkout();
+
+    let subscription = runtime(&mut model)
+        .subscriptions
+        .get_mut(&id("operation.reserve_inventory"))
+        .and_then(|inputs| inputs.get_mut(&id("input.reserve_inventory.created")))
+        .expect("the fixture declares it");
+
+    subscription.ordering = OrderingSemantics::Global;
+
+    assert!(
+        validation::validate(&model).iter().any(|error| matches!(
+            error,
+            ValidationError::TransportSemanticsAtBothScopes { topic, input, .. }
+                if topic == &id("topic.order_events")
+                    && input == &id("input.reserve_inventory.created")
+        ))
+    );
+}
+
+#[test]
+fn grouping_and_ordering_are_each_present_or_absent() {
+    // There is no half a declaration to write. A grouping is its own
+    // presence, and an absent ordering is `none`, so "groups without
+    // ordering" is a complete statement — the unordered-queue shape —
+    // rather than an unpaired one needing a rule to reject it.
+    let mut model = load_flash_checkout();
+
+    let topic = runtime(&mut model)
+        .topics
+        .get_mut(&id("topic.order_events"))
+        .unwrap();
+
+    topic.ordering = OrderingSemantics::None;
+
+    assert!(validation::validate(&model).is_empty());
+
+    // And the reverse: a precedence with no grouping of its own, which
+    // §11 of the patch admits because global order needs no key.
+    let topic = runtime(&mut model)
+        .topics
+        .get_mut(&id("topic.order_events"))
+        .unwrap();
+
+    topic.grouping = None;
+    topic.ordering = OrderingSemantics::Global;
+
+    // Only the routing declaration objects, because `grouping_key`
+    // routing has lost the domain it names — not the transport
+    // declaration itself.
+    let errors = validation::validate(&model);
+
+    assert!(
+        errors.iter().all(|error| matches!(
+            error,
+            ValidationError::RoutingWithoutGrouping { .. }
+        )),
+        "{errors:#?}"
     );
 }
 
@@ -2886,7 +2997,7 @@ fn a_subscription_runtime_must_name_a_subscription_boundary() {
     let dispatch = conseqa::spec::SubscriptionDispatch {
         pool: id("pool.order_workers"),
         routing: Some(conseqa::spec::SubscriptionRouting {
-            key: SubscriptionRoutingKey::TopicKey,
+            key: SubscriptionRoutingKey::GroupingKey,
             member_assignment: MemberAssignment::ConsistentHash,
         }),
     };
@@ -2899,6 +3010,8 @@ fn a_subscription_runtime_must_name_a_subscription_boundary() {
             id("input.create_order.request"),
             conseqa::spec::SubscriptionRuntime {
                 delivery: conseqa::spec::DeliverySemantics::AtLeastOnce,
+                grouping: None,
+                ordering: conseqa::spec::OrderingSemantics::None,
                 dispatch,
             },
         );

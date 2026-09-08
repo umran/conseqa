@@ -16,8 +16,8 @@ use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 
 use crate::spec::{
-    Effect, Id, MessageSelector, OperationStep, Schema, StateMachineSubject, TopicOrdering,
-    Transaction, TransactionStep, TransitionSideEffect, TypeRef, ValueRef, ValueSource,
+    Effect, Id, MessageSelector, OperationStep, Schema, StateMachineSubject, Transaction,
+    TransactionStep, TransitionSideEffect, TypeRef, ValueRef, ValueSource,
 };
 
 use super::fingerprint::SemanticHash;
@@ -584,10 +584,11 @@ impl<'w> Builder<'w> {
             .topics
             .iter()
             .map(|(id, topic_runtime)| {
-                let schemas = match &topic_runtime.ordering {
-                    TopicOrdering::Keyed(key) => key.mapping.keys().cloned().collect(),
-                    _ => Vec::new(),
-                };
+                let schemas = topic_runtime
+                    .grouping
+                    .as_ref()
+                    .map(|key| key.mapping.keys().cloned().collect())
+                    .unwrap_or_default();
 
                 (id.clone(), schemas)
             })
@@ -603,21 +604,28 @@ impl<'w> Builder<'w> {
             }
         }
 
-        let subscriptions: Vec<(Id, Id, Id)> = runtime
+        let subscriptions: Vec<(Id, Id, Id, Vec<Id>)> = runtime
             .subscriptions
             .iter()
             .flat_map(|(operation, inputs)| {
                 inputs.iter().map(move |(input, subscription)| {
+                    let schemas = subscription
+                        .grouping
+                        .as_ref()
+                        .map(|key| key.mapping.keys().cloned().collect())
+                        .unwrap_or_default();
+
                     (
                         operation.clone(),
                         input.clone(),
                         subscription.dispatch.pool.clone(),
+                        schemas,
                     )
                 })
             })
             .collect();
 
-        for (operation, input, pool) in subscriptions {
+        for (operation, input, pool, schemas) in subscriptions {
             let from = self.node_ids[&SymbolKey::SubscriptionRuntime {
                 operation: operation.clone(),
                 input: input.clone(),
@@ -625,6 +633,12 @@ impl<'w> Builder<'w> {
 
             self.link(from, EdgeKind::References, &SymbolKey::Input { operation, input });
             self.link(from, EdgeKind::References, &SymbolKey::ExecutionPool(pool));
+
+            // A subscription-scoped grouping key names schemas of its
+            // own, exactly as a topic-scoped one does.
+            for schema in schemas {
+                self.link(from, EdgeKind::References, &SymbolKey::Schema(schema));
+            }
         }
 
         let routers: Vec<(Id, Id, Id, Id)> = runtime

@@ -44,14 +44,21 @@ Extract every explicit correctness statement in the prompt as a prompt \
 obligation. Do not implement operation programs — establish stable \
 interfaces callers can reason against.
 
-You also own the runtime topology (L1): topic transport ordering, \
-subscription delivery and dispatch, execution pools and their member \
-concurrency, request routers, and storage layouts. This is architecture, \
+You also own the runtime topology (L1): transport grouping and \
+ordering, subscription delivery and dispatch, execution pools and \
+their member concurrency, request routers, and storage layouts. \
+Grouping and ordering are independent facts sharing one exclusive \
+scope — declare them either on the topic runtime, for every \
+subscription of it, or on each subscription runtime, never both. This is architecture, \
 not per-operation synthesis, which is why it is yours. L1 is optional — \
 declare only what the application genuinely realizes — but note that \
-serialization and ordering requirements are discharged from it: a keyed \
-routing domain owned by one pool member whose concurrency is bounded(1) \
-is what proves same-key invocations never overlap. Never invent \
+serialization and ordering requirements are discharged from it: a \
+grouping domain owned by one pool member whose concurrency is \
+bounded(1) is what proves same-key invocations never overlap, and a \
+transport ordering on top of that is what proves they take effect in \
+order. Serialization needs no ordering fact at all — declare \
+`ordering: none` where the transport genuinely orders nothing rather \
+than claiming an order to reach a grouping key. Never invent \
 topology to make a proof pass; if the architecture genuinely does not \
 constrain execution that way, leave the requirement unproven.
 

@@ -843,17 +843,20 @@ operations:
 # ---------------------------------------------------------------------
 runtime:
 
+  # Topic-scoped transport semantics: one grouping domain and one
+  # ordering guarantee for every subscription of this topic, as a
+  # partitioned log provides. No subscription may declare its own.
   topics:
     topic.order_events:
-      ordering:
-        kind: keyed
-        mapping:
-          schema.InventoryReserved: order_id
-          schema.OrderCancelled: order_id
-          schema.OrderCreated: order_id
-          schema.OrderPaid: order_id
-          schema.PaymentCaptured: order_id
-          schema.PaymentFailed: order_id
+      grouping:
+        schema.InventoryReserved: [order_id]
+        schema.OrderCancelled: [order_id]
+        schema.OrderCreated: [order_id]
+        schema.OrderPaid: [order_id]
+        schema.PaymentCaptured: [order_id]
+        schema.PaymentFailed: [order_id]
+
+      ordering: within_group
 
   execution_pools:
     pool.order_workers:
@@ -881,7 +884,7 @@ runtime:
         dispatch:
           pool: pool.order_workers
           routing:
-            key: topic_key
+            key: grouping_key
             member_assignment:
               kind: consistent_hash
 
@@ -891,7 +894,7 @@ runtime:
         dispatch:
           pool: pool.payment_workers
           routing:
-            key: topic_key
+            key: grouping_key
             member_assignment:
               kind: consistent_hash
 
@@ -901,7 +904,7 @@ runtime:
         dispatch:
           pool: pool.order_workers
           routing:
-            key: topic_key
+            key: grouping_key
             member_assignment:
               kind: consistent_hash
 

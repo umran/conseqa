@@ -92,9 +92,6 @@ pub enum ValidationCode {
     SubscriptionMessageNotOnTopic,
     PublicationEffectMessageNotOnTopic,
 
-    TopicKeySchemaNotOnTopic,
-    TopicKeyMissingSchema,
-
     MessageIdentitySchemaNotOnTopic,
     EmptyMessageIdentity,
     MessageIdentityArityMismatch,
@@ -123,8 +120,16 @@ pub enum ValidationCode {
 
     // L1 — runtime topology.
     EmptyRoutingKey,
-    TopicKeyRoutingWithoutKeyDomain,
+    RoutingWithoutGrouping,
     DuplicateRouterForBoundary,
     EmptyPartitionKey,
     DuplicateStorageLayoutForObject,
+
+    // L1 — transport grouping and ordering.
+    GroupingKeySchemaNotOnTopic,
+    GroupingKeyMissingSchema,
+    EmptyGroupingKey,
+    GroupingKeyArityMismatch,
+    WithinGroupWithoutGrouping,
+    TransportSemanticsAtBothScopes,
 }

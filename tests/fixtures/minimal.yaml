@@ -26,11 +26,9 @@ state_machines: {}
 
 operations: {}
 
-# The transport fact the topic used to carry: an explicit negative
-# ordering guarantee, which is L1 because it describes the realization
+# This transport neither groups nor orders — both facts are simply
+# absent. Transport facts are L1 because they describe the realization
 # rather than the logical channel.
 runtime:
     topics:
-        order_events:
-            ordering:
-                kind: unordered
+        order_events: {}

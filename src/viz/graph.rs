@@ -134,7 +134,16 @@ pub struct RequirementBadges {
 #[derive(Debug, Clone, Serialize)]
 pub struct TopicNode {
     pub id: Id,
+
+    /// Topic-scoped transport facts. In subscription-scoped mode both
+    /// read `none` and each subscribe edge carries its own.
     pub ordering: String,
+    pub grouping: String,
+
+    /// Whether the topic declares transport semantics for all its
+    /// subscriptions, or leaves each to declare its own.
+    pub topic_scoped_transport: bool,
+
     pub messages: Vec<Id>,
 }
 
@@ -187,6 +196,11 @@ pub enum EdgeDetail {
         schemas: Vec<Id>,
 
         delivery: String,
+
+        /// The transport facts in force for this subscription,
+        /// resolved from whichever scope declares them.
+        grouping: String,
+        ordering: String,
 
         /// The dispatch routing key, or `none` when the dispatch
         /// declares no member affinity. Absent entirely when the
@@ -323,6 +337,16 @@ pub fn extract(model: &Model) -> Graph {
                                 input: input_id.clone(),
                                 schemas,
                                 delivery: to_tag(&model.delivery(op_id, input_id)),
+                                grouping: grouping_label(
+                                    model
+                                        .effective_grouping(op_id, input_id, &sub.topic)
+                                        .as_ref(),
+                                ),
+                                ordering: ordering_label(model.effective_ordering(
+                                    op_id,
+                                    input_id,
+                                    &sub.topic,
+                                )),
                                 routing: runtime.map(|runtime| match &runtime.dispatch.routing {
                                     Some(routing) => to_tag(&routing.key),
                                     None => "none".to_string(),
@@ -497,7 +521,17 @@ pub fn extract(model: &Model) -> Graph {
         .iter()
         .map(|(id, topic)| TopicNode {
             id: id.clone(),
-            ordering: topic_ordering_label(&model.topic_ordering(id)),
+            ordering: model
+                .topic_runtime(id)
+                .map(|runtime| ordering_label(runtime.ordering))
+                .unwrap_or_else(|| "none".to_string()),
+            grouping: model
+                .topic_runtime(id)
+                .map(|runtime| grouping_label(runtime.grouping.as_ref()))
+                .unwrap_or_else(|| "none".to_string()),
+            // Whether these facts govern every subscription of the
+            // topic, or each declares its own.
+            topic_scoped_transport: model.topic_scoped_transport(id),
             messages: topic.messages.iter().cloned().collect(),
         })
         .collect();
@@ -778,12 +812,18 @@ fn idempotency_label(value: &crate::spec::IdempotencyGuarantee) -> String {
     }
 }
 
-fn topic_ordering_label(value: &crate::spec::TopicOrdering) -> String {
+fn ordering_label(value: crate::spec::OrderingSemantics) -> String {
     match value {
-        crate::spec::TopicOrdering::Unspecified => "unspecified".to_string(),
-        crate::spec::TopicOrdering::Unordered => "unordered".to_string(),
-        crate::spec::TopicOrdering::Global => "global".to_string(),
-        crate::spec::TopicOrdering::Keyed(_) => "keyed".to_string(),
+        crate::spec::OrderingSemantics::None => "none".to_string(),
+        crate::spec::OrderingSemantics::Global => "global".to_string(),
+        crate::spec::OrderingSemantics::WithinGroup => "within_group".to_string(),
+    }
+}
+
+fn grouping_label(value: Option<&crate::spec::GroupingKey>) -> String {
+    match value {
+        Some(_) => "keyed".to_string(),
+        None => "none".to_string(),
     }
 }
 

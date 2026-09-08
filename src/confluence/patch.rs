@@ -336,7 +336,7 @@ fn collect_references(mutation: &Mutation, out: &mut Vec<SymbolKey>) {
         Mutation::PutTopicRuntime { topic, value } => {
             out.push(SymbolKey::Topic(topic.clone()));
 
-            if let crate::spec::TopicOrdering::Keyed(key) = &value.ordering {
+            if let Some(key) = &value.grouping {
                 for schema in key.mapping.keys() {
                     out.push(SymbolKey::Schema(schema.clone()));
                 }
@@ -346,6 +346,12 @@ fn collect_references(mutation: &Mutation, out: &mut Vec<SymbolKey>) {
         Mutation::PutSubscriptionRuntime {
             operation, value, ..
         } => {
+            if let Some(key) = &value.grouping {
+                for schema in key.mapping.keys() {
+                    out.push(SymbolKey::Schema(schema.clone()));
+                }
+            }
+
             // The boundary belongs to another authority, so its
             // interface is a genuine external reference — and reading
             // the interface is what shows the input. So is the pool the

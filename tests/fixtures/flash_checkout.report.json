@@ -16,8 +16,8 @@
       "summary": "Invocations of operation.apply_payment sharing key input.apply_payment.captured.order_id never overlap.",
       "scope": "runtime_dependent",
       "assumptions": [
-        "topic.order_events declares a keyed transport domain, and input.apply_payment.captured dispatches into pool.order_workers by topic_key, so same-key deliveries share one routing domain",
-        "for schema.PaymentCaptured, the topic key order_id is the serialization key field",
+        "topic.order_events declares a keyed grouping for every subscription of it, and input.apply_payment.captured dispatches into pool.order_workers by that grouping key, so same-key deliveries share one routing domain",
+        "for schema.PaymentCaptured, the grouping key order_id is the serialization key field",
         "consistent_hash assignment gives each routing domain one owning pool member at a time, and transfers that ownership safely when membership changes",
         "pool.order_workers bounds each member to one simultaneously active invocation, so the owning member runs same-key invocations one at a time"
       ],
@@ -37,9 +37,10 @@
       "summary": "Invocations of operation.apply_payment sharing key input.apply_payment.captured.order_id take effect in their semantic order.",
       "scope": "runtime_dependent",
       "assumptions": [
-        "topic.order_events orders same-key messages (keyed transport ordering); that order is the precedence",
-        "for schema.PaymentCaptured, the topic key order_id is the ordering key field",
-        "input.apply_payment.captured dispatches by topic_key, so same-key deliveries belong to one semantic routing domain",
+        "the transport for topic.order_events orders messages within a group; that order is the precedence",
+        "topic.order_events declares a keyed grouping for every subscription of it",
+        "for schema.PaymentCaptured, the grouping key order_id is the ordering key field",
+        "input.apply_payment.captured dispatches by the grouping key, so same-key deliveries belong to the one routing domain the grouping established",
         "consistent_hash assignment gives each routing domain one owning pool member at a time, and transfers that ownership safely when membership changes",
         "pool.order_workers bounds each member to one simultaneously active invocation, so a later invocation cannot overtake an earlier one",
         "dispatch preserves the transport's established same-key precedence when admitting invocations, including across failure-driven redelivery and ownership reassignment",
@@ -102,8 +103,8 @@
       "summary": "Invocations of operation.charge_payment sharing key input.charge_payment.reserved.order_id never overlap.",
       "scope": "runtime_dependent",
       "assumptions": [
-        "topic.order_events declares a keyed transport domain, and input.charge_payment.reserved dispatches into pool.payment_workers by topic_key, so same-key deliveries share one routing domain",
-        "for schema.InventoryReserved, the topic key order_id is the serialization key field",
+        "topic.order_events declares a keyed grouping for every subscription of it, and input.charge_payment.reserved dispatches into pool.payment_workers by that grouping key, so same-key deliveries share one routing domain",
+        "for schema.InventoryReserved, the grouping key order_id is the serialization key field",
         "consistent_hash assignment gives each routing domain one owning pool member at a time, and transfers that ownership safely when membership changes",
         "pool.payment_workers bounds each member to one simultaneously active invocation, so the owning member runs same-key invocations one at a time"
       ],
@@ -123,9 +124,10 @@
       "summary": "Invocations of operation.charge_payment sharing key input.charge_payment.reserved.order_id take effect in their semantic order.",
       "scope": "runtime_dependent",
       "assumptions": [
-        "topic.order_events orders same-key messages (keyed transport ordering); that order is the precedence",
-        "for schema.InventoryReserved, the topic key order_id is the ordering key field",
-        "input.charge_payment.reserved dispatches by topic_key, so same-key deliveries belong to one semantic routing domain",
+        "the transport for topic.order_events orders messages within a group; that order is the precedence",
+        "topic.order_events declares a keyed grouping for every subscription of it",
+        "for schema.InventoryReserved, the grouping key order_id is the ordering key field",
+        "input.charge_payment.reserved dispatches by the grouping key, so same-key deliveries belong to the one routing domain the grouping established",
         "consistent_hash assignment gives each routing domain one owning pool member at a time, and transfers that ownership safely when membership changes",
         "pool.payment_workers bounds each member to one simultaneously active invocation, so a later invocation cannot overtake an earlier one",
         "dispatch preserves the transport's established same-key precedence when admitting invocations, including across failure-driven redelivery and ownership reassignment",
@@ -235,8 +237,8 @@
       "summary": "Invocations of operation.reserve_inventory sharing key input.reserve_inventory.created.order_id never overlap.",
       "scope": "runtime_dependent",
       "assumptions": [
-        "topic.order_events declares a keyed transport domain, and input.reserve_inventory.created dispatches into pool.order_workers by topic_key, so same-key deliveries share one routing domain",
-        "for schema.OrderCreated, the topic key order_id is the serialization key field",
+        "topic.order_events declares a keyed grouping for every subscription of it, and input.reserve_inventory.created dispatches into pool.order_workers by that grouping key, so same-key deliveries share one routing domain",
+        "for schema.OrderCreated, the grouping key order_id is the serialization key field",
         "consistent_hash assignment gives each routing domain one owning pool member at a time, and transfers that ownership safely when membership changes",
         "pool.order_workers bounds each member to one simultaneously active invocation, so the owning member runs same-key invocations one at a time"
       ],
@@ -256,9 +258,10 @@
       "summary": "Invocations of operation.reserve_inventory sharing key input.reserve_inventory.created.order_id take effect in their semantic order.",
       "scope": "runtime_dependent",
       "assumptions": [
-        "topic.order_events orders same-key messages (keyed transport ordering); that order is the precedence",
-        "for schema.OrderCreated, the topic key order_id is the ordering key field",
-        "input.reserve_inventory.created dispatches by topic_key, so same-key deliveries belong to one semantic routing domain",
+        "the transport for topic.order_events orders messages within a group; that order is the precedence",
+        "topic.order_events declares a keyed grouping for every subscription of it",
+        "for schema.OrderCreated, the grouping key order_id is the ordering key field",
+        "input.reserve_inventory.created dispatches by the grouping key, so same-key deliveries belong to the one routing domain the grouping established",
         "consistent_hash assignment gives each routing domain one owning pool member at a time, and transfers that ownership safely when membership changes",
         "pool.order_workers bounds each member to one simultaneously active invocation, so a later invocation cannot overtake an earlier one",
         "dispatch preserves the transport's established same-key precedence when admitting invocations, including across failure-driven redelivery and ownership reassignment",

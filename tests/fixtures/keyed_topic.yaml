@@ -43,7 +43,6 @@ operations: {}
 runtime:
     topics:
         order_events:
-            ordering:
-                kind: keyed
-                mapping:
-                    OrderEvent: order_id
+            grouping:
+                OrderEvent: [order_id]
+            ordering: within_group

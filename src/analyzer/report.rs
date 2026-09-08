@@ -24,8 +24,8 @@ use crate::analyzer::verification::{
     StableRoot, VerificationReport,
 };
 use crate::analyzer::verification::{
-    DuplicateHandling, LineageFact, ModelNote, OrderingProof, OrderingVerdict, PrecedenceSource,
-    ProofScope,
+    DuplicateHandling, GroupingScope, LineageFact, MessageKeyFact, ModelNote, OrderingProof,
+    OrderingVerdict, PrecedenceSource, ProofScope,
 };
 use crate::spec::{
     CompletionRequirement, Id, MemberAssignment, Model, ResultReplayRequirement,
@@ -591,29 +591,17 @@ fn serialization_assumptions(proof: &SerializationProof) -> Vec<String> {
             input,
             topic,
             pool,
+            grouping_scope,
             message_keys,
             member_assignment,
         } => {
             let mut assumptions = vec![format!(
-                "{topic} declares a keyed transport domain, and {input} dispatches \
-                 into {pool} by topic_key, so same-key deliveries share one routing \
-                 domain"
+                "{}, and {input} dispatches into {pool} by that grouping key, so \
+                 same-key deliveries share one routing domain",
+                grouping_declaration(grouping_scope, topic)
             )];
 
-            for key in message_keys {
-                assumptions.push(match &key.identity {
-                    KeyIdentity::SamePath => format!(
-                        "for {}, the topic key {} is the serialization key field",
-                        key.schema, key.topic_key
-                    ),
-
-                    KeyIdentity::SameCanonicalValue { schema, path } => format!(
-                        "for {}, the topic key {} carries the serialization key's \
-                         value ({schema}.{path} via fragment aliasing)",
-                        key.schema, key.topic_key
-                    ),
-                });
-            }
+            assumptions.extend(grouping_key_assumptions(message_keys, "serialization"));
 
             assumptions.push(member_assignment_assumption(member_assignment));
 
@@ -639,6 +627,48 @@ fn member_assignment_assumption(assignment: &MemberAssignment) -> String {
     }
 }
 
+/// Which declaration supplied the grouping — the two scopes are
+/// exclusive, so naming it tells a reader exactly what to look at, and
+/// which declaration changing would invalidate the proof.
+fn grouping_declaration(scope: &GroupingScope, topic: &Id) -> String {
+    match scope {
+        GroupingScope::Topic { topic } => {
+            format!("{topic} declares a keyed grouping for every subscription of it")
+        }
+
+        GroupingScope::Subscription { input, .. } => {
+            format!("{input} declares its own keyed grouping over {topic}")
+        }
+    }
+}
+
+/// The precedence half, named the same way.
+fn ordering_declaration(scope: &GroupingScope, topic: &Id) -> String {
+    match scope {
+        GroupingScope::Topic { topic } => topic.to_string(),
+        GroupingScope::Subscription { input, .. } => format!("{input} on {topic}"),
+    }
+}
+
+/// Per admitted schema, why the grouping key carries the requirement
+/// key's value.
+fn grouping_key_assumptions(keys: &[MessageKeyFact], requirement: &str) -> Vec<String> {
+    keys.iter()
+        .map(|key| match &key.identity {
+            KeyIdentity::SamePath => format!(
+                "for {}, the grouping key {} is the {requirement} key field",
+                key.schema, key.grouping_key
+            ),
+
+            KeyIdentity::SameCanonicalValue { schema, path } => format!(
+                "for {}, the grouping key {} carries the {requirement} key's value \
+                 ({schema}.{path} via fragment aliasing)",
+                key.schema, key.grouping_key
+            ),
+        })
+        .collect()
+}
+
 fn ordering_assumptions(proof: &OrderingProof) -> Vec<String> {
     match proof {
         OrderingProof::NoAdmittedInvocations { input } => vec![format!(
@@ -651,45 +681,38 @@ fn ordering_assumptions(proof: &OrderingProof) -> Vec<String> {
             topic,
             pool,
             precedence,
+            scope,
+            message_keys,
             routing_key,
             member_assignment,
             duplicates,
         } => {
             let mut assumptions = Vec::new();
 
-            match precedence {
-                PrecedenceSource::KeyedTopic { message_keys } => {
-                    assumptions.push(format!(
-                        "{topic} orders same-key messages (keyed transport ordering); \
-                         that order is the precedence"
-                    ));
+            // Precedence and grouping are independent facts, and the
+            // proof cites them as two.
+            assumptions.push(match precedence {
+                PrecedenceSource::WithinGroup => format!(
+                    "the transport for {} orders messages within a group; that order \
+                     is the precedence",
+                    ordering_declaration(scope, topic)
+                ),
 
-                    for key in message_keys {
-                        assumptions.push(match &key.identity {
-                            KeyIdentity::SamePath => format!(
-                                "for {}, the topic key {} is the ordering key field",
-                                key.schema, key.topic_key
-                            ),
+                PrecedenceSource::Global => format!(
+                    "the transport for {} orders every message; that order is the \
+                     precedence for any key",
+                    ordering_declaration(scope, topic)
+                ),
+            });
 
-                            KeyIdentity::SameCanonicalValue { schema, path } => format!(
-                                "for {}, the topic key {} and the ordering key both \
-                                 denote {schema}.{path} through declared fragment mappings",
-                                key.schema, key.topic_key
-                            ),
-                        });
-                    }
-                }
+            assumptions.push(grouping_declaration(scope, topic));
 
-                PrecedenceSource::GlobalTopic => assumptions.push(format!(
-                    "{topic} orders every message (global transport ordering); that \
-                     order is the precedence for any key"
-                )),
-            }
+            assumptions.extend(grouping_key_assumptions(message_keys, "ordering"));
 
             assumptions.push(match routing_key {
-                SubscriptionRoutingKey::TopicKey => format!(
-                    "{input} dispatches by topic_key, so same-key deliveries belong to \
-                     one semantic routing domain"
+                SubscriptionRoutingKey::GroupingKey => format!(
+                    "{input} dispatches by the grouping key, so same-key deliveries \
+                     belong to the one routing domain the grouping established"
                 ),
             });
 

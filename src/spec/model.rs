@@ -5,8 +5,8 @@ use serde::{Deserialize, Serialize};
 use crate::spec::StateMachine;
 
 use super::{
-    DataModel, DeliverySemantics, ExecutionPool, Id, Operation, Router, RuntimeModel, Schema,
-    Service, SubscriptionRuntime, Topic, TopicOrdering, TopicRuntime,
+    DataModel, DeliverySemantics, ExecutionPool, GroupingKey, Id, Operation, OrderingSemantics,
+    Router, RuntimeModel, Schema, Service, SubscriptionRuntime, Topic, TopicRuntime,
 };
 
 /// One Conseqa model, in two semantic layers.
@@ -49,15 +49,50 @@ impl Model {
         self.runtime.as_ref()?.topics.get(topic)
     }
 
-    /// The topic's declared transport ordering.
+    /// Whether a topic declares transport semantics for all of its
+    /// subscriptions, rather than leaving each to declare its own.
     ///
-    /// An undeclared topic runtime is `Unspecified`: the two are the
-    /// same epistemic position — no usable ordering fact — so the
-    /// analyzer needs no separate case for a missing L1.
-    pub fn topic_ordering(&self, topic: &Id) -> TopicOrdering {
+    /// This is the mode selector of §12: the two scopes are exclusive,
+    /// and validation rejects a model that declares at both.
+    pub fn topic_scoped_transport(&self, topic: &Id) -> bool {
         self.topic_runtime(topic)
-            .map(|runtime| runtime.ordering.clone())
-            .unwrap_or(TopicOrdering::Unspecified)
+            .is_some_and(TopicRuntime::declares_transport_semantics)
+    }
+
+    /// The grouping domain in force for one subscription.
+    ///
+    /// Resolved from exactly one scope. There is no fallback chain and
+    /// no override rule: a topic that declares transport semantics
+    /// supplies them to every subscription, and otherwise each
+    /// subscription supplies its own. A model validates into one mode
+    /// before analysis begins, so this is a lookup rather than a
+    /// precedence decision.
+    pub fn effective_grouping(
+        &self,
+        operation: &Id,
+        input: &Id,
+        topic: &Id,
+    ) -> Option<GroupingKey> {
+        if self.topic_scoped_transport(topic) {
+            return self.topic_runtime(topic)?.grouping.clone();
+        }
+
+        self.subscription_runtime(operation, input)?.grouping.clone()
+    }
+
+    /// The transport precedence in force for one subscription,
+    /// resolved from the same single scope as the grouping.
+    pub fn effective_ordering(&self, operation: &Id, input: &Id, topic: &Id) -> OrderingSemantics {
+        if self.topic_scoped_transport(topic) {
+            return self
+                .topic_runtime(topic)
+                .map(|runtime| runtime.ordering)
+                .unwrap_or_default();
+        }
+
+        self.subscription_runtime(operation, input)
+            .map(|runtime| runtime.ordering)
+            .unwrap_or_default()
     }
 
     /// The declared runtime facts for one subscription input, if any.

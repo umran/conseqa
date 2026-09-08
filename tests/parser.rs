@@ -10,7 +10,7 @@ use conseqa::{
         ErrorResultType, Field, FieldPath, Id, IdempotencyGuarantee, Input, Literal,
         MemberAssignment, MemberConcurrency, MessageIdentity, Model, OperationStep,
         RequestIdentity, ResultOutcome, ResultVariant, ScalarType, Schema, SchemaCompleteness,
-        SelectorValue, ServiceKind, SubscriptionRoutingKey, TopicOrdering, Transaction,
+        SelectorValue, ServiceKind, SubscriptionRoutingKey, OrderingSemantics, Transaction,
         TransactionStep, TransitionSideEffect, TypeRef, ValueSource,
     },
 };
@@ -101,12 +101,14 @@ fn parses_minimal_model() {
 
     assert!(order_events.messages.contains(&Id("OrderCreated".into())));
 
-    // Transport ordering is L1: the logical channel says what it
-    // carries, the runtime says in what order.
-    assert_eq!(
-        model.topic_ordering(&Id("order_events".into())),
-        TopicOrdering::Unordered
-    );
+    // Transport facts are L1: the logical channel says what it carries,
+    // the runtime says how it groups and orders.
+    let runtime = model
+        .topic_runtime(&Id("order_events".into()))
+        .expect("the fixture declares a topic runtime");
+
+    assert_eq!(runtime.ordering, OrderingSemantics::None);
+    assert!(runtime.grouping.is_none());
 }
 
 #[test]
@@ -178,19 +180,26 @@ fn parses_keyed_topic_model() {
         [Id("OrderEvent".into())].into_iter().collect()
     );
 
-    let TopicOrdering::Keyed(key) = model.topic_ordering(&Id("order_events".into())) else {
-        panic!("order_events should use keyed ordering");
-    };
+    let runtime = model
+        .topic_runtime(&Id("order_events".into()))
+        .expect("the fixture declares a topic runtime");
+
+    assert_eq!(runtime.ordering, OrderingSemantics::WithinGroup);
+
+    let key = runtime
+        .grouping
+        .as_ref()
+        .expect("order_events should declare a keyed grouping");
 
     let order_event_key = key
         .mapping
         .get(&Id("OrderEvent".into()))
-        .expect("OrderEvent should define its topic ordering key");
+        .expect("OrderEvent should define its grouping key");
 
-    assert_eq!(order_event_key.0, vec!["order_id".to_string()]);
+    assert_eq!(order_event_key, &vec![FieldPath(vec!["order_id".to_string()])]);
 
-    // The ordering key and the message identity are separate
-    // declarations: order_id sequences events for an order, event_id
+    // The grouping key and the message identity are separate
+    // declarations: order_id groups events for an order, event_id
     // identifies one logical message.
     let MessageIdentity::Keyed { mapping } = &topic.message_identity else {
         panic!("order_events should declare a keyed message identity");
@@ -390,6 +399,11 @@ fn flash_checkout_parses_nested_semantics() {
         )
         .expect("reserve_inventory should declare a subscription runtime");
 
+    // The topic declares transport semantics, so the subscription
+    // declares none of its own: the two scopes are exclusive.
+    assert!(runtime.grouping.is_none());
+    assert!(runtime.ordering.is_none());
+
     assert_eq!(runtime.delivery, DeliverySemantics::AtLeastOnce);
     assert_eq!(runtime.dispatch.pool, Id("pool.order_workers".into()));
 
@@ -399,7 +413,7 @@ fn flash_checkout_parses_nested_semantics() {
         .as_ref()
         .expect("the dispatch should declare routing");
 
-    assert_eq!(routing.key, SubscriptionRoutingKey::TopicKey);
+    assert_eq!(routing.key, SubscriptionRoutingKey::GroupingKey);
     assert_eq!(routing.member_assignment, MemberAssignment::ConsistentHash);
 
     let pool = model
@@ -1751,12 +1765,10 @@ topics:
     assert!(model.services.is_empty());
     assert!(model.operations.is_empty());
 
-    // With no runtime, transport ordering is simply unknown — the same
-    // epistemic position an explicit `unspecified` states.
-    assert_eq!(
-        model.topic_ordering(&Id("topic.order_events".into())),
-        TopicOrdering::Unspecified
-    );
+    // With no runtime there are no transport facts at all, and the
+    // topic is in neither declaration scope.
+    assert!(model.topic_runtime(&Id("topic.order_events".into())).is_none());
+    assert!(!model.topic_scoped_transport(&Id("topic.order_events".into())));
 }
 
 /// The canonical runtime-enriched surface: every L1 primitive in one
@@ -1770,10 +1782,9 @@ revision: 1
 runtime:
   topics:
     topic.order_events:
-      ordering:
-        kind: keyed
-        mapping:
-          schema.OrderCreated: order_id
+      grouping:
+        schema.OrderCreated: [order_id]
+      ordering: within_group
 
   execution_pools:
     pool.order_workers:
@@ -1792,7 +1803,7 @@ runtime:
         dispatch:
           pool: pool.order_workers
           routing:
-            key: topic_key
+            key: grouping_key
             member_assignment:
               kind: consistent_hash
 
@@ -1858,6 +1869,94 @@ runtime:
 
     // External tools read L1 from the serialized surface alone, so it
     // must round-trip.
+    let round_tripped = yaml::parse(&yaml::serialize(&model).expect("serializes"))
+        .expect("re-parses");
+
+    assert_eq!(model, round_tripped);
+}
+
+/// The second declaration mode on the wire: the topic declares no
+/// transport semantics and each subscription declares its own pair,
+/// so two subscribers of one channel may group differently.
+#[test]
+fn subscription_scoped_transport_semantics_parse() {
+    let source = "
+revision: 1
+
+schemas:
+  schema.Event:
+    kind: canonical
+    completeness: complete
+    fields:
+      account_id: uuid
+      region_id: uuid
+
+topics:
+  topic.events:
+    messages:
+      - schema.Event
+    message_identity:
+      kind: unspecified
+
+runtime:
+  execution_pools:
+    pool.accounts:
+      member_concurrency: { kind: bounded, value: 1 }
+    pool.regions:
+      member_concurrency: { kind: bounded, value: 1 }
+
+  subscriptions:
+    op.process_accounts:
+      input.events:
+        delivery: at_least_once
+        grouping:
+          schema.Event: [account_id]
+        ordering: within_group
+        dispatch:
+          pool: pool.accounts
+          routing:
+            key: grouping_key
+            member_assignment: { kind: consistent_hash }
+
+    op.process_regions:
+      input.events:
+        delivery: at_least_once
+        grouping:
+          schema.Event: [region_id]
+        dispatch:
+          pool: pool.regions
+          routing:
+            key: grouping_key
+            member_assignment: { kind: consistent_hash }
+";
+
+    let model = yaml::parse(source).expect("subscription-scoped semantics should parse");
+
+    // The topic declares nothing, so it is not in topic-scoped mode.
+    assert!(!model.topic_scoped_transport(&Id("topic.events".into())));
+
+    let accounts = model
+        .subscription_runtime(
+            &Id("op.process_accounts".into()),
+            &Id("input.events".into()),
+        )
+        .expect("a subscription runtime");
+
+    assert_eq!(accounts.ordering, OrderingSemantics::WithinGroup);
+
+    // Grouping and ordering are independent: one subscriber orders
+    // within its groups, the other only groups.
+    let regions = model
+        .subscription_runtime(&Id("op.process_regions".into()), &Id("input.events".into()))
+        .expect("a subscription runtime");
+
+    assert_eq!(regions.ordering, OrderingSemantics::None);
+
+    assert!(
+        regions.grouping.is_some(),
+        "grouping without ordering is a complete declaration, not half a pair"
+    );
+
     let round_tripped = yaml::parse(&yaml::serialize(&model).expect("serializes"))
         .expect("re-parses");
 

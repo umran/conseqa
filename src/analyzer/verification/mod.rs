@@ -93,8 +93,8 @@ pub use result_replay::{
     ResultReplayCheck, ResultReplayObstacle, ResultReplayProof, ResultReplayVerdict, ReturnedResult,
 };
 pub use serialization::{
-    KeyIdentity, MessageKeyFact, RoutingKeyFact, SerializationCheck, SerializationObstacle,
-    SerializationProof, SerializationVerdict,
+    GroupingScope, KeyIdentity, MessageKeyFact, RoutingKeyFact, SerializationCheck,
+    SerializationObstacle, SerializationProof, SerializationVerdict,
 };
 pub use trigger::{
     Consumer, EffectContract, Producer, ProducerSite, TriggerGraph, collapses_duplicates,

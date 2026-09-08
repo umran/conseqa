@@ -8,11 +8,12 @@ import type {
   IdempotencyGuarantee,
   Input,
   MemberAssignment,
+  GroupingKey,
   MemberConcurrency,
+  OrderingSemantics,
   ResultType,
   SubscriptionRoutingKey,
   Topic,
-  TopicOrdering,
 } from "../types/model";
 import { pathText } from "./ids";
 
@@ -280,17 +281,56 @@ export function messageIdentity(identity: Topic["message_identity"]): Explanatio
   };
 }
 
-export function topicOrdering(ordering: TopicOrdering): Explanation {
-  switch (ordering.kind) {
-    case "keyed":
-      return { label: "ordered per key", tone: "success", summary: "The transport delivers messages sharing the mapped key in publication order; different keys are unordered relative to each other. This is a realization fact, not a property of the logical channel." };
+/** The transport precedence in force — a realization fact, not a
+ *  property of the logical channel, and independent of grouping. */
+export function transportOrdering(ordering: OrderingSemantics | undefined): Explanation {
+  switch (ordering) {
+    case "within_group":
+      return {
+        label: "ordered within each group",
+        tone: "success",
+        summary:
+          "The transport delivers messages of one runtime group in publication order; " +
+          "different groups are unordered relative to each other.",
+      };
     case "global":
-      return { label: "globally ordered", tone: "success", summary: "Every message is part of one ordered sequence." };
-    case "unordered":
-      return { label: "unordered", tone: "warning", summary: "No delivery-order guarantee; observed order may not be relied on." };
-    case "unspecified":
-      return { label: "ordering unspecified", tone: "warning", summary: "No usable ordering fact is declared." };
+      return {
+        label: "globally ordered",
+        tone: "success",
+        summary:
+          "Every message is part of one ordered sequence — stronger than per-group order, " +
+          "and it needs no grouping key of its own. It does not imply ordered execution: " +
+          "the execution topology must still preserve the precedence.",
+      };
+    default:
+      return {
+        label: "no transport order",
+        tone: "warning",
+        summary: "No usable precedence guarantee; observed order may not be relied on.",
+      };
   }
+}
+
+/** The runtime equivalence domains the transport groups into. Enough
+ *  on its own for serialization to reason about; ordering is a
+ *  separate fact. */
+export function transportGrouping(grouping: GroupingKey | undefined): Explanation {
+  if (grouping) {
+    return {
+      label: "grouped by key",
+      tone: "success",
+      summary:
+        "Messages whose key tuples are equal belong to one runtime group. That is all it " +
+        "says — not ordering, not serialization, not member assignment, each of which " +
+        "needs its own declared fact.",
+    };
+  }
+
+  return {
+    label: "no grouping",
+    tone: "warning",
+    summary: "The transport establishes no equivalence domain over these messages.",
+  };
 }
 
 export function externalIdempotency(guarantee: IdempotencyGuarantee): Explanation {

@@ -7,8 +7,8 @@ import { pathText, shortId } from "../lib/ids";
 import {
   artifactRetention, commitGuarantee, delivery, externalIdempotency, externalResult, inheritedResult,
   isolation, messageIdentity, requestIdentity, requestResult, resultBinding,
-  memberAssignment, memberConcurrency, requestRouting, subscriptionRouting, topicOrdering,
-  transactionOutput,
+  memberAssignment, memberConcurrency, requestRouting, subscriptionRouting,
+  transactionOutput, transportGrouping, transportOrdering,
 } from "../lib/explain";
 import {
   effectDef, effectResultType, effectSummary, findTransaction, intentExecutors, operationEffects,
@@ -344,14 +344,15 @@ function TopicDetail({ id }: { id: Id }) {
   const subs = graph.edges.filter((e): e is Extract<Edge, { kind: "subscribe" }> => e.kind === "subscribe" && e.from === id);
   return (
     <Frame kind="topic" title={id} subtitle={<span>topic</span>}>
-      <FactNote fact={topicOrdering(topicRuntime?.ordering ?? { kind: "unspecified" })} />
+      <FactNote fact={transportGrouping(topicRuntime?.grouping)} />
+      <FactNote fact={transportOrdering(topicRuntime?.ordering)} />
       <FactNote fact={messageIdentity(topic.message_identity)} />
       <Section title="message schemas" count={topic.messages.length}>
         <List items={topic.messages.map((s) => <IdLink key={s} id={s} />)} />
       </Section>
-      {topicRuntime?.ordering.kind === "keyed" && (
-        <Section title="transport ordering key mapping">
-          <KeyValue rows={Object.entries(topicRuntime.ordering.mapping).map(([schema, path]) => [shortId(schema), <Mono key={schema}>{pathText(path)}</Mono>])} />
+      {topicRuntime?.grouping && (
+        <Section title="transport grouping key mapping">
+          <KeyValue rows={Object.entries(topicRuntime.grouping).map(([schema, tuple]) => [shortId(schema), <Mono key={schema}>{tuple.map(pathText).join(", ")}</Mono>])} />
         </Section>
       )}
       {topic.message_identity.kind === "keyed" && (

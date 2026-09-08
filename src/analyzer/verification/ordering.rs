@@ -36,6 +36,14 @@
 //! (`member_concurrency = bounded(1)`), so a later invocation cannot
 //! overtake an earlier one.
 //!
+//! The load-bearing step is that the precedence and the routing domain
+//! are established to be *the same domain*. A precedence over one
+//! domain composed with routing over another proves nothing: the
+//! transport would order two messages that routing then sends to
+//! different members. `check_requirement` therefore decides the
+//! pairing explicitly and exhaustively over both facts, rather than
+//! reading the presence of each as though it implied the other.
+//!
 //! Dispatch additionally carries an order-preservation obligation: a
 //! conforming runtime must not establish delivery A before B for the
 //! same ordered key, leave A semantically incomplete, and then admit B
@@ -56,7 +64,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::spec::{
     DeliverySemantics, FieldPath, Id, Input, MemberAssignment, MemberConcurrency, Model, Operation,
-    OrderingRequirement, SubscriptionRoutingKey, TopicOrdering, ValueRef, ValueSource,
+    OrderingRequirement, OrderingSemantics, SubscriptionRoutingKey, ValueRef, ValueSource,
 };
 
 use crate::analyzer::{Diagnostic, DiagnosticCode, Evidence, Severity, VerificationCode};
@@ -65,7 +73,8 @@ use super::ProofScope;
 use super::describe::describe_value_ref;
 use super::idempotency::{IdempotencyCheck, IdempotencyVerdict};
 use super::serialization::{
-    MessageKeyFact, SerializationObstacle, admits_no_messages, pool_is_serial, topic_key_facts,
+    GroupingScope, MessageKeyFact, SerializationObstacle, admits_no_messages, grouping_facts,
+    pool_is_serial,
 };
 
 /// The verdict for one declared ordering requirement.
@@ -111,14 +120,22 @@ pub enum OrderingProof {
     /// invocation bears the key and no precedence exists to preserve.
     NoAdmittedInvocations { input: Id },
 
-    /// The topic runtime's declared order is the precedence; one
-    /// owning member at concurrency one preserves it; redelivery
-    /// cannot reorder it.
+    /// The transport's declared precedence, preserved by one owning
+    /// member at concurrency one; redelivery cannot reorder it.
     RoutedOrder {
         input: Id,
         topic: Id,
         pool: Id,
+
+        /// The transport precedence, and which scope declared it.
         precedence: PrecedenceSource,
+        scope: GroupingScope,
+
+        /// Why same-key deliveries share one runtime group — the leg
+        /// serialization proves on its own, and which ordering needs
+        /// before a precedence is worth anything.
+        message_keys: Vec<MessageKeyFact>,
+
         routing_key: SubscriptionRoutingKey,
         member_assignment: MemberAssignment,
         duplicates: DuplicateHandling,
@@ -135,17 +152,22 @@ impl OrderingProof {
 }
 
 /// Where the preserved precedence comes from.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// Both variants require the same grouping identity to be useful — the
+/// mechanism has to keep same-key deliveries together either way — so
+/// the grouping evidence lives on the proof rather than inside one
+/// variant. What differs is only the reach of the precedence itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum PrecedenceSource {
-    /// The topic runtime orders same-key messages, and the ordering
-    /// key is established to carry the topic key for every admitted
-    /// schema.
-    KeyedTopic { message_keys: Vec<MessageKeyFact> },
+    /// The transport orders messages within a runtime group, and the
+    /// ordering key is established to be that group's key.
+    WithinGroup,
 
-    /// The topic runtime orders every message, so same-key messages
-    /// are ordered whatever the key.
-    GlobalTopic,
+    /// The transport orders every message in scope, so same-key
+    /// messages are ordered whatever the key. Still needs the
+    /// mechanism to keep them on one member.
+    Global,
 }
 
 /// Why redelivery cannot invert the precedence, and who answers for
@@ -195,26 +217,27 @@ pub enum OrderingObstacle {
     /// does not invent an order among independent requests.
     RequestInputHasNoPrecedenceSource { input: Id },
 
-    /// The subscribed topic's runtime declares no order that could
-    /// serve as the precedence.
-    TopicOrderingProvidesNoPrecedence {
-        input: Id,
-        topic: Id,
-        declared: TopicOrdering,
-    },
+    /// Neither scope declares a transport precedence, so there is no
+    /// order for the execution topology to preserve.
+    NoTransportPrecedence { input: Id, topic: Id },
 
-    /// The keyed topic declares no ordering-key mapping for an
-    /// admitted schema.
-    TopicKeyMappingMissing { input: Id, topic: Id, schema: Id },
+    /// No keyed grouping is declared at either scope, so same-key
+    /// deliveries are not established to share a runtime group — and
+    /// a precedence that execution cannot keep together is no proof.
+    NoGroupingDomain { input: Id, topic: Id },
 
-    /// The topic's order is per topic key, and the ordering key is
-    /// not established to carry it for this schema, so the declared
-    /// order says nothing about same-key invocations.
+    /// The grouping declares no key mapping for an admitted schema.
+    GroupingKeyMappingMissing { input: Id, topic: Id, schema: Id },
+
+    /// The grouping key is not established to carry the ordering key
+    /// for this schema, so same-key deliveries may land in different
+    /// runtime groups and the declared precedence says nothing about
+    /// them.
     KeyIdentityUnestablished {
         input: Id,
         topic: Id,
         schema: Id,
-        topic_key: FieldPath,
+        grouping_key: FieldPath,
     },
 
     /// The subscription declares no runtime, so nothing says where its
@@ -225,6 +248,7 @@ pub enum OrderingObstacle {
     /// so same-key deliveries may be owned by different members and
     /// dispatched out of order.
     RoutingAbsent { input: Id, pool: Id },
+
 
     /// The target execution pool is not declared, so its member
     /// concurrency is unknown.
@@ -310,68 +334,80 @@ fn check_requirement(
     let topic_id = subscription.topic.clone();
     let mut obstacles = Vec::new();
 
-    // The precedence source: the topic runtime's declared order, for
-    // this key.
-    let ordering = model.topic_ordering(&topic_id);
+    // The precedence: what the transport guarantees about the order in
+    // which these messages are observed, read from whichever scope
+    // declares it.
+    let precedence = match model.effective_ordering(operation_id, input_id, &topic_id) {
+        OrderingSemantics::WithinGroup => Some(PrecedenceSource::WithinGroup),
+        OrderingSemantics::Global => Some(PrecedenceSource::Global),
 
-    let precedence = match &ordering {
-        TopicOrdering::Keyed(_) => {
-            match topic_key_facts(model, input_id, subscription, &requirement.key.path) {
-                Ok((_, message_keys)) => Some(PrecedenceSource::KeyedTopic { message_keys }),
-
-                Err(serialization_obstacles) => {
-                    for obstacle in serialization_obstacles {
-                        obstacles.push(match obstacle {
-                            SerializationObstacle::TopicKeyMappingMissing {
-                                input,
-                                topic,
-                                schema,
-                            } => OrderingObstacle::TopicKeyMappingMissing {
-                                input,
-                                topic,
-                                schema,
-                            },
-
-                            SerializationObstacle::KeyIdentityUnestablished {
-                                input,
-                                topic,
-                                schema,
-                                topic_key,
-                            } => OrderingObstacle::KeyIdentityUnestablished {
-                                input,
-                                topic,
-                                schema,
-                                topic_key,
-                            },
-
-                            _ => OrderingObstacle::TopicOrderingProvidesNoPrecedence {
-                                input: input_id.clone(),
-                                topic: topic_id.clone(),
-                                declared: ordering.clone(),
-                            },
-                        });
-                    }
-
-                    None
-                }
-            }
-        }
-
-        TopicOrdering::Global => Some(PrecedenceSource::GlobalTopic),
-
-        TopicOrdering::Unspecified | TopicOrdering::Unordered => {
-            obstacles.push(OrderingObstacle::TopicOrderingProvidesNoPrecedence {
+        OrderingSemantics::None => {
+            obstacles.push(OrderingObstacle::NoTransportPrecedence {
                 input: input_id.clone(),
                 topic: topic_id.clone(),
-                declared: ordering.clone(),
             });
 
             None
         }
     };
 
-    // The mechanism: one routing domain per key, one owning member,
-    // one invocation at a time on that member.
+    // The grouping: why same-key deliveries stay together. Both
+    // precedence sources need it — `within_group` because its
+    // guarantee is *about* the group, `global` because a precedence
+    // over everything still has to survive into execution, and it only
+    // does when same-key deliveries reach one member. So the grouping
+    // identity is established once, for either.
+    let grouping = match grouping_facts(
+        model,
+        operation_id,
+        input_id,
+        subscription,
+        &requirement.key.path,
+    ) {
+        Ok(facts) => Some(facts),
+
+        Err(serialization_obstacles) => {
+            for obstacle in serialization_obstacles {
+                obstacles.push(match obstacle {
+                    SerializationObstacle::NoGroupingDomain { input, topic } => {
+                        OrderingObstacle::NoGroupingDomain { input, topic }
+                    }
+
+                    SerializationObstacle::GroupingKeyMappingMissing {
+                        input,
+                        topic,
+                        schema,
+                    } => OrderingObstacle::GroupingKeyMappingMissing {
+                        input,
+                        topic,
+                        schema,
+                    },
+
+                    SerializationObstacle::KeyIdentityUnestablished {
+                        input,
+                        topic,
+                        schema,
+                        grouping_key,
+                    } => OrderingObstacle::KeyIdentityUnestablished {
+                        input,
+                        topic,
+                        schema,
+                        grouping_key,
+                    },
+
+                    _ => OrderingObstacle::NoGroupingDomain {
+                        input: input_id.clone(),
+                        topic: topic_id.clone(),
+                    },
+                });
+            }
+
+            None
+        }
+    };
+
+    // The mechanism: the routing domain the grouping establishes, one
+    // owning member, one invocation at a time on that member.
     let Some(runtime) = model.subscription_runtime(operation_id, input_id) else {
         obstacles.push(OrderingObstacle::NoSubscriptionRuntime {
             input: input_id.clone(),
@@ -382,6 +418,11 @@ fn check_requirement(
 
     let pool_id = runtime.dispatch.pool.clone();
 
+    // Dispatch does not create precedence; it preserves the precedence
+    // the transport established, by admitting one runtime group to one
+    // member. `grouping_key` routing is what ties the two together —
+    // it names the very domain the grouping evidence is about, so the
+    // precedence and the routing domain cannot drift apart.
     let assignment = match &runtime.dispatch.routing {
         None => {
             obstacles.push(OrderingObstacle::RoutingAbsent {
@@ -392,13 +433,8 @@ fn check_requirement(
             None
         }
 
-        // `topic_key` is the only routing key a subscription may
-        // declare, and validation admits it only against a keyed topic
-        // runtime — which is exactly the precedence source above, so
-        // the routing fact and the precedence fact are about one
-        // domain.
         Some(routing) => match routing.key {
-            SubscriptionRoutingKey::TopicKey => Some((routing.key, routing.member_assignment)),
+            SubscriptionRoutingKey::GroupingKey => Some((routing.key, routing.member_assignment)),
         },
     };
 
@@ -455,15 +491,17 @@ fn check_requirement(
         }
     };
 
-    match (precedence, assignment) {
-        (Some(precedence), Some((routing_key, member_assignment)))
+    match (precedence, grouping, assignment) {
+        (Some(precedence), Some(grouping), Some((routing_key, member_assignment)))
             if serial && obstacles.is_empty() =>
         {
             OrderingVerdict::proven(OrderingProof::RoutedOrder {
                 input: input_id.clone(),
-                topic: topic_id,
+                topic: grouping.topic,
                 pool: pool_id,
                 precedence,
+                scope: grouping.scope,
+                message_keys: grouping.message_keys,
                 routing_key,
                 member_assignment,
                 duplicates,
@@ -527,40 +565,32 @@ impl OrderingObstacle {
                 ),
             },
 
-            Self::TopicOrderingProvidesNoPrecedence {
-                input,
-                topic,
-                declared,
-            } => Evidence {
+            Self::NoTransportPrecedence { input, topic } => Evidence {
                 subject: Some(topic.clone()),
-                message: match declared {
-                    TopicOrdering::Unordered => format!(
-                        "The runtime for `{topic}`, subscribed by `{input}`, is \
-                         explicitly `unordered`: it provides no message order to \
-                         serve as the precedence."
-                    ),
-
-                    TopicOrdering::Unspecified => format!(
-                        "`{topic}`, subscribed by `{input}`, declares no runtime \
-                         ordering fact to serve as the precedence."
-                    ),
-
-                    _ => format!(
-                        "The runtime ordering of `{topic}`, subscribed by \
-                         `{input}`, does not establish a precedence for this key."
-                    ),
-                },
+                message: format!(
+                    "Neither `{topic}` nor `{input}` declares a transport precedence, \
+                     so there is no order for the execution topology to preserve."
+                ),
             },
 
-            Self::TopicKeyMappingMissing {
+            Self::NoGroupingDomain { input, topic } => Evidence {
+                subject: Some(topic.clone()),
+                message: format!(
+                    "No keyed grouping is in effect for `{input}` on `{topic}`. A \
+                     transport precedence only reaches execution when same-key \
+                     deliveries stay in one group, and nothing establishes that here."
+                ),
+            },
+
+            Self::GroupingKeyMappingMissing {
                 input,
                 topic,
                 schema,
             } => Evidence {
                 subject: Some(topic.clone()),
                 message: format!(
-                    "`{topic}` orders messages by key but declares no key \
-                     mapping for `{schema}`, which `{input}` admits."
+                    "The grouping in effect for `{input}` declares no key mapping for \
+                     `{schema}`, which `{topic}` carries and the subscription admits."
                 ),
             },
 
@@ -568,13 +598,14 @@ impl OrderingObstacle {
                 input,
                 topic,
                 schema,
-                topic_key,
+                grouping_key,
             } => Evidence {
                 subject: Some(schema.clone()),
                 message: format!(
-                    "`{topic}` orders `{schema}` by `{topic_key}`, which is not \
-                     established to carry the ordering key of `{input}`; the \
-                     topic's order says nothing about same-key invocations."
+                    "For messages of `{schema}` on `{topic}`, the grouping key \
+                     `{grouping_key}` is not established to carry the ordering key of \
+                     `{input}`, so same-key deliveries may land in different runtime \
+                     groups."
                 ),
             },
 

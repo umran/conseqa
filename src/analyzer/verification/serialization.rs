@@ -35,10 +35,10 @@
 //!    `ExecutionPool` declares `member_concurrency = bounded(1)`, so
 //!    that member runs one invocation at a time.
 //! 3. **Subscription-routed**: the same argument on the delivery side.
-//!    The dispatch routes by `topic_key`, the topic runtime declares
-//!    the keyed domain that key names, and the serialization key is
-//!    established to carry the same logical value as the topic key for
-//!    every admitted message schema.
+//!    The dispatch routes by `grouping_key`, a keyed grouping is in
+//!    effect at one of the two declaration scopes, and the
+//!    serialization key is established to carry the same logical value
+//!    as the grouping key for every admitted message schema.
 //!
 //! Both runtime routes have the same shape, and it is the shape the
 //! whole model is built around:
@@ -76,9 +76,11 @@
 //!   end, not the invocation's whole execution.
 //! - **Serializable isolation** (§17). An equivalent serial commit
 //!   order does not prevent concurrent execution.
-//! - **Topic ordering alone** (§6). Delivery order does not serialize
-//!   consumer execution; the subscription route uses the keyed
-//!   declaration only for the key domain that routing references.
+//! - **Transport ordering**. Not merely uncredited — never consulted.
+//!   Serialization is about non-overlap, and a grouping domain is the
+//!   whole of what a transport supplies for it. This is the reason
+//!   grouping is declared independently of ordering: an unordered
+//!   transport that still groups by key serializes.
 //! - **`bounded(n)` with `n > 1`**: it permits overlap.
 //!
 //! A requirement no route establishes is `Unproven`, never violated:
@@ -91,8 +93,7 @@ use serde::{Deserialize, Serialize};
 use crate::analyzer::{Diagnostic, DiagnosticCode, Evidence, Severity, VerificationCode};
 use crate::spec::{
     FieldPath, Id, Input, MemberAssignment, MemberConcurrency, MessageSelector, Model, Operation,
-    SerializationRequirement, SubscriptionInput, SubscriptionRoutingKey, TopicOrdering, ValueRef,
-    ValueSource,
+    SerializationRequirement, SubscriptionInput, SubscriptionRoutingKey, ValueRef, ValueSource,
 };
 
 use super::ProofScope;
@@ -166,16 +167,24 @@ pub enum SerializationProof {
         member_assignment: MemberAssignment,
     },
 
-    /// The delivery-side counterpart: same-topic-key deliveries share
-    /// a routing domain, one member owns it, and that member executes
-    /// one invocation at a time.
+    /// The delivery-side counterpart: deliveries sharing a runtime
+    /// group share a routing domain, one member owns it, and that
+    /// member executes one invocation at a time.
+    ///
+    /// No ordering fact participates. Serialization is about
+    /// non-overlap, and a grouping domain is all the transport has to
+    /// supply for it — which is why grouping is declared independently
+    /// of ordering.
     SubscriptionRouted {
         input: Id,
         topic: Id,
         pool: Id,
 
+        /// Which scope declared the grouping this proof consumed.
+        grouping_scope: GroupingScope,
+
         /// Per admitted message schema, the fact identifying the
-        /// topic key with the serialization key.
+        /// grouping key with the serialization key.
         message_keys: Vec<MessageKeyFact>,
 
         member_assignment: MemberAssignment,
@@ -194,6 +203,22 @@ impl SerializationProof {
     }
 }
 
+/// Which declaration scope supplied the grouping a proof consumed.
+///
+/// Recorded because the two scopes are exclusive and a reader tracing
+/// the proof needs to know which declaration to look at — and which one
+/// changing would invalidate it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum GroupingScope {
+    /// The topic runtime declares transport semantics for every
+    /// subscription of the topic.
+    Topic { topic: Id },
+
+    /// The subscription declares its own.
+    Subscription { operation: Id, input: Id },
+}
+
 /// For one component of a request routing key, why it denotes the same
 /// logical value as the serialization key.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -203,15 +228,15 @@ pub struct RoutingKeyFact {
     pub identity: KeyIdentity,
 }
 
-/// For one admitted message schema, how the topic's ordering key was
-/// identified with the serialization key.
+/// For one admitted message schema, how the effective grouping key was
+/// identified with the requirement key.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MessageKeyFact {
     pub schema: Id,
 
-    /// The topic's declared ordering-key path for this schema.
-    pub topic_key: FieldPath,
+    /// The declared grouping-key path for this schema.
+    pub grouping_key: FieldPath,
 
     pub identity: KeyIdentity,
 }
@@ -278,23 +303,23 @@ pub enum SerializationObstacle {
         key: Vec<FieldPath>,
     },
 
-    /// Dispatch routes by `topic_key`, but the subscribed topic's
-    /// runtime declares no keyed ordering domain to route by.
-    TopicNotKeyed { input: Id, topic: Id },
+    /// Dispatch routes by `grouping_key`, but no keyed grouping is
+    /// declared at either scope, so there is no domain to route by.
+    NoGroupingDomain { input: Id, topic: Id },
 
-    /// The keyed topic declares no ordering-key mapping for an
-    /// admitted schema. Validation rejects this shape; verification
-    /// records it rather than assuming a mapping.
-    TopicKeyMappingMissing { input: Id, topic: Id, schema: Id },
+    /// The grouping declares no key mapping for an admitted schema.
+    /// Validation rejects this shape; verification records it rather
+    /// than assuming a mapping.
+    GroupingKeyMappingMissing { input: Id, topic: Id, schema: Id },
 
-    /// The topic's ordering key for this schema is not established to
-    /// carry the same logical value as the serialization key, so
-    /// same-key deliveries may enter different routing domains.
+    /// The grouping key for this schema is not established to carry
+    /// the same logical value as the serialization key, so same-key
+    /// deliveries may enter different runtime groups.
     KeyIdentityUnestablished {
         input: Id,
         topic: Id,
         schema: Id,
-        topic_key: FieldPath,
+        grouping_key: FieldPath,
     },
 
     /// The target execution pool is not declared, so its member
@@ -430,7 +455,7 @@ fn request_route(
     }
 }
 
-/// The delivery-side route: dispatch, topic-key equivalence, member
+/// The delivery-side route: dispatch, grouping-key equivalence, member
 /// assignment, member concurrency.
 fn subscription_route(
     model: &Model,
@@ -468,11 +493,9 @@ fn subscription_route(
         }
 
         Some(routing) => match routing.key {
-            SubscriptionRoutingKey::TopicKey => {
-                match topic_key_facts(model, input_id, subscription, key) {
-                    Ok((topic, message_keys)) => {
-                        Some((topic, message_keys, routing.member_assignment))
-                    }
+            SubscriptionRoutingKey::GroupingKey => {
+                match grouping_facts(model, operation_id, input_id, subscription, key) {
+                    Ok(facts) => Some((facts, routing.member_assignment)),
 
                     Err(routing_obstacles) => {
                         obstacles.extend(routing_obstacles);
@@ -487,12 +510,13 @@ fn subscription_route(
     let serial = pool_is_serial(model, input_id, &runtime.dispatch.pool, &mut obstacles);
 
     match routed {
-        Some((topic, message_keys, member_assignment)) if serial => {
+        Some((facts, member_assignment)) if serial => {
             SerializationVerdict::proven(SerializationProof::SubscriptionRouted {
                 input: input_id.clone(),
-                topic,
+                topic: facts.topic,
                 pool: runtime.dispatch.pool.clone(),
-                message_keys,
+                grouping_scope: facts.scope,
+                message_keys: facts.message_keys,
                 member_assignment,
             })
         }
@@ -614,29 +638,48 @@ fn routing_key_facts(
     Err(obstacles)
 }
 
-/// Establishes routing-domain equivalence for `key: topic_key`: for
-/// every admitted message schema, the topic's ordering key must carry
-/// the same logical value as the requirement key.
-pub(super) fn topic_key_facts(
+/// The grouping facts a `grouping_key` routing declaration rests on.
+pub(super) struct GroupingFacts {
+    pub topic: Id,
+    pub scope: GroupingScope,
+    pub message_keys: Vec<MessageKeyFact>,
+}
+
+/// Establishes routing-domain equivalence for `key: grouping_key`:
+/// for every admitted message schema, the effective grouping key must
+/// carry the same logical value as the requirement key.
+///
+/// The grouping is read from whichever scope declares it (§12), and the
+/// scope is recorded on the result so the proof can cite the
+/// declaration it actually consumed. No ordering fact is touched: a
+/// grouping domain is the whole of what the transport contributes here.
+pub(super) fn grouping_facts(
     model: &Model,
+    operation_id: &Id,
     input_id: &Id,
     subscription: &SubscriptionInput,
     requirement_key: &FieldPath,
-) -> Result<(Id, Vec<MessageKeyFact>), Vec<SerializationObstacle>> {
+) -> Result<GroupingFacts, Vec<SerializationObstacle>> {
     let topic_id = subscription.topic.clone();
 
-    let TopicOrdering::Keyed(topic_key) = model.topic_ordering(&topic_id) else {
-        return Err(vec![SerializationObstacle::TopicNotKeyed {
+    let grouping = model.effective_grouping(operation_id, input_id, &topic_id);
+
+    let (Some(grouping_key), Some(topic)) = (grouping.as_ref(), model.topics.get(&topic_id)) else {
+        return Err(vec![SerializationObstacle::NoGroupingDomain {
             input: input_id.clone(),
             topic: topic_id,
         }]);
     };
 
-    let Some(topic) = model.topics.get(&topic_id) else {
-        return Err(vec![SerializationObstacle::TopicNotKeyed {
+    let scope = if model.topic_scoped_transport(&topic_id) {
+        GroupingScope::Topic {
+            topic: topic_id.clone(),
+        }
+    } else {
+        GroupingScope::Subscription {
+            operation: operation_id.clone(),
             input: input_id.clone(),
-            topic: topic_id,
-        }]);
+        }
     };
 
     let admitted: Vec<&Id> = match &subscription.messages {
@@ -648,8 +691,8 @@ pub(super) fn topic_key_facts(
     let mut obstacles = Vec::new();
 
     for schema in admitted {
-        let Some(mapped) = topic_key.mapping.get(schema) else {
-            obstacles.push(SerializationObstacle::TopicKeyMappingMissing {
+        let Some(mapped) = grouping_key.mapping.get(schema) else {
+            obstacles.push(SerializationObstacle::GroupingKeyMappingMissing {
                 input: input_id.clone(),
                 topic: topic_id.clone(),
                 schema: schema.clone(),
@@ -658,24 +701,45 @@ pub(super) fn topic_key_facts(
             continue;
         };
 
-        match key_identity(model, schema, mapped, requirement_key) {
-            Some(identity) => facts.push(MessageKeyFact {
-                schema: schema.clone(),
-                topic_key: mapped.clone(),
-                identity,
-            }),
-
-            None => obstacles.push(SerializationObstacle::KeyIdentityUnestablished {
+        // A grouping key is a tuple. Every component must carry the
+        // requirement key's value, for the same reason a request
+        // routing key must: a wider tuple partitions same-key
+        // deliveries across groups, so equality of the requirement key
+        // would no longer imply a common group.
+        if mapped.is_empty() {
+            obstacles.push(SerializationObstacle::GroupingKeyMappingMissing {
                 input: input_id.clone(),
                 topic: topic_id.clone(),
                 schema: schema.clone(),
-                topic_key: mapped.clone(),
-            }),
+            });
+
+            continue;
+        }
+
+        for component in mapped {
+            match key_identity(model, schema, component, requirement_key) {
+                Some(identity) => facts.push(MessageKeyFact {
+                    schema: schema.clone(),
+                    grouping_key: component.clone(),
+                    identity,
+                }),
+
+                None => obstacles.push(SerializationObstacle::KeyIdentityUnestablished {
+                    input: input_id.clone(),
+                    topic: topic_id.clone(),
+                    schema: schema.clone(),
+                    grouping_key: component.clone(),
+                }),
+            }
         }
     }
 
     if obstacles.is_empty() {
-        Ok((topic_id, facts))
+        Ok(GroupingFacts {
+            topic: topic_id,
+            scope,
+            message_keys: facts,
+        })
     } else {
         Err(obstacles)
     }
@@ -811,32 +875,33 @@ impl SerializationObstacle {
                 ),
             },
 
-            Self::TopicNotKeyed { input, topic } => Evidence {
+            Self::NoGroupingDomain { input, topic } => Evidence {
                 subject: Some(topic.clone()),
                 message: format!(
-                    "The runtime for `{topic}` declares no keyed ordering, so \
-                     the `topic_key` routing of `{input}` has no semantic key \
-                     domain to route by."
+                    "No keyed grouping is in effect for `{input}` on `{topic}`, so the \
+                     `grouping_key` routing of `{input}` has no domain to route by."
                 ),
             },
 
-            Self::TopicKeyMappingMissing { topic, schema, .. } => Evidence {
+            Self::GroupingKeyMappingMissing { topic, schema, .. } => Evidence {
                 subject: Some(schema.clone()),
                 message: format!(
-                    "The keyed runtime ordering of `{topic}` declares no \
-                     key mapping for admitted schema `{schema}`."
+                    "The grouping in effect for `{topic}` declares no key mapping for \
+                     admitted schema `{schema}`."
                 ),
             },
 
             Self::KeyIdentityUnestablished {
-                schema, topic_key, ..
+                schema,
+                grouping_key,
+                ..
             } => Evidence {
                 subject: Some(schema.clone()),
                 message: format!(
-                    "For messages of `{schema}`, the topic's ordering key \
-                     `{topic_key}` is not established to carry the same \
-                     logical value as the serialization key `{}`, so same-key \
-                     deliveries may enter different routing domains.",
+                    "For messages of `{schema}`, the grouping key `{grouping_key}` is \
+                     not established to carry the same logical value as the \
+                     serialization key `{}`, so same-key deliveries may land in \
+                     different runtime groups.",
                     check.key.path
                 ),
             },

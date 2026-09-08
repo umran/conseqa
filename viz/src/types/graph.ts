@@ -75,7 +75,13 @@ export interface StorageLayoutNode {
 
 export interface TopicNode {
   id: Id;
+
+  /** Topic-scoped transport facts. In subscription-scoped mode both
+   *  read "none" and each subscribe edge carries its own. */
   ordering: string;
+  grouping: string;
+  topic_scoped_transport: boolean;
+
   messages: Id[];
 }
 
@@ -116,6 +122,10 @@ export type Edge = EdgeBase &
         input: Id;
         schemas: Id[];
         delivery: string;
+        /** The transport facts in force, resolved from whichever scope
+         *  declares them. */
+        grouping: string;
+        ordering: string;
         /** The dispatch routing key, or "none" when the dispatch
          *  declares no member affinity; null when the subscription has
          *  no declared runtime at all. */

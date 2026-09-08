@@ -29,7 +29,7 @@ use conseqa::{
         RecoverabilityRequirement, RequestIdentity, RequestInput, RequestRouting, ResultOutcome,
         ResultReplayRequirement, ResultType, ResultVariant, Return, Router, RuntimeModel, Schema,
         SchemaFragment, SelectorPredicate, SelectorValue, SerializationRequirement,
-        SubscriptionInput, SubscriptionRoutingKey, TopicOrdering, TopicRuntime, Transaction,
+        OrderingSemantics, SubscriptionInput, SubscriptionRoutingKey, TopicRuntime, Transaction,
         TransactionIsolation, TransactionStep, ValueRef, ValueSource, Write,
     },
 };
@@ -197,6 +197,14 @@ fn runtime_mut(model: &mut Model) -> &mut RuntimeModel {
         .expect("the fixture declares a runtime model")
 }
 
+/// The grouping key mapping of a topic-scoped grouping declaration.
+fn grouping_key_mut<'a>(model: &'a mut Model, topic: &str) -> &'a mut conseqa::spec::GroupingKey {
+    topic_runtime_mut(model, topic)
+        .grouping
+        .as_mut()
+        .unwrap_or_else(|| panic!("`{topic}` declares no grouping"))
+}
+
 fn topic_runtime_mut<'a>(model: &'a mut Model, topic: &str) -> &'a mut TopicRuntime {
     runtime_mut(model)
         .topics
@@ -328,6 +336,7 @@ fn the_subscription_proof_states_its_facts_and_is_runtime_dependent() {
                 pool,
                 message_keys,
                 member_assignment,
+                ..
             },
         scope,
     } = verdict
@@ -348,7 +357,7 @@ fn the_subscription_proof_states_its_facts_and_is_runtime_dependent() {
     // by the same field the requirement uses.
     assert_eq!(message_keys.len(), 1);
     assert_eq!(message_keys[0].schema, id("schema.OrderCreated"));
-    assert_eq!(message_keys[0].topic_key, path(&["order_id"]));
+    assert_eq!(message_keys[0].grouping_key, path(&["order_id"]));
     assert_eq!(message_keys[0].identity, KeyIdentity::SamePath);
 }
 
@@ -849,25 +858,25 @@ fn serialization_key_diverging_from_topic_key_is_unproven() {
             input: id("input.reserve_inventory.created"),
             topic: id("topic.order_events"),
             schema: id("schema.OrderCreated"),
-            topic_key: path(&["order_id"]),
+            grouping_key: path(&["order_id"]),
         }]
     );
 }
 
 #[test]
-fn a_topic_without_keyed_ordering_is_rejected_before_verification() {
-    // `key: topic_key` names the topic's keyed transport domain, so
+fn a_transport_without_grouping_is_rejected_before_verification() {
+    // `key: grouping_key` names the effective grouping domain, so
     // validation refuses the pair when no such domain exists.
     let mut model = load_flash_checkout();
 
-    topic_runtime_mut(&mut model, "topic.order_events").ordering = TopicOrdering::Global;
+    topic_runtime_mut(&mut model, "topic.order_events").grouping = None;
 
     let errors = validation::validate(&model);
 
     assert!(
         errors.iter().any(|error| matches!(
             error,
-            conseqa::analyzer::ValidationError::TopicKeyRoutingWithoutKeyDomain { .. }
+            conseqa::analyzer::ValidationError::RoutingWithoutGrouping { .. }
         )),
         "{errors:#?}"
     );
@@ -877,10 +886,49 @@ fn a_topic_without_keyed_ordering_is_rejected_before_verification() {
 
     assert_eq!(
         obstacles(&verdict),
-        &[SerializationObstacle::TopicNotKeyed {
+        &[SerializationObstacle::NoGroupingDomain {
             input: id("input.reserve_inventory.created"),
             topic: id("topic.order_events"),
         }]
+    );
+}
+
+#[test]
+fn serialization_consumes_grouping_and_never_ordering() {
+    // The point of separating the two facts. An unordered transport
+    // that still groups by key — an ordinary queue with consistent-hash
+    // workers — serializes; the model no longer has to claim an
+    // ordering guarantee it does not have in order to say so.
+    let mut model = load_flash_checkout();
+
+    topic_runtime_mut(&mut model, "topic.order_events").ordering = OrderingSemantics::None;
+
+    assert!(
+        validation::validate(&model).is_empty(),
+        "grouping without ordering is a valid declaration"
+    );
+
+    assert!(
+        matches!(
+            serialization_verdict(&model, "operation.reserve_inventory", 0),
+            SerializationVerdict::Proven {
+                proof: SerializationProof::SubscriptionRouted { .. },
+                ..
+            }
+        ),
+        "serialization rests on the grouping alone"
+    );
+
+    // Ordering correctly does not follow: nothing orders anything.
+    let verdict = ordering_verdict(&model, "operation.reserve_inventory", 0);
+
+    assert!(
+        matches!(
+            &verdict,
+            verification::OrderingVerdict::Unproven { obstacles }
+                if matches!(&obstacles[..], [verification::OrderingObstacle::NoTransportPrecedence { .. }])
+        ),
+        "{verdict:?}"
     );
 }
 
@@ -972,14 +1020,10 @@ fn fragment_aliasing_establishes_key_identity() {
         .messages
         .insert(id("schema.OrderCreatedView"));
 
-    let TopicOrdering::Keyed(key) = &mut topic_runtime_mut(&mut model, "topic.order_events").ordering
-    else {
-        panic!("fixture topic is keyed");
-    };
-
-    // The topic keys the fragment schema by its aliased name.
-    key.mapping
-        .insert(id("schema.OrderCreatedView"), path(&["ref"]));
+    // The grouping keys the fragment schema by its aliased name.
+    grouping_key_mut(&mut model, "topic.order_events")
+        .mapping
+        .insert(id("schema.OrderCreatedView"), vec![path(&["ref"])]);
 
     let subscription = subscription_mut(
         &mut model,
@@ -1008,7 +1052,7 @@ fn fragment_aliasing_establishes_key_identity() {
 
     assert_eq!(message_keys.len(), 1);
     assert_eq!(message_keys[0].schema, id("schema.OrderCreatedView"));
-    assert_eq!(message_keys[0].topic_key, path(&["ref"]));
+    assert_eq!(message_keys[0].grouping_key, path(&["ref"]));
     assert_eq!(
         message_keys[0].identity,
         KeyIdentity::SameCanonicalValue {
@@ -1022,12 +1066,9 @@ fn fragment_aliasing_establishes_key_identity() {
 fn missing_topic_key_mapping_is_an_obstacle_not_a_panic() {
     let mut model = load_flash_checkout();
 
-    let TopicOrdering::Keyed(key) = &mut topic_runtime_mut(&mut model, "topic.order_events").ordering
-    else {
-        panic!("fixture topic is keyed");
-    };
-
-    key.mapping.remove(&id("schema.OrderCreated"));
+    grouping_key_mut(&mut model, "topic.order_events")
+        .mapping
+        .remove(&id("schema.OrderCreated"));
 
     // The model no longer validates; verification must stay total and
     // conservative.
@@ -1038,7 +1079,7 @@ fn missing_topic_key_mapping_is_an_obstacle_not_a_panic() {
     assert_eq!(
         obstacles(&verdict),
         &[
-            SerializationObstacle::TopicKeyMappingMissing {
+            SerializationObstacle::GroupingKeyMappingMissing {
                 input: id("input.reserve_inventory.created"),
                 topic: id("topic.order_events"),
                 schema: id("schema.OrderCreated"),
@@ -3935,6 +3976,7 @@ fn flash_checkout_ordering_verdicts() {
                 routing_key,
                 member_assignment,
                 duplicates,
+                ..
             },
         scope,
     } = &verdict
@@ -3945,16 +3987,13 @@ fn flash_checkout_ordering_verdicts() {
     assert_eq!(input, &id("input.apply_payment.captured"));
     assert_eq!(topic, &id("topic.order_events"));
     assert_eq!(pool, &id("pool.order_workers"));
-    assert_eq!(*routing_key, SubscriptionRoutingKey::TopicKey);
+    assert_eq!(*routing_key, SubscriptionRoutingKey::GroupingKey);
     assert_eq!(*member_assignment, MemberAssignment::ConsistentHash);
 
     // Precedence, routing, and member concurrency are all L1 facts.
     assert_eq!(*scope, ProofScope::RuntimeDependent);
 
-    assert!(matches!(
-        precedence,
-        verification::PrecedenceSource::KeyedTopic { message_keys } if message_keys.len() == 1
-    ));
+    assert_eq!(*precedence, verification::PrecedenceSource::WithinGroup);
 
     assert_eq!(
         *duplicates,
@@ -4143,41 +4182,73 @@ fn dispatch_without_routing_preserves_no_order() {
 }
 
 #[test]
-fn a_global_topic_declares_no_key_domain_to_route_by() {
-    // A globally ordered transport does order same-key messages, so it
-    // remains a precedence — but the model offers no routing key that
-    // names a single domain, and validation refuses `topic_key` here.
-    // The refactor deliberately declines to promote "one domain for
-    // everything" into a routing variant of its own.
+fn a_global_transport_orders_any_key_the_grouping_keeps_together() {
+    // Global precedence plus a grouping that matches the requirement
+    // key composes soundly: the transport orders everything, and the
+    // grouping keeps same-key deliveries on one member so the order
+    // survives into execution. Separating the two facts is what made
+    // `global` usable — it no longer has to carry a key of its own.
     let mut model = load_flash_checkout();
 
-    topic_runtime_mut(&mut model, "topic.order_events").ordering = TopicOrdering::Global;
+    topic_runtime_mut(&mut model, "topic.order_events").ordering = OrderingSemantics::Global;
 
-    subscription_runtime_mut(
-        &mut model,
-        "operation.apply_payment",
-        "input.apply_payment.captured",
-    )
-    .dispatch
-    .routing = None;
+    assert!(validation::validate(&model).is_empty());
 
     let verdict = ordering_verdict(&model, "operation.apply_payment", 0);
+
+    let verification::OrderingVerdict::Proven {
+        proof: verification::OrderingProof::RoutedOrder { precedence, .. },
+        ..
+    } = &verdict
+    else {
+        panic!("expected a proven ordering verdict, found {verdict:?}");
+    };
+
+    assert_eq!(*precedence, verification::PrecedenceSource::Global);
+}
+
+#[test]
+fn a_global_transport_still_needs_the_grouping_to_reach_execution() {
+    // The regression the pairing rule guarded: a precedence over one
+    // domain composed with routing over another proves nothing. Now
+    // that grouping is a separate fact, the guard is structural — the
+    // ordering proof consumes the same grouping identity serialization
+    // does, whichever precedence supplied the order.
+    let mut model = load_flash_checkout();
+
+    topic_runtime_mut(&mut model, "topic.order_events").ordering = OrderingSemantics::Global;
+
+    model
+        .operations
+        .get_mut(&id("operation.reserve_inventory"))
+        .unwrap()
+        .requirements
+        .ordering = vec![conseqa::spec::OrderingRequirement {
+        key: input_key("input.reserve_inventory.created", &["quantity"]),
+    }];
+
+    assert!(validation::validate(&model).is_empty());
+
+    let verdict = ordering_verdict(&model, "operation.reserve_inventory", 0);
 
     assert!(
         matches!(
             &verdict,
             verification::OrderingVerdict::Unproven { obstacles }
-                if matches!(&obstacles[..], [verification::OrderingObstacle::RoutingAbsent { .. }])
+                if matches!(
+                    &obstacles[..],
+                    [verification::OrderingObstacle::KeyIdentityUnestablished { .. }]
+                )
         ),
-        "{verdict:?}"
+        "a global order does not reach a key the grouping does not keep together: {verdict:?}"
     );
 }
 
 #[test]
-fn an_unordered_topic_provides_no_precedence() {
+fn a_transport_with_no_precedence_provides_none() {
     let mut model = load_flash_checkout();
 
-    topic_runtime_mut(&mut model, "topic.order_events").ordering = TopicOrdering::Unordered;
+    topic_runtime_mut(&mut model, "topic.order_events").ordering = OrderingSemantics::None;
 
     let verdict = ordering_verdict(&model, "operation.apply_payment", 0);
 
@@ -4187,10 +4258,7 @@ fn an_unordered_topic_provides_no_precedence() {
             verification::OrderingVerdict::Unproven { obstacles }
                 if obstacles.iter().any(|obstacle| matches!(
                     obstacle,
-                    verification::OrderingObstacle::TopicOrderingProvidesNoPrecedence {
-                        declared: TopicOrdering::Unordered,
-                        ..
-                    }
+                    verification::OrderingObstacle::NoTransportPrecedence { .. }
                 ))
         ),
         "{verdict:?}"
@@ -4199,21 +4267,13 @@ fn an_unordered_topic_provides_no_precedence() {
 
 #[test]
 fn a_topic_with_no_declared_runtime_provides_no_precedence() {
-    // Absence of a topic runtime is the same epistemic position as
-    // `unspecified`: no usable ordering fact.
+    // Absence of any transport declaration leaves both facts absent,
+    // and the topic in neither scope.
     let mut model = load_flash_checkout();
 
     runtime_mut(&mut model)
         .topics
         .remove(&id("topic.order_events"));
-
-    subscription_runtime_mut(
-        &mut model,
-        "operation.apply_payment",
-        "input.apply_payment.captured",
-    )
-    .dispatch
-    .routing = None;
 
     let verdict = ordering_verdict(&model, "operation.apply_payment", 0);
 
@@ -4223,14 +4283,81 @@ fn a_topic_with_no_declared_runtime_provides_no_precedence() {
             verification::OrderingVerdict::Unproven { obstacles }
                 if obstacles.iter().any(|obstacle| matches!(
                     obstacle,
-                    verification::OrderingObstacle::TopicOrderingProvidesNoPrecedence {
-                        declared: TopicOrdering::Unspecified,
-                        ..
-                    }
+                    verification::OrderingObstacle::NoTransportPrecedence { .. }
                 ))
         ),
         "{verdict:?}"
     );
+}
+
+#[test]
+fn subscription_scoped_transport_semantics_prove_the_same_way() {
+    // The second declaration mode: the topic declares nothing, and each
+    // subscription states its own grouping and ordering. Two
+    // subscribers of one topic may group differently — the case a
+    // single topic-wide domain could not express.
+    let mut model = load_flash_checkout();
+
+    let topic = topic_runtime_mut(&mut model, "topic.order_events");
+
+    topic.grouping = None;
+    topic.ordering = OrderingSemantics::None;
+
+    let by_order_id = conseqa::spec::GroupingKey {
+        mapping: [
+            "schema.InventoryReserved",
+            "schema.OrderCancelled",
+            "schema.OrderCreated",
+            "schema.OrderPaid",
+            "schema.PaymentCaptured",
+            "schema.PaymentFailed",
+        ]
+        .into_iter()
+        .map(|schema| (id(schema), vec![path(&["order_id"])]))
+        .collect(),
+    };
+
+    for (operation, input) in [
+        ("operation.reserve_inventory", "input.reserve_inventory.created"),
+        ("operation.charge_payment", "input.charge_payment.reserved"),
+        ("operation.apply_payment", "input.apply_payment.captured"),
+    ] {
+        let subscription = subscription_runtime_mut(&mut model, operation, input);
+
+        subscription.grouping = Some(by_order_id.clone());
+        subscription.ordering = OrderingSemantics::WithinGroup;
+    }
+
+    assert!(
+        validation::validate(&model).is_empty(),
+        "{:#?}",
+        validation::validate(&model)
+    );
+
+    // Every serialization and ordering obligation still proves, now
+    // citing the subscription scope rather than the topic.
+    let verdict = serialization_verdict(&model, "operation.reserve_inventory", 0);
+
+    let SerializationVerdict::Proven {
+        proof: SerializationProof::SubscriptionRouted { grouping_scope, .. },
+        ..
+    } = &verdict
+    else {
+        panic!("expected a subscription-routed proof, found {verdict:?}");
+    };
+
+    assert_eq!(
+        *grouping_scope,
+        verification::GroupingScope::Subscription {
+            operation: id("operation.reserve_inventory"),
+            input: id("input.reserve_inventory.created"),
+        }
+    );
+
+    assert!(matches!(
+        ordering_verdict(&model, "operation.apply_payment", 0),
+        verification::OrderingVerdict::Proven { .. }
+    ));
 }
 
 // ---------------------------------------------------------------------------

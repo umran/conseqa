@@ -62,12 +62,6 @@ export interface DataObject {
   identity: FieldPath[];
 }
 
-export type TopicOrdering =
-  | { kind: "unspecified" }
-  | { kind: "unordered" }
-  | { kind: "global" }
-  | { kind: "keyed"; mapping: Record<Id, FieldPath> };
-
 export type MessageIdentity =
   | { kind: "unspecified" }
   | { kind: "keyed"; mapping: Record<Id, FieldPath[]> };
@@ -312,12 +306,32 @@ export interface RuntimeModel {
   storage_layouts?: Record<Id, StorageLayout>;
 }
 
+/** Transport facts for a topic, in topic-scoped mode. Declaring either
+ *  puts the topic in that mode: every subscription observes these, and
+ *  none may declare its own. */
 export interface TopicRuntime {
-  ordering: TopicOrdering;
+  grouping?: GroupingKey;
+  ordering?: OrderingSemantics;
 }
+
+/** Where a runtime grouping key lives in each grouped message schema.
+ *  Its presence is the declaration — there is no "none" to spell — and
+ *  it is independent of ordering, so a consumer needing only "same key,
+ *  same group" never touches an ordering declaration. */
+export type GroupingKey = Record<Id, FieldPath[]>;
+
+/** The precedence a transport establishes, independent of grouping.
+ *  Absent is "none". */
+export type OrderingSemantics = "none" | "global" | "within_group";
 
 export interface SubscriptionRuntime {
   delivery: DeliverySemantics;
+
+  /** Present only in subscription-scoped mode — only when the
+   *  subscribed topic declares neither fact. */
+  grouping?: GroupingKey;
+  ordering?: OrderingSemantics;
+
   dispatch: SubscriptionDispatch;
 }
 
@@ -333,7 +347,7 @@ export interface SubscriptionRouting {
   member_assignment: MemberAssignment;
 }
 
-export type SubscriptionRoutingKey = "topic_key";
+export type SubscriptionRoutingKey = "grouping_key";
 
 export interface Router {
   boundary: { operation: Id; input: Id };

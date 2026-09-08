@@ -719,16 +719,17 @@ operations:
 runtime:
 
   topics:
-    # The transport keeps same-video events in order. This is the
-    # precedence every ordering proof in the model rests on, and the
-    # semantic key domain topic_key routing names.
+    # Topic-scoped transport semantics: the transport groups events by
+    # video and keeps each video's events in order. Grouping is what
+    # every serialization proof here consumes; ordering is the extra
+    # fact the ordering proofs need on top of it.
     topic.video_events:
-      ordering:
-        kind: keyed
-        mapping:
-          schema.TranscodeCompleted: video_id
-          schema.VideoPublished: video_id
-          schema.VideoUploaded: video_id
+      grouping:
+        schema.TranscodeCompleted: [video_id]
+        schema.VideoPublished: [video_id]
+        schema.VideoUploaded: [video_id]
+
+      ordering: within_group
 
   execution_pools:
     # Serial members: one video's work does not overlap with itself.
@@ -771,7 +772,7 @@ runtime:
         dispatch:
           pool: pool.transcode_workers
           routing:
-            key: topic_key
+            key: grouping_key
             member_assignment:
               kind: consistent_hash
 
@@ -781,7 +782,7 @@ runtime:
         dispatch:
           pool: pool.catalog_workers
           routing:
-            key: topic_key
+            key: grouping_key
             member_assignment:
               kind: consistent_hash
 
@@ -791,7 +792,7 @@ runtime:
         dispatch:
           pool: pool.notifier_workers
           routing:
-            key: topic_key
+            key: grouping_key
             member_assignment:
               kind: consistent_hash
 

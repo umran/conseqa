@@ -7,13 +7,29 @@
 //! execution pools routing terminates at, and the field paths keys are
 //! written against are what this pass checks.
 //!
+//! It also settles the declaration scope of transport semantics. For
+//! every topic, grouping and ordering are declared either once at the
+//! topic runtime or independently at each subscription runtime, never
+//! at both — a structural invariant, so the analyzer never needs an
+//! inheritance or override rule and every subscription's effective
+//! semantics come from one unambiguous place.
+//!
+//! Only the cross-scope half of that needs checking. Within a scope,
+//! each fact is its own presence or absence, so "groups without
+//! ordering" is a complete declaration rather than half a pair, and
+//! half a pair cannot be written at all.
+//!
 //! It deliberately checks nothing about whether the declared topology
-//! *proves* anything. Whether a keyed domain and a serial pool
+//! *proves* anything. Whether a grouping domain and a serial pool
 //! discharge a serialization requirement is verification's judgment;
-//! here a runtime model is valid whenever its references resolve and
-//! its keys are well-formed.
+//! here a runtime model is valid whenever its references resolve, its
+//! keys are well-formed, and its transport semantics have one scope.
 
-use crate::spec::{Input, Model, RuntimeModel, SubscriptionRoutingKey, TopicOrdering};
+use std::collections::BTreeMap;
+
+use crate::spec::{
+    GroupingKey, Id, Input, Model, OrderingSemantics, RuntimeModel, SubscriptionRoutingKey,
+};
 
 use super::InputKind;
 use super::error::ValidationError;
@@ -31,15 +47,14 @@ pub(super) fn validate_runtime(
     };
 
     validate_topic_runtimes(model, runtime, index, errors);
-    validate_subscription_runtimes(model, runtime, errors);
+    validate_subscription_runtimes(model, runtime, index, errors);
+    validate_transport_scope(model, runtime, errors);
     validate_routers(model, runtime, errors);
     validate_storage_layouts(model, runtime, errors);
 }
 
-/// A topic runtime must target an existing topic, and a keyed ordering
-/// must satisfy the same schema, path, and total-coverage rules the
-/// key domain has always had: every carried schema is routed, and only
-/// carried schemas are mapped.
+/// A topic runtime must target an existing topic, and its grouping key
+/// must satisfy the schema, path, coverage, and arity rules.
 fn validate_topic_runtimes(
     model: &Model,
     runtime: &RuntimeModel,
@@ -49,47 +64,160 @@ fn validate_topic_runtimes(
     for (topic_id, topic_runtime) in &runtime.topics {
         super::expect_reference(index, topic_id, topic_id, ReferenceKind::Topic, errors);
 
-        let TopicOrdering::Keyed(key) = &topic_runtime.ordering else {
+        validate_grouping(
+            model,
+            index,
+            topic_id,
+            topic_id,
+            topic_runtime.grouping.as_ref(),
+            topic_runtime.ordering,
+            errors,
+        );
+    }
+}
+
+/// The shape rules a grouping declaration must satisfy, and the
+/// dependency `within_group` has on it.
+///
+/// `subject` is what a diagnostic points at — the topic or the input,
+/// depending on the scope. `topic_id` is the topic whose carried
+/// schemas the mapping is judged against, which is the same topic
+/// either way.
+fn validate_grouping(
+    model: &Model,
+    index: &ReferenceIndex<'_>,
+    subject: &Id,
+    topic_id: &Id,
+    grouping: Option<&GroupingKey>,
+    ordering: OrderingSemantics,
+    errors: &mut Vec<ValidationError>,
+) {
+    // `within_group` names the domain a grouping declares. Without one
+    // there is nothing for the guarantee to be interpreted over.
+    if ordering == OrderingSemantics::WithinGroup && grouping.is_none() {
+        errors.push(ValidationError::WithinGroupWithoutGrouping {
+            subject: subject.clone(),
+        });
+    }
+
+    let Some(key) = grouping else {
+        return;
+    };
+
+    for schema in key.mapping.keys() {
+        super::expect_reference(index, subject, schema, ReferenceKind::Schema, errors);
+    }
+
+    let Some(topic) = model.topics.get(topic_id) else {
+        return;
+    };
+
+    for schema in key.mapping.keys() {
+        if !topic.messages.contains(schema) {
+            errors.push(ValidationError::GroupingKeySchemaNotOnTopic {
+                subject: subject.clone(),
+                topic: topic_id.clone(),
+                schema: schema.clone(),
+            });
+        }
+    }
+
+    // A grouping key must place every carried message in some group:
+    // an unmapped schema would have no group at all.
+    for schema in &topic.messages {
+        if !key.mapping.contains_key(schema) {
+            errors.push(ValidationError::GroupingKeyMissingSchema {
+                subject: subject.clone(),
+                topic: topic_id.clone(),
+                schema: schema.clone(),
+            });
+        }
+    }
+
+    // Tuple positions correspond across schemas, so every mapped tuple
+    // shares one arity. Empty tuples are reported on their own and
+    // excluded from the baseline.
+    let expected = key.mapping.values().map(Vec::len).find(|len| *len > 0);
+
+    for (schema, tuple) in &key.mapping {
+        if tuple.is_empty() {
+            errors.push(ValidationError::EmptyGroupingKey {
+                subject: subject.clone(),
+                schema: schema.clone(),
+            });
+
             continue;
-        };
-
-        for schema in key.mapping.keys() {
-            super::expect_reference(index, topic_id, schema, ReferenceKind::Schema, errors);
         }
 
-        let Some(topic) = model.topics.get(topic_id) else {
-            continue;
-        };
-
-        for schema in key.mapping.keys() {
-            if !topic.messages.contains(schema) {
-                errors.push(ValidationError::TopicKeySchemaNotOnTopic {
-                    topic: topic_id.clone(),
-                    schema: schema.clone(),
-                });
-            }
+        if let Some(expected) = expected
+            && tuple.len() != expected
+        {
+            errors.push(ValidationError::GroupingKeyArityMismatch {
+                subject: subject.clone(),
+                schema: schema.clone(),
+                expected,
+                actual: tuple.len(),
+            });
         }
 
-        // Unlike message identity, the ordering key must route every
-        // carried message: an unmapped schema has no place in the
-        // sequence.
-        for schema in &topic.messages {
-            if !key.mapping.contains_key(schema) {
-                errors.push(ValidationError::TopicKeyMissingSchema {
-                    topic: topic_id.clone(),
-                    schema: schema.clone(),
-                });
-            }
-        }
-
-        for (schema, path) in &key.mapping {
+        for path in tuple {
             if !schema_path_resolves(model, schema, path) {
                 errors.push(ValidationError::InvalidFieldPath {
-                    subject: topic_id.clone(),
+                    subject: subject.clone(),
                     schema: schema.clone(),
                     path: path.clone(),
                 });
             }
+        }
+    }
+}
+
+/// Transport semantics have exactly one declaration scope per topic.
+///
+/// A topic declaring grouping or ordering supplies them to every
+/// subscription of it, and none of those subscriptions may declare its
+/// own. Checked as a structural invariant rather than resolved by
+/// precedence, so effective semantics are never a question of which
+/// declaration wins.
+fn validate_transport_scope(
+    model: &Model,
+    runtime: &RuntimeModel,
+    errors: &mut Vec<ValidationError>,
+) {
+    let mut subscription_scoped: BTreeMap<&Id, Vec<(&Id, &Id)>> = BTreeMap::new();
+
+    for (operation_id, inputs) in &runtime.subscriptions {
+        for (input_id, subscription_runtime) in inputs {
+            if !subscription_runtime.declares_transport_semantics() {
+                continue;
+            }
+
+            let Some(Input::Subscription(subscription)) = model
+                .operations
+                .get(operation_id)
+                .and_then(|operation| operation.inputs.get(input_id))
+            else {
+                continue;
+            };
+
+            subscription_scoped
+                .entry(&subscription.topic)
+                .or_default()
+                .push((operation_id, input_id));
+        }
+    }
+
+    for (topic_id, topic_runtime) in &runtime.topics {
+        if !topic_runtime.declares_transport_semantics() {
+            continue;
+        }
+
+        for (operation, input) in subscription_scoped.remove(topic_id).unwrap_or_default() {
+            errors.push(ValidationError::TransportSemanticsAtBothScopes {
+                topic: topic_id.clone(),
+                operation: operation.clone(),
+                input: input.clone(),
+            });
         }
     }
 }
@@ -100,6 +228,7 @@ fn validate_topic_runtimes(
 fn validate_subscription_runtimes(
     model: &Model,
     runtime: &RuntimeModel,
+    index: &ReferenceIndex<'_>,
     errors: &mut Vec<ValidationError>,
 ) {
     for (operation_id, inputs) in &runtime.subscriptions {
@@ -141,23 +270,29 @@ fn validate_subscription_runtimes(
 
             expect_pool(model, input_id, &subscription_runtime.dispatch.pool, errors);
 
+            validate_grouping(
+                model,
+                index,
+                input_id,
+                &subscription.topic,
+                subscription_runtime.grouping.as_ref(),
+                subscription_runtime.ordering,
+                errors,
+            );
+
             let Some(routing) = &subscription_runtime.dispatch.routing else {
                 continue;
             };
 
             match routing.key {
-                // The initial model derives the subscription's routing
-                // domain from the topic's keyed transport domain, so
-                // that domain has to exist. Separating the two is a
-                // later refactor.
-                SubscriptionRoutingKey::TopicKey => {
-                    let keyed = matches!(
-                        model.topic_ordering(&subscription.topic),
-                        TopicOrdering::Keyed(_)
-                    );
+                // `grouping_key` names the effective grouping domain,
+                // so one has to exist — at whichever scope declares it.
+                SubscriptionRoutingKey::GroupingKey => {
+                    let grouping =
+                        model.effective_grouping(operation_id, input_id, &subscription.topic);
 
-                    if !keyed {
-                        errors.push(ValidationError::TopicKeyRoutingWithoutKeyDomain {
+                    if grouping.is_none() {
+                        errors.push(ValidationError::RoutingWithoutGrouping {
                             operation: operation_id.clone(),
                             input: input_id.clone(),
                             topic: subscription.topic.clone(),
@@ -173,7 +308,7 @@ fn validate_subscription_runtimes(
 /// pool, and — when it routes — carry a non-empty key that resolves
 /// against the request schema. One boundary has at most one router.
 fn validate_routers(model: &Model, runtime: &RuntimeModel, errors: &mut Vec<ValidationError>) {
-    let mut seen: Vec<(&crate::spec::OperationInputRef, &crate::spec::Id)> = Vec::new();
+    let mut seen: Vec<(&crate::spec::OperationInputRef, &Id)> = Vec::new();
 
     for (router_id, router) in &runtime.routers {
         let boundary = &router.boundary;
@@ -256,7 +391,7 @@ fn validate_storage_layouts(
     runtime: &RuntimeModel,
     errors: &mut Vec<ValidationError>,
 ) {
-    let mut seen: Vec<(&crate::spec::DataObjectRef, &crate::spec::Id)> = Vec::new();
+    let mut seen: Vec<(&crate::spec::DataObjectRef, &Id)> = Vec::new();
 
     for (layout_id, layout) in &runtime.storage_layouts {
         if let Some((_, first)) = seen
@@ -311,12 +446,7 @@ fn validate_storage_layouts(
     }
 }
 
-fn expect_pool(
-    model: &Model,
-    subject: &crate::spec::Id,
-    pool: &crate::spec::Id,
-    errors: &mut Vec<ValidationError>,
-) {
+fn expect_pool(model: &Model, subject: &Id, pool: &Id, errors: &mut Vec<ValidationError>) {
     if model.execution_pool(pool).is_none() {
         errors.push(ValidationError::UnknownReference {
             subject: subject.clone(),

@@ -75,16 +75,6 @@ pub enum ValidationError {
         schema: Id,
     },
 
-    TopicKeySchemaNotOnTopic {
-        topic: Id,
-        schema: Id,
-    },
-
-    TopicKeyMissingSchema {
-        topic: Id,
-        schema: Id,
-    },
-
     /// A message-identity mapping names a schema the topic does not
     /// carry.
     MessageIdentitySchemaNotOnTopic {
@@ -118,13 +108,57 @@ pub enum ValidationError {
         router: Id,
     },
 
-    /// A subscription dispatch routes by `topic_key`, but the
-    /// subscribed topic's runtime declares no keyed ordering domain
-    /// for that key to name.
-    TopicKeyRoutingWithoutKeyDomain {
+    /// A subscription dispatch routes by `grouping_key`, but no keyed
+    /// grouping is in effect at either scope for that key to name.
+    RoutingWithoutGrouping {
         operation: Id,
         input: Id,
         topic: Id,
+    },
+
+    /// A grouping key maps a schema the topic does not carry.
+    GroupingKeySchemaNotOnTopic {
+        subject: Id,
+        topic: Id,
+        schema: Id,
+    },
+
+    /// A grouping key leaves a carried schema unmapped, so messages of
+    /// it would belong to no group.
+    GroupingKeyMissingSchema {
+        subject: Id,
+        topic: Id,
+        schema: Id,
+    },
+
+    /// A grouping key maps a schema to an empty tuple.
+    EmptyGroupingKey {
+        subject: Id,
+        schema: Id,
+    },
+
+    /// Grouping-key tuple positions correspond across schemas, so
+    /// every mapped tuple must have the same arity.
+    GroupingKeyArityMismatch {
+        subject: Id,
+        schema: Id,
+        expected: usize,
+        actual: usize,
+    },
+
+    /// `ordering: within_group` is declared where no keyed grouping is
+    /// declared at the same scope, so no domain exists for the
+    /// guarantee to be interpreted over.
+    WithinGroupWithoutGrouping {
+        subject: Id,
+    },
+
+    /// A topic and one of its subscriptions both declare transport
+    /// semantics. The two scopes are exclusive.
+    TransportSemanticsAtBothScopes {
+        topic: Id,
+        operation: Id,
+        input: Id,
     },
 
     /// Two routers serve one request boundary. The initial model
@@ -444,24 +478,131 @@ impl From<ValidationError> for Diagnostic {
                 }],
             },
 
-            ValidationError::TopicKeyRoutingWithoutKeyDomain {
+            ValidationError::RoutingWithoutGrouping {
                 operation,
                 input,
                 topic,
             } => Diagnostic {
                 code: DiagnosticCode::Validation(
-                    ValidationCode::TopicKeyRoutingWithoutKeyDomain,
+                    ValidationCode::RoutingWithoutGrouping,
                 ),
                 severity: Severity::Error,
                 subject: Some(input.clone()),
                 message: format!(
-                    "`{input}` of `{operation}` dispatches by `topic_key`, but the \
-                     runtime for `{topic}` declares no keyed ordering domain."
+                    "`{input}` of `{operation}` dispatches by `grouping_key`, but no \
+                     keyed grouping is in effect for `{topic}`."
                 ),
                 evidence: vec![Evidence {
                     subject: Some(topic),
-                    message: "Declare `ordering: keyed` for this topic's runtime, or \
-                              omit the routing block."
+                    message: "Declare a keyed `grouping` — on this topic's runtime, or \
+                              on this subscription if the topic declares no transport \
+                              semantics — or omit the routing block."
+                        .to_string(),
+                }],
+            },
+
+            ValidationError::GroupingKeySchemaNotOnTopic {
+                subject,
+                topic,
+                schema,
+            } => Diagnostic {
+                code: DiagnosticCode::Validation(ValidationCode::GroupingKeySchemaNotOnTopic),
+                severity: Severity::Error,
+                subject: Some(subject),
+                message: format!(
+                    "The grouping key maps `{schema}`, which `{topic}` does not carry."
+                ),
+                evidence: vec![Evidence {
+                    subject: Some(topic),
+                    message: "A grouping key may only map schemas the topic carries."
+                        .to_string(),
+                }],
+            },
+
+            ValidationError::GroupingKeyMissingSchema {
+                subject,
+                topic,
+                schema,
+            } => Diagnostic {
+                code: DiagnosticCode::Validation(ValidationCode::GroupingKeyMissingSchema),
+                severity: Severity::Error,
+                subject: Some(subject),
+                message: format!(
+                    "The grouping key leaves `{schema}`, carried by `{topic}`, unmapped."
+                ),
+                evidence: vec![Evidence {
+                    subject: Some(schema),
+                    message: "A grouping key must place every carried message in some \
+                              group; an unmapped schema would belong to none."
+                        .to_string(),
+                }],
+            },
+
+            ValidationError::EmptyGroupingKey { subject, schema } => Diagnostic {
+                code: DiagnosticCode::Validation(ValidationCode::EmptyGroupingKey),
+                severity: Severity::Error,
+                subject: Some(subject),
+                message: format!("The grouping key maps `{schema}` to an empty tuple."),
+                evidence: vec![Evidence {
+                    subject: Some(schema),
+                    message: "A grouping key tuple must name at least one field."
+                        .to_string(),
+                }],
+            },
+
+            ValidationError::GroupingKeyArityMismatch {
+                subject,
+                schema,
+                expected,
+                actual,
+            } => Diagnostic {
+                code: DiagnosticCode::Validation(ValidationCode::GroupingKeyArityMismatch),
+                severity: Severity::Error,
+                subject: Some(subject),
+                message: format!(
+                    "The grouping key maps `{schema}` to {actual} field(s), but other \
+                     schemas map {expected}."
+                ),
+                evidence: vec![Evidence {
+                    subject: Some(schema),
+                    message: "Tuple positions correspond across schemas, so every \
+                              mapped tuple shares one arity."
+                        .to_string(),
+                }],
+            },
+
+            ValidationError::WithinGroupWithoutGrouping { subject } => Diagnostic {
+                code: DiagnosticCode::Validation(ValidationCode::WithinGroupWithoutGrouping),
+                severity: Severity::Error,
+                subject: Some(subject.clone()),
+                message: "`ordering: within_group` is declared where no keyed grouping \
+                          is declared at the same scope."
+                    .to_string(),
+                evidence: vec![Evidence {
+                    subject: Some(subject),
+                    message: "Declare the grouping the guarantee is about, or use \
+                              `ordering: global` or `none`."
+                        .to_string(),
+                }],
+            },
+
+            ValidationError::TransportSemanticsAtBothScopes {
+                topic,
+                operation,
+                input,
+            } => Diagnostic {
+                code: DiagnosticCode::Validation(ValidationCode::TransportSemanticsAtBothScopes),
+                severity: Severity::Error,
+                subject: Some(input.clone()),
+                message: format!(
+                    "`{topic}` declares transport semantics for all its subscriptions, \
+                     and `{input}` of `{operation}` declares its own."
+                ),
+                evidence: vec![Evidence {
+                    subject: Some(topic),
+                    message: "Grouping and ordering are declared either once for the \
+                              topic or independently per subscription, never at both. \
+                              There is no override."
                         .to_string(),
                 }],
             },
@@ -697,52 +838,6 @@ impl From<ValidationError> for Diagnostic {
                         message: format!(
                             "Topic does not declare schema `{schema}` as a message."
                         ),
-                    }],
-                }
-            }
-
-            ValidationError::TopicKeySchemaNotOnTopic {
-                topic,
-                schema,
-            } => {
-                Diagnostic {
-                    code: DiagnosticCode::Validation(
-                        ValidationCode::TopicKeySchemaNotOnTopic,
-                    ),
-                    severity: Severity::Error,
-                    subject: Some(topic.clone()),
-                    message: format!(
-                        "Topic `{topic}` defines an ordering key for schema \
-                         `{schema}`, but does not carry that schema."
-                    ),
-                    evidence: vec![Evidence {
-                        subject: Some(schema),
-                        message:
-                            "Ordering-key mappings may only reference message schemas carried by the topic."
-                                .to_string(),
-                    }],
-                }
-            }
-
-            ValidationError::TopicKeyMissingSchema {
-                topic,
-                schema,
-            } => {
-                Diagnostic {
-                    code: DiagnosticCode::Validation(
-                        ValidationCode::TopicKeyMissingSchema,
-                    ),
-                    severity: Severity::Error,
-                    subject: Some(topic.clone()),
-                    message: format!(
-                        "Keyed topic `{topic}` carries schema `{schema}` \
-                         but defines no ordering-key mapping for it."
-                    ),
-                    evidence: vec![Evidence {
-                        subject: Some(schema),
-                        message:
-                            "Every message schema carried by a keyed topic must define how its ordering key is obtained."
-                                .to_string(),
                     }],
                 }
             }

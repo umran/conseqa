@@ -1718,8 +1718,15 @@ PATCH — {"mutations": [<mutation>, ...]}; each mutation {"kind": K, ...}:
      recommended {rationale, evidence})
 L1 RUNTIME TOPOLOGY (all shared-skeleton writes; L1 is optional):
   {"kind":"put_topic_runtime","topic":"topic.x",
-   "value":{"ordering":{"kind":"keyed","mapping":{"schema.Event":"order_id"}}}}
-    (ordering kinds: unspecified | unordered | global | keyed{mapping})
+   "value":{"grouping":{"schema.Event":[["order_id"]]},"ordering":"within_group"}}
+    (grouping: a per-schema key mapping, or omitted for no grouping;
+     ordering: "global" | "within_group", or omitted for none.
+     Grouping and ordering are INDEPENDENT facts sharing one declaration
+     scope. A topic declaring either supplies both to every subscription
+     of it, and no subscription of that topic may declare its own; a topic
+     declaring neither leaves each subscription to declare its own pair.
+     Never both scopes — there is no inheritance and no override.
+     `within_group` requires a keyed grouping at the same scope.)
   {"kind":"put_execution_pool","id":"pool.x",
    "value":{"member_concurrency":{"kind":"bounded","value":1}}}
     (member_concurrency kinds: unspecified | unbounded | bounded{value})
@@ -1733,10 +1740,13 @@ L1 RUNTIME TOPOLOGY (all shared-skeleton writes; L1 is optional):
   {"kind":"put_subscription_runtime","operation":"operation.x","input":"input.x.events",
    "value":{"delivery":"at_least_once",
             "dispatch":{"pool":"pool.x",
-                        "routing":{"key":"topic_key",
+                        "routing":{"key":"grouping_key",
                                    "member_assignment":{"kind":"consistent_hash"}}}}}
-    (delivery: unspecified | at_most_once | at_least_once;
-     key: topic_key, which requires a keyed topic runtime on the topic)
+    (delivery: unspecified | at_most_once | at_least_once.
+     Add "grouping" and "ordering" here — as a pair, same shapes as on a
+     topic runtime — only when the subscribed topic declares neither.
+     routing key: grouping_key, which routes by the effective grouping
+     domain and so requires a keyed grouping in effect at one scope.)
   {"kind":"put_storage_layout","id":"layout.x",
    "value":{"object":{"data_model":"data.x","object":"object.y"},
             "partition_key":["channel_id","bucket"]}}
