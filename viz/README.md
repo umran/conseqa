@@ -12,9 +12,13 @@ npm run dev      # http://localhost:5173
 npm run build    # typecheck + single-file bundle → dist/index.html
 ```
 
-`dist/index.html` is committed: the Rust binary embeds it with
-`include_str!`, so rebuild and commit it after changing the front end.
-See `CONSEQA_VIZ.md` at the repository root for the views, panels, and
+`dist/index.html` is committed: the Rust binaries embed it with
+`include_str!`, so rebuild and commit it after changing the front end —
+and then `cargo build --release`, which is what actually puts the new
+bundle inside `conseqa-viz`, `conseqa-confluence` (its `export_spec`
+renders through the same code) and `conseqa-harness`. A running MCP
+server keeps the image it started with until it is restarted. See
+`CONSEQA_VIZ.md` at the repository root for the views, panels, and
 report format.
 
 The system view draws two layers. L0 — the application machine — is

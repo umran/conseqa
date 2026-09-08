@@ -271,13 +271,28 @@ npm run build   # typecheck + single-file bundle → dist/index.html
 ```
 
 The production build is one `dist/index.html` with every script and
-stylesheet inlined (`vite-plugin-singlefile`). `conseqa-viz` embeds
-that file at compile time (`include_str!`) and injects the page data —
-title, model, derived graph, report — as `window.CONSEQA`, so `cargo`
-needs no Node toolchain. **Rebuild and commit `viz/dist/index.html`
-after changing the front end.** During development the app fetches
+stylesheet inlined (`vite-plugin-singlefile`). `conseqa::viz::render`
+embeds that file at compile time (`include_str!`) and injects the page
+data — title, model, derived graph, report — as `window.CONSEQA`, so
+`cargo` needs no Node toolchain. During development the app fetches
 `public/conseqa.json` instead; regenerate it with `npm run data`, or
 directly with `conseqa-viz <model> --verify --json --out <path>`.
+
+Compile time is the catch: every binary that renders carries the bundle
+it was built with, so a front-end change reaches a reader only after the
+whole chain runs.
+
+```
+cd viz && npm run build     # → viz/dist/index.html (committed)
+cargo build --release       # rebakes it into every binary that renders
+```
+
+`conseqa-viz` is one of those binaries; so is `conseqa-confluence`,
+whose `export_spec` writes `spec.html` through the same renderer, and
+`conseqa-harness`. **Rebuild and commit `viz/dist/index.html` after
+changing the front end, and rebuild the binaries after that.** An MCP
+server already running keeps the image it started with — a rebuilt
+binary reaches it only on its next start.
 
 ## Layout of the implementation
 
