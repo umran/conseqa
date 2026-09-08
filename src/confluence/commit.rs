@@ -219,10 +219,13 @@ pub fn skeleton_diagnostics(workspace: &WorkspaceState) -> Vec<DraftDiagnostic> 
         });
     }
 
-    // The runtime topology belongs to the skeleton too. Whole-model
-    // validation cannot reach it until every operation has a program,
-    // so without this the L1 declarations go unchecked for the entire
-    // fan-out window — and a broken one is a mistake every concurrent
+    // Whatever runtime topology already exists is checked here too.
+    // L1 is normally authored after the fan-out, once verification has
+    // said what it must discharge, so usually there is none yet. When
+    // an interactive author has declared some early, whole-model
+    // validation cannot reach it until every operation has a program —
+    // so without this it would go unchecked across the whole fan-out
+    // window, and a broken declaration is a mistake every concurrent
     // worker inherits at once.
     for (topic, value) in &workspace.runtime.topics {
         mutations.push(Mutation::PutTopicRuntime {

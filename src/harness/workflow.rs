@@ -215,12 +215,27 @@ impl Workflow {
                         continue;
                     }
 
-                    // Phase 6–7: verify and repair the unproven.
+                    // Phase 6–7b: verify, then repair the unproven —
+                    // runtime obstacles through the topology author,
+                    // the rest per operation.
                     let repaired = self.repair_unproven(revision).await?;
 
                     if repaired == 0 {
                         // Nothing left to repair this iteration: either
                         // success or a stuck obstacle.
+                        return self.finalize(iterations, Some(revision)).await;
+                    }
+
+                    if self.engine().head_revision() == before {
+                        // Repair ran and committed nothing at all. The
+                        // next iteration would build the same tasks
+                        // from the same snapshot and reach the same
+                        // place, so the obstacle is stuck: finalize now
+                        // with the gaps preserved rather than spending
+                        // the rest of the iteration budget on identical
+                        // work. Per-task nondeterminism is the
+                        // scheduler's retry policy to absorb, not the
+                        // fixpoint loop's.
                         return self.finalize(iterations, Some(revision)).await;
                     }
                 }

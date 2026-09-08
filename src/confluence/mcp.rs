@@ -108,6 +108,20 @@ the new head.
 drafting, validation errors, or the verification verdict with exactly \
 which obligations are proven and which are not. Fix what it names — \
 narrowly, yourself, or with another request_design pass.
+
+An unproven obligation carries a `remedy` saying which layer the \
+missing facts belong to. `runtime` means no program change can help: \
+the fix is the L1 runtime topology — transport grouping and ordering, \
+subscription delivery and dispatch, execution pools and their member \
+concurrency, request routers, storage layouts. Author it here, after \
+the programs exist and verification has said what it has to discharge, \
+not while drafting the skeleton: L1 exists to make specific \
+requirements provable, and before you know which ones, declaring it is \
+guesswork. Serialization and ordering are proven almost entirely from \
+this layer — a grouping domain owned by one pool member whose \
+concurrency is bounded(1) is what proves same-key invocations never \
+overlap. Never invent topology to make a proof pass; leaving a \
+requirement unproven is a legitimate outcome.
 7. export_spec delivers the result: the canonical YAML, the \
 verification report, and a self-contained interactive HTML \
 visualization, written to a directory you choose — show these to the \

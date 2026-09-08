@@ -654,15 +654,22 @@ async fn prompt_to_validated_model_with_all_requirements_proven() {
 async fn an_unprovable_obligation_yields_incomplete_preserving_the_gap() {
     let out_dir = std::env::temp_dir().join(format!("conseqa-wf-{}", Uuid::new_v4()));
 
-    // Cap iterations low: repair cannot fix the obstacle, so the
-    // fixpoint loop would otherwise spin until the budget.
-    let (workflow, engine) = workflow(out_dir.clone(), incomplete_script(), 2);
+    // A generous budget: the loop must recognize that repair committed
+    // nothing and stop, rather than spending the budget re-running
+    // identical tasks against an identical snapshot.
+    let (workflow, engine) = workflow(out_dir.clone(), incomplete_script(), 16);
 
     let report = workflow.run().await.expect("the workflow runs");
 
     let RunStatus::Incomplete { unresolved, .. } = &report.status else {
         panic!("expected incomplete, got {:?}", report.status);
     };
+
+    assert!(
+        report.iterations < 16,
+        "the stuck obstacle burned the whole iteration budget: {}",
+        report.iterations
+    );
 
     // The unresolved recoverability obligation is preserved (§75).
     assert!(

@@ -2543,6 +2543,10 @@ Its write scope is:
 SharedSkeleton
 ```
 
+L0 only. The runtime topology is deliberately excluded and is authored
+later, in phase 7b (§74.2), once verification has said what it must
+discharge.
+
 The decomposition patch creates all planned operation IDs/interfaces before operation fanout begins.
 
 ---
@@ -2854,6 +2858,94 @@ When a downstream/shared change is required:
 ```text
 dependency_request
 ```
+
+---
+
+## 74.1 Routing repair by remedy layer
+
+The default scope answers only for obligations whose missing facts are
+L0. Under the two-layer model most are not: every serialization and
+ordering proof route but the vacuous one rests on the runtime
+realization, so the common failure is a requirement blocked by an
+absent grouping key, router, member assignment, or pool concurrency —
+none of which a program edit can reach.
+
+Each unproven obligation therefore carries a remedy layer, derived from
+its obstacles:
+
+```text
+application   at least one obstacle names an L0 fact
+runtime       every obstacle names an L1 fact
+```
+
+Obstacles are conjunctive, so a single application obstacle keeps the
+whole obligation on the application side: topology work alone cannot
+close it, and the L0 fix is what to ask for first. Once it lands the
+obligation re-reports and what remains routes to the runtime.
+
+Repair partitions on the layer:
+
+```text
+application   one task per (operation, requirement), scope OperationProgram(op)
+runtime       ONE task for all of them, scope RuntimeTopology
+```
+
+Runtime obligations batch into a single task because the runtime model
+is shared. A grouping key, the router that carries it, and the pool it
+terminates at are one decision; two concurrent authors would each see
+the other's declarations as conflicting writes, and neither could
+declare one grouping that discharges several requirements at once.
+
+---
+
+# 74.2 Workflow phase 7b — runtime topology
+
+The task holding `RuntimeTopology` owns the whole L1 layer and nothing
+else:
+
+```text
+topic runtimes (transport grouping and ordering)
+subscription runtimes (delivery and dispatch)
+execution pools
+request routers
+storage layouts
+```
+
+It is entered from the unproven set, not from decomposition. L1 exists
+to discharge requirements; at decomposition none have been discovered,
+so authoring topology there is guessing at facts the run has not
+established. Phase order is therefore:
+
+```text
+decompose (L0)
+operation fanout (L0 programs)
+assembly and structural convergence
+requirement discovery
+runtime topology          <- first entered here, from the unproven set
+requirement repair
+```
+
+On the first verification pass the model has no runtime at all, so
+every serialization and ordering obligation is unproven with a runtime
+remedy and the phase authors the layer in one pass, knowing the full
+requirement set. The phase is not one-shot: it re-enters from the same
+partition whenever runtime obstacles remain.
+
+It owns no operation, so it receives no slice from the per-operation
+bundle. Its context is enumerated explicitly — every topic, every
+operation interface, every subscription boundary, and whatever runtime
+facts already exist — which is also what puts them in its read set.
+Without that the author would work from untracked tool reads and its
+patch would survive an L0 change that invalidated it.
+
+Structural validation of an L1 declaration routes here too. Those
+diagnostics name a topic, router, or pool rather than an operation, so
+they match no per-operation repair target; before this phase existed
+they ended the run with "validation failed with no operation to
+repair".
+
+An unproven requirement remains a legitimate outcome. The author must
+not invent topology to make a proof pass.
 
 ---
 
