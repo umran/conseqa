@@ -16,7 +16,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::Serialize;
 
-use conseqa::spec::{
+use crate::spec::{
     Effect, Id, Input, MessageSelector, Model, OperationStep, TransactionStep, TransitionSideEffect,
 };
 
@@ -504,7 +504,7 @@ fn collect_transition_refs(model: &Model) -> BTreeMap<String, Vec<TransitionRef>
 
 /// For one operation: effect id → program steps that execute it,
 /// either directly or by executing an intent binding that captured it.
-fn collect_effect_executions(op: &conseqa::spec::Operation) -> BTreeMap<Id, Vec<String>> {
+fn collect_effect_executions(op: &crate::spec::Operation) -> BTreeMap<Id, Vec<String>> {
     // Intent binding → the effect it captured: an inline establishment
     // site's effect_id, or a transition application's side-effect ID.
     let mut intent_effects: BTreeMap<&Id, &Id> = BTreeMap::new();
@@ -554,9 +554,9 @@ fn collect_effect_executions(op: &conseqa::spec::Operation) -> BTreeMap<Id, Vec<
 /// Uniform view over operation-declared and transition-owned effects.
 #[derive(Debug, Clone, Copy)]
 enum ResolvedEffect<'a> {
-    Publication(&'a conseqa::spec::PublicationEffect),
-    Request(&'a conseqa::spec::RequestEffect),
-    External(&'a conseqa::spec::ExternalEffect),
+    Publication(&'a crate::spec::PublicationEffect),
+    Request(&'a crate::spec::RequestEffect),
+    External(&'a crate::spec::ExternalEffect),
 }
 
 impl<'a> From<&'a Effect> for ResolvedEffect<'a> {
@@ -606,38 +606,38 @@ fn to_tag<T: serde::Serialize>(value: &T) -> String {
     }
 }
 
-fn concurrency_label(value: &conseqa::spec::LaneConcurrency) -> String {
+fn concurrency_label(value: &crate::spec::LaneConcurrency) -> String {
     match value {
-        conseqa::spec::LaneConcurrency::Unspecified => "unspecified".to_string(),
-        conseqa::spec::LaneConcurrency::Bounded(n) => format!("bounded({n})"),
-        conseqa::spec::LaneConcurrency::Unbounded => "unbounded".to_string(),
+        crate::spec::LaneConcurrency::Unspecified => "unspecified".to_string(),
+        crate::spec::LaneConcurrency::Bounded(n) => format!("bounded({n})"),
+        crate::spec::LaneConcurrency::Unbounded => "unbounded".to_string(),
     }
 }
 
-fn operation_concurrency_label(value: &conseqa::spec::OperationConcurrency) -> String {
+fn operation_concurrency_label(value: &crate::spec::OperationConcurrency) -> String {
     match value {
-        conseqa::spec::OperationConcurrency::Unspecified => "unspecified".to_string(),
-        conseqa::spec::OperationConcurrency::Bounded(n) => {
+        crate::spec::OperationConcurrency::Unspecified => "unspecified".to_string(),
+        crate::spec::OperationConcurrency::Bounded(n) => {
             format!("bounded({n})")
         }
-        conseqa::spec::OperationConcurrency::Unbounded => "unbounded".to_string(),
+        crate::spec::OperationConcurrency::Unbounded => "unbounded".to_string(),
     }
 }
 
-fn idempotency_label(value: &conseqa::spec::IdempotencyGuarantee) -> String {
+fn idempotency_label(value: &crate::spec::IdempotencyGuarantee) -> String {
     match value {
-        conseqa::spec::IdempotencyGuarantee::Unspecified => "unspecified".to_string(),
-        conseqa::spec::IdempotencyGuarantee::NotDeduplicated => "not_deduplicated".to_string(),
-        conseqa::spec::IdempotencyGuarantee::DeduplicatedBy { .. } => "deduplicated_by".to_string(),
+        crate::spec::IdempotencyGuarantee::Unspecified => "unspecified".to_string(),
+        crate::spec::IdempotencyGuarantee::NotDeduplicated => "not_deduplicated".to_string(),
+        crate::spec::IdempotencyGuarantee::DeduplicatedBy { .. } => "deduplicated_by".to_string(),
     }
 }
 
-fn topic_ordering_label(value: &conseqa::spec::TopicOrdering) -> String {
+fn topic_ordering_label(value: &crate::spec::TopicOrdering) -> String {
     match value {
-        conseqa::spec::TopicOrdering::Unspecified => "unspecified".to_string(),
-        conseqa::spec::TopicOrdering::Unordered => "unordered".to_string(),
-        conseqa::spec::TopicOrdering::Global => "global".to_string(),
-        conseqa::spec::TopicOrdering::Keyed(_) => "keyed".to_string(),
+        crate::spec::TopicOrdering::Unspecified => "unspecified".to_string(),
+        crate::spec::TopicOrdering::Unordered => "unordered".to_string(),
+        crate::spec::TopicOrdering::Global => "global".to_string(),
+        crate::spec::TopicOrdering::Keyed(_) => "keyed".to_string(),
     }
 }
 
@@ -649,7 +649,7 @@ mod tests {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/flash_checkout.yaml");
 
-        conseqa::parser::yaml::parse(&std::fs::read_to_string(path).expect("fixture readable"))
+        crate::parser::yaml::parse(&std::fs::read_to_string(path).expect("fixture readable"))
             .expect("fixture parses")
     }
 
