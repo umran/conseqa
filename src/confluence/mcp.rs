@@ -80,13 +80,26 @@ planned operation (its id, service, inputs, and request or \
 subscription contracts). Many small typed patches are normal. The \
 commit gate rejects a structurally broken patch with precise \
 diagnostics; fix it and resubmit in the same session.
-4. Then hand the operation programs to request_design. It runs one \
-coding agent per operation still missing a program, concurrently, each \
-committing through the same gate. This is the intended division of \
-labor: you establish the interfaces callers reason against, the \
-fanout writes the program bodies in parallel. Do not synthesize \
-operation programs one at a time yourself when the system has several \
-— that is what the fanout is for, and it is far slower without it.
+4. Only once that skeleton is complete for the whole system, hand the \
+operation programs to request_design. It runs one coding agent per \
+operation still missing a program, concurrently, each committing \
+through the same gate. This is the intended division of labor: you \
+establish the interfaces callers reason against, the fanout writes the \
+program bodies in parallel. Do not synthesize operation programs one \
+at a time yourself when the system has several — that is what the \
+fanout is for, and it is far slower without it.
+
+Fan out at the right moment, which means neither early nor late. Every \
+worker writes its program against the skeleton as it stands when the \
+run starts, so a missing schema, topic, or operation interface is a \
+mistake made simultaneously by all of them, and one that costs a full \
+round of concurrent sessions to discover. Before calling, check \
+spec_status: `skeleton.ready_to_fan_out` must be true, and the \
+operations it lists must be the whole system you intend to build, not \
+the part you have gotten to so far. The server refuses a run whose \
+skeleton has unresolved references, but it cannot know which \
+operations you still mean to declare — that judgment is yours, so make \
+it deliberately.
 5. While a run is active, do not submit patches: poll spec_status, \
 whose design block reports running and then the finished run's report. \
 When it finishes, call open_project again to refresh your session to \
@@ -935,15 +948,21 @@ impl ConseqaMcp {
         description = "Fan out concurrent coding agents to write the operation programs. \
                        This is the normal way to build a system with more than one \
                        operation, and is far faster than synthesizing them yourself one at \
-                       a time. Author the skeleton first — services, schemas, data models, \
-                       topics, machines, and an interface per planned operation — then call \
-                       this: it skips decomposition when interfaces already exist and runs \
-                       one agent per operation still missing a program, concurrently, each \
-                       committing through the same gate. It also repairs operations the \
-                       checker leaves unproven. Optionally pass an objective to steer the \
-                       workers. Returns immediately; poll spec_status (its design block) \
-                       rather than patching while it runs, then call open_project to refresh \
-                       your session to the new head. One workflow runs at a time."
+                       a time. Author the skeleton FIRST and completely — services, schemas, \
+                       data models, topics, machines, and an interface per planned \
+                       operation — then call this: it skips decomposition when interfaces \
+                       already exist and runs one agent per operation still missing a \
+                       program, concurrently, each committing through the same gate. It \
+                       also repairs operations the checker leaves unproven. Do not call it \
+                       early: workers write against the skeleton as it stands at launch, so \
+                       anything missing becomes every worker's mistake at once. A run whose \
+                       skeleton has unresolved references is refused; check \
+                       spec_status.skeleton.ready_to_fan_out first, and confirm the \
+                       operations it reports are the whole system you intend. Optionally \
+                       pass an objective to steer the workers. Returns immediately; poll \
+                       spec_status (its design block) rather than patching while it runs, \
+                       then call open_project to refresh your session to the new head. One \
+                       workflow runs at a time."
     )]
     async fn request_design(
         &self,
@@ -964,8 +983,69 @@ impl ConseqaMcp {
             }));
         };
 
+        // The skeleton is the contract every worker writes against, so
+        // an incoherent one is refused here rather than dispatched to
+        // all of them at once.
+        let head = engine.head_snapshot();
+        let gaps = super::commit::skeleton_diagnostics(&head.workspace);
+
+        if !gaps.is_empty() {
+            return json_error(serde_json::json!({
+                "launched": false,
+                "error": "the skeleton is not ready to fan out",
+                "skeleton_gaps": gaps,
+                "guidance": "Every worker writes its operation program against these \
+                             declarations, so fanning out now would send all of them at an \
+                             incoherent skeleton. Resolve each gap with submit_patch — \
+                             spec_status reports the same list under `skeleton` — then call \
+                             request_design again.",
+            }));
+        }
+
+        let no_interfaces = head.workspace.operations.is_empty();
+
+        let pending: Vec<String> = head
+            .workspace
+            .operations
+            .iter()
+            .filter(|(_, draft)| draft.program.is_none() || draft.execution.is_none())
+            .map(|(id, _)| id.to_string())
+            .collect();
+
         match launcher.launch(engine, params.0.objective) {
-            Ok(value) => json_result(value),
+            Ok(mut value) => {
+                // Naming the operations makes a premature fanout
+                // visible at once: a list short of the intended system
+                // means the skeleton was handed over half-built.
+                if let Some(object) = value.as_object_mut() {
+                    let (operations, check) = if no_interfaces {
+                        (
+                            serde_json::Value::Null,
+                            "No interfaces are declared, so this run decomposes the prompt \
+                             itself before synthesizing. To keep control of the contracts, \
+                             cancel and author the skeleton first.",
+                        )
+                    } else if pending.is_empty() {
+                        (
+                            serde_json::json!([]),
+                            "Every operation already has a program, so this run verifies and \
+                             repairs rather than synthesizing.",
+                        )
+                    } else {
+                        (
+                            serde_json::json!(pending),
+                            "These are the operations receiving a worker. If that is not the \
+                             whole system you intended, the skeleton went out too early.",
+                        )
+                    };
+
+                    object.insert("operations".to_string(), operations);
+                    object.insert("check".to_string(), serde_json::json!(check));
+                }
+
+                json_result(value)
+            }
+
             Err(error) => json_error(serde_json::json!({
                 "launched": false,
                 "error": error,
@@ -1167,8 +1247,14 @@ impl ConseqaMcp {
             analysis_json(&settled_analysis(&engine, head.revision).await)
         };
 
+        let skeleton_gaps = super::commit::skeleton_diagnostics(workspace);
+
         let mut body = serde_json::json!({
             "revision": head.revision.0,
+            "skeleton": {
+                "ready_to_fan_out": skeleton_gaps.is_empty(),
+                "gaps": skeleton_gaps,
+            },
             "inventory": {
                 "services": workspace.services.len(),
                 "schemas": workspace.schemas.len(),

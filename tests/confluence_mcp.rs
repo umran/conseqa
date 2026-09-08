@@ -918,6 +918,152 @@ async fn status_export_and_guide_serve_the_authoring_loop() {
     server.shutdown().await;
 }
 
+/// Fanning out over an incomplete skeleton makes one mistake
+/// simultaneously in every worker, so the server refuses rather than
+/// trusting the agent to remember. The refusal is deterministic — the
+/// same judgment the commit gate applies — and spec_status reports the
+/// same gaps so the agent can check before it calls.
+#[tokio::test]
+async fn request_design_refuses_a_skeleton_that_is_not_ready() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct CountingLauncher {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl mcp::DesignLauncher for CountingLauncher {
+        fn launch(
+            &self,
+            _engine: ConfluenceEngine,
+            _objective: Option<String>,
+        ) -> Result<serde_json::Value, String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+
+            Ok(serde_json::json!({"launched": true}))
+        }
+    }
+
+    // A schema an operation's request input names is gone: the
+    // interface no longer resolves, though every operation still has a
+    // program the workers would otherwise be asked to repair.
+    let mut workspace = fixture_workspace();
+
+    workspace
+        .schemas
+        .remove(&Id("schema.CreateOrderRequest".to_string()));
+
+    let engine = ConfluenceEngine::in_memory(workspace).expect("engine starts");
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let launcher = Arc::new(CountingLauncher {
+        calls: Arc::clone(&calls),
+    });
+
+    let router = mcp::router_with_launcher(engine.clone(), launcher);
+
+    let server = mcp::serve_router(router, "127.0.0.1:0".parse().expect("addr"))
+        .await
+        .expect("mcp server binds");
+
+    let url = format!("http://{}/mcp", server.local_addr);
+
+    let handle = engine
+        .create_session(WriteScope::shared_skeleton(), "ui")
+        .expect("session");
+
+    let mut client = McpClient::connect(&url, &handle.token.0).await;
+
+    let (refused, is_error) = client.call("request_design", serde_json::json!({})).await;
+
+    assert!(is_error, "a premature fanout is refused: {refused}");
+    assert_eq!(refused["launched"], false, "{refused}");
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "no worker is dispatched: {refused}"
+    );
+
+    let gaps = refused["skeleton_gaps"]
+        .as_array()
+        .expect("the refusal names the gaps");
+
+    assert!(
+        gaps.iter().any(|gap| gap["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("schema.CreateOrderRequest"))),
+        "the missing schema is named: {refused}"
+    );
+
+    // The agent can see the same verdict before it ever calls.
+    let (status, _) = client.call("spec_status", serde_json::json!({})).await;
+
+    assert_eq!(status["skeleton"]["ready_to_fan_out"], false, "{status}");
+
+    server.shutdown().await;
+}
+
+/// The complement: a coherent skeleton launches, and the result names
+/// the operations receiving a worker so a short list — the signature of
+/// handing the skeleton over half-built — is visible immediately.
+#[tokio::test]
+async fn a_ready_skeleton_launches_and_names_its_operations() {
+    use std::sync::Arc;
+
+    struct OkLauncher;
+
+    impl mcp::DesignLauncher for OkLauncher {
+        fn launch(
+            &self,
+            _engine: ConfluenceEngine,
+            _objective: Option<String>,
+        ) -> Result<serde_json::Value, String> {
+            Ok(serde_json::json!({"launched": true}))
+        }
+    }
+
+    // The intact fixture, with one operation's program dropped: the
+    // skeleton resolves, and exactly that operation needs a worker.
+    let mut workspace = fixture_workspace();
+
+    workspace
+        .operations
+        .get_mut(&Id("operation.create_order".to_string()))
+        .expect("the fixture declares create_order")
+        .program = None;
+
+    let engine = ConfluenceEngine::in_memory(workspace).expect("engine starts");
+
+    let router = mcp::router_with_launcher(engine.clone(), Arc::new(OkLauncher));
+
+    let server = mcp::serve_router(router, "127.0.0.1:0".parse().expect("addr"))
+        .await
+        .expect("mcp server binds");
+
+    let url = format!("http://{}/mcp", server.local_addr);
+
+    let handle = engine
+        .create_session(WriteScope::shared_skeleton(), "ui")
+        .expect("session");
+
+    let mut client = McpClient::connect(&url, &handle.token.0).await;
+
+    let (status, _) = client.call("spec_status", serde_json::json!({})).await;
+
+    assert_eq!(status["skeleton"]["ready_to_fan_out"], true, "{status}");
+
+    let (launched, is_error) = client.call("request_design", serde_json::json!({})).await;
+
+    assert!(!is_error, "{launched}");
+    assert_eq!(
+        launched["operations"],
+        serde_json::json!(["operation.create_order"]),
+        "the run names the operation it parallelizes: {launched}"
+    );
+
+    server.shutdown().await;
+}
+
 /// The fanout hand-off an interactive agent depends on: its objective
 /// reaches the orchestrator, and while workers are committing,
 /// spec_status reports the run rather than a verdict read off a head

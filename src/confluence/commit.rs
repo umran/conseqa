@@ -21,8 +21,8 @@ use super::patch::{Mutation, PatchId, RequirementSubmission, SpecPatch};
 use super::symbol::{RequirementFamily, SymbolKey};
 use super::task::{TaskId, TaskState};
 use super::workspace::{
-    DraftOperation, ProposalStatus, PromptObligationStatus, RequirementOrigin,
-    RequirementProposal, RequirementRef, WorkspaceState,
+    DraftOperation, OperationInterfaceDraft, ProposalStatus, PromptObligationStatus,
+    RequirementOrigin, RequirementProposal, RequirementRef, WorkspaceState,
 };
 
 /// One commit submission. The read-set is server-owned and never part
@@ -164,6 +164,76 @@ pub struct AgentBackendMetadata {
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session: Option<String>,
+}
+
+/// Whether the committed skeleton — the shared symbols and the
+/// operation interfaces — is coherent enough to synthesize programs
+/// against, judged exactly as the commit gate judges a patch by
+/// replaying the skeleton through the same checks.
+///
+/// This is the precondition for fanning out: every worker writes its
+/// program against these declarations, so launching over a skeleton
+/// with unresolved references sends all of them at once to build on
+/// sand. An interface with no inputs counts as a gap — it has no
+/// trigger, so it is a placeholder rather than a contract a worker
+/// could implement.
+pub fn skeleton_diagnostics(workspace: &WorkspaceState) -> Vec<DraftDiagnostic> {
+    let mut mutations: Vec<Mutation> = Vec::new();
+
+    for (id, value) in &workspace.schemas {
+        mutations.push(Mutation::PutSchema {
+            id: id.clone(),
+            value: value.clone(),
+        });
+    }
+
+    for (id, value) in &workspace.data_models {
+        mutations.push(Mutation::PutDataModel {
+            id: id.clone(),
+            value: value.clone(),
+        });
+    }
+
+    for (id, value) in &workspace.topics {
+        mutations.push(Mutation::PutTopic {
+            id: id.clone(),
+            value: value.clone(),
+        });
+    }
+
+    for (id, value) in &workspace.state_machines {
+        mutations.push(Mutation::PutStateMachine {
+            id: id.clone(),
+            value: value.clone(),
+        });
+    }
+
+    for (operation, draft) in &workspace.operations {
+        mutations.push(Mutation::PutOperationInterface {
+            operation: operation.clone(),
+            value: OperationInterfaceDraft {
+                service: draft.service.clone(),
+                description: draft.description.clone(),
+                inputs: draft.inputs.clone(),
+            },
+        });
+    }
+
+    let mut diagnostics = check_patch(workspace, &SpecPatch { mutations });
+
+    for (operation, draft) in &workspace.operations {
+        if draft.inputs.is_empty() {
+            diagnostics.push(DraftDiagnostic::new(
+                Some(SymbolKey::OperationInterface(operation.clone())),
+                format!(
+                    "operation {operation} declares no inputs, so nothing can invoke it; \
+                     give it a request or subscription input before its program is written"
+                ),
+            ));
+        }
+    }
+
+    diagnostics
 }
 
 /// Applies a patch to a candidate workspace, mutation by mutation in
