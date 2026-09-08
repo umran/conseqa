@@ -227,6 +227,7 @@ async fn run(command: Command) -> Result<ExitCode, String> {
             out_dir: out,
             analysis_timeout: Duration::from_secs(180),
             max_iterations: 8,
+            objective: None,
         },
     );
 

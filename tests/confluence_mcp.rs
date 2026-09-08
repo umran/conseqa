@@ -917,3 +917,81 @@ async fn status_export_and_guide_serve_the_authoring_loop() {
     std::fs::remove_dir_all(&dir).ok();
     server.shutdown().await;
 }
+
+/// The fanout hand-off an interactive agent depends on: its objective
+/// reaches the orchestrator, and while workers are committing,
+/// spec_status reports the run rather than a verdict read off a head
+/// that is still moving — so the agent polls instead of synthesizing
+/// operations serially or patching into a live run.
+#[tokio::test]
+async fn spec_status_reports_a_running_design_and_passes_the_objective() {
+    use std::sync::Arc;
+    use std::sync::Mutex;
+
+    struct MockLauncher {
+        objectives: Arc<Mutex<Vec<Option<String>>>>,
+    }
+
+    impl mcp::DesignLauncher for MockLauncher {
+        fn launch(
+            &self,
+            _engine: ConfluenceEngine,
+            objective: Option<String>,
+        ) -> Result<serde_json::Value, String> {
+            self.objectives.lock().expect("lock").push(objective);
+
+            Ok(serde_json::json!({"launched": true}))
+        }
+
+        fn status(&self) -> Option<serde_json::Value> {
+            // A run in flight, as the daemon launcher reports one.
+            Some(serde_json::json!({"running": true, "started_at_revision": 0}))
+        }
+    }
+
+    let engine = ConfluenceEngine::in_memory(fixture_workspace()).expect("engine starts");
+
+    let objectives = Arc::new(Mutex::new(Vec::new()));
+    let launcher = Arc::new(MockLauncher {
+        objectives: Arc::clone(&objectives),
+    });
+
+    let router = mcp::router_with_launcher(engine.clone(), launcher);
+
+    let server = mcp::serve_router(router, "127.0.0.1:0".parse().expect("addr"))
+        .await
+        .expect("mcp server binds");
+
+    let url = format!("http://{}/mcp", server.local_addr);
+
+    let handle = engine
+        .create_session(WriteScope::shared_skeleton(), "ui")
+        .expect("session");
+
+    let mut client = McpClient::connect(&url, &handle.token.0).await;
+
+    let (launched, is_error) = client
+        .call(
+            "request_design",
+            serde_json::json!({"objective": "prioritize the checkout path"}),
+        )
+        .await;
+
+    assert!(!is_error, "{launched}");
+    assert_eq!(
+        objectives.lock().expect("lock").as_slice(),
+        [Some("prioritize the checkout path".to_string())],
+        "the caller's objective reaches the orchestrator"
+    );
+
+    let (status, is_error) = client.call("spec_status", serde_json::json!({})).await;
+
+    assert!(!is_error, "{status}");
+    assert_eq!(status["design"]["running"], true, "{status}");
+    assert_eq!(
+        status["analysis"]["state"], "design_running",
+        "a moving head reports the run, not a verdict: {status}"
+    );
+
+    server.shutdown().await;
+}
