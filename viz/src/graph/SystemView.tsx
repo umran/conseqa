@@ -41,16 +41,70 @@ export function SystemView() {
   const matches = (id: string) =>
     !q || id.toLowerCase().includes(q) || shortId(id).toLowerCase().includes(q);
 
-  // What a selection keeps lit, followed across the layer boundary: a
-  // pool lights every boundary it runs (that is all "shared pool" means),
-  // an operation lights its realizations and the objects it persists to,
-  // an object lights the operations that touch it.
+  // What a selection keeps lit. The realization is a fact about a path
+  // or an entity, so selecting it lights that and nothing more: a router
+  // or a subscription lights only the path through it — its caller edges,
+  // the vertex, the operation — not the operation's whole neighbourhood;
+  // a pool lights every such path it runs (that is all "shared pool"
+  // means); an access edge lights just its operation and object. An L0
+  // selection keeps its old one-hop neighbourhood, with its realizations
+  // and the objects it persists to along for the ride.
   const related = useMemo(() => {
     const set = new Set<string>();
     if (!selection) return set;
     set.add(selection);
-    // A service stands for its operations: selecting the boundary keeps
-    // everything inside it, and everything it touches, lit.
+
+    // The edges that route through a realization vertex, and their callers.
+    const pathInto = (vertexId: string) => {
+      for (const e of graph.edges) {
+        if ("input" in e && `rt:${e.to}/${e.input}` === vertexId) {
+          set.add(e.id);
+          set.add(e.from);
+        }
+      }
+    };
+
+    // Router / subscription vertex: only its own path.
+    const vertex = runtime.links.find((l) => l.id === selection);
+    if (vertex) {
+      set.add(vertex.operation);
+      set.add(vertex.pool);
+      pathInto(vertex.id);
+      return set;
+    }
+
+    // Pool: every path it runs, and nothing else.
+    if (runtime.links.some((l) => l.pool === selection)) {
+      for (const link of runtime.links) {
+        if (link.pool !== selection) continue;
+        set.add(link.id);
+        set.add(link.operation);
+        pathInto(link.id);
+      }
+      return set;
+    }
+
+    // Access edge: just the operation and the object it wires.
+    const access = plane?.access.find((a) => a.id === selection);
+    if (access) {
+      set.add(access.operation);
+      set.add(access.object);
+      return set;
+    }
+
+    // Object: the operations that touch it, by their access edges.
+    if (plane?.dataObjects.some((o) => o.object === selection)) {
+      for (const a of plane.access) {
+        if (a.object === selection) {
+          set.add(a.id);
+          set.add(a.operation);
+        }
+      }
+      return set;
+    }
+
+    // L0 selection: a service stands for its operations; light the
+    // one-hop neighbourhood, then its realizations and accessed objects.
     for (const op of graph.services.find((s) => s.id === selection)?.operations ?? []) set.add(op);
     for (const e of graph.edges) {
       if (e.id === selection || set.has(e.from) || set.has(e.to)) {
@@ -60,17 +114,16 @@ export function SystemView() {
       }
     }
     for (const link of runtime.links) {
-      if (set.has(link.operation) || selection === link.pool || selection === link.id) {
+      if (set.has(link.operation)) {
         set.add(link.id);
         set.add(link.pool);
-        set.add(link.operation);
+        pathInto(link.id);
       }
     }
-    for (const access of plane?.access ?? []) {
-      if (set.has(access.operation) || selection === access.object || selection === access.id) {
-        set.add(access.id);
-        set.add(access.operation);
-        set.add(access.object);
+    for (const a of plane?.access ?? []) {
+      if (set.has(a.operation)) {
+        set.add(a.id);
+        set.add(a.object);
       }
     }
     return set;

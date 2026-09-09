@@ -88,6 +88,10 @@ export const SYS = {
    *  clear for its edges; only a service larger than this wraps. */
   SVC_MAX_ROWS: 8,
   COL_GAP: 130, ROW_GAP: 48,
+  /** With the L1 plane on, a realization vertex sits in the gutter on the
+   *  approach into an operation, so the gutter is widened to give the
+   *  caller → vertex → operation path a visible run on both sides. */
+  COL_GAP_L1: 236,
   TOPIC_W: 220, TOPIC_H: 54,
   EXT_W: 186, EXT_H: 50,
   CLIENT_W: 150, CLIENT_H: 58,
@@ -101,9 +105,9 @@ export const SYS = {
   /** Below this width a drawing still fits at a readable size, so it is
    *  left on one line however wide it looks. Roughly eight columns. */
   WRAP_THRESHOLD: 2800,
-  /** A realization tab: a small pill in the gutter on the approach into
-   *  the operation, its right edge held this far off the card. */
-  REAL_W: 126, REAL_H: 32, REAL_VGAP: 8, REAL_OFFSET: 14,
+  /** Realization vertex box; ARM is the run from the vertex to the
+   *  operation's input edge, so the vertex is not flush against it. */
+  REAL_W: 128, REAL_H: 32, REAL_VGAP: 10, REAL_ARM: 52,
   /** The data tier below the machine: object nodes and the gap down to
    *  them from the operations that persist to them. */
   DATA_GAP: 104, DATA_TITLE: 30,
@@ -163,11 +167,16 @@ interface BandGeometry {
  * all until the drawing is wide enough to be unreadable when fitted, and
  * then a band must still buy at least a fifth more size to be taken.
  */
-function chooseBandWidth(columnWidth: number[], columnHeight: number[], target: number): number {
+function chooseBandWidth(
+  columnWidth: number[],
+  columnHeight: number[],
+  target: number,
+  colGap: number,
+): number {
   const n = columnWidth.length;
   if (n <= 1) return Math.max(1, n);
 
-  const total = columnWidth.reduce((sum, w) => sum + w + SYS.COL_GAP, 0) - SYS.COL_GAP;
+  const total = columnWidth.reduce((sum, w) => sum + w + colGap, 0) - colGap;
   if (total <= SYS.WRAP_THRESHOLD) return n;
 
   let best = n;
@@ -180,10 +189,10 @@ function chooseBandWidth(columnWidth: number[], columnHeight: number[], target: 
       let bandWidth = 0;
       let bandHeight = 0;
       for (let c = start; c < Math.min(start + perBand, n); c++) {
-        bandWidth += columnWidth[c] + SYS.COL_GAP;
+        bandWidth += columnWidth[c] + colGap;
         bandHeight = Math.max(bandHeight, columnHeight[c]);
       }
-      width = Math.max(width, bandWidth - SYS.COL_GAP);
+      width = Math.max(width, bandWidth - colGap);
       height += bandHeight + SYS.BAND_ROW_GAP;
       count++;
     }
@@ -421,11 +430,15 @@ export function layoutSystem(graph: Graph, options: LayoutOptions = {}): SystemL
   // many of them, and a picture twenty columns wide and three rows tall
   // fits a 16:9 canvas by shrinking every card to nothing — so the
   // columns wrap into bands, the way a paragraph wraps into lines.
+  // Gutters widen when the realization is drawn, so the vertex that sits
+  // on the approach into an operation has a run of edge on each side of
+  // it rather than being wedged against the caller and the card.
+  const colGap = runtime ? SYS.COL_GAP_L1 : SYS.COL_GAP;
   const columnWidth = columns.map((column) => Math.max(0, ...column.map((m) => m.w)));
   const columnHeight = columns.map(
     (column) => column.reduce((sum, m) => sum + m.h, 0) + Math.max(0, column.length - 1) * SYS.ROW_GAP,
   );
-  const perBand = chooseBandWidth(columnWidth, columnHeight, options.aspect ?? SYS.TARGET_ASPECT);
+  const perBand = chooseBandWidth(columnWidth, columnHeight, options.aspect ?? SYS.TARGET_ASPECT, colGap);
   const bandOf = columns.map((_, c) => Math.floor(c / perBand));
   const bandCount = columns.length ? bandOf[columns.length - 1] + 1 : 1;
 
@@ -457,7 +470,7 @@ export function layoutSystem(graph: Graph, options: LayoutOptions = {}): SystemL
     cursorX = 0;
     for (const c of members) {
       columnX[c] = cursorX;
-      cursorX += columnWidth[c] + SYS.COL_GAP;
+      cursorX += columnWidth[c] + colGap;
     }
     bandTop[b] = cursorY;
     bandContentTop[b] = cursorY + channelSpace[b];
@@ -520,16 +533,21 @@ export function layoutSystem(graph: Graph, options: LayoutOptions = {}): SystemL
       if (!op) continue;
       links.sort((a, b) => a.input.localeCompare(b.input));
       const n = links.length;
+      // Vertices for one operation share an x — a clean lane in the
+      // gutter — and stack on their own pitch, centred on the card, so
+      // several realized inputs never overlap.
+      const x = op.x - SYS.REAL_W - SYS.REAL_ARM;
+      const pitch = SYS.REAL_H + SYS.REAL_VGAP;
+      const first = op.y + op.h / 2 - ((n - 1) * pitch) / 2;
       links.forEach((link, i) => {
-        const cy = op.y + (op.h * (i + 1)) / (n + 1);
-        const x = op.x - SYS.REAL_W - SYS.REAL_OFFSET;
+        const cy = first + i * pitch;
         const y = cy - SYS.REAL_H / 2;
         realizations.push({
           link,
           x, y, w: SYS.REAL_W, h: SYS.REAL_H,
           connector: roundedPolyline(
-            [{ x: x + SYS.REAL_W, y: cy }, { x: op.x - 3, y: cy }, { x: op.x, y: cy }],
-            6,
+            [{ x: x + SYS.REAL_W, y: cy }, { x: (x + SYS.REAL_W + op.x) / 2, y: cy }, { x: op.x, y: cy }],
+            8,
           ),
         });
         pos.set(link.id, { x, y, w: SYS.REAL_W, h: SYS.REAL_H });
@@ -546,9 +564,9 @@ export function layoutSystem(graph: Graph, options: LayoutOptions = {}): SystemL
   }
 
   const l0 = boundsOf([...pos.values()]);
-  const edges = routeEdges(graph, pos, columnOf, macro, columnX, columnWidth, bands, retarget, vertexColumn);
+  const edges = routeEdges(graph, pos, columnOf, macro, columnX, columnWidth, colGap, bands, retarget, vertexColumn);
   const plane = runtime
-    ? layoutRuntime(runtime, pos, columnOf, macro, columnX, columnWidth, l0, realizations)
+    ? layoutRuntime(runtime, pos, columnOf, macro, columnX, columnWidth, colGap, l0, realizations)
     : null;
 
   return { pos, services, edges, runtime: plane, l0 };
@@ -576,6 +594,7 @@ function routeEdges(
   macro: (vertex: string) => string,
   columnX: number[],
   columnWidth: number[],
+  colGap: number,
   bands: BandGeometry,
   /** Edges whose destination is a realization vertex rather than the
    *  operation itself — the vertex sits on the path into the boundary. */
@@ -658,12 +677,12 @@ function routeEdges(
   const riserX = (column: number, side: Side) => {
     const gutter =
       side === "left"
-        ? columnX[column] - SYS.COL_GAP / 2
-        : columnX[column] + columnWidth[column] + SYS.COL_GAP / 2;
+        ? columnX[column] - colGap / 2
+        : columnX[column] + columnWidth[column] + colGap / 2;
     const key = `${bands.of[column]}:${gutter}`;
     const n = used.get(key) ?? 0;
     used.set(key, n + 1);
-    const step = Math.min(Math.ceil((n + 1) / 2) * 14, SYS.COL_GAP / 2 - 12);
+    const step = Math.min(Math.ceil((n + 1) / 2) * 14, colGap / 2 - 12);
     return gutter + step * (n % 2 === 0 ? -1 : 1);
   };
 
@@ -773,6 +792,7 @@ function layoutRuntime(
   macro: (vertex: string) => string,
   columnX: number[],
   columnWidth: number[],
+  colGap: number,
   l0: Box,
   realizations: RealizationBox[],
 ): RuntimePlane {
@@ -826,7 +846,7 @@ function layoutRuntime(
     const obj = objectBox.get(fact.object);
     if (!op || !obj) continue;
     const column = columnOf.get(macro(fact.operation)) ?? 0;
-    const gutter = columnX[column] + columnWidth[column] + SYS.COL_GAP / 2;
+    const gutter = columnX[column] + columnWidth[column] + colGap / 2;
     const from = { x: op.x + op.w * 0.5, y: op.y + op.h };
     const to = { x: obj.x + obj.w / 2, y: obj.y };
     access.push({

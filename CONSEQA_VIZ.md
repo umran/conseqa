@@ -89,10 +89,15 @@ L1 fact is a fact about some L0 thing:
 
 The switch is disabled for a model that declares no L1 facts, and with
 L1 off none of the above appears — those are facts of the layer that
-declares them. Selecting an operation lights its realizations and the
-objects it persists to; selecting an object lights the operations that
-touch it. Nothing is a parallel graph joined by on-demand links: the
-realization sits on the paths and the entities it is about.
+declares them. Selection follows what a thing is a fact *about*, and
+nothing wider: a router or a subscription lights only its own path — the
+caller edges, the vertex, the operation — not the operation's other
+edges; a pool lights every path it runs, which is what a shared pool is;
+an access edge lights just its operation and object. Selecting the
+operation itself still lights its one-hop neighbourhood, its
+realizations, and the objects it writes. Nothing is a parallel graph
+joined by on-demand links: the realization sits on the paths and the
+entities it is about.
 
 **Operation view** (`#/op/<id>`). A page header (name, copyable id,
 description, and a fact strip: service, transaction and
