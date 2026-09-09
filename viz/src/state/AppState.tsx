@@ -25,6 +25,8 @@ export interface DetailContext {
   /** A program step, by its location in the operation's program. */
   step?: { op: Id; location: string };
   edge?: boolean;
+  /** A data-access edge: one operation's access to one object. */
+  access?: { operation: Id; object: Id };
 }
 
 export interface DetailTarget {

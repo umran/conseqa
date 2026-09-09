@@ -68,19 +68,22 @@ and it is laid *onto* the machine rather than beside it, because every
 L1 fact is a fact about some L0 thing:
 
 - A **router** or a **subscription dispatch** realizes a boundary — the
-  way a caller or a topic enters an operation — so it is drawn as a tab
-  on that approach, in the gutter off the operation's input edge, marked
-  request (solid) or subscribe (dashed). The tab names the execution
-  pool and its member concurrency, and the routing/affinity fact. The
-  pool name is its own target: a pool is a shared population, and
-  selecting one lights every tab that names it — which is all "shared
-  pool" means (§52), with no pool node needed to say it.
+  way a caller or a topic enters an operation — so it is an intermediate
+  vertex *on that edge*: the caller/topic edge ends at the vertex and a
+  short arm carries on into the operation (caller → [router] → op, topic
+  → [dispatch] → op). The vertex is marked request (solid) or subscribe
+  (dashed) and names the execution pool, its member concurrency, and the
+  routing/affinity fact. The pool name is its own target: a pool is a
+  shared population, and selecting one lights every vertex that names it
+  — which is all "shared pool" means (§52), with no pool node to say it.
 - A **storage layout** is a fact about an object, so the objects
   operations persist to are drawn as a downstream data tier, wired to
-  the operations that touch them by always-visible access edges.
-  Partitioned objects (a layout is declared) are solid and spined and
-  name their partition key; unpartitioned ones (no layout) are drawn
-  open and dashed — absence of a fact, not a claim of no partitioning.
+  the operations that touch them by always-visible access edges. Each
+  access edge is selectable and carries the one fact that matters of it
+  — whether the access keys to the object's partition (solid) or does
+  not (dashed) — and its detail says why. Partitioned objects (a layout
+  is declared) are solid and spined; unpartitioned ones are open and
+  dashed. No prose labels the tier; the shapes carry it.
 - A **topic** carries its transport facts (grouping, ordering) on its
   own node, since topic-scoped transport is a fact about the topic.
 
@@ -89,7 +92,7 @@ L1 off none of the above appears — those are facts of the layer that
 declares them. Selecting an operation lights its realizations and the
 objects it persists to; selecting an object lights the operations that
 touch it. Nothing is a parallel graph joined by on-demand links: the
-realization annotates the paths and the entities it is about.
+realization sits on the paths and the entities it is about.
 
 **Operation view** (`#/op/<id>`). A page header (name, copyable id,
 description, and a fact strip: service, transaction and
@@ -162,7 +165,8 @@ what it does not: a pool carries no cardinality, sharing one relates
 execution populations and not routing domains, a partition key is
 neither an object identity nor a routing key. A data object's panel
 carries its storage layout (or says none is declared) and the operations
-that access it. Each L1 declaration also lists **the proofs resting on
+that access it; a **data-access** edge's panel names the operation, the
+object, and whether that access keys to the partition, with the reason. Each L1 declaration also lists **the proofs resting on
 it** — the obligations whose reasoning names it — so the verdicts a
 change to the topology would put back in question can be read off the
 declaration itself. Topics and inputs carry the same list, being where

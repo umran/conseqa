@@ -15,7 +15,7 @@ import {
   walkProgram, type IndexEntry, type LocatedStep,
 } from "../lib/index";
 import { propertyMatchesRequirement } from "../lib/obligations";
-import { objectTouchers } from "../lib/runtime";
+import { accessKeysToPartition, objectAccesses, partitionKeyOf } from "../lib/runtime";
 import { hashes } from "../lib/route";
 import { conditionText } from "../lib/text";
 import { useApp, useCitations, useObligationsAt, type DetailTarget } from "../state/AppState";
@@ -137,6 +137,7 @@ function Dispatch({ target }: { target: DetailTarget }) {
     const edge = graph.edges.find((e) => e.id === id);
     if (edge) return <EdgeDetail edge={edge} />;
   }
+  if (ctx.access) return <AccessDetail operation={ctx.access.operation} object={ctx.access.object} />;
   if (id === CLIENT_NODE_ID) return <ClientDetail />;
   if (id.startsWith(EXTERNAL_PREFIX)) return <ExternalDetail name={id.slice(EXTERNAL_PREFIX.length)} />;
 
@@ -447,7 +448,7 @@ function ObjectDetail({ dmId, id }: { dmId: Id; id: Id }) {
   const layout = Object.entries(model.runtime?.storage_layouts ?? {}).find(
     ([, l]) => l.object.object === id,
   );
-  const touchers = objectTouchers(model).get(id) ?? [];
+  const touchers = [...(objectAccesses(model).get(id)?.keys() ?? [])];
   return (
     <Frame kind="data object" title={id} subtitle={<span>persistent object in <IdLink id={dmId} /></span>}>
       <KeyValue rows={[["schema", <IdLink key="s" id={obj.schema} />], ["identity", <Mono key="i">{obj.identity.map(pathText).join(", ")}</Mono>]]} />
@@ -1087,7 +1088,7 @@ function StorageLayoutDetail({ id }: { id: Id }) {
   const { model } = useApp();
   const layout = model.runtime?.storage_layouts?.[id];
   if (!layout) return <Frame kind="storage layout" title={id} />;
-  const touchers = objectTouchers(model).get(layout.object.object) ?? [];
+  const touchers = [...(objectAccesses(model).get(layout.object.object)?.keys() ?? [])];
   return (
     <Frame
       kind="storage layout"
@@ -1106,6 +1107,35 @@ function StorageLayoutDetail({ id }: { id: Id }) {
         </Section>
       )}
       <Citations id={id} />
+    </Frame>
+  );
+}
+
+/** One operation's access to one object: whether it keys to the object's
+ *  partition, which is the fact the access edge carries. */
+function AccessDetail({ operation, object }: { operation: Id; object: Id }) {
+  const { model } = useApp();
+  const predicates = objectAccesses(model).get(object)?.get(operation) ?? [];
+  const key = partitionKeyOf(model, object);
+  const keyed = key !== null && accessKeysToPartition(predicates, key);
+  return (
+    <Frame
+      kind="data access"
+      title={<span><IdLink id={operation}>{shortId(operation)}</IdLink> → <IdLink id={object}>{shortId(object)}</IdLink></span>}
+      subtitle={<span>{predicates.length} access{predicates.length === 1 ? "" : "es"} in <IdLink id={operation} /></span>}
+    >
+      <KeyValue rows={[
+        ["object", <IdLink key="o" id={object} />],
+        ["storage", key ? <Mono key="k">partitioned by {key.map(pathText).join(", ")}</Mono> : <Tag key="u">unpartitioned</Tag>],
+        ["access", <Tag key="a" variant={keyed ? "success" : "warning"}>{keyed ? "keys to partition" : key ? "crosses partitions" : "no partition to key"}</Tag>],
+      ]} />
+      <p className="text-xs leading-relaxed text-kumo-subtle">
+        {key === null
+          ? "The object declares no storage layout, so there is no partition for the access to key to."
+          : keyed
+            ? "Every selector on this path pins the partition key, so the access stays within one partition."
+            : "At least one selector on this path does not pin the partition key, so the access is not confined to one partition."}
+      </p>
     </Frame>
   );
 }

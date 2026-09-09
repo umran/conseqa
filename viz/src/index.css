@@ -123,23 +123,23 @@ svg.arch-canvas text { font-size: 12px; fill: var(--arch-text); user-select: non
 }
 .arch-real .pool:hover { text-decoration: underline; }
 
-/* Data tier: objects operations persist to, wired in by access edges. */
-.arch-data-tier .tier-label {
-  font-size: 10.5px;
-  letter-spacing: 0.06em;
-  text-transform: uppercase;
-  fill: color-mix(in srgb, var(--arch-l1) 60%, var(--arch-text-faint));
-}
-
+/* Data tier: objects operations persist to, wired in by access edges.
+   The edge carries whether the access keys to the object's partition —
+   solid when it does, dashed when it does not. */
 .arch-access {
   fill: none;
-  stroke: color-mix(in srgb, var(--arch-l1) 45%, transparent);
-  stroke-width: 1.3;
+  stroke: var(--arch-l1);
+  stroke-width: 1.4;
   transition: opacity 120ms ease;
+  cursor: pointer;
 }
-.arch-access.partitioned { stroke: var(--arch-l1); }
-.arch-access.plain { stroke-dasharray: 4 4; }
+.arch-access.unkeyed {
+  stroke: color-mix(in srgb, var(--arch-l1) 55%, transparent);
+  stroke-dasharray: 4 4;
+}
+.arch-access.selected { stroke-width: 2.6; }
 .arch-access.dimmed { opacity: 0.1; }
+.arch-access-hit { fill: none; stroke: transparent; stroke-width: 12; pointer-events: stroke; cursor: pointer; }
 
 .arch-object { cursor: pointer; transition: opacity 120ms ease; }
 .arch-object.dimmed { opacity: 0.22; }
@@ -160,9 +160,3 @@ svg.arch-canvas text { font-size: 12px; fill: var(--arch-text); user-select: non
 .arch-object.selected .body { stroke: var(--arch-l1); stroke-width: 2; stroke-dasharray: none; }
 .arch-object .title { font-weight: 600; font-size: 12px; }
 .arch-object .subtitle { fill: var(--arch-text-subtle); font-size: 10px; }
-.arch-object .l1-mark {
-  font-size: 9.5px;
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  fill: color-mix(in srgb, var(--arch-l1) 70%, var(--arch-text-faint));
-}
-.arch-object.plain .l1-mark { fill: var(--arch-text-faint); }

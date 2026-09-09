@@ -91,7 +91,8 @@ export function SystemView() {
       {drawRuntime && (
         <>
           <LegendChip color="var(--arch-l1)" label="L1 realization" />
-          <LegendLine color="var(--arch-l1)" label="data access" />
+          <LegendLine color="var(--arch-l1)" label="access, partition-keyed" />
+          <LegendLine color="var(--arch-l1)" label="access, not keyed" dashed />
         </>
       )}
       {report && (
@@ -109,21 +110,22 @@ export function SystemView() {
 
   return (
     <SvgCanvas legend={legend} empty={empty}>
-      {/* The data tier sits behind the machine and its access edges,
-          drawn first so operations and their wiring read on top of it. */}
-      {plane?.dataBand && (
-        <g className="arch-data-tier">
-          <text className="tier-label" x={plane.dataBand.x} y={plane.dataBand.y - 12}>
-            persistent data — objects these operations write, partitioned ones marked
-          </text>
-        </g>
-      )}
-
+      {/* Access edges behind everything, each carrying whether it keys to
+          the object's partition, and each its own selection target. */}
       {plane?.access.map((access) => {
         const dimmed = selection ? !related.has(access.id) : false;
-        const classes = ["arch-access", access.partitioned ? "partitioned" : "plain"];
+        const classes = ["arch-access", access.keyed ? "keyed" : "unkeyed"];
         if (dimmed) classes.push("dimmed");
-        return <path key={access.id} className={classes.join(" ")} d={access.d} markerEnd="url(#arr-l1)" />;
+        if (selection === access.id) classes.push("selected");
+        return (
+          <g
+            key={access.id}
+            data-sel={sel({ key: access.id, id: access.object, ctx: { access: { operation: access.operation, object: access.object } } })}
+          >
+            <path className={classes.join(" ")} d={access.d} markerEnd="url(#arr-l1)" />
+            <path className="arch-access-hit" d={access.d} />
+          </g>
+        );
       })}
 
       {plane?.dataObjects.map((obj) => (
@@ -350,21 +352,20 @@ function DataObject({ obj, dimmed, selected }: { obj: DataObjectBox; dimmed: boo
   const classes = ["arch-object", obj.partitioned ? "partitioned" : "plain"];
   if (dimmed) classes.push("dimmed");
   if (selected) classes.push("selected");
+  // Partitioning is carried by the node's style — spined and solid, or
+  // open and dashed — and by the access edges, not by a caption.
   const title = obj.partitioned
-    ? `${obj.object}\npartitioned by ${obj.partitionKey}\nA partition key is not an object identity, and not a routing key.`
-    : `${obj.object}\nno storage layout declared — drawn unpartitioned because that is all the model says`;
+    ? `${obj.object}\npartitioned`
+    : `${obj.object}\nno storage layout declared`;
   return (
     <g className={classes.join(" ")} data-sel={sel({ key: obj.object, id: obj.object })}>
       <rect className="body" x={obj.x} y={obj.y} width={obj.w} height={obj.h} rx={8} />
       {obj.partitioned && <rect className="spine" x={obj.x + 5} y={obj.y + 6} width={3} height={obj.h - 12} rx={1.5} />}
-      <text className="title" x={obj.x + 16} y={obj.y + 22}>
+      <text className="title" x={obj.x + 16} y={obj.y + 26}>
         {truncate(shortId(obj.object), 20)}
       </text>
-      <text className="subtitle" x={obj.x + 16} y={obj.y + 37}>
+      <text className="subtitle" x={obj.x + 16} y={obj.y + 42}>
         {obj.dataModel ? shortId(obj.dataModel) : "data object"}
-      </text>
-      <text className="l1-mark" x={obj.x + 16} y={obj.y + 51}>
-        {obj.partitioned ? `partitioned by ${obj.partitionKey}` : "unpartitioned"}
       </text>
       <title>{title}</title>
     </g>

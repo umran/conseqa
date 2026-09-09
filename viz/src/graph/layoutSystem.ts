@@ -45,17 +45,17 @@ export interface DataObjectBox extends Box {
   object: Id;
   dataModel: Id;
   partitioned: boolean;
-  partitionKey: string | null;
   operations: Id[];
 }
 
-/** An operation → object access, always drawn: the data tier is wired
- *  into the machine, not parked beside it. */
+/** An operation → object access, always drawn and selectable. `keyed`
+ *  is what the edge is about: whether this access confines itself to a
+ *  partition. */
 export interface AccessEdge {
   id: string;
   operation: Id;
   object: Id;
-  partitioned: boolean;
+  keyed: boolean;
   d: string;
   from: Point;
   to: Point;
@@ -103,7 +103,7 @@ export const SYS = {
   WRAP_THRESHOLD: 2800,
   /** A realization tab: a small pill in the gutter on the approach into
    *  the operation, its right edge held this far off the card. */
-  REAL_W: 150, REAL_H: 34, REAL_VGAP: 8, REAL_OFFSET: 16,
+  REAL_W: 126, REAL_H: 32, REAL_VGAP: 8, REAL_OFFSET: 14,
   /** The data tier below the machine: object nodes and the gap down to
    *  them from the operations that persist to them. */
   DATA_GAP: 104, DATA_TITLE: 30,
@@ -500,10 +500,55 @@ export function layoutSystem(graph: Graph, options: LayoutOptions = {}): SystemL
 
   const bands: BandGeometry = { of: bandOf, top: bandTop, contentTop: bandContentTop, count: bandCount };
 
+  // Realization vertices are placed before the edges are routed, so the
+  // edges that feed a realized boundary can terminate *at* the vertex —
+  // caller → [router] → operation, topic → [dispatch] → operation — with
+  // the vertex a real waypoint on the path, not a tag beside its end.
+  const realizations: RealizationBox[] = [];
+  const retarget = new Map<string, string>();
+  const vertexColumn = new Map<string, number>();
+  if (runtime) {
+    const byOperation = new Map<Id, BoundaryLink[]>();
+    for (const link of runtime.links) {
+      const list = byOperation.get(link.operation);
+      if (list) list.push(link);
+      else byOperation.set(link.operation, [link]);
+    }
+    const realized = new Set(runtime.links.map((l) => l.id));
+    for (const [opId, links] of byOperation) {
+      const op = pos.get(opId);
+      if (!op) continue;
+      links.sort((a, b) => a.input.localeCompare(b.input));
+      const n = links.length;
+      links.forEach((link, i) => {
+        const cy = op.y + (op.h * (i + 1)) / (n + 1);
+        const x = op.x - SYS.REAL_W - SYS.REAL_OFFSET;
+        const y = cy - SYS.REAL_H / 2;
+        realizations.push({
+          link,
+          x, y, w: SYS.REAL_W, h: SYS.REAL_H,
+          connector: roundedPolyline(
+            [{ x: x + SYS.REAL_W, y: cy }, { x: op.x - 3, y: cy }, { x: op.x, y: cy }],
+            6,
+          ),
+        });
+        pos.set(link.id, { x, y, w: SYS.REAL_W, h: SYS.REAL_H });
+        vertexColumn.set(link.id, columnFor(opId));
+      });
+    }
+    // Every edge into a realized boundary ends at its vertex.
+    for (const e of graph.edges) {
+      if ("input" in e) {
+        const vid = `rt:${e.to}/${e.input}`;
+        if (realized.has(vid)) retarget.set(e.id, vid);
+      }
+    }
+  }
+
   const l0 = boundsOf([...pos.values()]);
-  const edges = routeEdges(graph, pos, columnOf, macro, columnX, columnWidth, bands);
+  const edges = routeEdges(graph, pos, columnOf, macro, columnX, columnWidth, bands, retarget, vertexColumn);
   const plane = runtime
-    ? layoutRuntime(runtime, pos, columnOf, macro, columnX, columnWidth, l0)
+    ? layoutRuntime(runtime, pos, columnOf, macro, columnX, columnWidth, l0, realizations)
     : null;
 
   return { pos, services, edges, runtime: plane, l0 };
@@ -532,16 +577,26 @@ function routeEdges(
   columnX: number[],
   columnWidth: number[],
   bands: BandGeometry,
+  /** Edges whose destination is a realization vertex rather than the
+   *  operation itself — the vertex sits on the path into the boundary. */
+  retarget: Map<string, string>,
+  vertexColumn: Map<string, number>,
 ): EdgeGeometry[] {
   const columnFor = (vertex: string) => columnOf.get(macro(vertex)) ?? 0;
+  // Where an edge actually ends: its realization vertex, or its own `to`.
+  const dst = (e: Edge) => retarget.get(e.id) ?? e.to;
+  const dstColumn = (e: Edge) => {
+    const vid = retarget.get(e.id);
+    return vid !== undefined ? vertexColumn.get(vid)! : columnFor(e.to);
+  };
   type Mode = "direct" | "channel" | "cross";
   type Side = "left" | "right";
 
   const plan = new Map<string, { mode: Mode; from: Side; to: Side; span: number }>();
   for (const e of graph.edges) {
-    if (!pos.has(e.from) || !pos.has(e.to)) continue;
+    if (!pos.has(e.from) || !pos.has(dst(e))) continue;
     const a = columnFor(e.from);
-    const b = columnFor(e.to);
+    const b = dstColumn(e);
     const forward = b > a;
     if (bands.of[a] !== bands.of[b]) {
       plan.set(e.id, {
@@ -581,7 +636,7 @@ function routeEdges(
     const p = plan.get(e.id);
     if (!p) continue;
     bucket(e.from)[p.from].push(e);
-    bucket(e.to)[p.to].push(e);
+    bucket(dst(e))[p.to].push(e);
   }
   for (const [id, sides] of bySide) {
     const box = pos.get(id)!;
@@ -636,7 +691,7 @@ function routeEdges(
   for (const e of ordered) {
     const p = plan.get(e.id);
     const p1 = ports.get(`${e.id} ${e.from}`);
-    const p2 = ports.get(`${e.id} ${e.to}`);
+    const p2 = ports.get(`${e.id} ${dst(e)}`);
     if (!p || !p1 || !p2) continue;
 
     if (p.mode === "direct") {
@@ -651,7 +706,7 @@ function routeEdges(
     }
 
     const columnA = columnFor(e.from);
-    const columnB = columnFor(e.to);
+    const columnB = dstColumn(e);
     const rise = riserX(columnA, p.from);
     const fall = riserX(columnB, p.to);
 
@@ -701,19 +756,15 @@ function routeEdges(
 }
 
 /**
- * The realization, laid onto the machine it realizes.
+ * The data tier, wired to the machine above it.
  *
- * A router or a subscription dispatch is a fact about a boundary — the
- * way a caller or a topic enters an operation — so it is drawn as a tab
- * on that approach, in the gutter just off the operation's input edge,
- * not parked in a plane of its own. The pool it names is written on the
- * tab; a pool is a shared population, and selecting one lights every tab
- * that names it, which is the whole of what "shared" means here.
- *
- * A storage layout is a fact about an object, so the objects operations
- * persist to are drawn as a downstream tier and wired to the operations
- * that touch them, the partitioned ones marked apart from the rest. The
- * data is part of the machine, so it is connected to it.
+ * The realization vertices are already placed on the paths they belong
+ * to (a router or a dispatch is a fact about a boundary, so it lives on
+ * that boundary's edge). What is left is storage: a layout is a fact
+ * about an object, so the objects operations persist to are drawn as a
+ * downstream tier and wired to the operations that touch them. Each
+ * access edge carries the one fact that matters of it — whether the
+ * access keys to the partition — and every edge can be selected.
  */
 function layoutRuntime(
   runtime: RuntimeFacts,
@@ -723,6 +774,7 @@ function layoutRuntime(
   columnX: number[],
   columnWidth: number[],
   l0: Box,
+  realizations: RealizationBox[],
 ): RuntimePlane {
   const centre = l0.x + l0.w / 2;
   const centreX = (id: string) => {
@@ -730,51 +782,16 @@ function layoutRuntime(
     return b ? b.x + b.w / 2 : centre;
   };
 
-  // Realization tabs: stacked on the operation's input edge, one per
-  // realized boundary, each connected to the card by a short arm.
-  const byOperation = new Map<Id, BoundaryLink[]>();
-  for (const link of runtime.links) {
-    const list = byOperation.get(link.operation);
-    if (list) list.push(link);
-    else byOperation.set(link.operation, [link]);
-  }
-  const realizations: RealizationBox[] = [];
-  for (const [opId, links] of byOperation) {
-    const op = pos.get(opId);
-    if (!op) continue;
-    links.sort((a, b) => a.input.localeCompare(b.input));
-    const n = links.length;
-    links.forEach((link, i) => {
-      const cy = op.y + (op.h * (i + 1)) / (n + 1);
-      const y = cy - SYS.REAL_H / 2;
-      const x = op.x - SYS.REAL_W - SYS.REAL_OFFSET;
-      const box: RealizationBox = {
-        link,
-        x, y, w: SYS.REAL_W, h: SYS.REAL_H,
-        connector: roundedPolyline(
-          [
-            { x: x + SYS.REAL_W, y: cy },
-            { x: op.x - 4, y: cy },
-            { x: op.x, y: cy },
-          ],
-          6,
-        ),
-      };
-      realizations.push(box);
-      pos.set(link.id, { x, y, w: box.w, h: box.h });
-    });
-  }
-
-  // The data tier: object nodes below the machine, placed under the mean
-  // of the operations that touch them and pushed apart in that order,
-  // wrapped once a row reaches the width of the plane above.
+  // Object nodes below the machine, placed under the mean of the
+  // operations that touch them and pushed apart in that order, wrapped
+  // once a row reaches the width of the plane above.
   const anchorOf = (ops: Id[]) =>
     ops.length ? ops.reduce((sum, o) => sum + centreX(o), 0) / ops.length : centre;
   const objects = [...runtime.dataObjects].sort(
     (a, b) => anchorOf(a.operations) - anchorOf(b.operations) || a.object.localeCompare(b.object),
   );
   const limit = Math.max(l0.x + l0.w, l0.x + SYS.WRAP_THRESHOLD);
-  const dataTop = l0.y + l0.h + SYS.DATA_GAP + SYS.DATA_TITLE;
+  const dataTop = l0.y + l0.h + SYS.DATA_GAP;
   const dataObjects: DataObjectBox[] = [];
   let cursor = l0.x;
   let rowTop = dataTop;
@@ -790,7 +807,6 @@ function layoutRuntime(
       object: obj.object,
       dataModel: obj.dataModel,
       partitioned: obj.partitioned,
-      partitionKey: obj.partitionKey,
       operations: obj.operations,
       x, y: rowTop, w: SYS.OBJ_W, h: SYS.OBJ_H,
     };
@@ -802,29 +818,29 @@ function layoutRuntime(
   // beside its column to a trunk below the machine, and rise into the
   // object — kept out of the cards between, the way every other long
   // edge here is.
+  const objectBox = new Map(dataObjects.map((b) => [b.object, b]));
   const trunkY = l0.y + l0.h + SYS.DATA_GAP - SYS.CORNER;
   const access: AccessEdge[] = [];
-  for (const obj of dataObjects) {
-    for (const opId of obj.operations) {
-      const op = pos.get(opId);
-      if (!op) continue;
-      const column = columnOf.get(macro(opId)) ?? 0;
-      const gutter = columnX[column] + columnWidth[column] + SYS.COL_GAP / 2;
-      const from = { x: op.x + op.w * 0.5, y: op.y + op.h };
-      const to = { x: obj.x + obj.w / 2, y: obj.y };
-      access.push({
-        id: `ax:${opId}:${obj.object}`,
-        operation: opId,
-        object: obj.object,
-        partitioned: obj.partitioned,
-        from,
-        to,
-        d: roundedPolyline(
-          [from, { x: gutter, y: from.y }, { x: gutter, y: trunkY }, { x: to.x, y: trunkY }, to],
-          SYS.CORNER,
-        ),
-      });
-    }
+  for (const fact of runtime.access) {
+    const op = pos.get(fact.operation);
+    const obj = objectBox.get(fact.object);
+    if (!op || !obj) continue;
+    const column = columnOf.get(macro(fact.operation)) ?? 0;
+    const gutter = columnX[column] + columnWidth[column] + SYS.COL_GAP / 2;
+    const from = { x: op.x + op.w * 0.5, y: op.y + op.h };
+    const to = { x: obj.x + obj.w / 2, y: obj.y };
+    access.push({
+      id: fact.id,
+      operation: fact.operation,
+      object: fact.object,
+      keyed: fact.keyed,
+      from,
+      to,
+      d: roundedPolyline(
+        [from, { x: gutter, y: from.y }, { x: gutter, y: trunkY }, { x: to.x, y: trunkY }, to],
+        SYS.CORNER,
+      ),
+    });
   }
 
   const dataBand = dataObjects.length ? boundsOf(dataObjects) : null;
