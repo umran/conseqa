@@ -355,6 +355,118 @@ pub enum ValidationError {
         location: StepLocation,
         effect: Id,
     },
+
+    /// An outbox input selects a schema the outbox does not admit.
+    OutboxInputMessageNotAdmitted {
+        input: Id,
+        outbox: Id,
+        schema: Id,
+    },
+
+    /// An outbox write declares a schema the destination outbox does
+    /// not admit.
+    OutboxWriteMessageNotAdmitted {
+        effect: Id,
+        outbox: Id,
+        schema: Id,
+    },
+
+    /// An outbox message-identity mapping names a schema the outbox
+    /// does not admit.
+    OutboxMessageIdentitySchemaNotAdmitted {
+        outbox: Id,
+        schema: Id,
+    },
+
+    /// An outbox message-identity mapping declares an empty identity
+    /// tuple.
+    EmptyOutboxMessageIdentity {
+        outbox: Id,
+        schema: Id,
+    },
+
+    /// Outbox message-identity tuple positions correspond across
+    /// schemas, so every mapped tuple must have the same arity.
+    OutboxMessageIdentityArityMismatch {
+        outbox: Id,
+        schema: Id,
+        expected: usize,
+        actual: usize,
+    },
+
+    /// A `write_outbox` step targets an outbox owned by a data model
+    /// other than the transaction's. Conseqa never infers a
+    /// distributed cross-data-model atomic transaction.
+    OutboxOutsideDataModel {
+        transaction: Id,
+        effect: Id,
+        data_model: Id,
+        outbox: Id,
+    },
+
+    /// A `write_outbox` step appears in a transaction that declares no
+    /// data model, so no owning atomic boundary exists for the
+    /// admission.
+    OutboxWriteMissingDataModel {
+        transaction: Id,
+        effect: Id,
+        outbox: Id,
+    },
+
+    /// An `OutboxWriteEffect` appears at a direct execution site.
+    /// Its only legal execution site is a transaction's
+    /// `write_outbox` step.
+    OutboxWriteOutsideTransaction {
+        operation: Id,
+        effect: Id,
+    },
+
+    /// An `OutboxWriteEffect` appears as an effect-intent contract.
+    /// An outbox message is durable typed application data admitted
+    /// with a commit, not a captured effect instance for later
+    /// execution.
+    OutboxWriteCannotBeIntent {
+        transaction: Id,
+        effect: Id,
+    },
+
+    /// An outbox partition mapping names a schema the outbox does not
+    /// admit.
+    OutboxPartitionSchemaNotAdmitted {
+        input: Id,
+        outbox: Id,
+        schema: Id,
+    },
+
+    /// A keyed outbox partitioning leaves a schema admitted through
+    /// the target input unmapped, so such messages would belong to no
+    /// partition.
+    OutboxPartitionMissingSchema {
+        input: Id,
+        outbox: Id,
+        schema: Id,
+    },
+
+    /// An outbox partition mapping maps a schema to an empty tuple.
+    EmptyOutboxPartitionKey {
+        input: Id,
+        schema: Id,
+    },
+
+    /// Outbox partition-key tuple positions correspond across schemas,
+    /// so every mapped tuple must have the same arity.
+    OutboxPartitionKeyArityMismatch {
+        input: Id,
+        schema: Id,
+        expected: usize,
+        actual: usize,
+    },
+
+    /// `ordering: partition` is declared with `partitioning: none`, so
+    /// no domain exists for the guarantee to be interpreted over.
+    PartitionOrderingWithoutPartitioning {
+        input: Id,
+    },
 }
 
 /// Where a program point consumes a value, for a diagnostic to name.
@@ -1506,6 +1618,282 @@ impl From<ValidationError> for Diagnostic {
                     message: "Each effect kind explicitly declares whether \
                               `execute_effect_async` may launch it; none becomes \
                               async-capable merely by being an effect."
+                        .to_string(),
+                }],
+            },
+
+            ValidationError::OutboxInputMessageNotAdmitted {
+                input,
+                outbox,
+                schema,
+            } => Diagnostic {
+                code: DiagnosticCode::Validation(ValidationCode::OutboxInputMessageNotAdmitted),
+                severity: Severity::Error,
+                subject: Some(input.clone()),
+                message: format!(
+                    "Outbox input `{input}` selects schema `{schema}`, which \
+                     outbox `{outbox}` does not admit."
+                ),
+                evidence: vec![Evidence {
+                    subject: Some(outbox),
+                    message: format!(
+                        "The outbox does not declare schema `{schema}` as a message."
+                    ),
+                }],
+            },
+
+            ValidationError::OutboxWriteMessageNotAdmitted {
+                effect,
+                outbox,
+                schema,
+            } => Diagnostic {
+                code: DiagnosticCode::Validation(ValidationCode::OutboxWriteMessageNotAdmitted),
+                severity: Severity::Error,
+                subject: Some(effect.clone()),
+                message: format!(
+                    "Outbox write `{effect}` admits schema `{schema}` to outbox \
+                     `{outbox}`, but the outbox does not admit that schema."
+                ),
+                evidence: vec![Evidence {
+                    subject: Some(outbox),
+                    message: format!(
+                        "The outbox does not declare schema `{schema}` as a message."
+                    ),
+                }],
+            },
+
+            ValidationError::OutboxMessageIdentitySchemaNotAdmitted { outbox, schema } => {
+                Diagnostic {
+                    code: DiagnosticCode::Validation(
+                        ValidationCode::OutboxMessageIdentitySchemaNotAdmitted,
+                    ),
+                    severity: Severity::Error,
+                    subject: Some(outbox.clone()),
+                    message: format!(
+                        "Outbox `{outbox}` declares a message identity for schema \
+                         `{schema}`, but does not admit that schema."
+                    ),
+                    evidence: vec![Evidence {
+                        subject: Some(schema),
+                        message: "Message-identity mappings may only reference message \
+                                  schemas the outbox admits."
+                            .to_string(),
+                    }],
+                }
+            }
+
+            ValidationError::EmptyOutboxMessageIdentity { outbox, schema } => Diagnostic {
+                code: DiagnosticCode::Validation(ValidationCode::EmptyOutboxMessageIdentity),
+                severity: Severity::Error,
+                subject: Some(outbox.clone()),
+                message: format!(
+                    "Outbox `{outbox}` declares an empty message identity for \
+                     schema `{schema}`."
+                ),
+                evidence: vec![Evidence {
+                    subject: Some(schema),
+                    message: "A mapped schema must declare the complete, non-empty identity \
+                              of one logical message."
+                        .to_string(),
+                }],
+            },
+
+            ValidationError::OutboxMessageIdentityArityMismatch {
+                outbox,
+                schema,
+                expected,
+                actual,
+            } => Diagnostic {
+                code: DiagnosticCode::Validation(
+                    ValidationCode::OutboxMessageIdentityArityMismatch,
+                ),
+                severity: Severity::Error,
+                subject: Some(outbox.clone()),
+                message: format!(
+                    "Outbox `{outbox}` maps the message identity of `{schema}` \
+                     with {actual} field(s), but other mapped schemas use {expected}."
+                ),
+                evidence: vec![Evidence {
+                    subject: Some(schema),
+                    message: "Identity tuple positions correspond across schemas, so every \
+                              mapped tuple must have the same arity."
+                        .to_string(),
+                }],
+            },
+
+            ValidationError::OutboxOutsideDataModel {
+                transaction,
+                effect,
+                data_model,
+                outbox,
+            } => Diagnostic {
+                code: DiagnosticCode::Validation(ValidationCode::OutboxOutsideDataModel),
+                severity: Severity::Error,
+                subject: Some(effect.clone()),
+                message: format!(
+                    "Outbox write `{effect}` in transaction `{transaction}` targets \
+                     outbox `{outbox}`, which does not belong to the transaction's \
+                     data model `{data_model}`."
+                ),
+                evidence: vec![Evidence {
+                    subject: Some(outbox),
+                    message: "An outbox write is atomic with its containing transaction's \
+                              commit, so the destination outbox must belong to the declared \
+                              data model; Conseqa never infers a distributed cross-data-model \
+                              atomic transaction."
+                        .to_string(),
+                }],
+            },
+
+            ValidationError::OutboxWriteMissingDataModel {
+                transaction,
+                effect,
+                outbox,
+            } => Diagnostic {
+                code: DiagnosticCode::Validation(ValidationCode::OutboxWriteMissingDataModel),
+                severity: Severity::Error,
+                subject: Some(effect.clone()),
+                message: format!(
+                    "Outbox write `{effect}` targets outbox `{outbox}`, but its \
+                     transaction `{transaction}` declares no data model."
+                ),
+                evidence: vec![Evidence {
+                    subject: Some(transaction),
+                    message: "A transaction admitting an outbox message must declare the \
+                              data model that owns the outbox — the atomic boundary the \
+                              admission participates in."
+                        .to_string(),
+                }],
+            },
+
+            ValidationError::OutboxWriteOutsideTransaction { operation, effect } => Diagnostic {
+                code: DiagnosticCode::Validation(ValidationCode::OutboxWriteOutsideTransaction),
+                severity: Severity::Error,
+                subject: Some(operation.clone()),
+                message: format!(
+                    "`{operation}` executes outbox write `{effect}` outside a \
+                     transaction."
+                ),
+                evidence: vec![Evidence {
+                    subject: Some(effect),
+                    message: "An `OutboxWriteEffect`'s only legal execution site is a \
+                              transaction's `write_outbox` step: outside one, no containing \
+                              application transaction exists whose commit could make the \
+                              admission atomic."
+                        .to_string(),
+                }],
+            },
+
+            ValidationError::OutboxWriteCannotBeIntent {
+                transaction,
+                effect,
+            } => Diagnostic {
+                code: DiagnosticCode::Validation(ValidationCode::OutboxWriteCannotBeIntent),
+                severity: Severity::Error,
+                subject: Some(effect.clone()),
+                message: format!(
+                    "Transaction `{transaction}` establishes outbox write \
+                     `{effect}` as an effect intent."
+                ),
+                evidence: vec![Evidence {
+                    subject: Some(transaction),
+                    message: "An outbox message is durable typed application data admitted \
+                              atomically with a commit, not a captured effect instance for \
+                              later execution; write it with a `write_outbox` step instead."
+                        .to_string(),
+                }],
+            },
+
+            ValidationError::OutboxPartitionSchemaNotAdmitted {
+                input,
+                outbox,
+                schema,
+            } => Diagnostic {
+                code: DiagnosticCode::Validation(ValidationCode::OutboxPartitionSchemaNotAdmitted),
+                severity: Severity::Error,
+                subject: Some(input.clone()),
+                message: format!(
+                    "The outbox runtime of `{input}` maps a partition key for \
+                     schema `{schema}`, which outbox `{outbox}` does not admit."
+                ),
+                evidence: vec![Evidence {
+                    subject: Some(outbox),
+                    message: format!(
+                        "The outbox does not declare schema `{schema}` as a message."
+                    ),
+                }],
+            },
+
+            ValidationError::OutboxPartitionMissingSchema {
+                input,
+                outbox,
+                schema,
+            } => Diagnostic {
+                code: DiagnosticCode::Validation(ValidationCode::OutboxPartitionMissingSchema),
+                severity: Severity::Error,
+                subject: Some(input.clone()),
+                message: format!(
+                    "The outbox runtime of `{input}` declares keyed partitioning \
+                     but maps no partition key for `{schema}`, which the input \
+                     admits from outbox `{outbox}`."
+                ),
+                evidence: vec![Evidence {
+                    subject: Some(schema),
+                    message: "Every message schema admitted through the target input must \
+                              map into the common partition-key domain; an unmapped one \
+                              would belong to no partition."
+                        .to_string(),
+                }],
+            },
+
+            ValidationError::EmptyOutboxPartitionKey { input, schema } => Diagnostic {
+                code: DiagnosticCode::Validation(ValidationCode::EmptyOutboxPartitionKey),
+                severity: Severity::Error,
+                subject: Some(input.clone()),
+                message: format!(
+                    "The outbox runtime of `{input}` maps `{schema}` to an empty \
+                     partition-key tuple, which names no partition."
+                ),
+                evidence: Vec::new(),
+            },
+
+            ValidationError::OutboxPartitionKeyArityMismatch {
+                input,
+                schema,
+                expected,
+                actual,
+            } => Diagnostic {
+                code: DiagnosticCode::Validation(ValidationCode::OutboxPartitionKeyArityMismatch),
+                severity: Severity::Error,
+                subject: Some(input.clone()),
+                message: format!(
+                    "The outbox runtime of `{input}` maps the partition key of \
+                     `{schema}` with {actual} field(s), but other mapped schemas \
+                     use {expected}."
+                ),
+                evidence: vec![Evidence {
+                    subject: Some(schema),
+                    message: "Partition-key tuple positions correspond across schemas, so \
+                              every mapped tuple must have the same arity."
+                        .to_string(),
+                }],
+            },
+
+            ValidationError::PartitionOrderingWithoutPartitioning { input } => Diagnostic {
+                code: DiagnosticCode::Validation(
+                    ValidationCode::PartitionOrderingWithoutPartitioning,
+                ),
+                severity: Severity::Error,
+                subject: Some(input.clone()),
+                message: format!(
+                    "The outbox runtime of `{input}` declares `ordering: partition` \
+                     with `partitioning: none`."
+                ),
+                evidence: vec![Evidence {
+                    subject: Some(input),
+                    message: "Partition ordering is an independent order within each keyed \
+                              partition; without keyed partitioning no domain exists for \
+                              the guarantee to be interpreted over."
                         .to_string(),
                 }],
             },

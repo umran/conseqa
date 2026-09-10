@@ -71,12 +71,12 @@ pub mod value_identity;
 pub use describe::path_label;
 pub use idempotency::{
     ConsumerCollapse, EffectRetrySafety, EffectSafety, IdempotencyCheck, IdempotencyObstacle,
-    IdempotencyProof, IdempotencyVerdict, IdentityLineage, LineageFact, PathRetrySafety,
-    ProducerRef, RetryRoute, TransactionRetrySafety,
+    IdempotencyProof, IdempotencyVerdict, IdentityLineage, LineageFact, LineageSource,
+    PathRetrySafety, ProducerRef, RetryRoute, TransactionRetrySafety,
 };
 pub use ordering::{
     DuplicateCoverage, DuplicateHandling, OrderingCheck, OrderingObstacle, OrderingProof,
-    OrderingVerdict, PrecedenceSource,
+    OrderingVerdict, OutboxPrecedence, PrecedenceSource,
 };
 pub use paths::{DecisionTaken, PathRef};
 pub use recoverability::{
@@ -94,12 +94,12 @@ pub use result_replay::{
     ResultReplayCheck, ResultReplayObstacle, ResultReplayProof, ResultReplayVerdict, ReturnedResult,
 };
 pub use serialization::{
-    GroupingScope, KeyIdentity, MessageKeyFact, RoutingKeyFact, SerializationCheck,
-    SerializationObstacle, SerializationProof, SerializationVerdict,
+    GroupingScope, KeyIdentity, MessageKeyFact, OutboxPartitionKeyFact, RoutingKeyFact,
+    SerializationCheck, SerializationObstacle, SerializationProof, SerializationVerdict,
 };
 pub use trigger::{
-    Consumer, EffectContract, Producer, ProducerSite, TriggerGraph, collapses_duplicates,
-    effect_contract, key_input, returns_consistently,
+    Consumer, EffectContract, OutboxConsumer, OutboxProducer, Producer, ProducerSite,
+    TriggerGraph, collapses_duplicates, effect_contract, key_input, returns_consistently,
 };
 pub use value_identity::{CanonicalValuePath, canonical_value_path};
 
@@ -229,16 +229,36 @@ pub enum ModelNote {
         topic: Id,
         delivery: DeliverySemantics,
     },
+
+    /// The outbox counterpart: an outbox input admits duplicate
+    /// deliveries and its operation declares no idempotency
+    /// requirement keyed from it. Acknowledgement does not close this
+    /// gap — under at-least-once delivery an unacknowledged message is
+    /// redelivered, and nothing declares the repeated work safe.
+    DuplicateOutboxDeliveryUnchecked {
+        operation: Id,
+        input: Id,
+        outbox: Id,
+        delivery: DeliverySemantics,
+    },
 }
 
 impl ModelNote {
     pub fn subject(&self) -> Option<Id> {
         match self {
-            Self::DuplicateDeliveryUnchecked { input, .. } => Some(input.clone()),
+            Self::DuplicateDeliveryUnchecked { input, .. }
+            | Self::DuplicateOutboxDeliveryUnchecked { input, .. } => Some(input.clone()),
         }
     }
 
     pub fn message(&self) -> String {
+        let admits = |delivery: &DeliverySemantics| match delivery {
+            DeliverySemantics::AtLeastOnce => {
+                "declares at-least-once delivery, so a logical message may invoke it more than once"
+            }
+            _ => "declares no delivery fact, so duplicate invocations cannot be excluded",
+        };
+
         match self {
             Self::DuplicateDeliveryUnchecked {
                 operation,
@@ -246,17 +266,25 @@ impl ModelNote {
                 topic,
                 delivery,
             } => {
-                let admits = match delivery {
-                    DeliverySemantics::AtLeastOnce => {
-                        "declares at-least-once delivery, so a logical message may invoke it more than once"
-                    }
-                    _ => "declares no delivery fact, so duplicate invocations cannot be excluded",
-                };
-
                 format!(
-                    "`{input}` of `{operation}` subscribes to `{topic}` and {admits}; the \
+                    "`{input}` of `{operation}` subscribes to `{topic}` and {}; the \
                      operation declares no idempotency requirement keyed from that input, so \
-                     the work a duplicate delivery repeats is checked by nothing."
+                     the work a duplicate delivery repeats is checked by nothing.",
+                    admits(delivery)
+                )
+            }
+
+            Self::DuplicateOutboxDeliveryUnchecked {
+                operation,
+                input,
+                outbox,
+                delivery,
+            } => {
+                format!(
+                    "`{input}` of `{operation}` consumes outbox `{outbox}` and {}; the \
+                     operation declares no idempotency requirement keyed from that input, so \
+                     the work a duplicate delivery repeats is checked by nothing.",
+                    admits(delivery)
                 )
             }
         }
@@ -280,23 +308,42 @@ pub fn notes(model: &Model) -> Vec<ModelNote> {
 
     for (operation_id, operation) in &model.operations {
         for (input_id, input) in &operation.inputs {
-            let Input::Subscription(subscription) = input else {
-                continue;
-            };
+            match input {
+                Input::Subscription(subscription) => {
+                    let delivery = model.delivery(operation_id, input_id);
 
-            let delivery = model.delivery(operation_id, input_id);
+                    if delivery == DeliverySemantics::AtMostOnce {
+                        continue;
+                    }
 
-            if delivery == DeliverySemantics::AtMostOnce {
-                continue;
-            }
+                    if !collapses_duplicates(operation, input_id) {
+                        notes.push(ModelNote::DuplicateDeliveryUnchecked {
+                            operation: operation_id.clone(),
+                            input: input_id.clone(),
+                            topic: subscription.topic.clone(),
+                            delivery,
+                        });
+                    }
+                }
 
-            if !collapses_duplicates(operation, input_id) {
-                notes.push(ModelNote::DuplicateDeliveryUnchecked {
-                    operation: operation_id.clone(),
-                    input: input_id.clone(),
-                    topic: subscription.topic.clone(),
-                    delivery,
-                });
+                Input::Outbox(declared) => {
+                    let delivery = model.outbox_delivery(operation_id, input_id);
+
+                    if delivery == DeliverySemantics::AtMostOnce {
+                        continue;
+                    }
+
+                    if !collapses_duplicates(operation, input_id) {
+                        notes.push(ModelNote::DuplicateOutboxDeliveryUnchecked {
+                            operation: operation_id.clone(),
+                            input: input_id.clone(),
+                            outbox: declared.outbox.clone(),
+                            delivery,
+                        });
+                    }
+                }
+
+                Input::Request(_) => {}
             }
         }
     }

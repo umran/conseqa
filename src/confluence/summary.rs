@@ -68,6 +68,12 @@ pub enum InputContract {
         topic: Id,
         delivery: DeliverySemantics,
     },
+
+    Outbox {
+        outbox: Id,
+        delivery: DeliverySemantics,
+        acknowledge_on_success: bool,
+    },
 }
 
 /// One outward effect contract the operation's program declares.
@@ -92,6 +98,15 @@ pub enum OutwardEffectContract {
         effect: Id,
         name: String,
         deduplicated: bool,
+    },
+
+    /// A transactional outbox write: admitted atomically with the
+    /// named transaction's commit.
+    WritesOutbox {
+        effect: Id,
+        transaction: Id,
+        outbox: Id,
+        schema: Id,
     },
 }
 
@@ -156,6 +171,12 @@ fn derive_one(
                     topic: subscription.topic.clone(),
                     delivery: model.delivery(id, input_id),
                 },
+
+                Input::Outbox(input) => InputContract::Outbox {
+                    outbox: input.outbox.clone(),
+                    delivery: model.outbox_delivery(id, input_id),
+                    acknowledge_on_success: input.acknowledge_on_success,
+                },
             };
 
             (input_id.clone(), contract)
@@ -189,7 +210,24 @@ fn derive_one(
                     IdempotencyGuarantee::DeduplicatedBy { .. }
                 ),
             },
+
+            // Structurally invalid at a direct site — validation
+            // rejects the model — but the summary stays total.
+            crate::spec::Effect::OutboxWrite(write) => OutwardEffectContract::WritesOutbox {
+                effect: effect_id.clone(),
+                transaction: Id(String::new()),
+                outbox: write.outbox.clone(),
+                schema: write.schema.clone(),
+            },
         })
+        .chain(operation.program.outbox_write_declarations().into_iter().map(
+            |(transaction_id, write)| OutwardEffectContract::WritesOutbox {
+                effect: write.effect_id.clone(),
+                transaction: transaction_id.clone(),
+                outbox: write.effect.outbox.clone(),
+                schema: write.effect.schema.clone(),
+            },
+        ))
         .collect();
 
     let serialization = operation

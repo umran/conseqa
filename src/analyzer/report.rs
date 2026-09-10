@@ -18,10 +18,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::analyzer::verification::{
     self, ArtifactReplay, ConsumerCollapse, DecisionReplay, DecisionRule, EffectSafety,
-    IdempotencyProof, IdempotencyVerdict, InstanceStability, KeyIdentity, PathRef,
-    RecoverabilityProof, RecoverabilityVerdict, Resolution, ResultReplayProof, ResultReplayVerdict,
-    ResultStabilityRule, RetryDriver, RetryRoute, SerializationProof, SerializationVerdict,
-    StableRoot, VerificationReport,
+    IdempotencyProof, IdempotencyVerdict, InstanceStability, KeyIdentity,
+    OutboxPartitionKeyFact, PathRef, RecoverabilityProof, RecoverabilityVerdict, Resolution,
+    ResultReplayProof, ResultReplayVerdict, ResultStabilityRule, RetryDriver, RetryRoute,
+    SerializationProof, SerializationVerdict, StableRoot, VerificationReport,
 };
 use crate::analyzer::verification::{
     DuplicateHandling, GroupingScope, LineageFact, MessageKeyFact, ModelNote, OrderingProof,
@@ -381,6 +381,11 @@ pub fn obligations(model: &Model, verification: &VerificationReport) -> ProverRe
                     } => format!("{machine}'s {transition} through {effect}"),
                 };
 
+                let (source_label, source_kind) = match &lineage.source {
+                    verification::LineageSource::Topic { topic } => (topic, "topic"),
+                    verification::LineageSource::Outbox { outbox } => (outbox, "outbox"),
+                };
+
                 match &lineage.fact {
                     LineageFact::Propagated {
                         source,
@@ -398,12 +403,12 @@ pub fn obligations(model: &Model, verification: &VerificationReport) -> ProverRe
                                 "the identity of {} on {} is carried by its producer's \
                                  idempotency key ({key}, requirement #{index}): declared \
                                  propagation from {producer}",
-                                lineage.schema, lineage.topic
+                                lineage.schema, source_label
                             ),
                             None => format!(
                                 "the identity of {} on {} carries {key} by declared \
                                  propagation from {producer}",
-                                lineage.schema, lineage.topic
+                                lineage.schema, source_label
                             ),
                         });
                     }
@@ -416,10 +421,10 @@ pub fn obligations(model: &Model, verification: &VerificationReport) -> ProverRe
                             }
                         },
                         message: format!(
-                            "{producer} publishes {} to {} without a declared \
+                            "{producer} produces {} into {} without a declared \
                              propagation onto its identity fields; the identity this \
-                             population rests on is the topic declaration alone.",
-                            lineage.schema, lineage.topic
+                             population rests on is the {source_kind} declaration alone.",
+                            lineage.schema, source_label
                         ),
                     }),
                 }
@@ -642,6 +647,36 @@ fn serialization_assumptions(proof: &SerializationProof) -> Vec<String> {
 
             assumptions
         }
+
+        SerializationProof::OutboxRouted {
+            input,
+            outbox,
+            pool,
+            partition_keys,
+            member_assignment,
+        } => {
+            let mut assumptions = vec![format!(
+                "{outbox} consumption through {input} is partitioned by a keyed \
+                 partition, and dispatch into {pool} assigns each partition to a \
+                 member, so same-key deliveries share one partition domain"
+            )];
+
+            assumptions.extend(partition_key_assumptions(partition_keys, "serialization"));
+
+            assumptions.push(member_assignment_assumption(member_assignment));
+
+            assumptions.push(format!(
+                "{pool} bounds each member to one simultaneously active invocation, so \
+                 the owning member runs same-key invocations one at a time"
+            ));
+
+            assumptions.push(format!(
+                "{input} dispatches without a batching stage, so no opaque \
+                 batch-internal parallelism escapes the member-concurrency bound"
+            ));
+
+            assumptions
+        }
     }
 }
 
@@ -703,6 +738,25 @@ fn grouping_key_assumptions(keys: &[MessageKeyFact], requirement: &str) -> Vec<S
                 "for {}, the grouping key {} carries the {requirement} key's value \
                  ({schema}.{path} via fragment aliasing)",
                 key.schema, key.grouping_key
+            ),
+        })
+        .collect()
+}
+
+/// Per admitted schema, why the outbox partition key carries the
+/// requirement key's value.
+fn partition_key_assumptions(keys: &[OutboxPartitionKeyFact], requirement: &str) -> Vec<String> {
+    keys.iter()
+        .map(|key| match &key.identity {
+            KeyIdentity::SamePath => format!(
+                "for {}, the partition key {} is the {requirement} key field",
+                key.schema, key.partition_key
+            ),
+
+            KeyIdentity::SameCanonicalValue { schema, path } => format!(
+                "for {}, the partition key {} carries the {requirement} key's value \
+                 ({schema}.{path} via fragment aliasing)",
+                key.schema, key.partition_key
             ),
         })
         .collect()
@@ -800,6 +854,104 @@ fn ordering_assumptions(proof: &OrderingProof) -> Vec<String> {
 
             assumptions
         }
+
+        OrderingProof::OutboxRoutedOrder {
+            input,
+            outbox,
+            pool,
+            precedence,
+            partition_keys,
+            member_assignment,
+            batching,
+            duplicates,
+        } => {
+            let mut assumptions = Vec::new();
+
+            assumptions.push(match precedence {
+                verification::OutboxPrecedence::Partition => format!(
+                    "the outbox runtime of {input} on {outbox} orders messages within \
+                     each partition; that order is the precedence"
+                ),
+
+                verification::OutboxPrecedence::Global => format!(
+                    "the outbox runtime of {input} on {outbox} orders every message it \
+                     consumes; that order is the precedence for any key"
+                ),
+            });
+
+            assumptions.extend(partition_key_assumptions(partition_keys, "ordering"));
+
+            assumptions.push(member_assignment_assumption(member_assignment));
+
+            assumptions.push(format!(
+                "{pool} bounds each member to one simultaneously active invocation, so a \
+                 later invocation cannot overtake an earlier one"
+            ));
+
+            match batching {
+                None => assumptions.push(format!(
+                    "{input} dispatches without a batching stage, so no batch obstacle \
+                     exists to clear"
+                )),
+
+                Some(crate::spec::BatchOrderingPreservation::Preserved) => {
+                    assumptions.push(format!(
+                        "the batching stage of {input} declares order preservation: its \
+                         opaque batch processing does not let a later message overtake \
+                         an earlier one against the established order"
+                    ))
+                }
+
+                // Unreachable through a well-formed proof — the route
+                // gates on it — worded to read as obviously wrong if
+                // that gate is ever lost.
+                Some(crate::spec::BatchOrderingPreservation::Unspecified) => {
+                    assumptions.push(format!(
+                        "the batching stage of {input} declares no ordering \
+                         preservation, so this proof cites a fact that does not \
+                         support it"
+                    ))
+                }
+            }
+
+            match duplicates {
+                DuplicateHandling::SingleDelivery => assumptions.push(format!(
+                    "{input} receives each logical message at most once, so neither \
+                     redelivery nor a duplicate exists"
+                )),
+
+                DuplicateHandling::OrderPreservingRedelivery { idempotency } => {
+                    assumptions.push(
+                        "dispatch preserves the established same-key precedence when \
+                         admitting invocations, including across failure-driven \
+                         redelivery and ownership reassignment"
+                            .to_string(),
+                    );
+
+                    assumptions.push(match idempotency {
+                        Some(coverage) => format!(
+                            "a duplicate of a completed delivery repeats an invocation \
+                             that already took effect in order; its work is idempotency \
+                             requirement #{}'s obligation ({})",
+                            coverage.requirement,
+                            if coverage.proven {
+                                "proven"
+                            } else {
+                                "unproven"
+                            }
+                        ),
+
+                        None => format!(
+                            "a duplicate of a completed delivery repeats an invocation \
+                             that already took effect in order; no idempotency \
+                             requirement keyed from {input} answers for its work"
+                        ),
+                    });
+                }
+            }
+
+            assumptions
+        }
     }
 }
 
@@ -817,6 +969,11 @@ fn idempotency_assumptions(proof: &IdempotencyProof) -> Vec<String> {
         IdempotencyProof::SingleDelivery { input, topic } => vec![format!(
             "{input} receives at-most-once delivery from {topic}, whose message \
              identity is pinned by the key: a class holds at most one attempt"
+        )],
+
+        IdempotencyProof::SingleOutboxDelivery { input, outbox } => vec![format!(
+            "{input} receives at-most-once delivery from outbox {outbox}, whose \
+             message identity is pinned by the key: a class holds at most one attempt"
         )],
 
         IdempotencyProof::RetrySafePaths { paths } => {
@@ -906,6 +1063,59 @@ fn idempotency_assumptions(proof: &IdempotencyProof) -> Vec<String> {
                             effect.effect,
                             instance_label(instance)
                         )),
+
+                        EffectSafety::TransactionDeduplicated { transaction, key } => {
+                            assumptions.push(format!(
+                                "{prefix}{} commits atomically with {transaction}, whose \
+                                 commits are deduplicated by {}, stable across the \
+                                 attempt class: at most one committed occurrence of the \
+                                 outbox write exists",
+                                effect.effect,
+                                root_labels(key)
+                            ))
+                        }
+
+                        EffectSafety::SameLogicalOutboxMessage {
+                            outbox,
+                            schema,
+                            instance,
+                            consumers,
+                        } => {
+                            assumptions.push(format!(
+                                "{prefix}duplicate committed executions of {} admit the \
+                                 same logical message under {outbox}'s message identity \
+                                 ({})",
+                                effect.effect,
+                                instance_label(instance)
+                            ));
+
+                            if consumers.is_empty() {
+                                assumptions.push(format!(
+                                    "{prefix}no modeled outbox input on {outbox} admits \
+                                     {schema}; the cascade ends at the outbox"
+                                ));
+                            }
+
+                            for consumer in consumers {
+                                assumptions.push(match consumer {
+                                    ConsumerCollapse::ProvenRequirement { operation, input } => {
+                                        format!(
+                                            "{prefix}duplicate deliveries of {schema} to \
+                                             {operation} via {input} fall into one proven \
+                                             idempotency class"
+                                        )
+                                    }
+
+                                    ConsumerCollapse::SingleDelivery { operation, input } => {
+                                        format!(
+                                            "{prefix}{operation} via {input} receives \
+                                             {schema} at most once: one logical message \
+                                             under at-most-once delivery"
+                                        )
+                                    }
+                                });
+                            }
+                        }
                     }
                 }
             }
@@ -971,6 +1181,11 @@ fn recoverability_assumptions(proof: &RecoverabilityProof) -> Vec<String> {
             let mut assumptions = vec![match driver {
                 RetryDriver::AtLeastOnceDelivery { input, topic } => format!(
                     "{input} redelivers via {topic} at least once, re-driving \
+                     interrupted invocations"
+                ),
+
+                RetryDriver::AtLeastOnceOutboxDelivery { input, outbox } => format!(
+                    "{input} redelivers via outbox {outbox} at least once, re-driving \
                      interrupted invocations"
                 ),
 

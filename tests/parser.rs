@@ -2159,3 +2159,135 @@ operations:
 
     assert_eq!(model, reparsed);
 }
+
+// ---------------------------------------------------------------------
+// Transactional outboxes
+// ---------------------------------------------------------------------
+
+#[test]
+fn parses_transactional_outbox_model() {
+    let source = read_fixture("transactional_outbox.yaml");
+
+    let model = yaml::parse(&source).expect("transactional outbox fixture should parse");
+
+    // The outbox lives on its data model, with a keyed identity.
+    let outbox = model
+        .data_models
+        .get(&Id("data.orders".into()))
+        .unwrap()
+        .outboxes
+        .get(&Id("outbox.order_events".into()))
+        .expect("data.orders should declare the outbox");
+
+    assert!(outbox.messages.contains(&Id("schema.OrderCreated".into())));
+    assert!(matches!(outbox.message_identity, MessageIdentity::Keyed(_)));
+
+    // The producer stages the write as a transaction step with the
+    // specific transactional contract, not the general effect enum.
+    let create = transaction(&model, "operation.create_order", "tx.create_order");
+
+    let write = create
+        .steps
+        .iter()
+        .find_map(|step| match step {
+            TransactionStep::WriteOutbox(write) => Some(write),
+            _ => None,
+        })
+        .expect("the transaction should stage an outbox write");
+
+    assert_eq!(write.effect_id, Id("effect.create_order.outbox_created".into()));
+    assert_eq!(write.effect.outbox, Id("outbox.order_events".into()));
+    assert_eq!(write.effect.schema, Id("schema.OrderCreated".into()));
+    assert_eq!(write.effect.idempotency_key_propagation.len(), 1);
+
+    // The relay consumes through an outbox input with an explicit
+    // acknowledgement declaration.
+    let relay = model
+        .operations
+        .get(&Id("operation.publish_order_event".into()))
+        .unwrap();
+
+    let Some(Input::Outbox(input)) = relay
+        .inputs
+        .get(&Id("input.publish_order_event.outbox".into()))
+    else {
+        panic!("the relay should declare an outbox input");
+    };
+
+    assert_eq!(input.outbox, Id("outbox.order_events".into()));
+    assert!(input.acknowledge_on_success);
+
+    // The subscriber declares the optional companion acknowledgement.
+    let Some(Input::Subscription(subscription)) = model
+        .operations
+        .get(&Id("operation.project_order".into()))
+        .unwrap()
+        .inputs
+        .get(&Id("input.project_order.created".into()))
+    else {
+        panic!("the projector should subscribe");
+    };
+
+    assert_eq!(subscription.acknowledge_on_success, Some(true));
+
+    // The outbox runtime declares all four facts, with an
+    // order-preserving batching stage.
+    let runtime = model
+        .outbox_runtime(
+            &Id("operation.publish_order_event".into()),
+            &Id("input.publish_order_event.outbox".into()),
+        )
+        .expect("the relay's outbox runtime should be declared");
+
+    assert_eq!(runtime.delivery, DeliverySemantics::AtLeastOnce);
+    assert!(matches!(
+        runtime.partitioning,
+        conseqa::spec::OutboxPartitioning::Keyed(_)
+    ));
+    assert_eq!(runtime.ordering, conseqa::spec::OutboxOrdering::Partition);
+    assert_eq!(runtime.dispatch.member_assignment, MemberAssignment::ConsistentHash);
+    assert_eq!(
+        runtime.dispatch.batching.as_ref().map(|batching| batching.ordering),
+        Some(conseqa::spec::BatchOrderingPreservation::Preserved)
+    );
+}
+
+#[test]
+fn serializes_and_reparses_transactional_outbox_model() {
+    let source = read_fixture("transactional_outbox.yaml");
+
+    let original = yaml::parse(&source).expect("transactional outbox fixture should parse");
+
+    let serialized = yaml::serialize(&original).expect("model should serialize");
+
+    let reparsed = yaml::parse(&serialized).expect("serialized model should parse");
+
+    assert_eq!(original, reparsed);
+}
+
+/// A subscription that declares no acknowledgement fact parses with
+/// `None` — absence, not a silent negative — and a model without
+/// outboxes round-trips without an `outboxes` key appearing.
+#[test]
+fn absent_acknowledgement_and_outboxes_stay_absent() {
+    let source = read_fixture("flash_checkout.yaml");
+
+    let model = yaml::parse(&source).expect("flash checkout fixture should parse");
+
+    let Some(Input::Subscription(subscription)) = model
+        .operations
+        .get(&Id("operation.reserve_inventory".into()))
+        .unwrap()
+        .inputs
+        .get(&Id("input.reserve_inventory.created".into()))
+    else {
+        panic!("reserve_inventory should subscribe");
+    };
+
+    assert_eq!(subscription.acknowledge_on_success, None);
+
+    let serialized = yaml::serialize(&model).expect("model should serialize");
+
+    assert!(!serialized.contains("acknowledge_on_success"));
+    assert!(!serialized.contains("outboxes"));
+}

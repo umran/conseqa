@@ -1073,6 +1073,7 @@ fn planned_operation_commits_as_draft_and_requirements_flow_through_proposals() 
                             messages: MessageSelector::Only(BTreeSet::from([id(
                                 "schema.OrderPaid",
                             )])),
+                            acknowledge_on_success: None,
                         }),
                     )]),
                 },

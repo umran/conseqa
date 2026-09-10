@@ -111,16 +111,24 @@ pub struct IdempotencyCheck {
     pub lineage: Vec<IdentityLineage>,
 }
 
-/// How a message's declared identity on its topic relates to the key
-/// of the declaration that publishes it — the propagation lineage of
-/// §12, read from the consumer's side.
+/// How a message's declared identity on its topic or outbox relates
+/// to the key of the declaration that produces it — the propagation
+/// lineage of §12, read from the consumer's side.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct IdentityLineage {
-    pub topic: Id,
+    pub source: LineageSource,
     pub schema: Id,
     pub producer: ProducerRef,
     pub fact: LineageFact,
+}
+
+/// The message boundary whose declared identity anchors the lineage.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum LineageSource {
+    Topic { topic: Id },
+    Outbox { outbox: Id },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -193,6 +201,11 @@ pub enum IdempotencyProof {
     /// than once, so repeated attempts cannot exist.
     SingleDelivery { input: Id, topic: Id },
 
+    /// The outbox counterpart of `SingleDelivery`: `at_most_once`
+    /// outbox delivery with the payload pinned by the outbox's keyed
+    /// message identity.
+    SingleOutboxDelivery { input: Id, outbox: Id },
+
     /// Every admitted path is retry-safe in all three legs.
     RetrySafePaths { paths: Vec<PathRetrySafety> },
 }
@@ -207,7 +220,9 @@ impl IdempotencyProof {
             }
 
             // `at_most_once` is a delivery fact, and delivery is L1.
-            Self::SingleDelivery { .. } => ProofScope::RuntimeDependent,
+            Self::SingleDelivery { .. } | Self::SingleOutboxDelivery { .. } => {
+                ProofScope::RuntimeDependent
+            }
 
             Self::RetrySafePaths { paths } => ProofScope::joined(
                 paths
@@ -245,33 +260,38 @@ impl IdempotencyProof {
 
 impl EffectSafety {
     fn direct_scope(&self) -> ProofScope {
-        match self {
-            Self::ExternallyDeduplicated { .. } | Self::DeduplicatedByTarget { .. } => {
-                ProofScope::L0Only
-            }
+        let consumer_scopes = |consumers: &[ConsumerCollapse]| {
+            ProofScope::joined(consumers.iter().map(|consumer| match consumer {
+                // The consumer never sees a second delivery — a fact
+                // about the realized transport.
+                ConsumerCollapse::SingleDelivery { .. } => ProofScope::RuntimeDependent,
+                ConsumerCollapse::ProvenRequirement { .. } => ProofScope::L0Only,
+            }))
+        };
 
-            Self::SameLogicalMessage { consumers, .. } => ProofScope::joined(
-                consumers
-                    .iter()
-                    .map(|consumer| match consumer {
-                        // The consumer never sees a second delivery —
-                        // a fact about the realized transport.
-                        ConsumerCollapse::SingleDelivery { .. } => ProofScope::RuntimeDependent,
-                        ConsumerCollapse::ProvenRequirement { .. } => ProofScope::L0Only,
-                    }),
-            ),
+        match self {
+            Self::ExternallyDeduplicated { .. }
+            | Self::DeduplicatedByTarget { .. }
+            // Transaction commit deduplication is an L0 fact.
+            | Self::TransactionDeduplicated { .. } => ProofScope::L0Only,
+
+            Self::SameLogicalMessage { consumers, .. }
+            | Self::SameLogicalOutboxMessage { consumers, .. } => consumer_scopes(consumers),
         }
     }
 
     fn dependencies(&self) -> Vec<(Id, Id)> {
         match self {
-            Self::ExternallyDeduplicated { .. } => Vec::new(),
+            Self::ExternallyDeduplicated { .. } | Self::TransactionDeduplicated { .. } => {
+                Vec::new()
+            }
 
             Self::DeduplicatedByTarget {
                 operation, input, ..
             } => vec![(operation.clone(), input.clone())],
 
-            Self::SameLogicalMessage { consumers, .. } => consumers
+            Self::SameLogicalMessage { consumers, .. }
+            | Self::SameLogicalOutboxMessage { consumers, .. } => consumers
                 .iter()
                 .filter_map(|consumer| match consumer {
                     ConsumerCollapse::ProvenRequirement { operation, input } => {
@@ -352,6 +372,31 @@ pub enum EffectSafety {
         operation: Id,
         input: Id,
         instance: InstanceStability,
+    },
+
+    /// The producer-suppressed route for a transactional outbox write
+    /// (§50 of the outbox revision): the containing transaction
+    /// deduplicates its commit by a class-stable key, so at most one
+    /// logical commit — and therefore at most one committed occurrence
+    /// of the contained write — exists per class. No class-fixity of
+    /// the message instance is needed: the single commit admitted
+    /// whatever it admitted, once.
+    TransactionDeduplicated {
+        transaction: Id,
+        key: Vec<StableRoot>,
+    },
+
+    /// The message/consumer route for a transactional outbox write
+    /// (§51): every attempt admits the same logical outbox message —
+    /// the instance is class-fixed and the outbox's message identity
+    /// maps the schema — and every modeled consumer of it collapses
+    /// duplicate deliveries, exactly as duplicate topic publication is
+    /// discharged.
+    SameLogicalOutboxMessage {
+        outbox: Id,
+        schema: Id,
+        instance: InstanceStability,
+        consumers: Vec<ConsumerCollapse>,
     },
 }
 
@@ -439,6 +484,42 @@ pub enum IdempotencyObstacle {
         path: PathRef,
         effect: Id,
         topic: Id,
+        schema: Id,
+        operation: Id,
+        input: Id,
+    },
+
+    /// Neither outbox-write route holds on the identity leg: the
+    /// containing transaction is not established to suppress a second
+    /// commit, and the destination outbox declares no message identity
+    /// for the written schema, so repeated committed writes are not
+    /// established to be the same logical message.
+    OutboxWriteNotIdentified {
+        path: PathRef,
+        effect: Id,
+        transaction: Id,
+        outbox: Id,
+        schema: Id,
+    },
+
+    /// A modeled consumer of the written outbox message declares no
+    /// idempotency requirement keyed from its outbox input, so nothing
+    /// collapses the duplicate work a duplicate delivery causes there.
+    OutboxConsumerNotKeyed {
+        path: PathRef,
+        effect: Id,
+        outbox: Id,
+        schema: Id,
+        operation: Id,
+        input: Id,
+    },
+
+    /// The outbox consumer declares such a requirement, but it is not
+    /// proven in this analysis.
+    OutboxConsumerRequirementUnproven {
+        path: PathRef,
+        effect: Id,
+        outbox: Id,
         schema: Id,
         operation: Id,
         input: Id,
@@ -645,19 +726,86 @@ fn proven_set(checks: &[IdempotencyCheck]) -> BTreeSet<(Id, Id)> {
         .collect()
 }
 
-/// The propagation lineage behind a subscription-triggered governing
-/// key: for every admitted schema on the input's topic and every
+/// The propagation lineage behind a message-triggered governing key:
+/// for every admitted schema on the input's topic or outbox and every
 /// modeled producer of it, whether a declared propagation carries a
-/// key onto the identity fields the population rests on.
+/// key onto the identity fields the population rests on. An outbox
+/// boundary continues the same lineage a topic does — no
+/// outbox-specific key type exists.
 fn lineage(scope: &Scope<'_>, operation: &Operation, key: &IdempotencyKey) -> Vec<IdentityLineage> {
     let Some(input_id) = key_input(key) else {
         return Vec::new();
     };
 
-    let Some(Input::Subscription(subscription)) = operation.inputs.get(input_id) else {
-        return Vec::new();
-    };
+    match operation.inputs.get(input_id) {
+        Some(Input::Subscription(subscription)) => {
+            subscription_lineage(scope, subscription)
+        }
 
+        Some(Input::Outbox(outbox_input)) => outbox_lineage(scope, outbox_input),
+
+        _ => Vec::new(),
+    }
+}
+
+/// The identity fields the population rests on, per admitted schema.
+fn identified_schemas<'a>(
+    mapping: &'a std::collections::BTreeMap<Id, Vec<FieldPath>>,
+    admitted: Vec<&'a Id>,
+) -> Vec<(&'a Id, &'a Vec<FieldPath>)> {
+    admitted
+        .into_iter()
+        .filter_map(|schema| mapping.get(schema).map(|identity| (schema, identity)))
+        .collect()
+}
+
+/// Whether one of the producer's declared propagations covers the
+/// identity fields at its own effect site, and from which source key.
+fn propagation_fact(
+    scope: &Scope<'_>,
+    producer_operation: Option<&Id>,
+    effect: &Id,
+    propagations: &[crate::spec::IdempotencyKeyPropagation],
+    identity: &[FieldPath],
+) -> LineageFact {
+    propagations
+        .iter()
+        .find_map(|propagation| {
+            let targets: Vec<&FieldPath> = propagation
+                .target
+                .components
+                .iter()
+                .filter(|component| component.source == ValueSource::Effect(effect.clone()))
+                .map(|component| &component.path)
+                .collect();
+
+            identity
+                .iter()
+                .all(|field| targets.contains(&field))
+                .then(|| {
+                    let requirement = producer_operation.and_then(|operation| {
+                        scope.model.operations.get(operation).and_then(|declaration| {
+                            declaration
+                                .requirements
+                                .idempotency
+                                .iter()
+                                .position(|requirement| requirement.key == propagation.source)
+                        })
+                    });
+
+                    LineageFact::Propagated {
+                        source: propagation.source.clone(),
+                        requirement,
+                    }
+                })
+        })
+        .unwrap_or(LineageFact::Undeclared)
+}
+
+fn subscription_lineage(
+    scope: &Scope<'_>,
+    subscription: &crate::spec::SubscriptionInput,
+) -> Vec<IdentityLineage> {
     let Some(topic) = scope.model.topics.get(&subscription.topic) else {
         return Vec::new();
     };
@@ -673,55 +821,25 @@ fn lineage(scope: &Scope<'_>, operation: &Operation, key: &IdempotencyKey) -> Ve
 
     let mut out = Vec::new();
 
-    for schema in admitted {
-        let Some(identity) = mapping.get(schema) else {
-            continue;
-        };
-
+    for (schema, identity) in identified_schemas(mapping, admitted) {
         for producer in scope.graph.producers(&subscription.topic, schema) {
-            let fact = producer
-                .publication
-                .idempotency_key_propagation
-                .iter()
-                .find_map(|propagation| {
-                    let targets: Vec<&FieldPath> = propagation
-                        .target
-                        .components
-                        .iter()
-                        .filter(|component| {
-                            component.source == ValueSource::Effect(producer.effect.clone())
-                        })
-                        .map(|component| &component.path)
-                        .collect();
+            let producer_operation = match producer.site {
+                ProducerSite::Operation { operation } => Some(operation),
+                ProducerSite::Transition { .. } => None,
+            };
 
-                    identity
-                        .iter()
-                        .all(|field| targets.contains(&field))
-                        .then(|| {
-                            let requirement = match producer.site {
-                                ProducerSite::Operation { operation } => scope
-                                    .model
-                                    .operations
-                                    .get(operation)
-                                    .and_then(|declaration| {
-                                        declaration.requirements.idempotency.iter().position(
-                                            |requirement| requirement.key == propagation.source,
-                                        )
-                                    }),
-
-                                ProducerSite::Transition { .. } => None,
-                            };
-
-                            LineageFact::Propagated {
-                                source: propagation.source.clone(),
-                                requirement,
-                            }
-                        })
-                })
-                .unwrap_or(LineageFact::Undeclared);
+            let fact = propagation_fact(
+                scope,
+                producer_operation,
+                producer.effect,
+                &producer.publication.idempotency_key_propagation,
+                identity,
+            );
 
             out.push(IdentityLineage {
-                topic: subscription.topic.clone(),
+                source: LineageSource::Topic {
+                    topic: subscription.topic.clone(),
+                },
                 schema: schema.clone(),
                 producer: match producer.site {
                     ProducerSite::Operation { operation } => ProducerRef::Operation {
@@ -737,6 +855,52 @@ fn lineage(scope: &Scope<'_>, operation: &Operation, key: &IdempotencyKey) -> Ve
                         transition: transition.clone(),
                         effect: producer.effect.clone(),
                     },
+                },
+                fact,
+            });
+        }
+    }
+
+    out
+}
+
+fn outbox_lineage(
+    scope: &Scope<'_>,
+    input: &crate::spec::OutboxInput,
+) -> Vec<IdentityLineage> {
+    let Some((_, outbox)) = scope.model.outbox(&input.outbox) else {
+        return Vec::new();
+    };
+
+    let MessageIdentity::Keyed(MessageIdentityKey { mapping }) = &outbox.message_identity else {
+        return Vec::new();
+    };
+
+    let admitted: Vec<&Id> = match &input.messages {
+        MessageSelector::All => outbox.messages.iter().collect(),
+        MessageSelector::Only(schemas) => schemas.iter().collect(),
+    };
+
+    let mut out = Vec::new();
+
+    for (schema, identity) in identified_schemas(mapping, admitted) {
+        for producer in scope.graph.outbox_producers(&input.outbox, schema) {
+            let fact = propagation_fact(
+                scope,
+                Some(producer.operation),
+                producer.effect,
+                &producer.write.idempotency_key_propagation,
+                identity,
+            );
+
+            out.push(IdentityLineage {
+                source: LineageSource::Outbox {
+                    outbox: input.outbox.clone(),
+                },
+                schema: schema.clone(),
+                producer: ProducerRef::Operation {
+                    operation: producer.operation.clone(),
+                    effect: producer.effect.clone(),
                 },
                 fact,
             });
@@ -799,6 +963,20 @@ fn check_requirement(
                 topic: subscription.topic.clone(),
             },
         );
+    }
+
+    // The same route for an outbox-triggered population, from the
+    // outbox runtime's delivery fact and the outbox's keyed message
+    // identity.
+    if let Some(Input::Outbox(outbox_input)) = operation.inputs.get(analysis.input())
+        && scope.model.outbox_delivery(operation_id, analysis.input())
+            == DeliverySemantics::AtMostOnce
+        && analysis.payload_identified()
+    {
+        return IdempotencyVerdict::proven(IdempotencyProof::SingleOutboxDelivery {
+            input: analysis.input().clone(),
+            outbox: outbox_input.outbox.clone(),
+        });
     }
 
     let all = paths(&operation.program);
@@ -876,6 +1054,9 @@ impl IdempotencyObstacle {
             | Self::PublicationNotIdentified { path, .. }
             | Self::PublicationConsumerNotKeyed { path, .. }
             | Self::PublicationConsumerRequirementUnproven { path, .. }
+            | Self::OutboxWriteNotIdentified { path, .. }
+            | Self::OutboxConsumerNotKeyed { path, .. }
+            | Self::OutboxConsumerRequirementUnproven { path, .. }
             | Self::EffectInstanceUnspecified { path, .. }
             | Self::EffectInstanceRootUnstable { path, .. }
             | Self::IntentNotEstablished { path, .. }
@@ -903,6 +1084,12 @@ fn analyze_path(
     let mut transactions = Vec::new();
     let mut effects = Vec::new();
 
+    // The keyed-commit judgment of each transaction on the path, for
+    // the outbox writes that commit with it: the producer-suppressed
+    // route (§50 of the outbox revision) is the transaction's route B.
+    let mut commits: std::collections::BTreeMap<&Id, &Vec<StableRoot>> =
+        std::collections::BTreeMap::new();
+
     for step in &trace.steps {
         match step {
             TracedStep::Transaction {
@@ -910,26 +1097,32 @@ fn analyze_path(
                 recovery,
                 natural,
                 ..
-            } => match (recovery, natural) {
-                (Ok(key), _) => transactions.push(TransactionRetrySafety {
-                    transaction: transaction.id.clone(),
-                    route: RetryRoute::KeyedCommit { key: key.clone() },
-                }),
-
-                (Err(_), Ok(())) => transactions.push(TransactionRetrySafety {
-                    transaction: transaction.id.clone(),
-                    route: RetryRoute::NaturalReplay,
-                }),
-
-                (Err(recovery), Err(reconstruction)) => {
-                    obstacles.push(IdempotencyObstacle::TransactionNotRetrySafe {
-                        path: reference.clone(),
-                        transaction: transaction.id.clone(),
-                        recovery: recovery.clone(),
-                        reconstruction: reconstruction.clone(),
-                    });
+            } => {
+                if let Ok(key) = recovery {
+                    commits.insert(&transaction.id, key);
                 }
-            },
+
+                match (recovery, natural) {
+                    (Ok(key), _) => transactions.push(TransactionRetrySafety {
+                        transaction: transaction.id.clone(),
+                        route: RetryRoute::KeyedCommit { key: key.clone() },
+                    }),
+
+                    (Err(_), Ok(())) => transactions.push(TransactionRetrySafety {
+                        transaction: transaction.id.clone(),
+                        route: RetryRoute::NaturalReplay,
+                    }),
+
+                    (Err(recovery), Err(reconstruction)) => {
+                        obstacles.push(IdempotencyObstacle::TransactionNotRetrySafe {
+                            path: reference.clone(),
+                            transaction: transaction.id.clone(),
+                            recovery: recovery.clone(),
+                            reconstruction: reconstruction.clone(),
+                        });
+                    }
+                }
+            }
 
             TracedStep::Effect {
                 site,
@@ -943,7 +1136,8 @@ fn analyze_path(
                 };
 
                 if let Some(safety) = contract_safety(
-                    scope, analysis, context, &reference, site, contract, instance, obstacles,
+                    scope, analysis, context, &reference, site, contract, instance, &commits,
+                    obstacles,
                 ) {
                     effects.push(EffectRetrySafety {
                         effect: site.effect().clone(),
@@ -1013,7 +1207,8 @@ fn instance_obstacle(
 
 /// The per-kind duplicate-execution judgment. The instance is consulted
 /// only for kinds whose discharge needs a class-fixed one; an external
-/// boundary deduplicates by key alone.
+/// boundary deduplicates by key alone, and a transactionally
+/// suppressed outbox write commits at most once whatever its instance.
 #[allow(clippy::too_many_arguments)]
 fn contract_safety(
     scope: &Scope<'_>,
@@ -1023,11 +1218,131 @@ fn contract_safety(
     site: &EffectSite<'_>,
     contract: &EffectContract<'_>,
     instance: &Result<InstanceStability, InstanceGap>,
+    commits: &std::collections::BTreeMap<&Id, &Vec<StableRoot>>,
     obstacles: &mut Vec<IdempotencyObstacle>,
 ) -> Option<EffectSafety> {
     let effect = site.effect();
 
     match contract {
+        EffectContract::OutboxWrite(write) => {
+            let EffectSite::OutboxWrite { transaction, .. } = site else {
+                // An outbox write reaches the trace only from its one
+                // legal site; any other shape is an invalid model,
+                // judged conservatively as an unidentified duplicate
+                // write below.
+                obstacles.push(IdempotencyObstacle::OutboxWriteNotIdentified {
+                    path: path.clone(),
+                    effect: effect.clone(),
+                    transaction: Id(String::new()),
+                    outbox: write.outbox.clone(),
+                    schema: write.schema.clone(),
+                });
+
+                return None;
+            };
+
+            // Route one — producer-suppressed (§50): the containing
+            // transaction commits at most once per class, so at most
+            // one committed occurrence of this write exists. The
+            // transaction's key stability was judged where the
+            // transaction was traced.
+            if let Some(key) = commits.get(*transaction) {
+                return Some(EffectSafety::TransactionDeduplicated {
+                    transaction: (*transaction).clone(),
+                    key: (*key).clone(),
+                });
+            }
+
+            // Route two — message/consumer (§51), the publication
+            // pattern: repeated committed writes must denote one
+            // logical message, and every modeled consumer must
+            // collapse the duplicate work an extra delivery causes.
+            let outbox = &write.outbox;
+            let schema = &write.schema;
+
+            let identified = scope
+                .model
+                .outbox(outbox)
+                .is_some_and(|(_, outbox)| match &outbox.message_identity {
+                    MessageIdentity::Keyed(MessageIdentityKey { mapping }) => {
+                        mapping.contains_key(schema)
+                    }
+                    MessageIdentity::Unspecified => false,
+                });
+
+            if !identified {
+                obstacles.push(IdempotencyObstacle::OutboxWriteNotIdentified {
+                    path: path.clone(),
+                    effect: effect.clone(),
+                    transaction: (*transaction).clone(),
+                    outbox: outbox.clone(),
+                    schema: schema.clone(),
+                });
+            }
+
+            let mut consumers = Vec::new();
+            let mut collapsed = true;
+
+            for consumer in scope.graph.outbox_consumers(outbox, schema) {
+                let operation = consumer.operation.clone();
+                let input = consumer.input.clone();
+
+                if identified
+                    && scope
+                        .model
+                        .outbox_delivery(consumer.operation, consumer.input)
+                        == DeliverySemantics::AtMostOnce
+                {
+                    consumers.push(ConsumerCollapse::SingleDelivery { operation, input });
+                } else if !scope
+                    .model
+                    .operations
+                    .get(consumer.operation)
+                    .is_some_and(|target| collapses_duplicates(target, consumer.input))
+                {
+                    collapsed = false;
+
+                    obstacles.push(IdempotencyObstacle::OutboxConsumerNotKeyed {
+                        path: path.clone(),
+                        effect: effect.clone(),
+                        outbox: outbox.clone(),
+                        schema: schema.clone(),
+                        operation,
+                        input,
+                    });
+                } else if !scope.proven.contains(&(operation.clone(), input.clone())) {
+                    collapsed = false;
+
+                    obstacles.push(IdempotencyObstacle::OutboxConsumerRequirementUnproven {
+                        path: path.clone(),
+                        effect: effect.clone(),
+                        outbox: outbox.clone(),
+                        schema: schema.clone(),
+                        operation,
+                        input,
+                    });
+                } else {
+                    consumers.push(ConsumerCollapse::ProvenRequirement { operation, input });
+                }
+            }
+
+            let instance = match instance {
+                Ok(instance) => instance.clone(),
+
+                Err(gap) => {
+                    obstacles.push(instance_obstacle(path, site, gap));
+
+                    return None;
+                }
+            };
+
+            (identified && collapsed).then_some(EffectSafety::SameLogicalOutboxMessage {
+                outbox: outbox.clone(),
+                schema: schema.clone(),
+                instance,
+                consumers,
+            })
+        }
         EffectContract::External(external) => match &external.idempotency {
             IdempotencyGuarantee::DeduplicatedBy { key } => {
                 let roots: Vec<_> = key.components.iter().collect();
@@ -1375,6 +1690,61 @@ impl IdempotencyObstacle {
                 subject: Some(operation.clone()),
                 message: format!(
                     "{} publishes `{schema}` to `{topic}` through `{effect}`, and \
+                     `{operation}` consumes it through `{input}`, whose idempotency \
+                     requirement is not proven in this analysis, so the duplicate \
+                     work a duplicate delivery causes there is not established to \
+                     collapse.",
+                    capitalize(&describe_path(path))
+                ),
+            },
+
+            Self::OutboxWriteNotIdentified {
+                path,
+                effect,
+                transaction,
+                outbox,
+                schema,
+            } => Evidence {
+                subject: Some(effect.clone()),
+                message: format!(
+                    "{} admits `{schema}` to outbox `{outbox}` through `{effect}` in \
+                     `{transaction}`; the transaction is not established to suppress \
+                     a second commit, and the outbox declares no message identity for \
+                     that schema, so repeated committed writes are not established to \
+                     be the same logical message.",
+                    capitalize(&describe_path(path))
+                ),
+            },
+
+            Self::OutboxConsumerNotKeyed {
+                path,
+                effect,
+                outbox,
+                schema,
+                operation,
+                input,
+            } => Evidence {
+                subject: Some(operation.clone()),
+                message: format!(
+                    "{} admits `{schema}` to outbox `{outbox}` through `{effect}`, and \
+                     `{operation}` consumes it through `{input}` with no idempotency \
+                     requirement keyed from that input; nothing collapses the \
+                     duplicate work a duplicate delivery causes there.",
+                    capitalize(&describe_path(path))
+                ),
+            },
+
+            Self::OutboxConsumerRequirementUnproven {
+                path,
+                effect,
+                outbox,
+                schema,
+                operation,
+                input,
+            } => Evidence {
+                subject: Some(operation.clone()),
+                message: format!(
+                    "{} admits `{schema}` to outbox `{outbox}` through `{effect}`, and \
                      `{operation}` consumes it through `{input}`, whose idempotency \
                      requirement is not proven in this analysis, so the duplicate \
                      work a duplicate delivery causes there is not established to \

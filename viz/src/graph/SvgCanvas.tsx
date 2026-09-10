@@ -155,6 +155,8 @@ function Defs() {
     <defs>
       {marker("arr-publish", "var(--arch-edge-publish)")}
       {marker("arr-subscribe", "var(--arch-edge-subscribe)")}
+      {marker("arr-outbox_write", "var(--arch-edge-outbox)")}
+      {marker("arr-outbox_consume", "var(--arch-edge-outbox)")}
       {marker("arr-request", "var(--arch-edge-request)")}
       {marker("arr-external", "var(--arch-edge-external)")}
       {marker("arr-client", "var(--arch-edge-client)")}

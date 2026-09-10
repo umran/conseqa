@@ -123,7 +123,7 @@ export const SYS = {
  *  system, or the clients vertex. */
 interface Macro {
   id: string;
-  kind: "service" | "topic" | "external" | "client";
+  kind: "service" | "topic" | "outbox" | "external" | "client";
   w: number;
   h: number;
   rank: number;
@@ -399,6 +399,9 @@ export function layoutSystem(graph: Graph, options: LayoutOptions = {}): SystemL
   for (const t of graph.topics) {
     macros.set(t.id, { id: t.id, kind: "topic", w: SYS.TOPIC_W, h: SYS.TOPIC_H, rank: 0 });
   }
+  for (const o of graph.outboxes) {
+    macros.set(o.id, { id: o.id, kind: "outbox", w: SYS.TOPIC_W, h: SYS.TOPIC_H, rank: 0 });
+  }
   for (const e of graph.externals) {
     macros.set(e.id, { id: e.id, kind: "external", w: SYS.EXT_W, h: SYS.EXT_H, rank: 0 });
   }
@@ -454,9 +457,18 @@ export function layoutSystem(graph: Graph, options: LayoutOptions = {}): SystemL
     if (!macros.has(macro(e.from)) || !macros.has(macro(e.to))) continue;
     const a = columnFor(e.from);
     const b = columnFor(e.to);
-    if (bandOf[a] === bandOf[b] && Math.abs(b - a) === 1) continue;
-    channelLanes[bandOf[a]]++;
-    if (bandOf[a] !== bandOf[b]) channelLanes[bandOf[b]]++;
+    const bandA = bandOf[a];
+    const bandB = bandOf[b];
+    if (bandA === bandB) {
+      if (Math.abs(b - a) !== 1) channelLanes[bandA]++;
+    } else if (Math.abs(bandA - bandB) === 1) {
+      // Adjacent bands share the channel between them — the lower
+      // band's — and the edge crosses nothing else.
+      channelLanes[Math.max(bandA, bandB)]++;
+    } else {
+      channelLanes[bandA]++;
+      channelLanes[bandB]++;
+    }
   }
   const channelSpace = channelLanes.map((n) => (n ? SYS.CHANNEL_GAP + n * SYS.LANE : SYS.ROW_GAP));
 
@@ -579,9 +591,13 @@ export function layoutSystem(graph: Graph, options: LayoutOptions = {}): SystemL
  * directly, in either direction. A longer one — a leap over columns, a
  * return to an earlier one, a hop within one — leaves through the side
  * it is headed for, climbs a column gutter into the channel reserved
- * above its band, and comes back down another gutter. An edge that
- * crosses bands does the same and travels between them outside every
- * band, which is the only column of space guaranteed to be empty.
+ * above its band, and comes back down another gutter. An edge into the
+ * neighbouring band continues the way a line of text wraps: through its
+ * own gutter into the one channel that separates the two bands, across,
+ * and on into the target — the direct path, since it has nothing to
+ * clear but that gap. Only an edge that must clear whole bands travels
+ * around the outside, which is the one column of space guaranteed to be
+ * empty at every height.
  *
  * Risers stay in gutters and channels for the same reason: a line drawn
  * straight from card to card would cross whatever lies between them, and
@@ -608,7 +624,7 @@ function routeEdges(
     const vid = retarget.get(e.id);
     return vid !== undefined ? vertexColumn.get(vid)! : columnFor(e.to);
   };
-  type Mode = "direct" | "channel" | "cross";
+  type Mode = "direct" | "channel" | "wrap" | "cross";
   type Side = "left" | "right";
 
   const plan = new Map<string, { mode: Mode; from: Side; to: Side; span: number }>();
@@ -619,7 +635,7 @@ function routeEdges(
     const forward = b > a;
     if (bands.of[a] !== bands.of[b]) {
       plan.set(e.id, {
-        mode: "cross",
+        mode: Math.abs(bands.of[a] - bands.of[b]) === 1 ? "wrap" : "cross",
         from: forward ? "right" : "left",
         to: forward ? "left" : "right",
         span: Math.abs(b - a),
@@ -729,8 +745,16 @@ function routeEdges(
     const rise = riserX(columnA, p.from);
     const fall = riserX(columnB, p.to);
 
-    if (p.mode === "channel") {
-      const yc = channelY(bands.of[columnA], `${e.id} c`);
+    if (p.mode === "channel" || p.mode === "wrap") {
+      // A same-band edge rides the channel above its own band; an
+      // adjacent-band edge rides the one channel between the two
+      // bands, which is the lower band's. Either way the shape is the
+      // same: gutter, channel, gutter.
+      const channelBand =
+        p.mode === "wrap"
+          ? Math.max(bands.of[columnA], bands.of[columnB])
+          : bands.of[columnA];
+      const yc = channelY(channelBand, `${e.id} c`);
       geometry.set(e.id, {
         edge: e,
         d: roundedPolyline(

@@ -20,8 +20,9 @@ use uuid::Uuid;
 
 use crate::spec::{
     DataModel, Effect, ExecutionPool, Id, Input, OperationBlock, OperationRequirements,
-    OperationStep, Router, Schema, Service, StateMachine, StorageLayout, SubscriptionRuntime,
-    Topic, TopicRuntime, TransactionStep, TransitionSideEffect, ValueRef, ValueSource,
+    OperationStep, OutboxPartitioning, OutboxRuntime, Router, Schema, Service, StateMachine,
+    StorageLayout, SubscriptionRuntime, Topic, TopicRuntime, TransactionStep,
+    TransitionSideEffect, ValueRef, ValueSource,
 };
 
 use super::symbol::SymbolKey;
@@ -112,6 +113,12 @@ pub enum Mutation {
         value: SubscriptionRuntime,
     },
 
+    PutOutboxRuntime {
+        operation: Id,
+        input: Id,
+        value: OutboxRuntime,
+    },
+
     PutExecutionPool {
         id: Id,
         value: ExecutionPool,
@@ -179,6 +186,13 @@ impl Mutation {
             Self::PutSubscriptionRuntime {
                 operation, input, ..
             } => SymbolKey::SubscriptionRuntime {
+                operation: operation.clone(),
+                input: input.clone(),
+            },
+
+            Self::PutOutboxRuntime {
+                operation, input, ..
+            } => SymbolKey::OutboxRuntime {
                 operation: operation.clone(),
                 input: input.clone(),
             },
@@ -289,6 +303,12 @@ fn collect_references(mutation: &Mutation, out: &mut Vec<SymbolKey>) {
             for object in value.objects.values() {
                 out.push(SymbolKey::Schema(object.schema.clone()));
             }
+
+            for outbox in value.outboxes.values() {
+                for schema in &outbox.messages {
+                    out.push(SymbolKey::Schema(schema.clone()));
+                }
+            }
         }
 
         Mutation::PutTopic { value, .. } => {
@@ -360,6 +380,25 @@ fn collect_references(mutation: &Mutation, out: &mut Vec<SymbolKey>) {
             out.push(SymbolKey::ExecutionPool(value.dispatch.pool.clone()));
         }
 
+        Mutation::PutOutboxRuntime {
+            operation, value, ..
+        } => {
+            if let OutboxPartitioning::Keyed(key) = &value.partitioning {
+                for schema in key.mapping.keys() {
+                    out.push(SymbolKey::Schema(schema.clone()));
+                }
+            }
+
+            // Same rule as a subscription runtime: the targeted
+            // boundary and the dispatch pool are genuine external
+            // references. The consumed outbox is named through the
+            // input, whose owning data model the DSL leaves implicit —
+            // resolution is the validator's concern, as with a state
+            // machine's subject.
+            out.push(SymbolKey::OperationInterface(operation.clone()));
+            out.push(SymbolKey::ExecutionPool(value.dispatch.pool.clone()));
+        }
+
         Mutation::PutExecutionPool { .. } => {}
 
         Mutation::PutRouter { value, .. } => {
@@ -411,6 +450,19 @@ fn collect_input_refs(input: &Input, out: &mut Vec<SymbolKey>) {
                 }
             }
         }
+
+        Input::Outbox(input) => {
+            // The outbox id alone names the boundary; its owning data
+            // model is implicit and resolved by the validator, so no
+            // data-model key can be produced here — the same treatment
+            // a state machine's subject gets. The selected schemas are
+            // ordinary references.
+            if let crate::spec::MessageSelector::Only(schemas) = &input.messages {
+                for schema in schemas {
+                    out.push(SymbolKey::Schema(schema.clone()));
+                }
+            }
+        }
     }
 }
 
@@ -435,6 +487,14 @@ fn collect_program_refs(operation: &Id, program: &OperationBlock, into: &mut Vec
                 out.push(SymbolKey::Schema(result.ok.clone()));
                 out.push(SymbolKey::Schema(result.err.schema.clone()));
             }
+        }
+
+        // Only legal inside a transaction's `write_outbox` step; at
+        // this illegal site the schema is still a reference, and the
+        // outbox resolves through the transaction's data model, which
+        // this site does not have.
+        Effect::OutboxWrite(write) => {
+            out.push(SymbolKey::Schema(write.schema.clone()));
         }
     };
 
@@ -483,6 +543,15 @@ fn collect_program_refs(operation: &Id, program: &OperationBlock, into: &mut Vec
 
                         TransactionStep::EstablishTransactionOutput(establish) => {
                             out.push(SymbolKey::Schema(establish.schema.clone()));
+                        }
+
+                        TransactionStep::WriteOutbox(write) => {
+                            // The destination outbox lives in the
+                            // transaction's data model, whose key the
+                            // transaction itself contributes below;
+                            // the written schema is a reference of its
+                            // own.
+                            out.push(SymbolKey::Schema(write.effect.schema.clone()));
                         }
                     }
                 }

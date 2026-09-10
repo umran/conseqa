@@ -28,8 +28,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::spec::{
-    GroupingKey, Id, Input, MessageSelector, Model, OrderingSemantics, RuntimeModel,
-    SubscriptionRoutingKey,
+    GroupingKey, Id, Input, MessageSelector, Model, OrderingSemantics, OutboxOrdering,
+    OutboxPartitioning, RuntimeModel, SubscriptionRoutingKey,
 };
 
 use super::InputKind;
@@ -49,6 +49,7 @@ pub(super) fn validate_runtime(
 
     validate_topic_runtimes(model, runtime, index, errors);
     validate_subscription_runtimes(model, runtime, index, errors);
+    validate_outbox_runtimes(model, runtime, index, errors);
     validate_transport_scope(model, runtime, errors);
     validate_routers(model, runtime, errors);
     validate_storage_layouts(model, runtime, errors);
@@ -263,12 +264,12 @@ fn validate_subscription_runtimes(
             let subscription = match operation.inputs.get(input_id) {
                 Some(Input::Subscription(subscription)) => subscription,
 
-                Some(Input::Request(_)) => {
+                Some(other) => {
                     errors.push(ValidationError::InvalidInputKind {
                         subject: input_id.clone(),
                         input: input_id.clone(),
                         expected: InputKind::Subscription,
-                        actual: InputKind::Request,
+                        actual: super::input_kind(other),
                     });
 
                     continue;
@@ -334,6 +335,144 @@ fn validate_subscription_runtimes(
     }
 }
 
+/// An outbox runtime must name an existing outbox input, dispatch to a
+/// declared pool, and satisfy the partitioning shape rules: a keyed
+/// partitioning maps only schemas the outbox admits, covers every
+/// schema admitted through the target input, keeps one tuple arity,
+/// and resolves its field paths; `ordering: partition` requires keyed
+/// partitioning. A declared batching block carries its explicit
+/// ordering-preservation value by construction — no default states
+/// preservation.
+fn validate_outbox_runtimes(
+    model: &Model,
+    runtime: &RuntimeModel,
+    index: &ReferenceIndex<'_>,
+    errors: &mut Vec<ValidationError>,
+) {
+    for (operation_id, inputs) in &runtime.outboxes {
+        let Some(operation) = model.operations.get(operation_id) else {
+            errors.push(ValidationError::UnknownReference {
+                subject: operation_id.clone(),
+                reference: operation_id.clone(),
+                expected: ReferenceKind::Operation,
+            });
+
+            continue;
+        };
+
+        for (input_id, outbox_runtime) in inputs {
+            let input = match operation.inputs.get(input_id) {
+                Some(Input::Outbox(input)) => input,
+
+                Some(other) => {
+                    errors.push(ValidationError::InvalidInputKind {
+                        subject: input_id.clone(),
+                        input: input_id.clone(),
+                        expected: InputKind::Outbox,
+                        actual: super::input_kind(other),
+                    });
+
+                    continue;
+                }
+
+                None => {
+                    errors.push(ValidationError::UnknownReference {
+                        subject: operation_id.clone(),
+                        reference: input_id.clone(),
+                        expected: ReferenceKind::Input,
+                    });
+
+                    continue;
+                }
+            };
+
+            expect_pool(model, input_id, &outbox_runtime.dispatch.pool, errors);
+
+            if outbox_runtime.ordering == OutboxOrdering::Partition
+                && matches!(outbox_runtime.partitioning, OutboxPartitioning::None)
+            {
+                errors.push(ValidationError::PartitionOrderingWithoutPartitioning {
+                    input: input_id.clone(),
+                });
+            }
+
+            let OutboxPartitioning::Keyed(key) = &outbox_runtime.partitioning else {
+                continue;
+            };
+
+            for schema in key.mapping.keys() {
+                super::expect_reference(index, input_id, schema, ReferenceKind::Schema, errors);
+            }
+
+            let Some((_, outbox)) = model.outbox(&input.outbox) else {
+                continue;
+            };
+
+            for schema in key.mapping.keys() {
+                if !outbox.messages.contains(schema) {
+                    errors.push(ValidationError::OutboxPartitionSchemaNotAdmitted {
+                        input: input_id.clone(),
+                        outbox: input.outbox.clone(),
+                        schema: schema.clone(),
+                    });
+                }
+            }
+
+            // The mapping only has to cover what this input admits
+            // (§31 of the outbox revision); an unmapped admitted
+            // schema would belong to no partition.
+            let admitted: BTreeSet<&Id> = match &input.messages {
+                MessageSelector::Only(schemas) => schemas.iter().collect(),
+                MessageSelector::All => outbox.messages.iter().collect(),
+            };
+
+            for schema in admitted {
+                if !key.mapping.contains_key(schema) {
+                    errors.push(ValidationError::OutboxPartitionMissingSchema {
+                        input: input_id.clone(),
+                        outbox: input.outbox.clone(),
+                        schema: schema.clone(),
+                    });
+                }
+            }
+
+            let expected = key.mapping.values().map(Vec::len).find(|len| *len > 0);
+
+            for (schema, tuple) in &key.mapping {
+                if tuple.is_empty() {
+                    errors.push(ValidationError::EmptyOutboxPartitionKey {
+                        input: input_id.clone(),
+                        schema: schema.clone(),
+                    });
+
+                    continue;
+                }
+
+                if let Some(expected) = expected
+                    && tuple.len() != expected
+                {
+                    errors.push(ValidationError::OutboxPartitionKeyArityMismatch {
+                        input: input_id.clone(),
+                        schema: schema.clone(),
+                        expected,
+                        actual: tuple.len(),
+                    });
+                }
+
+                for path in tuple {
+                    if !schema_path_resolves(model, schema, path) {
+                        errors.push(ValidationError::InvalidFieldPath {
+                            subject: input_id.clone(),
+                            schema: schema.clone(),
+                            path: path.clone(),
+                        });
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// A router must name an existing request boundary, target a declared
 /// pool, and — when it routes — carry a non-empty key that resolves
 /// against the request schema. One boundary has at most one router.
@@ -369,12 +508,12 @@ fn validate_routers(model: &Model, runtime: &RuntimeModel, errors: &mut Vec<Vali
         let request = match operation.inputs.get(&boundary.input) {
             Some(Input::Request(request)) => request,
 
-            Some(Input::Subscription(_)) => {
+            Some(other) => {
                 errors.push(ValidationError::InvalidInputKind {
                     subject: router_id.clone(),
                     input: boundary.input.clone(),
                     expected: InputKind::Request,
-                    actual: InputKind::Subscription,
+                    actual: super::input_kind(other),
                 });
 
                 continue;

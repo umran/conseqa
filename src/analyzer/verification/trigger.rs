@@ -3,18 +3,19 @@
 //!
 //! A request names its target directly. A publication reaches every
 //! subscription on its topic whose message selection admits the
-//! published schema — the model's closed world of consumers. Verifiers
-//! that follow effects across operations — idempotency's cascade
-//! today; ordering's precedence source and process completion when
-//! they come — resolve those edges here, once per model, so they all
-//! agree on what "downstream" means.
+//! published schema; an outbox write reaches every outbox input on its
+//! outbox whose selection admits the written schema — the model's
+//! closed world of consumers. Verifiers that follow effects across
+//! operations — idempotency's cascade today; ordering's precedence
+//! source and process completion when they come — resolve those edges
+//! here, once per model, so they all agree on what "downstream" means.
 
 use std::collections::BTreeMap;
 
 use crate::spec::{
     Effect, ExternalEffect, Id, IdempotencyKey, Input, MessageSelector, Model, Operation,
-    PublicationEffect, RequestEffect, ResultReplayRequirement, SubscriptionInput,
-    TransitionSideEffect, ValueSource,
+    OutboxInput, OutboxWriteEffect, PublicationEffect, RequestEffect, ResultReplayRequirement,
+    SubscriptionInput, TransitionSideEffect, ValueSource,
 };
 
 /// A modeled consumer of messages on a topic: the operation and the
@@ -44,6 +45,27 @@ pub enum ProducerSite<'a> {
     Transition { machine: &'a Id, transition: &'a Id },
 }
 
+/// A modeled consumer of messages admitted to an outbox: the operation
+/// and the outbox input through which it consumes them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OutboxConsumer<'a> {
+    pub operation: &'a Id,
+    pub input: &'a Id,
+    pub declaration: &'a OutboxInput,
+}
+
+/// A modeled producer of messages into an outbox: a transactional
+/// outbox-write site and the operation and transaction that carry it.
+/// Only operations produce outbox writes — transitions cannot declare
+/// them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OutboxProducer<'a> {
+    pub operation: &'a Id,
+    pub transaction: &'a Id,
+    pub effect: &'a Id,
+    pub write: &'a OutboxWriteEffect,
+}
+
 #[derive(Debug)]
 pub struct TriggerGraph<'a> {
     model: &'a Model,
@@ -54,6 +76,12 @@ pub struct TriggerGraph<'a> {
     /// Publications per topic, in model order: operation effects, then
     /// transition side effects.
     publications: BTreeMap<&'a Id, Vec<Producer<'a>>>,
+
+    /// Outbox inputs per outbox, in model order.
+    outbox_inputs: BTreeMap<&'a Id, Vec<OutboxConsumer<'a>>>,
+
+    /// Transactional outbox writes per outbox, in model order.
+    outbox_writes: BTreeMap<&'a Id, Vec<OutboxProducer<'a>>>,
 }
 
 impl<'a> TriggerGraph<'a> {
@@ -112,10 +140,45 @@ impl<'a> TriggerGraph<'a> {
             }
         }
 
+        let mut outbox_inputs: BTreeMap<&'a Id, Vec<OutboxConsumer<'a>>> = BTreeMap::new();
+
+        for (operation, declaration) in &model.operations {
+            for (input, declared) in &declaration.inputs {
+                if let Input::Outbox(outbox_input) = declared {
+                    outbox_inputs
+                        .entry(&outbox_input.outbox)
+                        .or_default()
+                        .push(OutboxConsumer {
+                            operation,
+                            input,
+                            declaration: outbox_input,
+                        });
+                }
+            }
+        }
+
+        let mut outbox_writes: BTreeMap<&'a Id, Vec<OutboxProducer<'a>>> = BTreeMap::new();
+
+        for (operation, declaration) in &model.operations {
+            for (transaction, write) in declaration.program.outbox_write_declarations() {
+                outbox_writes
+                    .entry(&write.effect.outbox)
+                    .or_default()
+                    .push(OutboxProducer {
+                        operation,
+                        transaction,
+                        effect: &write.effect_id,
+                        write: &write.effect,
+                    });
+            }
+        }
+
         Self {
             model,
             subscriptions,
             publications,
+            outbox_inputs,
+            outbox_writes,
         }
     }
 
@@ -146,6 +209,40 @@ impl<'a> TriggerGraph<'a> {
             .into_iter()
             .flatten()
             .filter(|consumer| match &consumer.subscription.messages {
+                MessageSelector::All => declared,
+                MessageSelector::Only(schemas) => schemas.contains(schema),
+            })
+            .copied()
+            .collect()
+    }
+
+    /// The modeled producers of `schema` into `outbox`, in model
+    /// order.
+    pub fn outbox_producers(&self, outbox: &Id, schema: &Id) -> Vec<OutboxProducer<'a>> {
+        self.outbox_writes
+            .get(outbox)
+            .into_iter()
+            .flatten()
+            .filter(|producer| &producer.write.schema == schema)
+            .copied()
+            .collect()
+    }
+
+    /// The modeled consumers of `schema` admitted to `outbox`, in
+    /// model order: every outbox input on the outbox whose message
+    /// selection admits the schema, under the same rules as topic
+    /// consumers.
+    pub fn outbox_consumers(&self, outbox: &Id, schema: &Id) -> Vec<OutboxConsumer<'a>> {
+        let declared = self
+            .model
+            .outbox(outbox)
+            .is_some_and(|(_, outbox)| outbox.messages.contains(schema));
+
+        self.outbox_inputs
+            .get(outbox)
+            .into_iter()
+            .flatten()
+            .filter(|consumer| match &consumer.declaration.messages {
                 MessageSelector::All => declared,
                 MessageSelector::Only(schemas) => schemas.contains(schema),
             })
@@ -195,12 +292,14 @@ pub fn returns_consistently(operation: &Operation, input: &Id) -> Option<usize> 
 }
 
 /// The effect contract behind an execution site, unifying
-/// operation-owned inline effects and transition side effects.
+/// operation-owned inline effects, transition side effects, and
+/// transactional outbox writes.
 #[derive(Debug, Clone, Copy)]
 pub enum EffectContract<'a> {
     Publication(&'a PublicationEffect),
     Request(&'a RequestEffect),
     External(&'a ExternalEffect),
+    OutboxWrite(&'a OutboxWriteEffect),
 }
 
 impl<'a> From<&'a Effect> for EffectContract<'a> {
@@ -209,6 +308,7 @@ impl<'a> From<&'a Effect> for EffectContract<'a> {
             Effect::Publication(publication) => Self::Publication(publication),
             Effect::Request(request) => Self::Request(request),
             Effect::External(external) => Self::External(external),
+            Effect::OutboxWrite(write) => Self::OutboxWrite(write),
         }
     }
 }
@@ -234,6 +334,12 @@ pub fn effect_contract<'a>(
     for (declared_id, declared) in operation.program.effect_declarations() {
         if declared_id == effect {
             return Some(EffectContract::from(declared));
+        }
+    }
+
+    for (_, write) in operation.program.outbox_write_declarations() {
+        if &write.effect_id == effect {
+            return Some(EffectContract::OutboxWrite(&write.effect));
         }
     }
 

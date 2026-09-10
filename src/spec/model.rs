@@ -6,7 +6,8 @@ use crate::spec::StateMachine;
 
 use super::{
     DataModel, DeliverySemantics, ExecutionPool, GroupingKey, Id, Operation, OrderingSemantics,
-    Router, RuntimeModel, Schema, Service, SubscriptionRuntime, Topic, TopicRuntime,
+    Outbox, OutboxRuntime, Router, RuntimeModel, Schema, Service, SubscriptionRuntime, Topic,
+    TopicRuntime,
 };
 
 /// One Conseqa model, in two semantic layers.
@@ -110,6 +111,31 @@ impl Model {
     /// `Unspecified`: duplicate and loss behaviour is simply unknown.
     pub fn delivery(&self, operation: &Id, input: &Id) -> DeliverySemantics {
         self.subscription_runtime(operation, input)
+            .map(|runtime| runtime.delivery)
+            .unwrap_or(DeliverySemantics::Unspecified)
+    }
+
+    /// The named outbox and the data model that owns it, resolved
+    /// through the global ID namespace.
+    pub fn outbox(&self, outbox: &Id) -> Option<(&Id, &Outbox)> {
+        self.data_models.iter().find_map(|(data_model_id, data_model)| {
+            data_model
+                .outboxes
+                .get(outbox)
+                .map(|declared| (data_model_id, declared))
+        })
+    }
+
+    /// The declared runtime facts for one outbox input, if any.
+    pub fn outbox_runtime(&self, operation: &Id, input: &Id) -> Option<&OutboxRuntime> {
+        self.runtime.as_ref()?.outboxes.get(operation)?.get(input)
+    }
+
+    /// The outbox input's declared delivery semantics. As with
+    /// subscriptions, an undeclared outbox runtime is `Unspecified`:
+    /// duplicate and loss behaviour is simply unknown.
+    pub fn outbox_delivery(&self, operation: &Id, input: &Id) -> DeliverySemantics {
+        self.outbox_runtime(operation, input)
             .map(|runtime| runtime.delivery)
             .unwrap_or(DeliverySemantics::Unspecified)
     }

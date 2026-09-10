@@ -561,12 +561,24 @@ pub enum EffectSite<'a> {
         intent: &'a Id,
         effect: &'a Id,
     },
+
+    /// A transactional outbox write, executed as a step of the named
+    /// transaction: its admission commits with that transaction, so
+    /// the transaction's keyed-commit judgment is part of the site's
+    /// duplicate-execution analysis (§50 of the outbox revision).
+    OutboxWrite {
+        effect: &'a Id,
+        values: &'a Derivation,
+        transaction: &'a Id,
+    },
 }
 
 impl<'a> EffectSite<'a> {
     pub fn effect(&self) -> &'a Id {
         match self {
-            Self::Direct { effect, .. } | Self::Intent { effect, .. } => effect,
+            Self::Direct { effect, .. }
+            | Self::Intent { effect, .. }
+            | Self::OutboxWrite { effect, .. } => effect,
         }
     }
 }
@@ -658,6 +670,16 @@ struct IntentSite<'a> {
     contract: EffectContract<'a>,
 }
 
+/// One transactional outbox write of a traced transaction, with its
+/// instance judged at its step position and the context in force
+/// there — the transaction-entry context plus the artifacts earlier
+/// steps of the same transaction established.
+pub(crate) struct OutboxWriteTrace<'a> {
+    pub step: &'a crate::spec::WriteOutboxEffect,
+    pub before: PathContext,
+    pub instance: Result<InstanceStability, InstanceGap>,
+}
+
 /// The replay engine for one operation and governing key.
 pub struct ReplayAnalysis<'a> {
     model: &'a Model,
@@ -736,6 +758,14 @@ impl<'a> ReplayAnalysis<'a> {
                     .topics
                     .get(&subscription.topic)
                     .map(|topic| topic.messages.iter().collect()),
+            },
+
+            Input::Outbox(outbox_input) => match &outbox_input.messages {
+                MessageSelector::Only(messages) => Some(messages.iter().collect()),
+
+                MessageSelector::All => model
+                    .outbox(&outbox_input.outbox)
+                    .map(|(_, outbox)| outbox.messages.iter().collect()),
             },
         };
 
@@ -858,59 +888,80 @@ impl<'a> ReplayAnalysis<'a> {
                     .get(&subscription.topic)
                     .map(|topic| &topic.message_identity);
 
-                let Some(MessageIdentity::Keyed(MessageIdentityKey { mapping })) = identity else {
-                    return Err(PayloadIdentityGap::NotDeclared);
-                };
+                self.mapped_payload_stability(identity)
+            }
 
-                let Some(schemas) = &self.schemas else {
-                    return Err(PayloadIdentityGap::NotDeclared);
-                };
+            // An outbox declares message identity with the same
+            // semantic concept a topic does, so the same rule pins the
+            // triggering payload.
+            Input::Outbox(outbox_input) => {
+                let identity = self
+                    .model
+                    .outbox(&outbox_input.outbox)
+                    .map(|(_, outbox)| &outbox.message_identity);
 
-                let mut tuples = Vec::new();
-
-                for schema in schemas {
-                    match mapping.get(*schema) {
-                        Some(tuple) if !tuple.is_empty() => tuples.push((*schema, tuple)),
-
-                        _ => {
-                            return Err(PayloadIdentityGap::SchemaNotMapped {
-                                schema: (*schema).clone(),
-                            });
-                        }
-                    }
-                }
-
-                let Some((_, first)) = tuples.first() else {
-                    return Err(PayloadIdentityGap::NotDeclared);
-                };
-
-                // For each identity position, one key component must
-                // pin that position's field in every admitted schema;
-                // this is what carries key equality across schemas.
-                for (position, field) in first.iter().enumerate() {
-                    let pinned = self.key.components.iter().any(|component| {
-                        tuples.iter().all(|(schema, tuple)| {
-                            tuple.get(position).is_some_and(|identity_field| {
-                                self.same_value(schema, &component.path, identity_field)
-                            })
-                        })
-                    });
-
-                    if !pinned {
-                        let unpinned = tuples
-                            .iter()
-                            .find(|(_, tuple)| tuple.get(position).is_none());
-
-                        return Err(PayloadIdentityGap::NotPinnedByKey {
-                            schema: unpinned.map(|(schema, _)| (*schema).clone()),
-                            field: field.clone(),
-                        });
-                    }
-                }
-
-                Ok(())
+                self.mapped_payload_stability(identity)
             }
         }
+    }
+
+    /// The keyed message-identity half of §18 rule 3, shared by the
+    /// two message-driven input kinds.
+    fn mapped_payload_stability(
+        &self,
+        identity: Option<&MessageIdentity>,
+    ) -> Result<(), PayloadIdentityGap> {
+        let Some(MessageIdentity::Keyed(MessageIdentityKey { mapping })) = identity else {
+            return Err(PayloadIdentityGap::NotDeclared);
+        };
+
+        let Some(schemas) = &self.schemas else {
+            return Err(PayloadIdentityGap::NotDeclared);
+        };
+
+        let mut tuples = Vec::new();
+
+        for schema in schemas {
+            match mapping.get(*schema) {
+                Some(tuple) if !tuple.is_empty() => tuples.push((*schema, tuple)),
+
+                _ => {
+                    return Err(PayloadIdentityGap::SchemaNotMapped {
+                        schema: (*schema).clone(),
+                    });
+                }
+            }
+        }
+
+        let Some((_, first)) = tuples.first() else {
+            return Err(PayloadIdentityGap::NotDeclared);
+        };
+
+        // For each identity position, one key component must
+        // pin that position's field in every admitted schema;
+        // this is what carries key equality across schemas.
+        for (position, field) in first.iter().enumerate() {
+            let pinned = self.key.components.iter().any(|component| {
+                tuples.iter().all(|(schema, tuple)| {
+                    tuple.get(position).is_some_and(|identity_field| {
+                        self.same_value(schema, &component.path, identity_field)
+                    })
+                })
+            });
+
+            if !pinned {
+                let unpinned = tuples
+                    .iter()
+                    .find(|(_, tuple)| tuple.get(position).is_none());
+
+                return Err(PayloadIdentityGap::NotPinnedByKey {
+                    schema: unpinned.map(|(schema, _)| (*schema).clone()),
+                    field: field.clone(),
+                });
+            }
+        }
+
+        Ok(())
     }
 
     /// Whether a payload path is pinned by the governing key in every
@@ -1098,15 +1149,37 @@ impl<'a> ReplayAnalysis<'a> {
                 } => {
                     let before = context.clone();
 
-                    let (recovery, natural) = self.apply_transaction(&mut context, transaction);
+                    let (recovery, natural, writes) =
+                        self.apply_transaction(&mut context, transaction);
 
                     steps.push(TracedStep::Transaction {
                         location: location.clone(),
                         transaction,
-                        before,
+                        before: before.clone(),
                         recovery,
                         natural,
                     });
+
+                    // Each contained outbox write is a real effect
+                    // occurrence of the path, surfaced in step order
+                    // after its transaction so a verifier sees the
+                    // transaction's replay routes before judging the
+                    // writes that commit with it. The write binds no
+                    // result.
+                    for write in writes {
+                        steps.push(TracedStep::Effect {
+                            location: location.clone(),
+                            site: EffectSite::OutboxWrite {
+                                effect: &write.step.effect_id,
+                                values: &write.step.values,
+                                transaction: &transaction.id,
+                            },
+                            contract: Some(EffectContract::OutboxWrite(&write.step.effect)),
+                            before: write.before,
+                            instance: write.instance,
+                            result: None,
+                        });
+                    }
                 }
 
                 PathStep::ExecuteEffect {
@@ -1404,7 +1477,9 @@ impl<'a> ReplayAnalysis<'a> {
         };
 
         let request = match contract {
-            None | Some(EffectContract::Publication(_)) => {
+            None
+            | Some(EffectContract::Publication(_))
+            | Some(EffectContract::OutboxWrite(_)) => {
                 return unstable(ResultGap::NoResultContract);
             }
 
@@ -1618,25 +1693,29 @@ impl<'a> ReplayAnalysis<'a> {
         }
     }
 
-    /// Judges one transaction's replay routes and folds the artifacts
-    /// it establishes into the context, returning the routes.
+    /// Judges one transaction's replay routes, folds the artifacts it
+    /// establishes into the context, and judges each contained outbox
+    /// write's instance, returning the routes and the writes.
     ///
     /// Both route legs are judged from the transaction-entry context;
     /// a commit key may not observe transaction state, and natural
-    /// replay concerns the body as a whole. Artifact derivations see
-    /// artifacts established earlier in the same transaction, in step
-    /// order.
+    /// replay concerns the body as a whole. Artifact and outbox-write
+    /// derivations see artifacts established earlier in the same
+    /// transaction, in step order.
     #[allow(clippy::type_complexity)]
     pub(crate) fn apply_transaction(
         &self,
         context: &mut PathContext,
-        body: &Transaction,
+        body: &'a Transaction,
     ) -> (
         Result<Vec<StableRoot>, Vec<ReplayGap>>,
         Result<(), Vec<ReplayGap>>,
+        Vec<OutboxWriteTrace<'a>>,
     ) {
         let recovery = self.recovery_route(context, body);
         let natural = self.natural_route(context, body);
+
+        let mut writes = Vec::new();
 
         for inner in &body.steps {
             match inner {
@@ -1678,11 +1757,25 @@ impl<'a> ReplayAnalysis<'a> {
                     }
                 }
 
+                TransactionStep::WriteOutbox(write) => {
+                    // The instance is judged where the derivation is
+                    // evaluated — at this step, in the transaction
+                    // context built so far, so it may consume
+                    // artifacts established by earlier steps.
+                    // A transaction-read root stays unstable here as
+                    // everywhere.
+                    writes.push(OutboxWriteTrace {
+                        step: write,
+                        before: context.clone(),
+                        instance: self.direct_instance(context, &write.values),
+                    });
+                }
+
                 _ => {}
             }
         }
 
-        (recovery, natural)
+        (recovery, natural, writes)
     }
 
     /// Route B: keyed commit deduplication over a stable key (§17).
@@ -1772,6 +1865,17 @@ impl<'a> ReplayAnalysis<'a> {
                         }
                     }
                 }
+
+                // An outbox write does not block the natural route:
+                // the state leg judges whether re-execution reproduces
+                // the same DataObject state, and whether the repeated
+                // admission it also commits is the *same logical
+                // message* is exactly the effect leg's judgment (§51
+                // of the outbox revision) — surfaced as an effect
+                // occurrence of the same path, so a proof cannot rest
+                // on natural replay while the duplicate admission goes
+                // unjudged.
+                TransactionStep::WriteOutbox(_) => {}
 
                 TransactionStep::Read(_)
                 | TransactionStep::Lock(_)

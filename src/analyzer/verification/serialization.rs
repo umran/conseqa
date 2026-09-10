@@ -93,7 +93,8 @@ use serde::{Deserialize, Serialize};
 use crate::analyzer::{Diagnostic, DiagnosticCode, Evidence, Severity, VerificationCode};
 use crate::spec::{
     FieldPath, Id, Input, MemberAssignment, MemberConcurrency, MessageSelector, Model, Operation,
-    SerializationRequirement, SubscriptionInput, SubscriptionRoutingKey, ValueRef, ValueSource,
+    OutboxInput, OutboxPartitioning, SerializationRequirement, SubscriptionInput,
+    SubscriptionRoutingKey, ValueRef, ValueSource,
 };
 
 use super::{ProofScope, RemedyLayer};
@@ -189,6 +190,22 @@ pub enum SerializationProof {
 
         member_assignment: MemberAssignment,
     },
+
+    /// The outbox-side counterpart: same-key messages share a keyed
+    /// outbox partition, one member owns each partition, that member
+    /// executes one invocation at a time, and no batching stage exists
+    /// whose internal overlap the model leaves opaque.
+    OutboxRouted {
+        input: Id,
+        outbox: Id,
+        pool: Id,
+
+        /// Per admitted message schema, the fact identifying the
+        /// partition key with the serialization key.
+        partition_keys: Vec<OutboxPartitionKeyFact>,
+
+        member_assignment: MemberAssignment,
+    },
 }
 
 impl SerializationProof {
@@ -196,9 +213,9 @@ impl SerializationProof {
         match self {
             Self::NoAdmittedInvocations { .. } => ProofScope::L0Only,
 
-            Self::RequestRouted { .. } | Self::SubscriptionRouted { .. } => {
-                ProofScope::RuntimeDependent
-            }
+            Self::RequestRouted { .. }
+            | Self::SubscriptionRouted { .. }
+            | Self::OutboxRouted { .. } => ProofScope::RuntimeDependent,
         }
     }
 }
@@ -237,6 +254,21 @@ pub struct MessageKeyFact {
 
     /// The declared grouping-key path for this schema.
     pub grouping_key: FieldPath,
+
+    pub identity: KeyIdentity,
+}
+
+/// For one admitted outbox message schema, how the declared partition
+/// key was identified with the requirement key. Deliberately its own
+/// vocabulary: an outbox partition is not a subscription group,
+/// however analogous the equivalence relations.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OutboxPartitionKeyFact {
+    pub schema: Id,
+
+    /// The declared partition-key path for this schema.
+    pub partition_key: FieldPath,
 
     pub identity: KeyIdentity,
 }
@@ -339,6 +371,43 @@ pub enum SerializationObstacle {
         grouping_key: FieldPath,
     },
 
+    /// Key-bearing deliveries arrive through an outbox input with no
+    /// declared runtime, so no runtime fact says where they execute.
+    NoOutboxRuntime { input: Id },
+
+    /// The outbox runtime declares `partitioning: none` — one
+    /// undivided consumption domain, not a keyed one — and V1 consumes
+    /// only keyed partition affinity, so same-key deliveries are not
+    /// established to share a keyed runtime partition.
+    NoPartitionDomain { input: Id, outbox: Id },
+
+    /// The keyed partitioning declares no mapping for an admitted
+    /// schema. Validation rejects this shape; verification records it
+    /// rather than assuming a mapping.
+    OutboxPartitionMappingMissing { input: Id, outbox: Id, schema: Id },
+
+    /// The partition mapping maps a schema to an empty tuple, which
+    /// names no partition.
+    EmptyOutboxPartitionKey { input: Id, outbox: Id, schema: Id },
+
+    /// The partition key for this schema is not established to carry
+    /// the same logical value as the requirement key, so same-key
+    /// deliveries may enter different partitions.
+    OutboxPartitionKeyNotEquivalent {
+        input: Id,
+        outbox: Id,
+        schema: Id,
+        partition_key: FieldPath,
+    },
+
+    /// The dispatch declares a batching stage, whose internal overlap
+    /// the model intentionally leaves opaque: the pool's member
+    /// concurrency must not be silently read as a fact about
+    /// unmodeled batch-internal parallelism, so no serialization
+    /// conclusion survives the stage — whatever its declared ordering
+    /// preservation, which is an ordering fact, not a no-overlap one.
+    BatchingOverlapOpaque { input: Id, pool: Id },
+
     /// The target execution pool is not declared, so its member
     /// concurrency is unknown.
     PoolUndeclared { input: Id, pool: Id },
@@ -415,6 +484,14 @@ fn check_requirement(
             operation_id,
             input_id,
             subscription,
+            &requirement.key.path,
+        ),
+
+        Input::Outbox(outbox_input) => outbox_route(
+            model,
+            operation_id,
+            input_id,
+            outbox_input,
             &requirement.key.path,
         ),
     }
@@ -583,6 +660,178 @@ fn subscription_route(
         }
 
         _ => SerializationVerdict::Unproven { obstacles },
+    }
+}
+
+/// The outbox route: keyed partition affinity, member assignment,
+/// member concurrency, and no opaque batching stage.
+///
+/// The partition domain plays the role the grouping domain plays for
+/// subscriptions: every partition-key component must carry the
+/// requirement key, one member owns each partition, and that member
+/// executes one invocation at a time. Batching is the one place the
+/// routes differ: an outbox dispatch may declare an opaque batching
+/// stage, and its batch-internal overlap is deliberately unmodeled, so
+/// its presence stops any serialization argument (§79 of the outbox
+/// revision) — order preservation is not a no-overlap fact.
+fn outbox_route(
+    model: &Model,
+    operation_id: &Id,
+    input_id: &Id,
+    input: &OutboxInput,
+    key: &FieldPath,
+) -> SerializationVerdict {
+    if admits_no_outbox_messages(model, input) {
+        return SerializationVerdict::proven(SerializationProof::NoAdmittedInvocations {
+            input: input_id.clone(),
+        });
+    }
+
+    let Some(runtime) = model.outbox_runtime(operation_id, input_id) else {
+        return SerializationVerdict::Unproven {
+            obstacles: vec![SerializationObstacle::NoOutboxRuntime {
+                input: input_id.clone(),
+            }],
+        };
+    };
+
+    let mut obstacles = Vec::new();
+
+    let partitioned = match outbox_partition_facts(model, input_id, input, runtime, key) {
+        Ok(facts) => Some((facts, runtime.dispatch.member_assignment)),
+
+        Err(partition_obstacles) => {
+            obstacles.extend(partition_obstacles);
+
+            None
+        }
+    };
+
+    let serial = pool_is_serial(model, input_id, &runtime.dispatch.pool, &mut obstacles);
+
+    let unbatched = runtime.dispatch.batching.is_none();
+
+    if !unbatched {
+        obstacles.push(SerializationObstacle::BatchingOverlapOpaque {
+            input: input_id.clone(),
+            pool: runtime.dispatch.pool.clone(),
+        });
+    }
+
+    let exclusive = partitioned
+        .as_ref()
+        .is_none_or(|(_, assignment)| assignment_owns_one_member(*assignment));
+
+    if !exclusive && let Some((_, declared)) = &partitioned {
+        obstacles.push(SerializationObstacle::MemberAssignmentNotExclusive {
+            input: input_id.clone(),
+            declared: *declared,
+        });
+    }
+
+    match partitioned {
+        Some((facts, member_assignment)) if serial && exclusive && unbatched => {
+            SerializationVerdict::proven(SerializationProof::OutboxRouted {
+                input: input_id.clone(),
+                outbox: input.outbox.clone(),
+                pool: runtime.dispatch.pool.clone(),
+                partition_keys: facts,
+                member_assignment,
+            })
+        }
+
+        _ => SerializationVerdict::Unproven { obstacles },
+    }
+}
+
+/// Whether the outbox input's admitted message set is empty by
+/// declaration, under the same rules as a subscription's.
+pub(super) fn admits_no_outbox_messages(model: &Model, input: &OutboxInput) -> bool {
+    match &input.messages {
+        MessageSelector::Only(messages) => messages.is_empty(),
+
+        MessageSelector::All => model
+            .outbox(&input.outbox)
+            .is_some_and(|(_, outbox)| outbox.messages.is_empty()),
+    }
+}
+
+/// Establishes partition-domain equivalence for a keyed outbox
+/// partitioning: for every admitted message schema, every declared
+/// partition-key component must carry the same logical value as the
+/// requirement key — a wider tuple partitions same-key deliveries
+/// across partitions, exactly as a wider grouping key does.
+pub(super) fn outbox_partition_facts(
+    model: &Model,
+    input_id: &Id,
+    input: &OutboxInput,
+    runtime: &crate::spec::OutboxRuntime,
+    requirement_key: &FieldPath,
+) -> Result<Vec<OutboxPartitionKeyFact>, Vec<SerializationObstacle>> {
+    let outbox_id = input.outbox.clone();
+
+    let OutboxPartitioning::Keyed(partition_key) = &runtime.partitioning else {
+        return Err(vec![SerializationObstacle::NoPartitionDomain {
+            input: input_id.clone(),
+            outbox: outbox_id,
+        }]);
+    };
+
+    let admitted: Vec<Id> = match &input.messages {
+        MessageSelector::Only(messages) => messages.iter().cloned().collect(),
+
+        MessageSelector::All => model
+            .outbox(&input.outbox)
+            .map(|(_, outbox)| outbox.messages.iter().cloned().collect())
+            .unwrap_or_default(),
+    };
+
+    let mut facts = Vec::new();
+    let mut obstacles = Vec::new();
+
+    for schema in &admitted {
+        let Some(mapped) = partition_key.mapping.get(schema) else {
+            obstacles.push(SerializationObstacle::OutboxPartitionMappingMissing {
+                input: input_id.clone(),
+                outbox: outbox_id.clone(),
+                schema: schema.clone(),
+            });
+
+            continue;
+        };
+
+        if mapped.is_empty() {
+            obstacles.push(SerializationObstacle::EmptyOutboxPartitionKey {
+                input: input_id.clone(),
+                outbox: outbox_id.clone(),
+                schema: schema.clone(),
+            });
+
+            continue;
+        }
+
+        for component in mapped {
+            match key_identity(model, schema, component, requirement_key) {
+                Some(identity) => facts.push(OutboxPartitionKeyFact {
+                    schema: schema.clone(),
+                    partition_key: component.clone(),
+                    identity,
+                }),
+
+                None => obstacles.push(SerializationObstacle::OutboxPartitionKeyNotEquivalent {
+                    input: input_id.clone(),
+                    outbox: outbox_id.clone(),
+                    schema: schema.clone(),
+                    partition_key: component.clone(),
+                }),
+            }
+        }
+    }
+
+    if obstacles.is_empty() {
+        Ok(facts)
+    } else {
+        Err(obstacles)
     }
 }
 
@@ -928,6 +1177,12 @@ impl SerializationObstacle {
             | Self::NoGroupingDomain { .. }
             | Self::GroupingKeyMappingMissing { .. }
             | Self::KeyIdentityUnestablished { .. }
+            | Self::NoOutboxRuntime { .. }
+            | Self::NoPartitionDomain { .. }
+            | Self::OutboxPartitionMappingMissing { .. }
+            | Self::EmptyOutboxPartitionKey { .. }
+            | Self::OutboxPartitionKeyNotEquivalent { .. }
+            | Self::BatchingOverlapOpaque { .. }
             | Self::PoolUndeclared { .. }
             | Self::MemberAssignmentNotExclusive { .. }
             | Self::MemberConcurrencyNotSerial { .. } => RemedyLayer::Runtime,
@@ -1086,6 +1341,66 @@ impl SerializationObstacle {
                      serialization key `{}`, so same-key deliveries may land in \
                      different runtime groups.",
                     check.key.path
+                ),
+            },
+
+            Self::NoOutboxRuntime { input } => Evidence {
+                subject: Some(input.clone()),
+                message: format!(
+                    "Outbox input `{input}` declares no runtime, so nothing says \
+                     where its deliveries execute or how many may execute at once."
+                ),
+            },
+
+            Self::NoPartitionDomain { input, outbox } => Evidence {
+                subject: Some(input.clone()),
+                message: format!(
+                    "The outbox runtime of `{input}` on `{outbox}` declares \
+                     `partitioning: none` — one undivided consumption domain — and \
+                     no keyed partition relates same-key deliveries to a common \
+                     member; this verifier consumes keyed partition affinity only."
+                ),
+            },
+
+            Self::OutboxPartitionMappingMissing { outbox, schema, .. } => Evidence {
+                subject: Some(schema.clone()),
+                message: format!(
+                    "The partitioning declared for `{outbox}` maps no partition key \
+                     for admitted schema `{schema}`."
+                ),
+            },
+
+            Self::EmptyOutboxPartitionKey { outbox, schema, .. } => Evidence {
+                subject: Some(schema.clone()),
+                message: format!(
+                    "The partitioning declared for `{outbox}` maps `{schema}` to an \
+                     empty tuple, which names no partition."
+                ),
+            },
+
+            Self::OutboxPartitionKeyNotEquivalent {
+                schema,
+                partition_key,
+                ..
+            } => Evidence {
+                subject: Some(schema.clone()),
+                message: format!(
+                    "For messages of `{schema}`, the partition key `{partition_key}` \
+                     is not established to carry the same logical value as the \
+                     requirement key `{}`, so same-key deliveries may land in \
+                     different partitions.",
+                    check.key.path
+                ),
+            },
+
+            Self::BatchingOverlapOpaque { input, pool } => Evidence {
+                subject: Some(input.clone()),
+                message: format!(
+                    "`{input}` dispatches to `{pool}` through a declared batching \
+                     stage whose internal overlap the model intentionally leaves \
+                     opaque; the pool's member concurrency says nothing about \
+                     batch-internal parallelism, so no no-overlap conclusion \
+                     survives the stage."
                 ),
             },
 

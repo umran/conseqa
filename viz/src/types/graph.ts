@@ -9,6 +9,7 @@ export interface Graph {
   services: ServiceNode[];
   operations: OperationNode[];
   topics: TopicNode[];
+  outboxes: OutboxNode[];
   externals: ExternalNode[];
   /** The declared L1 runtime topology; empty for an L0-only model. */
   runtime: RuntimeView;
@@ -82,6 +83,17 @@ export interface TopicNode {
   grouping: string;
   topic_scoped_transport: boolean;
 
+  messages: Id[];
+}
+
+/** A data-model-owned outbox: a transactional message collection,
+ *  rendered distinctly from a topic so the atomic producer boundary
+ *  stays visible. */
+export interface OutboxNode {
+  id: Id;
+  data_model: Id;
+  /** "keyed" or "unspecified". */
+  message_identity: string;
   messages: Id[];
 }
 
@@ -159,6 +171,33 @@ export type Edge = EdgeBase &
         async_executed_at: string[];
       }
     | { kind: "client"; operation: Id; input: Id; schema: Id }
+    | {
+        kind: "outbox_write";
+        operation: Id;
+        effect: Id;
+        schema: Id;
+        /** The inline transaction whose commit admits the message;
+         *  null only for the structurally invalid direct-site shape. */
+        transaction: Id | null;
+        /** Program steps whose transaction stages the write. */
+        executed_at: string[];
+      }
+    | {
+        kind: "outbox_consume";
+        operation: Id;
+        input: Id;
+        schemas: Id[];
+        acknowledge_on_success: boolean;
+        delivery: string;
+        /** Declared runtime facts; null without an outbox runtime. */
+        partitioning: string | null;
+        ordering: string | null;
+        pool: Id | null;
+        member_assignment: string | null;
+        /** "none" when a runtime declares no batching stage; null
+         *  without a runtime at all. */
+        batching: string | null;
+      }
   );
 
 export type EdgeKind = Edge["kind"];

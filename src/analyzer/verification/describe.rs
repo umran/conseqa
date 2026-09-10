@@ -117,7 +117,7 @@ pub(crate) fn stability_sentence(gap: &StabilityGap) -> String {
             }
 
             PayloadIdentityGap::SchemaNotMapped { schema } => {
-                format!("the topic declares no message identity for admitted schema `{schema}`")
+                format!("no message identity is declared for admitted schema `{schema}`")
             }
 
             PayloadIdentityGap::NotPinnedByKey { schema, field } => match schema {

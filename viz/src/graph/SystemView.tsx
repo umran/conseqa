@@ -20,8 +20,10 @@ function edgeShortLabel(e: Edge): string {
     case "publish":
     case "request":
     case "client":
+    case "outbox_write":
       return shortId(e.schema);
     case "subscribe":
+    case "outbox_consume":
       return e.schemas.map(shortId).join(", ");
     case "external":
       return "external";
@@ -135,6 +137,9 @@ export function SystemView() {
     <>
       <LegendLine color="var(--arch-edge-publish)" label="publication" />
       <LegendLine color="var(--arch-edge-subscribe)" label="subscription" />
+      {graph.outboxes.length > 0 && (
+        <LegendLine color="var(--arch-edge-outbox)" label="outbox write / consume" />
+      )}
       {graph.edges.some((e) => e.kind === "request") && (
         <LegendLine color="var(--arch-edge-request)" label="request" />
       )}
@@ -309,6 +314,33 @@ export function SystemView() {
             )}
             <title>{`${t.id}\nmessages: ${t.messages.map(shortId).join(", ")}\ntransport: ${transport}`}</title>
             <StatusChip x={p.x + p.w - 6} y={p.y} obKey={t.id} />
+          </g>
+        );
+      })}
+
+      {graph.outboxes.map((o) => {
+        const p = layout.pos.get(o.id);
+        if (!p) return null;
+        const classes = ["arch-node", "outbox"];
+        if (isDim(o.id)) classes.push("dimmed");
+        if (selection === o.id) classes.push("selected");
+        const n = o.messages.length;
+        const identity = o.message_identity === "keyed" ? "keyed identity" : "no message identity";
+        return (
+          <g key={o.id} className={classes.join(" ")} data-sel={sel({ key: o.id, id: o.id })}>
+            <StatusRing x={p.x} y={p.y} w={p.w} h={p.h} rx={10} obKey={o.id} />
+            <rect className="body" x={p.x} y={p.y} width={p.w} height={p.h} rx={10} />
+            <text className="title" x={p.x + p.w / 2} y={p.y + 21} textAnchor="middle">
+              {truncate(shortId(o.id), 24)}
+            </text>
+            <text className="subtitle" x={p.x + p.w / 2} y={p.y + 35} textAnchor="middle">
+              {`outbox of ${truncate(shortId(o.data_model), 16)} · ${n} message${n === 1 ? "" : "s"}`}
+            </text>
+            <title>{`${o.id}
+outbox of ${o.data_model} — admissions commit atomically with its transactions
+messages: ${o.messages.map(shortId).join(", ")}
+${identity}`}</title>
+            <StatusChip x={p.x + p.w - 6} y={p.y} obKey={o.id} />
           </g>
         );
       })}

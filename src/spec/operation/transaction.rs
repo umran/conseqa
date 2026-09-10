@@ -8,7 +8,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 use crate::spec::operation::value::opens_with_value_source_kind;
 use crate::spec::{FieldPath, Id};
 
-use super::{Derivation, Effect, IdempotencyGuarantee, ValueRef};
+use super::{Derivation, Effect, IdempotencyGuarantee, OutboxWriteEffect, ValueRef};
 
 /// One atomic transaction, declared and executed at the program step
 /// that carries it.
@@ -64,6 +64,11 @@ pub enum TransactionStep {
     Transition(StateTransition),
     EstablishEffectIntent(EstablishEffectIntent),
     EstablishTransactionOutput(EstablishTransactionOutput),
+
+    /// Stages one outbox message for admission atomically with this
+    /// transaction's commit — the one legal execution site of an
+    /// `OutboxWriteEffect`.
+    WriteOutbox(WriteOutboxEffect),
 }
 
 impl TransactionStep {
@@ -110,6 +115,17 @@ impl TransactionStep {
             }
 
             Self::EstablishTransactionOutput(establish) => establish.values.roots(),
+
+            Self::WriteOutbox(write) => {
+                let mut roots = write.values.roots();
+
+                for propagation in &write.effect.idempotency_key_propagation {
+                    roots.extend(propagation.source.components.iter());
+                    roots.extend(propagation.target.components.iter());
+                }
+
+                roots
+            }
         }
     }
 }
@@ -589,6 +605,33 @@ pub struct EstablishEffectIntent {
     pub effect: Effect,
 
     /// Provenance of the intent's logical contents.
+    pub values: Derivation,
+}
+
+/// Declares an `OutboxWriteEffect` contract, constructs one concrete
+/// logical message instance from `values`, and stages its admission to
+/// the destination outbox inside the current transaction. The message
+/// becomes durable if and only if the containing transaction commits.
+///
+/// This step is an effect execution site, not a persistent-object
+/// insertion: `effect_id` has the same stable execution-site role as
+/// other inline effect IDs — value lineage, idempotency-key
+/// propagation, diagnostics, proof evidence, visualization. The
+/// derivation is evaluated in the transaction context at this step, so
+/// it may reference transaction-local values valid at that point. The
+/// step binds nothing: an outbox write has no synchronous result, and
+/// its payload is not implicitly available to later control merely
+/// because the write succeeded.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WriteOutboxEffect {
+    /// Stable identity of this inline effect occurrence.
+    pub effect_id: Id,
+
+    /// The transactional outbox-write contract declared at this site.
+    pub effect: OutboxWriteEffect,
+
+    /// Provenance of the complete logical message instance.
     pub values: Derivation,
 }
 

@@ -26,16 +26,26 @@ rendering proceeds anyway, so imperfect models can still be inspected
 ## Views
 
 **System view** (`#/system`). Services are drawn as boundary boxes with
-their operations inside; topics, external systems, and a synthetic
-"clients" vertex (for request inputs no modeled operation invokes) sit
-around them. Edges are the model's information routes:
+their operations inside; topics, outboxes, external systems, and a
+synthetic "clients" vertex (for request inputs no modeled operation
+invokes) sit around them. Edges are the model's information routes:
 
 - publication effects: operation → topic
 - subscription inputs: topic → operation
+- outbox writes: operation → outbox — drawn distinctly from
+  publication, because the admission is atomic with a transaction's
+  commit; the edge names the transaction whose commit admits it
+- outbox inputs: outbox → operation, carrying the acknowledgement
+  declaration and, with L1 drawn, the runtime's delivery, partitioning,
+  ordering, member assignment, and batching facts
 - request effects: operation → operation
 - external effects: operation → external system
 - client requests: clients → operation, for request inputs no modeled
   operation invokes
+
+An **outbox** node (dashed teal, distinct from a topic) belongs to a
+data model and says so on the card: it is the transactional message
+collection of §5.1 of the semantics, not a logical channel.
 
 Operation-owned effects are derived directly from the program — its
 inline `execute_effect` sites and `establish_effect_intent` sites —
@@ -58,8 +68,11 @@ or a hop within a column climbs a gutter into the channel reserved above
 its band and comes back down another, so no edge is ever drawn through a
 card. A drawing too wide to fit at a readable size wraps: its columns
 break into bands the way a paragraph breaks into lines, at whichever
-width leaves everything largest once fitted, and an edge that crosses
-bands travels outside them. Small graphs never wrap.
+width leaves everything largest once fitted. An edge into the
+neighbouring band continues the way a line of text wraps — through its
+own gutter into the one channel separating the two bands, straight
+across, and on into its target; only an edge that must clear whole
+bands travels around the outside. Small graphs never wrap.
 
 *Layers.* L0 — the abstract application machine — is always drawn. L1,
 the declared runtime realization, is switched from the top bar (`L0` is

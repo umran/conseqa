@@ -71,7 +71,18 @@ struct OperationFacts<'a> {
 
 struct EffectSiteFacts<'a> {
     effect_id: &'a Id,
-    effect: &'a Effect,
+    effect: SiteContract<'a>,
+}
+
+/// The contract behind one effect site: the general effect enum, or a
+/// transactional outbox write with the transaction that carries it.
+#[derive(Clone, Copy)]
+enum SiteContract<'a> {
+    Effect(&'a Effect),
+    OutboxWrite {
+        transaction: &'a Id,
+        write: &'a crate::spec::OutboxWriteEffect,
+    },
 }
 
 /// The launch an async handle refers back to, for attributing the
@@ -170,7 +181,7 @@ fn collect_operation<'w>(
                             TransactionStep::EstablishEffectIntent(establish) => {
                                 facts.effect_sites.push(EffectSiteFacts {
                                     effect_id: &establish.effect_id,
-                                    effect: &establish.effect,
+                                    effect: SiteContract::Effect(&establish.effect),
                                 });
 
                                 facts.bindings.push(BindingFacts {
@@ -191,6 +202,16 @@ fn collect_operation<'w>(
                                     )),
                                     producer: BindingProducer::TransactionOutput {
                                         transaction: &transaction.id,
+                                    },
+                                });
+                            }
+
+                            TransactionStep::WriteOutbox(write) => {
+                                facts.effect_sites.push(EffectSiteFacts {
+                                    effect_id: &write.effect_id,
+                                    effect: SiteContract::OutboxWrite {
+                                        transaction: &transaction.id,
+                                        write: &write.effect,
                                     },
                                 });
                             }
@@ -221,7 +242,7 @@ fn collect_operation<'w>(
                 OperationStep::ExecuteEffect(execute) => {
                     facts.effect_sites.push(EffectSiteFacts {
                         effect_id: &execute.effect_id,
-                        effect: &execute.effect,
+                        effect: SiteContract::Effect(&execute.effect),
                     });
 
                     if let Some(bind) = &execute.bind {
@@ -252,7 +273,7 @@ fn collect_operation<'w>(
                 OperationStep::ExecuteEffectAsync(execute) => {
                     facts.effect_sites.push(EffectSiteFacts {
                         effect_id: &execute.effect_id,
-                        effect: &execute.effect,
+                        effect: SiteContract::Effect(&execute.effect),
                     });
                 }
 
@@ -373,6 +394,16 @@ impl<'w> Builder<'w> {
                     SemanticHash::of(object),
                 );
             }
+
+            for (outbox_id, outbox) in &data_model.outboxes {
+                self.add_node(
+                    SymbolKey::Outbox {
+                        data_model: id.clone(),
+                        outbox: outbox_id.clone(),
+                    },
+                    SemanticHash::of(outbox),
+                );
+            }
         }
 
         for (id, topic) in &self.workspace.topics {
@@ -487,12 +518,20 @@ impl<'w> Builder<'w> {
         }
 
         for site in &facts.effect_sites {
+            let fingerprint = match site.effect {
+                SiteContract::Effect(effect) => SemanticHash::of(&(site.effect_id, effect)),
+
+                SiteContract::OutboxWrite { transaction, write } => {
+                    SemanticHash::of(&(site.effect_id, "write_outbox", transaction, write))
+                }
+            };
+
             self.add_node(
                 SymbolKey::EffectSite {
                     operation: operation.clone(),
                     effect: site.effect_id.clone(),
                 },
-                SemanticHash::of(&(site.effect_id, site.effect)),
+                fingerprint,
             );
         }
 
@@ -570,6 +609,25 @@ impl<'w> Builder<'w> {
                     EdgeKind::References,
                     &SymbolKey::Schema(object.schema.clone()),
                 );
+            }
+
+            for (outbox_id, outbox) in &data_model.outboxes {
+                let outbox_key = SymbolKey::Outbox {
+                    data_model: id.clone(),
+                    outbox: outbox_id.clone(),
+                };
+
+                self.link(from, EdgeKind::Contains, &outbox_key);
+
+                let outbox_node = self.node_ids[&outbox_key];
+
+                for message in &outbox.messages {
+                    self.link(
+                        outbox_node,
+                        EdgeKind::References,
+                        &SymbolKey::Schema(message.clone()),
+                    );
+                }
             }
         }
 
@@ -868,8 +926,64 @@ impl<'w> Builder<'w> {
                         );
                     }
                 }
+
+                crate::spec::Input::Outbox(declared) => {
+                    let Some(outbox_key) = self.outbox_key(&declared.outbox) else {
+                        // A dangling outbox reference produces no edge,
+                        // like any other unresolvable target.
+                        continue;
+                    };
+
+                    self.link(input_node, EdgeKind::ConsumesOutbox, &outbox_key);
+                    self.link(operation_node, EdgeKind::TriggeredBy, &outbox_key);
+
+                    // The same consumer index topics use, keyed by the
+                    // outbox id: ids share one global namespace, so the
+                    // consumers query answers for either boundary.
+                    self.indexes
+                        .topic_consumers
+                        .entry(declared.outbox.clone())
+                        .or_default()
+                        .push(ConsumerRef {
+                            operation: operation.clone(),
+                            input: input_id.clone(),
+                        });
+
+                    let selected: Vec<Id> = match &declared.messages {
+                        MessageSelector::Only(schemas) => schemas.iter().cloned().collect(),
+                        MessageSelector::All => self
+                            .workspace
+                            .data_models
+                            .values()
+                            .find_map(|data_model| data_model.outboxes.get(&declared.outbox))
+                            .map(|outbox| outbox.messages.iter().cloned().collect())
+                            .unwrap_or_default(),
+                    };
+
+                    for schema in selected {
+                        self.link(
+                            interface_node,
+                            EdgeKind::ContractDependsOn,
+                            &SymbolKey::Schema(schema),
+                        );
+                    }
+                }
             }
         }
+    }
+
+    /// The symbol key of an outbox, resolved through its owning data
+    /// model.
+    fn outbox_key(&self, outbox: &Id) -> Option<SymbolKey> {
+        self.workspace
+            .data_models
+            .iter()
+            .find_map(|(data_model_id, data_model)| {
+                data_model.outboxes.contains_key(outbox).then(|| SymbolKey::Outbox {
+                    data_model: data_model_id.clone(),
+                    outbox: outbox.clone(),
+                })
+            })
     }
 
     fn add_program_edges(
@@ -910,7 +1024,38 @@ impl<'w> Builder<'w> {
             };
 
             match site.effect {
-                Effect::Publication(publication) => {
+                SiteContract::OutboxWrite { write, .. } => {
+                    if let Some(outbox_key) = self.outbox_key(&write.outbox) {
+                        self.link(site_node, EdgeKind::WritesOutbox, &outbox_key);
+
+                        if !write.idempotency_key_propagation.is_empty() {
+                            self.link(
+                                site_node,
+                                EdgeKind::PropagatesIdempotencyKey,
+                                &outbox_key,
+                            );
+                        }
+                    }
+
+                    self.link(
+                        site_node,
+                        EdgeKind::References,
+                        &SymbolKey::Schema(write.schema.clone()),
+                    );
+
+                    // The publishers index, keyed by the outbox id —
+                    // the producers query answers for either boundary.
+                    self.indexes
+                        .topic_publishers
+                        .entry(write.outbox.clone())
+                        .or_default()
+                        .push(PublisherRef {
+                            site: site_ref.clone(),
+                            schema: write.schema.clone(),
+                        });
+                }
+
+                SiteContract::Effect(Effect::Publication(publication)) => {
                     let topic_key = SymbolKey::Topic(publication.topic.clone());
 
                     self.link(site_node, EdgeKind::PublishesTopic, &topic_key);
@@ -934,7 +1079,7 @@ impl<'w> Builder<'w> {
                         });
                 }
 
-                Effect::Request(request) => {
+                SiteContract::Effect(Effect::Request(request)) => {
                     let target_key = SymbolKey::Operation(request.target.operation.clone());
 
                     self.link(site_node, EdgeKind::CallsOperation, &target_key);
@@ -968,7 +1113,7 @@ impl<'w> Builder<'w> {
                         .push(call);
                 }
 
-                Effect::External(external) => {
+                SiteContract::Effect(Effect::External(external)) => {
                     if let Some(result) = &external.result {
                         for schema in [&result.ok, &result.err.schema] {
                             self.link(
@@ -978,6 +1123,21 @@ impl<'w> Builder<'w> {
                             );
                         }
                     }
+                }
+
+                // Structurally invalid at a direct site; the reference
+                // edge is still recorded through the outbox-write arm's
+                // vocabulary so an invalid draft stays inspectable.
+                SiteContract::Effect(Effect::OutboxWrite(write)) => {
+                    if let Some(outbox_key) = self.outbox_key(&write.outbox) {
+                        self.link(site_node, EdgeKind::WritesOutbox, &outbox_key);
+                    }
+
+                    self.link(
+                        site_node,
+                        EdgeKind::References,
+                        &SymbolKey::Schema(write.schema.clone()),
+                    );
                 }
             }
         }
@@ -1117,6 +1277,11 @@ impl<'w> Builder<'w> {
                 // A lock constrains scheduling; it neither observes nor
                 // changes object state, so it contributes no access.
                 TransactionStep::Lock(_) => {}
+
+                // The write's semantics live on its effect site, which
+                // add_program_edges links; the step itself contributes
+                // no object access.
+                TransactionStep::WriteOutbox(_) => {}
 
                 TransactionStep::Transition(transition) => {
                     let machine_key = SymbolKey::StateMachine(transition.machine.clone());
