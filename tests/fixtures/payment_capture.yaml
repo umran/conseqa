@@ -1,0 +1,418 @@
+# Payment capture with a transactional outbox — the pattern's textbook
+# habitat.
+#
+# An unmodeled checkout calls capture_payment and retries on timeout,
+# presenting the same idempotency_key each time (the Stripe-style
+# boundary contract the request identity declares). The producer's
+# idempotency requirement is therefore not decorative: a duplicate
+# capture is a double charge. Its transaction deduplicates commits by
+# that key, which discharges both the payment insert and the staged
+# outbox write — at most one commit per key, so at most one recorded
+# payment and one admitted PaymentCaptured, however often checkout
+# retries.
+#
+# The outbox is the honest answer to the dual write: recording a
+# payment without the event loses it to the ledger and the books stop
+# balancing; emitting the event without the record invents money. One
+# atomic commit rules both failure shapes out.
+#
+# A relay consumes the outbox one message at a time — at-least-once,
+# partitioned by account with partition ordering, one owning serial
+# worker per partition — and republishes onto topic.payment_events,
+# whose keyed event_id identity makes its own redeliveries the same
+# logical message. Two independent subscribers consume that topic: the
+# ledger posts a double-entry record (keyed commit by event_id, driven
+# to completion by at-least-once delivery), and receipts emails the
+# customer through a provider that deduplicates sends by event_id.
+# Every declared obligation proves.
+revision: 1
+services:
+  service.payments:
+    kind: backend
+  service.relay:
+    kind: worker
+  service.ledger:
+    kind: worker
+  service.receipts:
+    kind: worker
+schemas:
+  schema.CapturePaymentRequest:
+    kind: canonical
+    completeness: complete
+    fields:
+      idempotency_key: string
+      payment_id: uuid
+      order_id: uuid
+      account_id: uuid
+      amount_cents: int
+      currency: string
+  schema.PaymentAccepted:
+    kind: canonical
+    completeness: complete
+    fields:
+      payment_id: uuid
+  schema.PaymentRejected:
+    kind: canonical
+    completeness: complete
+    fields:
+      reason: string
+  schema.Payment:
+    kind: canonical
+    completeness: complete
+    fields:
+      payment_id: uuid
+      order_id: uuid
+      account_id: uuid
+      amount_cents: int
+      currency: string
+  schema.PaymentCaptured:
+    kind: canonical
+    completeness: complete
+    fields:
+      event_id: string
+      payment_id: uuid
+      order_id: uuid
+      account_id: uuid
+      amount_cents: int
+      currency: string
+  schema.LedgerEntry:
+    kind: canonical
+    completeness: complete
+    fields:
+      entry_id: string
+      payment_id: uuid
+      account_id: uuid
+      amount_cents: int
+      currency: string
+data_models:
+  data.payments:
+    objects:
+      object.payment:
+        schema: schema.Payment
+        identity:
+        - payment_id
+    outboxes:
+      outbox.payment_events:
+        messages:
+        - schema.PaymentCaptured
+        message_identity:
+          kind: keyed
+          mapping:
+            schema.PaymentCaptured:
+            - event_id
+  data.ledger:
+    objects:
+      object.ledger_entry:
+        schema: schema.LedgerEntry
+        identity:
+        - entry_id
+topics:
+  topic.payment_events:
+    messages:
+    - schema.PaymentCaptured
+    message_identity:
+      kind: keyed
+      mapping:
+        schema.PaymentCaptured:
+        - event_id
+state_machines: {}
+operations:
+  operation.capture_payment:
+    service: service.payments
+    description: >-
+      Capture a payment and admit PaymentCaptured to the outbox in one
+      atomic commit. Checkout retries this request on timeout under the
+      same idempotency key.
+    inputs:
+      input.capture_payment.request:
+        kind: request
+        schema: schema.CapturePaymentRequest
+        identity:
+          kind: keyed
+          fields:
+          - idempotency_key
+        result:
+          ok: schema.PaymentAccepted
+          err: schema.PaymentRejected
+    program:
+      steps:
+      - kind: transaction
+        id: tx.capture_payment
+        data_model: data.payments
+        isolation: read_committed
+        idempotency:
+          kind: deduplicated_by
+          key:
+            components:
+            - source: input:input.capture_payment.request
+              path: idempotency_key
+        steps:
+        - kind: insert
+          object: object.payment
+          values:
+            kind: deterministic
+            from:
+            - source: input:input.capture_payment.request
+              path: payment_id
+            - source: input:input.capture_payment.request
+              path: order_id
+            - source: input:input.capture_payment.request
+              path: account_id
+            - source: input:input.capture_payment.request
+              path: amount_cents
+            - source: input:input.capture_payment.request
+              path: currency
+        - kind: write_outbox
+          effect_id: effect.capture_payment.outbox_captured
+          effect:
+            outbox: outbox.payment_events
+            schema: schema.PaymentCaptured
+            idempotency_key_propagation:
+            - source:
+                components:
+                - source: input:input.capture_payment.request
+                  path: idempotency_key
+              target:
+                components:
+                - source: effect:effect.capture_payment.outbox_captured
+                  path: event_id
+          values:
+            kind: deterministic
+            from:
+            - source: input:input.capture_payment.request
+              path: idempotency_key
+            - source: input:input.capture_payment.request
+              path: payment_id
+            - source: input:input.capture_payment.request
+              path: order_id
+            - source: input:input.capture_payment.request
+              path: account_id
+            - source: input:input.capture_payment.request
+              path: amount_cents
+            - source: input:input.capture_payment.request
+              path: currency
+      - kind: return
+        request: input.capture_payment.request
+        outcome:
+          kind: ok
+          values:
+            kind: deterministic
+            from:
+            - source: input:input.capture_payment.request
+              path: payment_id
+    requirements:
+      serialization: []
+      ordering: []
+      idempotency:
+      - key:
+          components:
+          - source: input:input.capture_payment.request
+            path: idempotency_key
+        result: replay_consistent
+      recoverability:
+      - key:
+          components:
+          - source: input:input.capture_payment.request
+            path: idempotency_key
+        completion: resumable
+  operation.publish_payment_event:
+    service: service.relay
+    description: >-
+      Relay one committed outbox message onto the payment-events topic,
+      preserving per-account order.
+    inputs:
+      input.publish_payment_event.outbox:
+        kind: outbox
+        outbox: outbox.payment_events
+        messages:
+          kind: only
+          schemas:
+          - schema.PaymentCaptured
+        acknowledge_on_success: true
+    program:
+      steps:
+      - kind: execute_effect
+        effect_id: effect.publish_payment_event.captured
+        effect:
+          kind: publication
+          topic: topic.payment_events
+          schema: schema.PaymentCaptured
+          idempotency_key_propagation:
+          - source:
+              components:
+              - source: input:input.publish_payment_event.outbox
+                path: event_id
+            target:
+              components:
+              - source: effect:effect.publish_payment_event.captured
+                path: event_id
+        values:
+          kind: deterministic
+          from:
+          - source: input:input.publish_payment_event.outbox
+            path: event_id
+          - source: input:input.publish_payment_event.outbox
+            path: payment_id
+          - source: input:input.publish_payment_event.outbox
+            path: order_id
+          - source: input:input.publish_payment_event.outbox
+            path: account_id
+          - source: input:input.publish_payment_event.outbox
+            path: amount_cents
+          - source: input:input.publish_payment_event.outbox
+            path: currency
+      - kind: complete
+    requirements:
+      serialization: []
+      ordering:
+      - key:
+          source: input:input.publish_payment_event.outbox
+          path: account_id
+      idempotency:
+      - key:
+          components:
+          - source: input:input.publish_payment_event.outbox
+            path: event_id
+        result: unspecified
+      recoverability:
+      - key:
+          components:
+          - source: input:input.publish_payment_event.outbox
+            path: event_id
+        completion: guaranteed
+  operation.post_ledger_entry:
+    service: service.ledger
+    description: >-
+      Post the double-entry ledger record for one captured payment.
+    inputs:
+      input.post_ledger_entry.captured:
+        kind: subscription
+        topic: topic.payment_events
+        messages:
+          kind: only
+          schemas:
+          - schema.PaymentCaptured
+        acknowledge_on_success: true
+    program:
+      steps:
+      - kind: transaction
+        id: tx.post_ledger_entry
+        data_model: data.ledger
+        isolation: read_committed
+        idempotency:
+          kind: deduplicated_by
+          key:
+            components:
+            - source: input:input.post_ledger_entry.captured
+              path: event_id
+        steps:
+        - kind: insert
+          object: object.ledger_entry
+          values:
+            kind: deterministic
+            from:
+            - source: input:input.post_ledger_entry.captured
+              path: event_id
+            - source: input:input.post_ledger_entry.captured
+              path: payment_id
+            - source: input:input.post_ledger_entry.captured
+              path: account_id
+            - source: input:input.post_ledger_entry.captured
+              path: amount_cents
+            - source: input:input.post_ledger_entry.captured
+              path: currency
+      - kind: complete
+    requirements:
+      serialization: []
+      ordering: []
+      idempotency:
+      - key:
+          components:
+          - source: input:input.post_ledger_entry.captured
+            path: event_id
+        result: unspecified
+      recoverability:
+      - key:
+          components:
+          - source: input:input.post_ledger_entry.captured
+            path: event_id
+        completion: guaranteed
+  operation.send_receipt:
+    service: service.receipts
+    description: >-
+      Email the customer's receipt through a provider that deduplicates
+      sends by event id.
+    inputs:
+      input.send_receipt.captured:
+        kind: subscription
+        topic: topic.payment_events
+        messages:
+          kind: only
+          schemas:
+          - schema.PaymentCaptured
+    program:
+      steps:
+      - kind: execute_effect
+        effect_id: effect.send_receipt.email
+        effect:
+          kind: external
+          name: receipt_email_provider
+          idempotency:
+            kind: deduplicated_by
+            key:
+              components:
+              - source: input:input.send_receipt.captured
+                path: event_id
+          result: null
+        values:
+          kind: deterministic
+          from:
+          - source: input:input.send_receipt.captured
+            path: event_id
+          - source: input:input.send_receipt.captured
+            path: payment_id
+          - source: input:input.send_receipt.captured
+            path: amount_cents
+          - source: input:input.send_receipt.captured
+            path: currency
+      - kind: complete
+    requirements:
+      serialization: []
+      ordering: []
+      idempotency:
+      - key:
+          components:
+          - source: input:input.send_receipt.captured
+            path: event_id
+        result: unspecified
+      recoverability: []
+runtime:
+  outboxes:
+    operation.publish_payment_event:
+      input.publish_payment_event.outbox:
+        delivery: at_least_once
+        partitioning:
+          kind: keyed
+          mapping:
+            schema.PaymentCaptured:
+            - account_id
+        ordering: partition
+        dispatch:
+          pool: pool.relay_workers
+          member_assignment:
+            kind: consistent_hash
+  subscriptions:
+    operation.post_ledger_entry:
+      input.post_ledger_entry.captured:
+        delivery: at_least_once
+        dispatch:
+          pool: pool.ledger_workers
+  execution_pools:
+    pool.relay_workers:
+      member_concurrency:
+        kind: bounded
+        value: 1
+    pool.ledger_workers:
+      member_concurrency:
+        kind: bounded
+        value: 4

@@ -333,6 +333,46 @@ The scope rule for this iteration is:
 
 Object-history requirements are to be reconsidered, as a coherent family rather than an isolated flag, when Conseqa begins modeling distributed persistence and availability. Their exact vocabulary is not predeclared here.
 
+### Outboxes
+
+A data model may also contain **outboxes**: typed logical message collections belonging to the same transactional state boundary as its objects.
+
+```yaml
+data_models:
+  data.orders:
+    objects:
+      ...
+    outboxes:
+      outbox.order_events:
+        messages:
+          - schema.OrderCreated
+        message_identity:
+          kind: keyed
+          mapping:
+            schema.OrderCreated:
+              - event_id
+```
+
+`messages` is the set of schemas the outbox is permitted to durably contain; membership asserts nothing about whether such a message is ever produced. `message_identity` uses exactly the `MessageIdentity` semantics of §6 — the same `unspecified`/`keyed` vocabulary, the same per-schema mapping, arity, and cross-schema collision rules, and the same guarantee: any two admitted messages of mapped schemas whose identity tuples are equal are the **same logical message**, of the same schema, with equal payloads. As on a topic, the identity is not a partition key and not business-object identity — `message_identity = event_id` with `partitioning = tenant_id` (§10.3.2) is entirely coherent — and it implies no deduplicated physical writes, no at-most-once delivery, and no exactly-once processing.
+
+Because an outbox belongs to the data model, a transaction declaring that data model may atomically mutate its objects **and** admit messages to its outboxes in one logical commit. That placement is the whole point, and it is what a topic deliberately does not offer:
+
+| Concern | Topic | Outbox |
+|---|---|---|
+| Layer | L0 logical channel | L0 `DataModel` entity |
+| Payload | typed message | typed message |
+| Allowed schemas | `messages` | `messages` |
+| Logical message identity | `message_identity` | `message_identity` |
+| Producer effect | publication (§13.1) | outbox write (§13.4) |
+| Producer execution | ordinary effect execution | transaction-exclusive |
+| Atomic with `DataObject` mutation | not implied | yes, through the containing transaction |
+| Consumer input | subscription (§8.2) | outbox input (§8.3) |
+| Runtime | topic/subscription runtime (§10.2–§10.3.1) | outbox runtime (§10.3.2) |
+
+The similarity is intentional; the difference in transactional placement is fundamental, and the two remain distinct semantic concepts rather than instances of a generic channel abstraction.
+
+The declaration implies nothing physical: not one SQL database, one server, one table namespace, or one storage technology shared between objects and outboxes. A conforming implementation must merely realize the declared atomic boundary. An outbox message is also neither an `EffectIntent` (§14) — it is durable typed application message data, not a captured effect instance awaiting execution — nor a `TransactionOutput` (§15), which exports a value back into the same operation's continuation rather than creating durable work for independent consumers. No `DataObject` named "outbox" acquires outbox semantics; they exist only through this explicit entity.
+
 ---
 
 ## 6. Topics as logical channels
@@ -533,6 +573,44 @@ Only the listed topic message schemas may invoke through this subscription.
 
 It does not restrict what other schemas the topic itself may carry.
 
+### `acknowledge_on_success`
+
+A subscription may declare the same acknowledgement semantic an outbox input carries (§8.3):
+
+> When an invocation triggered through this input reaches successful logical completion, the triggering logical source item is acknowledged for this consumer.
+
+The field is optional here because the semantic postdates existing models: absent is **no declared acknowledgement fact** — how every model written before the field existed reads, and migration must not guess a value the model never stated — while `false` is the explicit negative. Everything §8.3 says about the semantic applies unchanged: it is consumer-relative, it is not a program statement, and it neither closes an idempotency proof nor proves duplicate collapse.
+
+---
+
+## 8.3 Outbox input
+
+An outbox input declares invocation from a committed outbox message (§5). Its L0 content:
+
+- the outbox,
+- the selected message schemas, and
+- an explicit `acknowledge_on_success` declaration.
+
+It means:
+
+> One logical message admitted to the outbox may invoke this operation, and the invocation's payload is that one message.
+
+The operation program stays a **per-message logical machine**. No batch payload, batch iterator, or batch index exists at L0, and none is needed: a runtime may retrieve or dispatch several committed messages together, but that is an opaque realization over multiple logical per-message invocations (§10.3.2), never a new invocation shape. `M1 -> Operation(M1); M2 -> Operation(M2)` — not `Batch[M1,M2] -> BatchOperation`.
+
+`MessageSelector` has exactly its §8.2 meaning, read against the outbox: `all` admits every schema the outbox declares, `only` restricts this input without restricting the outbox. Several outbox inputs may consume one outbox; each is an independent logical consumer relationship with its own selection, acknowledgement, and runtime facts — one input acknowledging a message says nothing about another.
+
+An outbox input has no synchronous result; its normal terminal is `complete`. How often a committed message is delivered, how consumption is partitioned and ordered, and where invocations execute are realization facts declared by an **outbox runtime** (§10.3.2) against the `(operation, input)` pair.
+
+### `acknowledge_on_success`
+
+Acknowledgement is an input-level application semantic, deliberately explicit and deliberately not a program statement:
+
+> When an invocation triggered through this input reaches successful logical completion — its normal terminal, with no unresolved execution failure — the triggering logical message is acknowledged for this consumer.
+
+There is no `Acknowledge(item)` primitive in `OperationBlock`, and Conseqa does not distinguish "effect succeeded", "ack call began", and "ack call returned" inside the application program; those mechanics are below the abstraction, as is whether the concrete runtime sends one batch ACK, per-message ACKs, an offset commit, or row deletes.
+
+If the invocation does not successfully complete, the declaration does not take effect and the message remains logically unacknowledged; whether another delivery attempt occurs is the runtime's delivery semantics (§10.3.2). Acknowledgement itself implies neither at-most-once nor exactly-once execution, neither eventual redelivery nor eventual success — and it neither closes an idempotency proof nor proves duplicate collapse (§13.4): under at-least-once delivery, failure or uncertainty *before* acknowledgement may admit another attempt, so consumer idempotency is still needed wherever duplicates are admitted.
+
 ---
 
 ## 9. Operation requirements
@@ -562,7 +640,7 @@ semantic key equivalence
     -> member concurrency
 ```
 
-V1 accepts three routes. **Vacuous population**: the key's subscription input admits no message schemas, so the constrained population is empty by declaration — the only `l0_only` route. **Request-routed**: a `Router` serves the key's request boundary, every component of its semantic routing key carries the same logical value as the requirement key (§4), its `MemberAssignment` gives that domain one active owning member including through handoff, and the target pool declares `member_concurrency = bounded(1)`. **Subscription-routed**: the same argument on the delivery side, with `key: grouping_key` naming the effective grouping domain (§10.2) and the requirement key established to carry the grouping key for every admitted schema.
+V1 accepts four routes. **Vacuous population**: the key's message-driven input admits no message schemas, so the constrained population is empty by declaration — the only `l0_only` route. **Request-routed**: a `Router` serves the key's request boundary, every component of its semantic routing key carries the same logical value as the requirement key (§4), its `MemberAssignment` gives that domain one active owning member including through handoff, and the target pool declares `member_concurrency = bounded(1)`. **Subscription-routed**: the same argument on the delivery side, with `key: grouping_key` naming the effective grouping domain (§10.2) and the requirement key established to carry the grouping key for every admitted schema. **Outbox-routed**: the same argument over an outbox input's keyed partitioning (§10.3.2) — every partition-key component carries the requirement key for every admitted schema, the dispatch's `MemberAssignment` gives each partition one active owning member, the pool is serial, **and the dispatch declares no batching stage**. A declared batching stage stops the route whatever its ordering preservation: batch-internal overlap is intentionally unmodeled, and `member_concurrency` must not be silently read as a fact about it. `partitioning: none` also proves nothing here — it declares one undivided consumption domain, and V1 consumes keyed partition affinity only.
 
 **No ordering fact participates in any of them.** Serialization is about non-overlap; a grouping domain is the whole of what a transport has to supply for it. That is the main reason grouping is declared independently of ordering — an unordered transport that still groups by key serializes, and the model can say so without claiming an order it does not provide.
 
@@ -585,7 +663,7 @@ Arbitrarily serializing concurrent inputs can satisfy a serialization requiremen
 
 Where preserving the required order entails preventing later invocations from overtaking earlier ones, the proof must also establish the necessary execution serialization.
 
-V1 recognizes one precedence source: the effective transport ordering (§10.2–§10.3) — `within_group`, or `global`. A request input has no precedence source at all, and a key not sourced from an input selects no population; both are unproven.
+V1 recognizes two precedence sources: the effective transport ordering (§10.2–§10.3) — `within_group`, or `global` — for a subscription-triggered key, and the outbox runtime's declared ordering (§10.3.2) — `partition`, or `global` — for an outbox-triggered one. A request input has no precedence source at all, and a key not sourced from an input selects no population; both are unproven.
 
 That request inputs have none is worth stating plainly: a router keyed exactly like the requirement, on a pool whose members are serial, does establish serialization — and still no ordering, because arrival order of unmodeled callers is not a logical precedence. There is nothing for the mechanism to preserve. A separate precedence source would be required.
 
@@ -595,7 +673,9 @@ Every leg is interrogated, not merely cited. The routing key is matched exhausti
 
 Both precedence sources require that same grouping identity, and for the same reason: a precedence only reaches execution if same-key deliveries stay together. `within_group` needs it because its guarantee is *about* the group. `global` needs it because an order over everything is still lost the moment two same-key deliveries land on different members. So the grouping evidence is established once and cited by either — serialization proves on the grouping alone, and ordering is that argument with a precedence added.
 
-This is why an ordering proof is strictly stronger than a serialization one over the same key, and why dispatch alone can never supply it: dispatch preserves precedence, it does not create any (§10.3.1). Dispatch additionally carries the order-preservation obligation of §10.3, so redelivery cannot invert the precedence: a failure-driven redelivery cannot be overtaken by a later message of its domain, and a duplicate of an already completed message is a repeated attempt at a logical invocation that took effect in order — what that attempt does is the idempotency requirement's obligation, not ordering's, and the proof records which requirement answers for it or that none does. Vacuously discharged: a subscription admitting no message schemas.
+This is why an ordering proof is strictly stronger than a serialization one over the same key, and why dispatch alone can never supply it: dispatch preserves precedence, it does not create any (§10.3.1). Dispatch additionally carries the order-preservation obligation of §10.3, so redelivery cannot invert the precedence: a failure-driven redelivery cannot be overtaken by a later message of its domain, and a duplicate of an already completed message is a repeated attempt at a logical invocation that took effect in order — what that attempt does is the idempotency requirement's obligation, not ordering's, and the proof records which requirement answers for it or that none does. Vacuously discharged: a message-driven input admitting no message schemas.
+
+The outbox route is the same composition in the outbox's own vocabulary: the runtime declares `ordering: partition` (or `global`), every partition-key component carries the requirement key for every admitted schema — same-key deliveries then share one partition, which both precedence reaches need — the dispatch's `MemberAssignment` gives that partition one active owning member, and the pool is serial. One leg is new: a declared **batching stage** is judged explicitly. Absent, there is no batch obstacle; `ordering: preserved` lets the established precedence pass through the stage — the opaque batch processing does not let a later message overtake an earlier one against it; `ordering: unspecified` stops the proof, because the stage then provides no evidence the order survives execution. Order preservation is an ordering fact only: it is never read as a no-overlap guarantee, which is why the serialization route above refuses batching outright while this route accepts `preserved` (§10.3.2).
 
 ### Serialization versus ordering
 
@@ -628,10 +708,10 @@ The requirement is not discharged merely because the operation has a field named
 V1 discharges the requirement over each **admitted path** of the program — a path ending at `complete`, or at a `return` for the triggering input (§16) — under the governing key's population (§12). Three legs must hold on every admitted path:
 
 - **State leg.** Every transaction step must be retry-safe: a keyed commit over a stable key, or naturally replayable. There is no final-step exemption, because a duplicate delivery re-drives the whole program even after terminal completion.
-- **Effect leg.** Every effect-executing step must be duplicate-safe per the §13 rules, since even a recovered intent may be executed again (§14) — and those rules follow the work an attempt causes into other operations: a request is safe only when its target collapses duplicate invocations, a publication only when every modeled consumer collapses duplicate deliveries, each through its own proven requirement.
+- **Effect leg.** Every effect-executing step must be duplicate-safe per the §13 rules, since even a recovered intent may be executed again (§14) — and those rules follow the work an attempt causes into other operations: a request is safe only when its target collapses duplicate invocations, a publication only when every modeled consumer of the topic collapses duplicate deliveries, an outbox write only when its containing transaction suppresses a second commit or every modeled consumer of the outbox collapses duplicate deliveries (§13.4), each through its own proven requirement. An outbox boundary does not terminate the causal effect graph: the writes staged by a path's transactions are effect occurrences of that path, and the cascade continues through every outbox input admitting the written schema.
 - **Control leg.** Every decision on the path must replay (§16): the matched result replay-stable, or the branch condition deterministic over replay-stable roots, so that every attempt in the class traverses the same path. When a controlling observation may differ between attempts, a retry may do different work, and V1 has no compatibility argument for the two histories; the decision is an obstacle.
 
-A verdict therefore covers the cascade the operation starts, and V1 computes the mutually dependent verdicts as a greatest fixpoint (below), so a cycle whose members each collapse the others' duplicates is proven and marked coinductive. Result consistency is the separate result-replay obligation below; its verdicts feed in only where a decision rests on a request effect's result. Vacuously discharged: an empty population; no admitted path, so an attempt performs no modeled work; and a triggering subscription with `at_most_once` delivery whose payload is identity-pinned by the key (§18) — same-class messages are then one logical message delivered at most once, so a class holds at most one attempt.
+A verdict therefore covers the cascade the operation starts, and V1 computes the mutually dependent verdicts as a greatest fixpoint (below), so a cycle whose members each collapse the others' duplicates is proven and marked coinductive — a cycle through outboxes no less than one through topics or requests; there is no separate outbox solver. Result consistency is the separate result-replay obligation below; its verdicts feed in only where a decision rests on a request effect's result. Vacuously discharged: an empty population; no admitted path, so an attempt performs no modeled work; and a triggering subscription or outbox input with `at_most_once` delivery whose payload is identity-pinned by the key (§18) — same-class messages are then one logical message delivered at most once, so a class holds at most one attempt.
 
 ### `ResultReplayRequirement::replay_consistent`
 
@@ -715,7 +795,7 @@ In addition to resumability, the architecture must guarantee that the logical in
 
 This is a liveness obligation and additionally requires a modeled retry driver, such as:
 
-- `delivery: at_least_once` on the triggering subscription's runtime (§10.3) — an L1 fact, so a proof taking this route is `runtime_dependent`; or
+- `delivery: at_least_once` on the triggering subscription's runtime (§10.3) or on the triggering outbox input's runtime (§10.3.2) — L1 facts, so a proof taking either route is `runtime_dependent`; or
 - an inbound `RequestEffect` whose `retry` is `may_repeat` — an L0 guarantee, so that route stays `l0_only`.
 
 An inbound repeatable request may be declared among a modeled caller's effects or as a state-machine transition side effect, which is a `RequestEffect` under §22. Both driver facts re-drive the *same logical invocation*: a redelivery is another delivery of one logical message, and `may_repeat` repeats one logical request, so the re-driven attempt carries the same payload and hence the same key.
@@ -933,6 +1013,75 @@ Where a precedence exists, dispatch must preserve it when admitting invocations 
 
 This order-preservation responsibility is what replaces the logical-lane semantics of the previous model. It is a preservation obligation only: dispatch contributes no precedence of its own, so a routing declaration alone proves no ordering.
 
+### 10.3.2 `OutboxRuntime`
+
+Runtime facts for one L0 outbox input (§8.3), addressed like a subscription runtime by the `(operation, input)` pair:
+
+```yaml
+runtime:
+  outboxes:
+    operation.publish_order_event:
+      input.publish_order_event.outbox:
+        delivery: at_least_once
+        partitioning:
+          kind: keyed
+          mapping:
+            schema.OrderCreated:
+              - tenant_id
+        ordering: partition
+        dispatch:
+          pool: pool.outbox_workers
+          member_assignment:
+            kind: consistent_hash
+          batching:
+            ordering: preserved
+```
+
+An outbox runtime is deliberately its own concept, not a `SubscriptionRuntime` with the labels changed: an outbox consumer is a different architecture concept from a topic subscription, and equivalent proof machinery is not sufficient reason to erase semantic vocabulary. What *is* shared is shared because the mechanism genuinely is the same thing: `DeliverySemantics`, `MemberAssignment`, and `ExecutionPool` keep their exact §10.3–§10.6 meanings. There is no scope split — every fact of one consumer relationship is declared here, once — and each of several inputs on one outbox declares its own runtime. Absence of the whole declaration is epistemic: the logical consumption relationship exists with no usable runtime facts, never evidence that no concrete runtime exists.
+
+#### `delivery`
+
+Delivery multiplicity of one committed logical outbox message relative to this input, in the §10.3 vocabulary: `unspecified`, `at_most_once` (no redelivery; loss possible; not exactly-once execution), `at_least_once` (duplicate invocation possible; no retry count, timing, or eventual-success guarantee). Where the input declares `acknowledge_on_success = true`, a successful acknowledged invocation ends ordinary redelivery of that item for this consumer; uncertainty or failure before acknowledgement may admit another attempt under `at_least_once`.
+
+#### `partitioning`
+
+The outbox's one runtime grouping concept — partition identity **is** the logical grouping identity used for runtime consumption; there is no separate outbox grouping primitive, and no generic runtime-domain-key abstraction. `none` declares one undivided consumption domain for this consumer (implying no physical singularity — not one table, worker, or host — unless another declaration establishes it). `keyed` maps each consumed schema into the common logical partition-key domain, under the familiar tuple rules: per-schema field mappings, corresponding positions, one arity; only schemas admitted through the targeted input need participate. The keyed meaning is exactly the grouping-key relation:
+
+```
+partition_key(A) = partition_key(B)  =>  partition(A) = partition(B)
+```
+
+and nothing further — not ordering, not serialization, not member assignment, not execution affinity. Partition identity is semantic L1 topology, never a physical node identifier; distinct partitions may be physically co-located.
+
+#### `ordering`
+
+The precedence this runtime establishes among consumed messages, in the outbox's own vocabulary: `none` (no usable precedence; keyed partitioning may still exist, and the combination is meaningful), `global` (one order over everything this runtime consumes), `partition` (an independent order within each keyed partition, none between partitions — structurally valid only with keyed partitioning). As with transport order (§6), a declared order neither implies that invocations cannot overlap nor retroactively establishes business causality between the producing operations; and `ordering: partition` requires the partitioning it is interpreted over, exactly as `within_group` requires a grouping.
+
+#### `dispatch`
+
+Which member of the referenced pool owns the consumption partition — or, unpartitioned, the undivided consumption scope — from which a logical invocation is dispatched:
+
+```
+outbox message
+    |  partition key
+    v
+outbox partition
+    |  member assignment
+    v
+ExecutionPool member
+    |
+    v
+logical OutboxInput invocation
+```
+
+`member_assignment` is mandatory and carries the normative §10.6 semantics unchanged, including safe ownership transfer; no outbox-specific hash, lease, or consumer-group protocol is prescribed. No polling primitive exists either — a conforming realization may poll a table, tail a CDC stream, or consume a broker without changing the model — and no outbox-specific concurrency field exists: general execution concurrency remains `ExecutionPool.member_concurrency`. The §10.3.1 rule that dispatch preserves precedence and never invents it applies here verbatim, redelivery and ownership reassignment included.
+
+#### `batching`
+
+The declared fact that this consumer may retrieve or dispatch several logical source items together. L0 is untouched: each item remains one logical per-message invocation (§8.3), batching changes no message, partition, or input identity, creates no new idempotency identity, and leaves acknowledgement per-message. The batch's internals — sequential iteration, parallel futures, vectorized APIs, sizes, wait durations — are deliberately opaque and partly external scenario inputs.
+
+The one semantic the declaration carries is `ordering`, explicit with no default: `preserved` guarantees the opaque batch processing does not let a later message overtake an earlier one against an already-established ordering relation — without requiring literal serial execution, if an implementation is observationally consistent with the guarantee; `unspecified` provides no usable fact, and a verifier must not propagate a source ordering guarantee through the stage. Preservation is **not** a serialization guarantee: opaque batch processing may still overlap logical item evaluations, and `member_concurrency` must not be silently read as a fact about batch-internal parallelism — which is why a declared batching stage stops a serialization proof outright while an ordering proof accepts `preserved` (§9). Absent `batching` declares no batching fact, and no default silently states preservation.
+
 ### 10.4 `Router`
 
 ```
@@ -1146,9 +1295,9 @@ An input reference is not automatically replay-stable merely because two attempt
 
 ### `ValueSource::effect`
 
-References a field in the payload of a `PublicationEffect` or `RequestEffect`.
+References a field in the payload of a `PublicationEffect`, a `RequestEffect`, or an `OutboxWriteEffect`.
 
-For an operation-owned effect, the ID resolves to the inline occurrence that declares it: an `ExecuteEffect.effect_id` or an `EstablishEffectIntent.effect_id`. For a transition-owned effect it resolves, as before, to the state-machine transition side-effect declaration. This preserves the idempotency-key-propagation and value-lineage semantics without an operation effect registry.
+For an operation-owned effect, the ID resolves to the inline occurrence that declares it: an `ExecuteEffect.effect_id`, an `EstablishEffectIntent.effect_id`, or a `write_outbox` step's `effect_id` (§13.4), whose references resolve against the written message schema. For a transition-owned effect it resolves, as before, to the state-machine transition side-effect declaration. This preserves the idempotency-key-propagation and value-lineage semantics without an operation effect registry.
 
 Declaring such a reference establishes value lineage only if the surrounding declaration states how the value is propagated. It does not mean the effect has already executed.
 
@@ -1214,13 +1363,15 @@ It can bridge renamed fields or different message/request schemas.
 
 Propagation does **not** itself deduplicate anything. It allows the verifier to trace the same logical key across an effect boundary.
 
-V1 reads it on the consumer's side: for a governing key whose population rests on a topic's keyed message identity, each modeled producer of an admitted schema either declares a propagation whose targets cover the identity fields — the identity then carries the producer's key, and when that key is one of the producer's own idempotency requirements, distinct logical invocations of the producer publish distinct messages — or declares none, in which case the identity rests on the topic declaration alone. Both facts are recorded next to the consumer's verdict; neither changes it.
+V1 reads it on the consumer's side: for a governing key whose population rests on a topic's or an outbox's keyed message identity, each modeled producer of an admitted schema — a publication site, or an outbox-write site (§13.4) — either declares a propagation whose targets cover the identity fields — the identity then carries the producer's key, and when that key is one of the producer's own idempotency requirements, distinct logical invocations of the producer produce distinct messages — or declares none, in which case the identity rests on the declaration alone. Both facts are recorded next to the consumer's verdict; neither changes it. An outbox boundary does not break the lineage: `request_id -> event_id` through an outbox write, `event_id` as the outbox's message identity, `event_id` as the consumer's governing key, and onward through the consumer's own publication is one continuous lineage graph, with no outbox-specific key type.
 
 ---
 
 ## 13. Effects
 
-Effects describe work outside the operation's immediate transaction state.
+An effect describes semantically relevant work or state transition caused by an operation beyond ordinary `DataObject` mutation: external interactions, message publication, downstream requests, and transactional admission of messages to an outbox.
+
+The earlier reading — "work outside the operation's immediate transaction state" — is too narrow now that an outbox write exists, whose execution is transaction-bound while its consequences are not. The property that matters is unchanged: effects form the edges of the operation's externally relevant, transitively relevant side-effect graph, and every effect kind participates in side-effect enumeration, idempotency analysis, value lineage, blast-radius analysis, visualization, and downstream traversal.
 
 ### Effect contract versus effect instance
 
@@ -1230,7 +1381,8 @@ An operation-owned contract lives inline at its one execution or establishment s
 
 - a direct `execute_effect` or `execute_effect_async` program step declares the contract and `values` (§16);
 - an explicit `establish_effect_intent` transaction step declares the contract and `values` (§14);
-- a `transition` transaction step declares `effect_intents`, one intent binding and one derivation per side effect of the applied transition (§22).
+- a `transition` transaction step declares `effect_intents`, one intent binding and one derivation per side effect of the applied transition (§22);
+- a `write_outbox` transaction step declares an outbox-write contract and `values` — the effect kind's one legal site (§13.4).
 
 `execute_effect_intent` and `execute_effect_intent_async` consume an already-established effect instance and therefore declare no derivation: the instance's values were fixed at establishment (§14). Async is an execution mode, not a new kind of effect: there is no `AsyncEffect` contract type, and an asynchronous launch uses exactly the same `Effect`, `Derivation`, and `effect_id` semantics as its synchronous counterpart.
 
@@ -1242,7 +1394,8 @@ A synchronous effect may yield a first-class `Result<Ok, Err>` (§8.1). Which ef
 
 - a **publication** has no synchronous result and cannot bind one (§13.1);
 - a **request** inherits the result contract of the request input it targets, and never redeclares it (§13.2);
-- an **external** effect may declare `result: { ok, err }`, or declare none (§13.3).
+- an **external** effect may declare `result: { ok, err }`, or declare none (§13.3);
+- an **outbox write** has no synchronous result and its step binds nothing (§13.4).
 
 A synchronous execution site — `execute_effect` or `execute_effect_intent` — may **bind** the result under an operation-unique binding (`bind: result.charge_payment.card`). The result type is inferred from the contract, never restated at the site. A result-bearing effect may be executed without a binding when the result is deliberately ignored; an effect with no synchronous result must not declare one (validation: `EffectHasNoResult`). The binding is an attempt-local observation, not a transaction artifact, and its variant payloads are reached through `effect_result_ok` / `effect_result_err` inside a `match_result` on it (§11, §16).
 
@@ -1365,6 +1518,71 @@ Absent (`result: null`), no synchronous result is modeled and an execution site 
 The declaration carries the result's shape and the error's disposition, and combines with the effect's idempotency guarantee. For a result-bearing `ExternalEffect`, `deduplicated_by { key }` identifies one logical external interaction for equal evaluated keys and, in addition to suppressing duplicate logical work, fixes the interaction's terminal logical `Result`: after the first terminal `Ok` or terminal `Err`, every subsequent same-key execution observes the same variant and a replay-equivalent payload. Retryable `Err` outcomes are attempt-level, nonterminal outcomes and do not establish the logical interaction's terminal result; an `Err` with unspecified disposition provides no usable terminality fact.
 
 Relative to a governing key, a bound external result is therefore replay-stable — per observed variant — when the effect declares `deduplicated_by`, every component of its key is replay-stable, and the observed variant is terminal: `Ok` by definition, `Err` under a declared `terminal` disposition (§16, §18). A retryable or unspecified `Err`, a boundary declared `not_deduplicated` or with an unspecified guarantee, or an unstable key leaves the observation unusable as a replay-stable root, and a decision resting on it is not established to replay — an honest gap the checker reports rather than a fact it assumes. `not_deduplicated` does not say repeated executions return *different* results; only that the guarantee is unavailable.
+
+## 13.4 Outbox write effect
+
+An outbox write effect declares transactional admission of one message of one schema to a `DataModel` outbox (§5).
+
+```yaml
+- kind: write_outbox
+  effect_id: effect.create_order.outbox_created
+  effect:
+    outbox: outbox.order_events
+    schema: schema.OrderCreated
+    idempotency_key_propagation:
+      - source:
+          components:
+            - source: input:input.create_order.request
+              path: request_id
+        target:
+          components:
+            - source: effect:effect.create_order.outbox_created
+              path: event_id
+  values:
+    kind: deterministic
+    from:
+      - ...
+```
+
+It is a real effect, and it is distinct from a publication: both produce logical typed messages, both declare `schema` and `idempotency_key_propagation`, both participate in transitive idempotency analysis, and neither alone implies exactly-once downstream processing — but a publication's destination is a topic and its execution is external to transaction state, while an outbox write's destination is a data-model outbox and its execution exists only inside a transaction. One does not subtype the other.
+
+### One legal execution site
+
+An `OutboxWriteEffect` executes only as a transaction's `write_outbox` step. It is rejected under `execute_effect`, `execute_effect_async` (nor is the kind async-capable), `establish_effect_intent` — an outbox message is not a captured intent (§5, §14) — and it cannot appear among a transition's side effects. This is what keeps the DSL from claiming transactional outbox semantics where no containing application transaction exists. A transition that should cause an outbox message applies the transition and stages the write as two logically ordered steps of one transaction.
+
+The `write_outbox` step is an **effect execution site**, not a persistent-object insertion: `effect_id` carries the same stable execution-site role as every inline effect ID — value lineage, propagation, diagnostics, proof evidence, visualization — and `ValueSource::effect` references into the written payload resolve against the written schema (§11). Reaching the step constructs one logical message instance conforming to the schema, evaluates `values` in the transaction context at that point — preceding reads and outputs are usable under the usual rules — and stages the admission. Structurally, the destination outbox must exist, belong to the transaction's declared data model — a transaction with `data_model: null` cannot stage one, and Conseqa never infers a distributed cross-data-model atomic transaction — and admit the written schema.
+
+### Atomicity
+
+The staged admission participates in the containing transaction's atomicity:
+
+```
+T aborts   =>  no mutation commits AND the message is not admitted
+T commits  =>  the mutations commit AND the message is durably admitted
+```
+
+There is no state of the L0 machine where the commit succeeds without the declared admission, or an admission survives an abort. This is the defining atomic-outbox property, and it is exactly what an ordinary publication does not promise.
+
+### No synchronous result
+
+An outbox write has no first-class result and its step binds nothing; the transaction alone determines whether the staged write commits. It is not a substitute for a `TransactionOutput`, and the message payload is not implicitly available to later control merely because the write succeeded — data the continuation needs still exits through transaction outputs (§15).
+
+### Transaction idempotency and the write
+
+An outbox write introduces no second transaction: its admission is the containing commit's. A transaction declared `DeduplicatedBy(K)` therefore also bounds its contained writes — an already-resolved `Commit(T,K)` does not commit the body again, so no further committed occurrence of the write exists. This producer-side fact must not be confused with the outbox's message identity: `DeduplicatedBy` may prevent another logical commit; `message_identity` says when two admitted messages are the same logical message. They answer different questions.
+
+### Blast radius
+
+The producing operation's effect graph treats the write as a fully visible side-effect edge: the cascade continues through the outbox to every `OutboxInput` admitting the schema, and transitively through those consumers' own effects — for idempotency verification, effect-cascade visualization, dependency analysis, and simulation-graph construction alike. An outbox boundary never terminates the causal effect graph.
+
+### Duplicate outbox write
+
+For an upstream idempotency requirement, a potentially repeated outbox write is discharged by either of two routes, and they remain distinct:
+
+1. **Producer-suppressed.** The containing transaction's keyed commit deduplication, over a key stable for the governing attempt class, admits at most one logical commit per class — hence at most one committed occurrence of the write. No class-fixity of the message instance is needed: the single commit admitted whatever it admitted, once. This reuses the existing transaction-idempotency rules; no outbox-specific deduplication guarantee exists.
+2. **Message/consumer.** Where repeated executions may commit repeated writes, the publication pattern applies (§13.1): the destination outbox declares a keyed message identity covering the written schema, the instance is class-fixed — repeated writes then denote the *same logical message* rather than two — and every modeled consumer of that message collapses duplicate deliveries, through an idempotency requirement keyed from its outbox input that is itself proven, or through `at_most_once` outbox delivery of the one identified message. A write stamping a fresh random identifier or unstable timestamp into each attempt is not class-fixed merely because the outbox declares an identity field; the implementation must actually conform to the identity claim.
+
+As with publication, the analysis is closed-world over modeled consumers, verdicts join the one greatest-fixpoint computation with request and publication discharge, and `idempotency_key_propagation` plays no role in the producer-side discharge — a class-fixed instance already makes duplicates payload-equal; propagation remains lineage for the consumer's analysis (§12). `acknowledge_on_success` on a consumer proves no collapse either: it defines the consumption-completion boundary, not a duplicate-delivery guarantee — under at-least-once delivery, a crash after the downstream work but before acknowledgement redelivers the message, which is precisely why the consumer's own idempotency requirement is what the discharge cites.
 
 ---
 

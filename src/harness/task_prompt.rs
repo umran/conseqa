@@ -38,15 +38,17 @@ pub fn focus(kind: TaskKind) -> &'static str {
 ## Your task: decomposition
 
 Propose the shared architecture skeleton for this application: services, \
-schemas, data objects, topics, state machines, and one interface per \
-planned operation (id, service, inputs, request/subscription contracts). \
+schemas, data objects, data-model outboxes, topics, state machines, and \
+one interface per planned operation (id, service, inputs, \
+request/subscription/outbox contracts). \
 Extract every explicit correctness statement in the prompt as a prompt \
 obligation. Do not implement operation programs — establish stable \
 interfaces callers can reason against.
 
 This is the L0 application model only. The runtime topology (L1) — \
 transport grouping and ordering, subscription delivery and dispatch, \
-execution pools, request routers, storage layouts — is authored in a \
+outbox runtimes, execution pools, request routers, storage layouts — is \
+authored in a \
 later phase, once the run knows which requirements it has to \
 discharge. Do not declare any of it here, and do not shape an \
 interface around a topology you are imagining.
@@ -58,9 +60,10 @@ and the prompt obligations.",
 ## Your task: runtime topology
 
 You own the runtime topology (L1), and nothing else: transport \
-grouping and ordering, subscription delivery and dispatch, execution \
-pools and their member concurrency, request routers, and storage \
-layouts. The L0 application model is settled and not yours to change.
+grouping and ordering, subscription delivery and dispatch, outbox \
+delivery, partitioning, ordering, and dispatch, execution pools and \
+their member concurrency, request routers, and storage layouts. The L0 \
+application model is settled and not yours to change.
 
 Sometimes no topology can discharge a requirement, because the \
 application model does not carry what a proof would need — a message \

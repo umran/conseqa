@@ -7,6 +7,7 @@ pub enum ReferenceKind {
 
     DataModel,
     DataObject,
+    Outbox,
 
     Topic,
 
@@ -43,6 +44,7 @@ impl fmt::Display for ReferenceKind {
 
             Self::DataModel => "data model",
             Self::DataObject => "data object",
+            Self::Outbox => "outbox",
 
             Self::Topic => "topic",
 

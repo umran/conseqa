@@ -35,7 +35,8 @@ pub struct ValueRef {
 pub enum ValueSource {
     Input(Id),
 
-    /// A field in the payload of a Publication or Request effect.
+    /// A field in the payload of a Publication, Request, or
+    /// OutboxWrite effect.
     Effect(Id),
 
     /// A field of a transaction output: a typed value a transaction

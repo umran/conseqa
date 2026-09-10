@@ -15,6 +15,7 @@ export type IndexEntry =
   | { kind: "topic" }
   | { kind: "data_model" }
   | { kind: "object"; dataModel: Id }
+  | { kind: "outbox"; dataModel: Id }
   | { kind: "machine" }
   | { kind: "state"; machine: Id }
   | { kind: "transition"; machine: Id }
@@ -91,7 +92,10 @@ export function findTransaction(op: Operation, id: Id): Transaction | null {
 }
 
 /** Every operation-owned inline effect declaration with its id: direct
- *  execution sites and intent establishment sites, in program order. */
+ *  execution sites, intent establishment sites, and transactional
+ *  outbox-write sites, in program order. A write site's specific
+ *  contract is surfaced through the effect union's `outbox_write`
+ *  variant. */
 export function operationEffects(op: Operation): [Id, Effect][] {
   const out: [Id, Effect][] = [];
   for (const { step } of walkProgram(op.program)) {
@@ -100,6 +104,9 @@ export function operationEffects(op: Operation): [Id, Effect][] {
     } else if (step.kind === "transaction") {
       for (const inner of step.steps) {
         if (inner.kind === "establish_effect_intent") out.push([inner.effect_id, inner.effect]);
+        if (inner.kind === "write_outbox") {
+          out.push([inner.effect_id, { kind: "outbox_write", ...inner.effect }]);
+        }
       }
     }
   }
@@ -119,6 +126,9 @@ export function buildIndex(model: Model): ModelIndex {
   for (const [dmId, dm] of Object.entries(model.data_models)) {
     put(dmId, { kind: "data_model" });
     for (const objId of Object.keys(dm.objects)) put(objId, { kind: "object", dataModel: dmId });
+    for (const outboxId of Object.keys(dm.outboxes ?? {})) {
+      put(outboxId, { kind: "outbox", dataModel: dmId });
+    }
   }
 
   for (const [mId, m] of Object.entries(model.state_machines)) {
@@ -143,6 +153,8 @@ export function buildIndex(model: Model): ModelIndex {
           if (inner.kind === "establish_effect_intent") {
             put(inner.effect_id, { kind: "effect", op: opId });
             put(inner.bind, { kind: "intent", op: opId, effect: inner.effect_id, transaction: step.id });
+          } else if (inner.kind === "write_outbox") {
+            put(inner.effect_id, { kind: "effect", op: opId });
           } else if (inner.kind === "establish_transaction_output") {
             put(inner.bind, { kind: "output", op: opId, schema: inner.schema, transaction: step.id });
           } else if (inner.kind === "transition") {
@@ -252,6 +264,8 @@ export function effectSummary(model: Model, index: ModelIndex, effectId: Id): st
       return `request ${shortId(e.target.operation)} (${shortId(e.target.input)}) · retry ${e.retry}`;
     case "external":
       return `external ${e.name} · ${e.idempotency.kind}`;
+    case "outbox_write":
+      return `write ${shortId(e.schema)} → outbox ${shortId(e.outbox)}`;
   }
 }
 
@@ -264,6 +278,7 @@ export function effectResultType(model: Model, index: ModelIndex, effectId: Id):
   const e = def.effect;
   switch (e.kind) {
     case "publication":
+    case "outbox_write":
       return null;
     case "external":
       return e.result;

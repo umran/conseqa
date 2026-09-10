@@ -71,6 +71,11 @@ pub enum SymbolKey {
         object: Id,
     },
 
+    Outbox {
+        data_model: Id,
+        outbox: Id,
+    },
+
     Topic(Id),
 
     StateMachine(Id),
@@ -125,6 +130,13 @@ pub enum SymbolKey {
         input: Id,
     },
 
+    /// Delivery, partitioning, ordering, and dispatch facts for one
+    /// outbox consumer boundary.
+    OutboxRuntime {
+        operation: Id,
+        input: Id,
+    },
+
     ExecutionPool(Id),
     Router(Id),
     StorageLayout(Id),
@@ -144,6 +156,7 @@ impl SymbolKey {
             Self::Schema(_) => SymbolKind::Schema,
             Self::DataModel(_) => SymbolKind::DataModel,
             Self::DataObject { .. } => SymbolKind::DataObject,
+            Self::Outbox { .. } => SymbolKind::Outbox,
             Self::Topic(_) => SymbolKind::Topic,
             Self::StateMachine(_) => SymbolKind::StateMachine,
             Self::Transition { .. } => SymbolKind::Transition,
@@ -153,6 +166,7 @@ impl SymbolKey {
             Self::OperationRequirements(_) => SymbolKind::OperationRequirements,
             Self::TopicRuntime(_) => SymbolKind::TopicRuntime,
             Self::SubscriptionRuntime { .. } => SymbolKind::SubscriptionRuntime,
+            Self::OutboxRuntime { .. } => SymbolKind::OutboxRuntime,
             Self::ExecutionPool(_) => SymbolKind::ExecutionPool,
             Self::Router(_) => SymbolKind::Router,
             Self::StorageLayout(_) => SymbolKind::StorageLayout,
@@ -216,6 +230,9 @@ impl fmt::Display for SymbolKey {
             Self::DataObject { data_model, object } => {
                 write!(f, "data_object({data_model}/{object})")
             }
+            Self::Outbox { data_model, outbox } => {
+                write!(f, "outbox({data_model}/{outbox})")
+            }
             Self::Topic(id) => write!(f, "topic({id})"),
             Self::StateMachine(id) => write!(f, "state_machine({id})"),
             Self::Transition {
@@ -229,6 +246,9 @@ impl fmt::Display for SymbolKey {
             Self::TopicRuntime(id) => write!(f, "topic_runtime({id})"),
             Self::SubscriptionRuntime { operation, input } => {
                 write!(f, "subscription_runtime({operation}/{input})")
+            }
+            Self::OutboxRuntime { operation, input } => {
+                write!(f, "outbox_runtime({operation}/{input})")
             }
             Self::ExecutionPool(id) => write!(f, "execution_pool({id})"),
             Self::Router(id) => write!(f, "router({id})"),
@@ -269,6 +289,7 @@ pub enum SymbolKind {
     Schema,
     DataModel,
     DataObject,
+    Outbox,
     Topic,
     StateMachine,
     Transition,
@@ -278,6 +299,7 @@ pub enum SymbolKind {
     OperationRequirements,
     TopicRuntime,
     SubscriptionRuntime,
+    OutboxRuntime,
     ExecutionPool,
     Router,
     StorageLayout,

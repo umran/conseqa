@@ -26,16 +26,26 @@ rendering proceeds anyway, so imperfect models can still be inspected
 ## Views
 
 **System view** (`#/system`). Services are drawn as boundary boxes with
-their operations inside; topics, external systems, and a synthetic
-"clients" vertex (for request inputs no modeled operation invokes) sit
-around them. Edges are the model's information routes:
+their operations inside; topics, outboxes, external systems, and a
+synthetic "clients" vertex (for request inputs no modeled operation
+invokes) sit around them. Edges are the model's information routes:
 
 - publication effects: operation → topic
 - subscription inputs: topic → operation
+- outbox writes: operation → outbox — drawn distinctly from
+  publication, because the admission is atomic with a transaction's
+  commit; the edge names the transaction whose commit admits it
+- outbox inputs: outbox → operation, carrying the acknowledgement
+  declaration and, with L1 drawn, the runtime's delivery, partitioning,
+  ordering, member assignment, and batching facts
 - request effects: operation → operation
 - external effects: operation → external system
 - client requests: clients → operation, for request inputs no modeled
   operation invokes
+
+An **outbox** node (dashed teal, distinct from a topic) belongs to a
+data model and says so on the card: it is the transactional message
+collection of §5.1 of the semantics, not a logical channel.
 
 Operation-owned effects are derived directly from the program — its
 inline `execute_effect` sites and `establish_effect_intent` sites —

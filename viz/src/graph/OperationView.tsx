@@ -35,6 +35,7 @@ const EFFECT_BADGE: Record<EffectKind, { variant: "purple" | "orange" | "warning
   publication: { variant: "purple", label: "publication" },
   request: { variant: "orange", label: "request" },
   external: { variant: "warning", label: "external" },
+  outbox_write: { variant: "purple", label: "outbox write" },
 };
 
 /** Left-edge stripes reuse the system graph's edge colours, so a step's
@@ -174,6 +175,10 @@ function TxStepRow({ step, index, txId, opId }: { step: TransactionStep; index: 
     case "establish_transaction_output":
       kind = "establish output"; title = step.bind; bound = true;
       note = `← a ${shortId(step.schema)} value · values: ${step.values.kind}`;
+      break;
+    case "write_outbox":
+      kind = "write outbox"; title = shortId(step.effect.outbox);
+      note = `admits ${shortId(step.effect.schema)} atomically with the commit · values: ${step.values.kind}`;
       break;
   }
 
@@ -662,8 +667,35 @@ function RequirementsTable({ id, op }: { id: Id; op: Operation }) {
  *  shape — a routing key and a member assignment, terminating at a pool
  *  — so they are shown the same way and in the same column, next to but
  *  never mixed with the L0 contract they realize. */
-function Realization({ opId, inputId, kind }: { opId: Id; inputId: Id; kind: "request" | "subscription" }) {
+function Realization({ opId, inputId, kind }: { opId: Id; inputId: Id; kind: "request" | "subscription" | "outbox" }) {
   const { model } = useApp();
+
+  if (kind === "outbox") {
+    const runtime = model.runtime?.outboxes?.[opId]?.[inputId];
+    if (!runtime) {
+      return (
+        <>
+          <FactBadge fact={noRuntimeDeclared()} />
+          <FactBadge fact={delivery("unspecified")} />
+        </>
+      );
+    }
+    const pool = model.runtime?.execution_pools?.[runtime.dispatch.pool];
+    return (
+      <>
+        <FactBadge fact={delivery(runtime.delivery)} />
+        <Badge variant="neutral">
+          {runtime.partitioning.kind === "keyed" ? "keyed partitions" : "unpartitioned"}
+        </Badge>
+        <Badge variant="neutral">{`ordering: ${runtime.ordering}`}</Badge>
+        <FactBadge fact={memberAssignment(runtime.dispatch.member_assignment)} />
+        {runtime.dispatch.batching && (
+          <Badge variant="neutral">{`batching: ${runtime.dispatch.batching.ordering}`}</Badge>
+        )}
+        {pool && <FactBadge fact={memberConcurrency(pool.member_concurrency)} />}
+      </>
+    );
+  }
 
   if (kind === "request") {
     const routed = Object.entries(model.runtime?.routers ?? {}).find(
@@ -741,10 +773,15 @@ function InputsTable({ opId, op }: { opId: Id; op: Operation }) {
                     <span className="text-xs text-kumo-subtle">schema</span>
                     <IdLink id={input.schema}>{shortId(input.schema)}</IdLink>
                   </span>
-                ) : (
+                ) : input.kind === "subscription" ? (
                   <span className="inline-flex items-center gap-1.5">
                     <span className="text-xs text-kumo-subtle">topic</span>
                     <IdLink id={input.topic}>{shortId(input.topic)}</IdLink>
+                  </span>
+                ) : (
+                  <span className="inline-flex items-center gap-1.5">
+                    <span className="text-xs text-kumo-subtle">outbox</span>
+                    <IdLink id={input.outbox}>{shortId(input.outbox)}</IdLink>
                   </span>
                 )}
               </Table.Cell>
@@ -765,11 +802,23 @@ function InputsTable({ opId, op }: { opId: Id; op: Operation }) {
                       </span>
                     </>
                   ) : (
-                    <Badge variant="neutral">
-                      {input.messages.kind === "all"
-                        ? "all topic messages"
-                        : input.messages.schemas.map(shortId).join(", ")}
-                    </Badge>
+                    <>
+                      <Badge variant="neutral">
+                        {input.messages.kind === "all"
+                          ? input.kind === "outbox" ? "all outbox messages" : "all topic messages"
+                          : input.messages.schemas.map(shortId).join(", ")}
+                      </Badge>
+                      {input.kind === "outbox" && (
+                        <Badge variant="outline">
+                          {input.acknowledge_on_success ? "ack on success" : "no ack on success"}
+                        </Badge>
+                      )}
+                      {input.kind === "subscription" && input.acknowledge_on_success != null && (
+                        <Badge variant="outline">
+                          {input.acknowledge_on_success ? "ack on success" : "no ack on success"}
+                        </Badge>
+                      )}
+                    </>
                   )}
                 </span>
               </Table.Cell>

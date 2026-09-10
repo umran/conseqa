@@ -15,6 +15,7 @@ pub use reference::*;
 pub enum InputKind {
     Request,
     Subscription,
+    Outbox,
 }
 
 impl std::fmt::Display for InputKind {
@@ -22,6 +23,7 @@ impl std::fmt::Display for InputKind {
         match self {
             Self::Request => f.write_str("request input"),
             Self::Subscription => f.write_str("subscription input"),
+            Self::Outbox => f.write_str("outbox input"),
         }
     }
 }
@@ -121,6 +123,12 @@ struct ReferenceIndex<'a> {
     /// establishment sites.
     effect_contracts: BTreeMap<&'a Id, &'a Effect>,
 
+    /// The contract of each transactional outbox-write site, by its
+    /// inline `effect_id`. Kept apart from `effect_contracts` because
+    /// a `write_outbox` step declares the specific contract rather
+    /// than the general effect enum.
+    outbox_write_contracts: BTreeMap<&'a Id, &'a OutboxWriteEffect>,
+
     /// The schema of each inline transaction-output binder, by binding.
     output_schemas: BTreeMap<&'a Id, &'a Id>,
 
@@ -152,6 +160,7 @@ impl<'a> ReferenceIndex<'a> {
 
         let mut transition_appliers: BTreeMap<&Id, BTreeSet<&Id>> = BTreeMap::new();
         let mut effect_contracts: BTreeMap<&Id, &Effect> = BTreeMap::new();
+        let mut outbox_write_contracts: BTreeMap<&Id, &OutboxWriteEffect> = BTreeMap::new();
         let mut output_schemas: BTreeMap<&Id, &Id> = BTreeMap::new();
         let mut intent_effects: BTreeMap<&Id, &Id> = BTreeMap::new();
 
@@ -181,6 +190,11 @@ impl<'a> ReferenceIndex<'a> {
 
                                 TransactionStep::EstablishTransactionOutput(establish) => {
                                     output_schemas.insert(&establish.bind, &establish.schema);
+                                }
+
+                                TransactionStep::WriteOutbox(write) => {
+                                    outbox_write_contracts
+                                        .insert(&write.effect_id, &write.effect);
                                 }
 
                                 _ => {}
@@ -272,6 +286,7 @@ impl<'a> ReferenceIndex<'a> {
             entries,
             transition_appliers,
             effect_contracts,
+            outbox_write_contracts,
             output_schemas,
             result_bindings,
             handle_effects,
@@ -290,6 +305,11 @@ impl<'a> ReferenceIndex<'a> {
     /// The contract of an operation-owned inline effect.
     fn effect_contract(&self, effect: &Id) -> Option<&'a Effect> {
         self.effect_contracts.get(effect).copied()
+    }
+
+    /// The contract of a transactional outbox-write site.
+    fn outbox_write_contract(&self, effect: &Id) -> Option<&'a OutboxWriteEffect> {
+        self.outbox_write_contracts.get(effect).copied()
     }
 
     /// The underlying effect an async handle's execution runs.
@@ -355,6 +375,8 @@ pub fn validate(model: &Model) -> Vec<ValidationError> {
     errors.extend(validate_data_models(model));
 
     errors.extend(validate_topics(model));
+
+    errors.extend(validate_outboxes(model));
 
     errors.extend(validate_request_identity_shape(model));
 
@@ -462,6 +484,8 @@ fn is_program_local_error(error: &ValidationError) -> bool {
         | TransactionReadOutOfOrder { .. }
         | TransactionReadFieldNotSelected { .. }
         | ValueSourceOutOfScope { .. }
+        | OutboxWriteOutsideTransaction { .. }
+        | OutboxWriteCannotBeIntent { .. }
         | InvalidReferenceOwner { .. } => true,
 
         UnknownReference { expected, .. } | InvalidReferenceKind { expected, .. } => {
@@ -661,6 +685,96 @@ fn validate_message_identity_shape(model: &Model, errors: &mut Vec<ValidationErr
     }
 }
 
+/// The outbox-side counterparts of the topic checks: message-identity
+/// shape against the outbox's admitted schemas, and outbox-input
+/// message selection against the same set.
+fn validate_outboxes(model: &Model) -> Vec<ValidationError> {
+    let mut errors = Vec::new();
+
+    for data_model in model.data_models.values() {
+        for (outbox_id, outbox) in &data_model.outboxes {
+            validate_outbox_message_identity_shape(outbox_id, outbox, &mut errors);
+        }
+    }
+
+    validate_outbox_input_membership(model, &mut errors);
+
+    errors
+}
+
+fn validate_outbox_message_identity_shape(
+    outbox_id: &Id,
+    outbox: &Outbox,
+    errors: &mut Vec<ValidationError>,
+) {
+    let MessageIdentity::Keyed(MessageIdentityKey { mapping }) = &outbox.message_identity else {
+        return;
+    };
+
+    // As on a topic, the mapping may cover a subset of the admitted
+    // schemas; identity is meaningful knowledge per schema.
+    for schema in mapping.keys() {
+        if !outbox.messages.contains(schema) {
+            errors.push(ValidationError::OutboxMessageIdentitySchemaNotAdmitted {
+                outbox: outbox_id.clone(),
+                schema: schema.clone(),
+            });
+        }
+    }
+
+    let expected = mapping.values().map(Vec::len).find(|len| *len > 0);
+
+    for (schema, identity) in mapping {
+        if identity.is_empty() {
+            errors.push(ValidationError::EmptyOutboxMessageIdentity {
+                outbox: outbox_id.clone(),
+                schema: schema.clone(),
+            });
+
+            continue;
+        }
+
+        if let Some(expected) = expected
+            && identity.len() != expected
+        {
+            errors.push(ValidationError::OutboxMessageIdentityArityMismatch {
+                outbox: outbox_id.clone(),
+                schema: schema.clone(),
+                expected,
+                actual: identity.len(),
+            });
+        }
+    }
+}
+
+fn validate_outbox_input_membership(model: &Model, errors: &mut Vec<ValidationError>) {
+    for operation in model.operations.values() {
+        for (input_id, input) in &operation.inputs {
+            let Input::Outbox(input_declaration) = input else {
+                continue;
+            };
+
+            let (_, outbox) = model
+                .outbox(&input_declaration.outbox)
+                .expect("references already validated");
+
+            let MessageSelector::Only(messages) = &input_declaration.messages else {
+                continue;
+            };
+
+            for schema in messages {
+                if !outbox.messages.contains(schema) {
+                    errors.push(ValidationError::OutboxInputMessageNotAdmitted {
+                        input: input_id.clone(),
+                        outbox: input_declaration.outbox.clone(),
+                        schema: schema.clone(),
+                    });
+                }
+            }
+        }
+    }
+}
+
 fn validate_request_identity_shape(model: &Model) -> Vec<ValidationError> {
     let mut errors = Vec::new();
 
@@ -787,6 +901,16 @@ fn validate_transactions(model: &Model, index: &ReferenceIndex<'_>) -> Vec<Valid
                         );
                     }
 
+                    TransactionStep::WriteOutbox(write) => {
+                        validate_transaction_outbox(
+                            model,
+                            index,
+                            transaction,
+                            write,
+                            &mut errors,
+                        );
+                    }
+
                     TransactionStep::EstablishEffectIntent(_)
                     | TransactionStep::EstablishTransactionOutput(_) => {}
                 }
@@ -795,6 +919,55 @@ fn validate_transactions(model: &Model, index: &ReferenceIndex<'_>) -> Vec<Valid
     }
 
     errors
+}
+
+/// The transactional placement rules of an outbox write: the
+/// transaction must declare a data model, the destination outbox must
+/// belong to it — Conseqa never infers a distributed cross-data-model
+/// atomic transaction — and the outbox must admit the written schema.
+fn validate_transaction_outbox(
+    model: &Model,
+    index: &ReferenceIndex<'_>,
+    transaction: &Transaction,
+    write: &WriteOutboxEffect,
+    errors: &mut Vec<ValidationError>,
+) {
+    let info = index
+        .get(&write.effect.outbox)
+        .expect("references already validated");
+
+    let Some(data_model) = &transaction.data_model else {
+        errors.push(ValidationError::OutboxWriteMissingDataModel {
+            transaction: transaction.id.clone(),
+            effect: write.effect_id.clone(),
+            outbox: write.effect.outbox.clone(),
+        });
+
+        return;
+    };
+
+    if info.owner != Some(data_model) {
+        errors.push(ValidationError::OutboxOutsideDataModel {
+            transaction: transaction.id.clone(),
+            effect: write.effect_id.clone(),
+            data_model: data_model.clone(),
+            outbox: write.effect.outbox.clone(),
+        });
+
+        return;
+    }
+
+    let (_, outbox) = model
+        .outbox(&write.effect.outbox)
+        .expect("references already validated");
+
+    if !outbox.messages.contains(&write.effect.schema) {
+        errors.push(ValidationError::OutboxWriteMessageNotAdmitted {
+            effect: write.effect_id.clone(),
+            outbox: write.effect.outbox.clone(),
+            schema: write.effect.schema.clone(),
+        });
+    }
 }
 
 /// Applying a transition establishes one bound intent per declared
@@ -871,6 +1044,22 @@ fn validate_field_paths(model: &Model, index: &ReferenceIndex<'_>) -> Vec<Valida
         for (schema, identity) in mapping {
             for path in identity {
                 validate_schema_path(model, topic_id, schema, path, &mut errors);
+            }
+        }
+    }
+
+    // Outbox message-identity fields, under the same rules.
+    for data_model in model.data_models.values() {
+        for (outbox_id, outbox) in &data_model.outboxes {
+            let MessageIdentity::Keyed(MessageIdentityKey { mapping }) = &outbox.message_identity
+            else {
+                continue;
+            };
+
+            for (schema, identity) in mapping {
+                for path in identity {
+                    validate_schema_path(model, outbox_id, schema, path, &mut errors);
+                }
             }
         }
     }
@@ -1025,6 +1214,26 @@ fn validate_value_ref_path(
                     match &subscription.messages {
                         MessageSelector::All => {
                             for schema in &topic.messages {
+                                validate_schema_path(model, subject, schema, &value.path, errors);
+                            }
+                        }
+
+                        MessageSelector::Only(messages) => {
+                            for schema in messages {
+                                validate_schema_path(model, subject, schema, &value.path, errors);
+                            }
+                        }
+                    }
+                }
+
+                Input::Outbox(input) => {
+                    let (_, outbox) = model
+                        .outbox(&input.outbox)
+                        .expect("references already validated");
+
+                    match &input.messages {
+                        MessageSelector::All => {
+                            for schema in &outbox.messages {
                                 validate_schema_path(model, subject, schema, &value.path, errors);
                             }
                         }
@@ -1213,6 +1422,17 @@ fn validate_effect_paths(
             if let IdempotencyGuarantee::DeduplicatedBy { key } = &effect.idempotency {
                 validate_idempotency_key_paths(model, index, effect_id, context, key, errors);
             }
+        }
+
+        Effect::OutboxWrite(effect) => {
+            validate_propagation_paths(
+                model,
+                index,
+                effect_id,
+                context,
+                &effect.idempotency_key_propagation,
+                errors,
+            );
         }
     }
 }
@@ -1419,6 +1639,30 @@ fn validate_transaction_paths(
                     errors,
                 );
             }
+
+            TransactionStep::WriteOutbox(step) => {
+                // The contract's propagation paths and the instance
+                // derivation are evaluated in the transaction context
+                // at this step; propagation targets resolve against
+                // the written message schema through the effect site.
+                validate_propagation_paths(
+                    model,
+                    index,
+                    &step.effect_id,
+                    context,
+                    &step.effect.idempotency_key_propagation,
+                    errors,
+                );
+
+                validate_derivation_paths(
+                    model,
+                    index,
+                    transaction_id,
+                    context,
+                    &step.values,
+                    errors,
+                );
+            }
         }
     }
 }
@@ -1608,6 +1852,19 @@ fn validate_data_model_references(
                 errors,
             );
         }
+
+        for (outbox_id, outbox) in &data_model.outboxes {
+            for schema in &outbox.messages {
+                expect_reference(index, outbox_id, schema, ReferenceKind::Schema, errors);
+            }
+
+            if let MessageIdentity::Keyed(MessageIdentityKey { mapping }) = &outbox.message_identity
+            {
+                for schema in mapping.keys() {
+                    expect_reference(index, outbox_id, schema, ReferenceKind::Schema, errors);
+                }
+            }
+        }
     }
 }
 
@@ -1773,6 +2030,40 @@ fn validate_effect_references(
                 validate_result_type_references(index, effect_id, result, errors);
             }
         }
+
+        Effect::OutboxWrite(write) => {
+            validate_outbox_write_references(index, effect_id, context, write, errors);
+        }
+    }
+}
+
+fn validate_outbox_write_references(
+    index: &ReferenceIndex<'_>,
+    effect_id: &Id,
+    context: ValueContext<'_>,
+    effect: &OutboxWriteEffect,
+    errors: &mut Vec<ValidationError>,
+) {
+    expect_reference(
+        index,
+        effect_id,
+        &effect.outbox,
+        ReferenceKind::Outbox,
+        errors,
+    );
+
+    expect_reference(
+        index,
+        effect_id,
+        &effect.schema,
+        ReferenceKind::Schema,
+        errors,
+    );
+
+    for propagation in &effect.idempotency_key_propagation {
+        validate_idempotency_key_references(index, effect_id, context, &propagation.source, errors);
+
+        validate_idempotency_key_references(index, effect_id, context, &propagation.target, errors);
     }
 }
 
@@ -1822,6 +2113,22 @@ fn validate_input_references(
             );
 
             if let MessageSelector::Only(messages) = &subscription.messages {
+                for schema in messages {
+                    expect_reference(index, input_id, schema, ReferenceKind::Schema, errors);
+                }
+            }
+        }
+
+        Input::Outbox(input) => {
+            expect_reference(
+                index,
+                input_id,
+                &input.outbox,
+                ReferenceKind::Outbox,
+                errors,
+            );
+
+            if let MessageSelector::Only(messages) = &input.messages {
                 for schema in messages {
                     expect_reference(index, input_id, schema, ReferenceKind::Schema, errors);
                 }
@@ -1967,6 +2274,17 @@ fn validate_transaction_references(
             }
 
             TransactionStep::EstablishEffectIntent(step) => {
+                // An intent captures an effect for later execution
+                // outside the transaction, which is exactly what a
+                // transactional outbox write must never be (§68 of
+                // the outbox revision).
+                if matches!(step.effect, Effect::OutboxWrite(_)) {
+                    errors.push(ValidationError::OutboxWriteCannotBeIntent {
+                        transaction: transaction_id.clone(),
+                        effect: step.effect_id.clone(),
+                    });
+                }
+
                 // The inline effect contract's references are evaluated
                 // in the enclosing transaction context at this step.
                 validate_effect_references(
@@ -1993,6 +2311,27 @@ fn validate_transaction_references(
                     transaction_id,
                     &step.schema,
                     ReferenceKind::Schema,
+                    errors,
+                );
+
+                validate_derivation_references(
+                    index,
+                    transaction_id,
+                    context,
+                    &step.values,
+                    errors,
+                );
+            }
+
+            TransactionStep::WriteOutbox(step) => {
+                // The contract's references and the instance
+                // derivation are evaluated in the enclosing
+                // transaction context at this step.
+                validate_outbox_write_references(
+                    index,
+                    &step.effect_id,
+                    context,
+                    &step.effect,
                     errors,
                 );
 
@@ -2031,6 +2370,17 @@ fn validate_program_references(
             }
 
             OperationStep::ExecuteEffect(step) => {
+                // An outbox write's only legal execution site is a
+                // transaction's `write_outbox` step: outside one there
+                // is no containing application transaction whose
+                // commit could make the admission atomic.
+                if matches!(step.effect, Effect::OutboxWrite(_)) {
+                    errors.push(ValidationError::OutboxWriteOutsideTransaction {
+                        operation: operation_id.clone(),
+                        effect: step.effect_id.clone(),
+                    });
+                }
+
                 // The inline effect contract's references are evaluated
                 // in the operation context immediately before the step.
                 validate_effect_references(
@@ -2049,6 +2399,13 @@ fn validate_program_references(
             }
 
             OperationStep::ExecuteEffectAsync(step) => {
+                if matches!(step.effect, Effect::OutboxWrite(_)) {
+                    errors.push(ValidationError::OutboxWriteOutsideTransaction {
+                        operation: operation_id.clone(),
+                        effect: step.effect_id.clone(),
+                    });
+                }
+
                 validate_effect_references(
                     model,
                     index,
@@ -2460,6 +2817,10 @@ fn visit_declarations<'a>(
         for object_id in data_model.objects.keys() {
             visit(object_id, ReferenceKind::DataObject, Some(data_model_id));
         }
+
+        for outbox_id in data_model.outboxes.keys() {
+            visit(outbox_id, ReferenceKind::Outbox, Some(data_model_id));
+        }
     }
 
     for id in model.topics.keys() {
@@ -2557,6 +2918,14 @@ fn visit_declarations<'a>(
                                         Some(operation_id),
                                     );
                                 }
+                            }
+
+                            TransactionStep::WriteOutbox(write) => {
+                                visit(
+                                    &write.effect_id,
+                                    ReferenceKind::Effect,
+                                    Some(operation_id),
+                                );
                             }
 
                             _ => {}
@@ -2729,10 +3098,11 @@ fn expect_owned_by(
     true
 }
 
-fn input_kind(input: &Input) -> InputKind {
+pub(crate) fn input_kind(input: &Input) -> InputKind {
     match input {
         Input::Request(_) => InputKind::Request,
         Input::Subscription(_) => InputKind::Subscription,
+        Input::Outbox(_) => InputKind::Outbox,
     }
 }
 
@@ -2829,11 +3199,20 @@ fn effect_schema<'a>(
 
     let owner_info = index.get(owner).expect("effect owner exists");
 
+    // A transactional outbox write declares a typed message payload
+    // (§57 of the outbox revision): `effect:` references into it
+    // resolve against the written schema.
+    if let Some(write) = index.outbox_write_contract(effect_id) {
+        return Some(&write.schema);
+    }
+
     match owner_info.kind {
         ReferenceKind::Operation => match index.effect_contract(effect_id)? {
             Effect::Publication(effect) => Some(&effect.schema),
 
             Effect::Request(effect) => Some(&effect.schema),
+
+            Effect::OutboxWrite(effect) => Some(&effect.schema),
 
             Effect::External(_) => None,
         },
@@ -2884,13 +3263,13 @@ fn effect_result_type<'a>(
             .get(&request.target.input)?
         {
             Input::Request(input) => Some(&input.result),
-            Input::Subscription(_) => None,
+            Input::Subscription(_) | Input::Outbox(_) => None,
         }
     };
 
     match owner_info.kind {
         ReferenceKind::Operation => match index.effect_contract(effect_id)? {
-            Effect::Publication(_) => None,
+            Effect::Publication(_) | Effect::OutboxWrite(_) => None,
             Effect::Request(request) => request_result(request),
             Effect::External(external) => external.result.as_ref(),
         },

@@ -59,6 +59,11 @@ pub struct RuntimeModel {
     #[serde(default)]
     pub subscriptions: BTreeMap<Id, BTreeMap<Id, SubscriptionRuntime>>,
 
+    /// Delivery, partitioning, ordering, and dispatch facts for L0
+    /// outbox inputs, keyed by operation ID and then by input ID.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub outboxes: BTreeMap<Id, BTreeMap<Id, OutboxRuntime>>,
+
     /// The execution-resource populations invocations are assigned to.
     #[serde(default)]
     pub execution_pools: BTreeMap<Id, ExecutionPool>,
@@ -77,6 +82,7 @@ impl RuntimeModel {
     pub fn is_empty(&self) -> bool {
         self.topics.is_empty()
             && self.subscriptions.is_empty()
+            && self.outboxes.is_empty()
             && self.execution_pools.is_empty()
             && self.routers.is_empty()
             && self.storage_layouts.is_empty()
@@ -302,6 +308,188 @@ pub enum SubscriptionRoutingKey {
     /// free, and keeps the two from drifting apart. It requires a keyed
     /// grouping to name.
     GroupingKey,
+}
+
+// ---------------------------------------------------------------------
+// Outbox delivery and dispatch
+// ---------------------------------------------------------------------
+
+/// Runtime facts for one L0 outbox input, addressed by the
+/// `(operation, input)` pair the L0 model already establishes.
+///
+/// The L0 [`OutboxInput`](super::OutboxInput) says that a committed
+/// logical outbox message may invoke the operation. This says how
+/// often it may be delivered, how the consumption population is
+/// partitioned, what precedence the runtime establishes, and where
+/// invocations execute. Deliberately distinct from
+/// [`SubscriptionRuntime`]: an outbox consumer is a different
+/// architecture concept from a topic subscription, however analogous
+/// the proof machinery; only genuinely shared mechanisms —
+/// [`DeliverySemantics`], [`MemberAssignment`], [`ExecutionPool`] —
+/// are reused.
+///
+/// Unlike topic transport, there is no scope split: every fact of an
+/// outbox consumer relationship is declared here, once. Absence of the
+/// whole runtime is epistemic — the logical consumption relationship
+/// exists with no usable runtime facts — never evidence that no
+/// concrete runtime exists.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OutboxRuntime {
+    /// Delivery multiplicity of one committed logical outbox message
+    /// relative to this input — the same vocabulary subscriptions use.
+    /// Where the input declares `acknowledge_on_success`, a successful
+    /// acknowledged invocation ends ordinary redelivery of that item
+    /// for this consumer; uncertainty or failure before
+    /// acknowledgement may admit another attempt under
+    /// `at_least_once`.
+    pub delivery: DeliverySemantics,
+
+    /// The outbox's one runtime grouping concept. There is no separate
+    /// outbox grouping primitive: partition identity *is* the logical
+    /// grouping identity used for runtime consumption.
+    pub partitioning: OutboxPartitioning,
+
+    /// The precedence this runtime establishes among consumed
+    /// messages.
+    pub ordering: OutboxOrdering,
+
+    /// Where invocations execute.
+    pub dispatch: OutboxDispatch,
+}
+
+/// How the outbox consumption population is subdivided for this
+/// consumer.
+///
+/// A keyed partitioning means
+///
+/// ```text
+/// partition_key(A) = partition_key(B)  =>  partition(A) = partition(B)
+/// ```
+///
+/// and nothing further — not ordering, not serialization, not member
+/// assignment, not execution affinity. Partition identity is semantic
+/// L1 topology, never a physical node, table, or worker identifier;
+/// different partition keys may still be physically co-located.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum OutboxPartitioning {
+    /// No keyed subdivision: the relevant messages form one undivided
+    /// runtime consumption domain for this consumer. This implies no
+    /// physical singularity — not one database partition, table,
+    /// worker, or host — unless another declaration establishes it.
+    None,
+
+    /// Messages are partitioned by the mapped key.
+    Keyed(OutboxPartitionKey),
+}
+
+/// The per-schema partition-key mapping, mapping each consumed schema
+/// into the common logical partition-key domain.
+///
+/// Different schemas may map differently named fields into one domain;
+/// tuple positions correspond across schemas, so every mapped tuple
+/// has the same arity — the rule [`MessageIdentity`](super::MessageIdentity)
+/// and [`GroupingKey`] already use. Only schemas admitted through the
+/// targeted input need participate.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OutboxPartitionKey {
+    pub mapping: BTreeMap<Id, Vec<FieldPath>>,
+}
+
+/// The precedence an outbox runtime establishes among the messages
+/// consumed through it — deliberately distinct from
+/// [`OrderingSemantics`], because outbox consumption is its own
+/// architecture concept; equivalent proof machinery is not sufficient
+/// reason to erase semantic vocabulary.
+///
+/// Any declared order is a real runtime order over deliveries. It does
+/// not retroactively establish business causality, transaction
+/// happens-before, or semantic command precedence between the
+/// producing operations, and it never by itself implies that one
+/// invocation completes before the next begins.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OutboxOrdering {
+    /// No usable relative delivery/dispatch precedence exists. Keyed
+    /// partitioning may still exist; the combination is meaningful.
+    None,
+
+    /// One logical order over all messages consumed through this
+    /// runtime.
+    Global,
+
+    /// An independent logical order within each keyed outbox
+    /// partition, with no order between distinct partitions.
+    /// Structurally valid only with keyed partitioning — without one
+    /// there is no domain the guarantee could be interpreted over.
+    Partition,
+}
+
+/// Where outbox invocations execute: which member of the referenced
+/// pool owns the consumption partition — or, unpartitioned, the
+/// undivided consumption scope — from which a logical invocation is
+/// dispatched.
+///
+/// Distinct from [`SubscriptionDispatch`], and deliberately reusing
+/// [`MemberAssignment`] and [`ExecutionPool`], whose semantics are
+/// genuinely the same. No outbox-specific concurrency field exists:
+/// general execution concurrency remains
+/// [`ExecutionPool::member_concurrency`]. No polling primitive exists
+/// either — a conforming realization may poll, tail a CDC stream, or
+/// consume a broker without changing the model.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OutboxDispatch {
+    /// The execution pool invocations are assigned to.
+    pub pool: Id,
+
+    /// How partition domains are assigned to a member of that pool,
+    /// under the existing safe ownership-transfer semantics.
+    pub member_assignment: MemberAssignment,
+
+    /// The declared fact that this consumer may retrieve or dispatch
+    /// several logical source items together. Absent means no batching
+    /// fact is declared.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub batching: Option<BatchingSemantics>,
+}
+
+/// An opaque runtime batching stage over multiple logical per-message
+/// invocations.
+///
+/// L0 continues to model one logical invocation per message; a batch
+/// is a realization of several logical source-item evaluations, not a
+/// new application payload type. Whether the batch is implemented by
+/// sequential iteration, parallel futures, or vectorized APIs is below
+/// the abstraction, as are batch sizes and wait durations — external
+/// scenario inputs. Batching changes no message, partition, or input
+/// identity, and no acknowledgement semantics: each logical message is
+/// acknowledged on its own invocation's successful completion.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BatchingSemantics {
+    /// Whether established source ordering survives the batching
+    /// stage. Explicit — no default silently states preservation.
+    pub ordering: BatchOrderingPreservation,
+}
+
+/// Whether an already-established ordering relation survives opaque
+/// batch processing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BatchOrderingPreservation {
+    /// The batch-processing mechanism does not allow a later message
+    /// to overtake an earlier one in a way that violates the
+    /// established ordering relation. Not a serialization guarantee:
+    /// opaque batch processing may still overlap logical item
+    /// evaluations.
+    Preserved,
+
+    /// No usable fact says batch processing preserves existing
+    /// ordering. This does not assert that reordering occurs.
+    Unspecified,
 }
 
 // ---------------------------------------------------------------------

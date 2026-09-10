@@ -1682,6 +1682,7 @@ SYMBOL KEYS — {"kind": K, "value": V}:
   {"kind":"schema","value":"schema.Order"}
   {"kind":"data_model","value":"data.checkout"}
   {"kind":"data_object","value":{"data_model":"data.checkout","object":"object.order"}}
+  {"kind":"outbox","value":{"data_model":"data.checkout","outbox":"outbox.order_events"}}
   {"kind":"topic","value":"topic.order_events"}
   {"kind":"state_machine","value":"machine.order_lifecycle"}
   {"kind":"transition","value":{"machine":"machine.x","transition":"transition.y"}}
@@ -1691,6 +1692,7 @@ SYMBOL KEYS — {"kind": K, "value": V}:
   {"kind":"operation_requirements","value":"operation.checkout"}
   {"kind":"topic_runtime","value":"topic.order_events"}
   {"kind":"subscription_runtime","value":{"operation":"operation.x","input":"input.x.events"}}
+  {"kind":"outbox_runtime","value":{"operation":"operation.x","input":"input.x.outbox"}}
   {"kind":"execution_pool","value":"pool.order_workers"}
   {"kind":"router","value":"router.checkout"}
   {"kind":"storage_layout","value":"layout.order"}
@@ -1706,8 +1708,8 @@ GRAPH QUERIES — {"kind": K, ...}:
   {"kind":"callees","operation":"operation.x"}
   {"kind":"readers","data_model":"data.x","object":"object.y","field":"status"}   (field optional)
   {"kind":"writers","data_model":"data.x","object":"object.y","field":"status"}   (field optional)
-  {"kind":"publishers","topic":"topic.x"}
-  {"kind":"consumers","topic":"topic.x"}
+  {"kind":"publishers","topic":"topic.x"}      (also answers for an outbox id)
+  {"kind":"consumers","topic":"topic.x"}       (also answers for an outbox id)
   {"kind":"transition_users","machine":"machine.x","transition":"transition.y"}
   {"kind":"references_to","symbol":<symbol key>}
   {"kind":"impacted_by","symbol":<symbol key>,"depth":2}
@@ -1717,7 +1719,13 @@ GRAPH QUERIES — {"kind": K, ...}:
 PATCH — {"mutations": [<mutation>, ...]}; each mutation {"kind": K, ...}:
   {"kind":"put_service","id":"service.x","value":{"kind":"backend"}}
   {"kind":"put_schema","id":"schema.X","value":<schema declaration>}
-  {"kind":"put_data_model","id":"data.x","value":{"objects":{...}}}
+  {"kind":"put_data_model","id":"data.x","value":{"objects":{...},"outboxes":{...}}}
+    (outboxes optional: {"outbox.x":{"messages":["schema.X"],
+     "message_identity":{"kind":"keyed","mapping":{"schema.X":[["event_id"]]}}}}.
+     An outbox is a typed transactional message collection of the data
+     model: a transaction on the model may mutate objects AND admit
+     messages to its outboxes in one atomic commit. Written only by a
+     transaction's write_outbox step; consumed by an outbox input.)
   {"kind":"put_topic","id":"topic.x","value":{"messages":[...],"message_identity":...}}
   {"kind":"put_state_machine","id":"machine.x","value":{...}}
   {"kind":"put_operation_interface","operation":"operation.x",
@@ -1766,6 +1774,25 @@ L1 RUNTIME TOPOLOGY (all shared-skeleton writes; L1 is optional):
      topic runtime — only when the subscribed topic declares neither.
      routing key: grouping_key, which routes by the effective grouping
      domain and so requires a keyed grouping in effect at one scope.)
+  {"kind":"put_outbox_runtime","operation":"operation.x","input":"input.x.outbox",
+   "value":{"delivery":"at_least_once",
+            "partitioning":{"kind":"keyed",
+                            "mapping":{"schema.Event":[["tenant_id"]]}},
+            "ordering":"partition",
+            "dispatch":{"pool":"pool.x",
+                        "member_assignment":{"kind":"consistent_hash"},
+                        "batching":{"ordering":"preserved"}}}}
+    (all four facts are required; the target input must be kind outbox.
+     partitioning: {"kind":"none"} or keyed with a per-schema mapping
+     covering every schema the input admits — the outbox's ONE grouping
+     concept. ordering: "none" | "global" | "partition"; "partition"
+     requires keyed partitioning. member_assignment is mandatory — the
+     partition (or the undivided scope) is the assignment subject.
+     batching is optional; when present its "ordering" is explicit:
+     "preserved" | "unspecified". Batching is an opaque L1 realization
+     over per-message logical invocations: "preserved" lets an
+     established order pass through the stage, and its presence stops
+     any serialization proof regardless.)
   {"kind":"put_storage_layout","id":"layout.x",
    "value":{"object":{"data_model":"data.x","object":"object.y"},
             "partition_key":["channel_id","bucket"]}}
@@ -1775,7 +1802,25 @@ L1 RUNTIME TOPOLOGY (all shared-skeleton writes; L1 is optional):
   {"kind":"delete_top_level","symbol":<symbol key>}   (coordinator-only)
 
 Schema, topic, state-machine, input, and program declarations use the
-Conseqa model YAML structure, as JSON. Value references:
+Conseqa model YAML structure, as JSON. An outbox input:
+  {"kind":"outbox","outbox":"outbox.x",
+   "messages":{"kind":"only","schemas":["schema.X"]},
+   "acknowledge_on_success":true}
+    (acknowledge_on_success is REQUIRED here: successful logical
+     completion acknowledges the triggering message for this consumer.
+     One committed message = one logical invocation; no batch payload
+     exists at L0. A subscription input may declare the same field,
+     optionally.)
+A transactional outbox write, legal ONLY as a transaction step:
+  {"kind":"write_outbox","effect_id":"effect.x.outbox",
+   "effect":{"outbox":"outbox.x","schema":"schema.X",
+             "idempotency_key_propagation":[]},
+   "values":<derivation>}
+    (the destination outbox must belong to the transaction's data_model;
+     admission is atomic with the commit; the step binds no result. The
+     kind is rejected under execute_effect, execute_effect_async, and
+     establish_effect_intent.)
+Value references:
   {"source":"input:input.x.request","path":"order_id"}
 Derivations: {"kind":"unspecified"} or {"kind":"deterministic","from":[<value ref>...]}.
 

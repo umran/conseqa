@@ -97,6 +97,16 @@ pub enum ValidationCode {
     MessageIdentityArityMismatch,
     EmptyRequestIdentity,
 
+    OutboxInputMessageNotAdmitted,
+    OutboxWriteMessageNotAdmitted,
+    OutboxMessageIdentitySchemaNotAdmitted,
+    EmptyOutboxMessageIdentity,
+    OutboxMessageIdentityArityMismatch,
+    OutboxOutsideDataModel,
+    OutboxWriteMissingDataModel,
+    OutboxWriteOutsideTransaction,
+    OutboxWriteCannotBeIntent,
+
     TransactionObjectOutsideDataModel,
     TransactionMissingDataModel,
 
@@ -139,6 +149,13 @@ pub enum ValidationCode {
     GroupingKeyArityMismatch,
     WithinGroupWithoutGrouping,
     TransportSemanticsAtBothScopes,
+
+    // L1 — outbox partitioning, ordering, and dispatch.
+    OutboxPartitionSchemaNotAdmitted,
+    OutboxPartitionMissingSchema,
+    EmptyOutboxPartitionKey,
+    OutboxPartitionKeyArityMismatch,
+    PartitionOrderingWithoutPartitioning,
 }
 
 impl ValidationCode {
@@ -162,6 +179,11 @@ impl ValidationCode {
                 | Self::GroupingKeyArityMismatch
                 | Self::WithinGroupWithoutGrouping
                 | Self::TransportSemanticsAtBothScopes
+                | Self::OutboxPartitionSchemaNotAdmitted
+                | Self::OutboxPartitionMissingSchema
+                | Self::EmptyOutboxPartitionKey
+                | Self::OutboxPartitionKeyArityMismatch
+                | Self::PartitionOrderingWithoutPartitioning
         )
     }
 }

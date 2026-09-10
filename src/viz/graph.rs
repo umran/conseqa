@@ -28,6 +28,7 @@ pub struct Graph {
     pub services: Vec<ServiceNode>,
     pub operations: Vec<OperationNode>,
     pub topics: Vec<TopicNode>,
+    pub outboxes: Vec<OutboxNode>,
     pub externals: Vec<ExternalNode>,
 
     /// The declared L1 runtime topology, empty when the model
@@ -147,6 +148,22 @@ pub struct TopicNode {
     pub messages: Vec<Id>,
 }
 
+/// A `DataModel`-owned outbox: a transactional message collection,
+/// rendered distinctly from a topic so the atomic producer boundary
+/// stays visible.
+#[derive(Debug, Clone, Serialize)]
+pub struct OutboxNode {
+    pub id: Id,
+
+    /// The data model whose transactions may admit to this outbox.
+    pub data_model: Id,
+
+    /// `keyed` or `unspecified`.
+    pub message_identity: String,
+
+    pub messages: Vec<Id>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ExternalNode {
     pub id: String,
@@ -252,6 +269,49 @@ pub enum EdgeDetail {
         operation: Id,
         input: Id,
         schema: Id,
+    },
+
+    /// A transactional outbox write: admission is atomic with the
+    /// named transaction's commit.
+    OutboxWrite {
+        operation: Id,
+        effect: Id,
+        schema: Id,
+
+        /// The inline transaction whose commit admits the message;
+        /// absent only for the structurally invalid direct-site shape,
+        /// which validation rejects.
+        transaction: Option<Id>,
+
+        /// Program steps whose transaction stages the write.
+        executed_at: Vec<String>,
+    },
+
+    /// An outbox input: one committed logical message per logical
+    /// invocation.
+    OutboxConsume {
+        operation: Id,
+        input: Id,
+
+        /// Concrete message schemas, with `MessageSelector::All`
+        /// resolved against the outbox.
+        schemas: Vec<Id>,
+
+        acknowledge_on_success: bool,
+
+        delivery: String,
+
+        /// The declared runtime facts, absent without an outbox
+        /// runtime.
+        partitioning: Option<String>,
+        ordering: Option<String>,
+        pool: Option<Id>,
+        member_assignment: Option<String>,
+
+        /// The batching stage's ordering preservation; `None` inside
+        /// `Some` never occurs — absent means no runtime, "none" means
+        /// no batching declared.
+        batching: Option<String>,
     },
 }
 
@@ -395,6 +455,45 @@ pub fn extract(model: &Model) -> Graph {
                         });
                     }
                 }
+
+                Input::Outbox(declared) => {
+                    let schemas = match &declared.messages {
+                        MessageSelector::All => model
+                            .outbox(&declared.outbox)
+                            .map(|(_, outbox)| outbox.messages.iter().cloned().collect())
+                            .unwrap_or_default(),
+                        MessageSelector::Only(schemas) => schemas.iter().cloned().collect(),
+                    };
+
+                    let runtime = model.outbox_runtime(op_id, input_id);
+
+                    edges.push(Edge {
+                        id: next_edge_id(),
+                        from: declared.outbox.to_string(),
+                        to: op_id.to_string(),
+                        detail: EdgeDetail::OutboxConsume {
+                            operation: op_id.clone(),
+                            input: input_id.clone(),
+                            schemas,
+                            acknowledge_on_success: declared.acknowledge_on_success,
+                            delivery: to_tag(&model.outbox_delivery(op_id, input_id)),
+                            partitioning: runtime
+                                .map(|runtime| to_tag(&runtime.partitioning)),
+                            ordering: runtime.map(|runtime| to_tag(&runtime.ordering)),
+                            pool: runtime.map(|runtime| runtime.dispatch.pool.clone()),
+                            member_assignment: runtime
+                                .map(|runtime| to_tag(&runtime.dispatch.member_assignment)),
+                            batching: runtime.map(|runtime| {
+                                runtime
+                                    .dispatch
+                                    .batching
+                                    .as_ref()
+                                    .map(|batching| to_tag(&batching.ordering))
+                                    .unwrap_or_else(|| "none".to_string())
+                            }),
+                        },
+                    });
+                }
             }
         }
 
@@ -491,7 +590,55 @@ pub fn extract(model: &Model) -> Graph {
                         },
                     });
                 }
+
+                // Structurally invalid outside a transaction, but the
+                // extraction stays total over an invalid model.
+                ResolvedEffect::OutboxWrite(write) => {
+                    edges.push(Edge {
+                        id: next_edge_id(),
+                        from: op_id.to_string(),
+                        to: write.outbox.to_string(),
+                        detail: EdgeDetail::OutboxWrite {
+                            operation: op_id.clone(),
+                            effect: effect_id,
+                            schema: write.schema.clone(),
+                            transaction: None,
+                            executed_at,
+                        },
+                    });
+                }
             }
+        }
+
+        // Transactional outbox writes: one edge per `write_outbox`
+        // site, executed where its transaction step sits.
+        for (transaction_id, write) in op.program.outbox_write_declarations() {
+            let executed_at: Vec<String> = op
+                .program
+                .steps_with_locations()
+                .into_iter()
+                .filter_map(|(location, step)| match step {
+                    OperationStep::Transaction(transaction)
+                        if &transaction.id == transaction_id =>
+                    {
+                        Some(location.to_string())
+                    }
+                    _ => None,
+                })
+                .collect();
+
+            edges.push(Edge {
+                id: next_edge_id(),
+                from: op_id.to_string(),
+                to: write.effect.outbox.to_string(),
+                detail: EdgeDetail::OutboxWrite {
+                    operation: op_id.clone(),
+                    effect: write.effect_id.clone(),
+                    schema: write.effect.schema.clone(),
+                    transaction: Some(transaction_id.clone()),
+                    executed_at,
+                },
+            });
         }
 
         // Machines referenced by transition steps in inline
@@ -556,6 +703,19 @@ pub fn extract(model: &Model) -> Graph {
         })
         .collect();
 
+    let outboxes = model
+        .data_models
+        .iter()
+        .flat_map(|(data_model_id, data_model)| {
+            data_model.outboxes.iter().map(|(id, outbox)| OutboxNode {
+                id: id.clone(),
+                data_model: data_model_id.clone(),
+                message_identity: to_tag(&outbox.message_identity),
+                messages: outbox.messages.iter().cloned().collect(),
+            })
+        })
+        .collect();
+
     let externals = external_names
         .into_iter()
         .map(|name| ExternalNode {
@@ -568,6 +728,7 @@ pub fn extract(model: &Model) -> Graph {
         services,
         operations,
         topics,
+        outboxes,
         externals,
         runtime: runtime_view(model),
         client: client_used.then(|| ClientNode {
@@ -586,6 +747,15 @@ fn collect_effect_owners(model: &Model) -> BTreeMap<Id, EffectOwner> {
         for (effect_id, _) in op.program.effect_declarations() {
             owners.insert(
                 effect_id.clone(),
+                EffectOwner::Operation {
+                    operation: op_id.clone(),
+                },
+            );
+        }
+
+        for (_, write) in op.program.outbox_write_declarations() {
+            owners.insert(
+                write.effect_id.clone(),
                 EffectOwner::Operation {
                     operation: op_id.clone(),
                 },
@@ -708,6 +878,7 @@ enum ResolvedEffect<'a> {
     Publication(&'a crate::spec::PublicationEffect),
     Request(&'a crate::spec::RequestEffect),
     External(&'a crate::spec::ExternalEffect),
+    OutboxWrite(&'a crate::spec::OutboxWriteEffect),
 }
 
 impl<'a> From<&'a Effect> for ResolvedEffect<'a> {
@@ -716,6 +887,7 @@ impl<'a> From<&'a Effect> for ResolvedEffect<'a> {
             Effect::Publication(publication) => Self::Publication(publication),
             Effect::Request(request) => Self::Request(request),
             Effect::External(external) => Self::External(external),
+            Effect::OutboxWrite(write) => Self::OutboxWrite(write),
         }
     }
 }
@@ -779,6 +951,18 @@ fn runtime_view(model: &Model) -> RuntimeView {
         for (input, subscription) in inputs {
             assignments
                 .entry(&subscription.dispatch.pool)
+                .or_default()
+                .push(BoundaryRef {
+                    operation: operation.clone(),
+                    input: input.clone(),
+                });
+        }
+    }
+
+    for (operation, inputs) in &runtime.outboxes {
+        for (input, outbox_runtime) in inputs {
+            assignments
+                .entry(&outbox_runtime.dispatch.pool)
                 .or_default()
                 .push(BoundaryRef {
                     operation: operation.clone(),

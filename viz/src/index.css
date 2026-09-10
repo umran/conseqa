@@ -10,6 +10,7 @@
   --arch-edge-request: #e0a640;
   --arch-edge-external: #e08a5a;
   --arch-edge-client: #58b884;
+  --arch-edge-outbox: #5ab8b0;
 
   /* L1 reads as one hue, cooler than every L0 edge: the realization
      tabs, the data-access edges, and the object nodes all wear it. Two
@@ -50,6 +51,7 @@ svg.arch-canvas text { font-size: 12px; fill: var(--arch-text); user-select: non
 .arch-node .badge-text { fill: var(--arch-text-faint); font-size: 9.5px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; letter-spacing: 0.04em; }
 
 .arch-node.topic .body { stroke: var(--arch-edge-publish); fill: color-mix(in srgb, var(--arch-edge-publish) 12%, var(--arch-node-fill)); }
+.arch-node.outbox .body { stroke: var(--arch-edge-outbox); fill: color-mix(in srgb, var(--arch-edge-outbox) 12%, var(--arch-node-fill)); stroke-dasharray: 7 3; }
 .arch-node.external .body { stroke: var(--arch-edge-external); fill: color-mix(in srgb, var(--arch-edge-external) 12%, var(--arch-node-fill)); stroke-dasharray: 4 3; }
 .arch-node.client .body { stroke: var(--arch-edge-client); fill: color-mix(in srgb, var(--arch-edge-client) 12%, var(--arch-node-fill)); }
 .arch-node.state-node .body { stroke: var(--arch-node-line); }
@@ -68,6 +70,8 @@ svg.arch-canvas text { font-size: 12px; fill: var(--arch-text); user-select: non
 .arch-edge.request { stroke: var(--arch-edge-request); }
 .arch-edge.external { stroke: var(--arch-edge-external); }
 .arch-edge.client { stroke: var(--arch-edge-client); }
+.arch-edge.outbox_write { stroke: var(--arch-edge-outbox); }
+.arch-edge.outbox_consume { stroke: var(--arch-edge-outbox); }
 .arch-edge.unexecuted { stroke-dasharray: 5 4; opacity: 0.7; }
 /* Every execution of the effect is an async launch: the line breaks —
    there is no completion dependency on the following step — but keeps

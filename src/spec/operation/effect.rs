@@ -8,6 +8,18 @@ pub enum Effect {
     Publication(PublicationEffect),
     Request(RequestEffect),
     External(ExternalEffect),
+
+    /// Transactional admission of a message to a `DataModel` outbox.
+    ///
+    /// A real effect — it participates in the operation's side-effect
+    /// blast radius, idempotency analysis, and value lineage — with
+    /// exactly one legal execution site: a transaction's
+    /// `write_outbox` step. Validation rejects it under
+    /// `execute_effect`, `execute_effect_async`,
+    /// `establish_effect_intent`, and transition side effects; the
+    /// variant exists here so those illegal sites are rejected with a
+    /// precise diagnostic rather than a parse error.
+    OutboxWrite(OutboxWriteEffect),
 }
 
 /// Publishes one schema to one topic. A publication has no synchronous
@@ -32,6 +44,30 @@ pub struct RequestEffect {
     pub schema: Id,
     pub retry: RetrySemantics,
 
+    pub idempotency_key_propagation: Vec<IdempotencyKeyPropagation>,
+}
+
+/// Admits one logical message of one schema to a `DataModel` outbox,
+/// atomically with the containing transaction's commit.
+///
+/// The destination outbox must belong to the transaction's declared
+/// `data_model` — Conseqa never infers a distributed cross-data-model
+/// atomic transaction. Like a publication, the effect has no
+/// synchronous result and cannot bind one; the transaction alone
+/// determines whether the staged write commits.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OutboxWriteEffect {
+    /// The destination outbox, owned by the transaction's data model.
+    pub outbox: Id,
+
+    /// Schema of the admitted message.
+    pub schema: Id,
+
+    /// Lineage only, with exactly the meaning it has on a
+    /// publication: the declared target fields of the emitted message
+    /// carry the same logical idempotency identity as the declared
+    /// source values. It deduplicates nothing.
     pub idempotency_key_propagation: Vec<IdempotencyKeyPropagation>,
 }
 
@@ -80,6 +116,11 @@ impl Effect {
     pub fn permits_direct_async(&self) -> bool {
         match self {
             Self::Publication(_) | Self::Request(_) | Self::External(_) => true,
+
+            // Transaction-exclusive: admission is atomic with the
+            // containing transaction's commit, and a direct launch has
+            // no containing transaction.
+            Self::OutboxWrite(_) => false,
         }
     }
 
@@ -92,6 +133,7 @@ impl Effect {
         let propagations = match self {
             Self::Publication(effect) => &effect.idempotency_key_propagation,
             Self::Request(effect) => &effect.idempotency_key_propagation,
+            Self::OutboxWrite(effect) => &effect.idempotency_key_propagation,
             Self::External(effect) => {
                 if let IdempotencyGuarantee::DeduplicatedBy { key } = &effect.idempotency {
                     roots.extend(key.components.iter());

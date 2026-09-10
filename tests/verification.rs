@@ -187,7 +187,7 @@ fn subscription_mut<'a>(
 
     match input {
         Input::Subscription(subscription) => subscription,
-        Input::Request(_) => panic!("`{input:?}` is not a subscription"),
+        other => panic!("`{other:?}` is not a subscription"),
     }
 }
 
@@ -5194,4 +5194,464 @@ fn fire_and_forget_launches_stay_in_the_effect_cascade() {
         idempotency_verdict(&sync_model, "operation.charge_payment", 0),
         idempotency_verdict(&async_model, "operation.charge_payment", 0),
     );
+}
+
+// ---------------------------------------------------------------------
+// Transactional outboxes
+// ---------------------------------------------------------------------
+
+fn load_transactional_outbox() -> Model {
+    let path = fixture_path("transactional_outbox.yaml");
+
+    let source = fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("failed to read fixture `{}`: {error}", path.display()));
+
+    yaml::parse(&source).expect("transactional outbox fixture should parse")
+}
+
+/// Mutable access to the relay's declared outbox runtime.
+fn outbox_runtime_mut(model: &mut Model) -> &mut conseqa::spec::OutboxRuntime {
+    model
+        .runtime
+        .as_mut()
+        .expect("the fixture declares a runtime model")
+        .outboxes
+        .get_mut(&id("operation.publish_order_event"))
+        .and_then(|inputs| inputs.get_mut(&id("input.publish_order_event.outbox")))
+        .expect("the fixture declares the relay's outbox runtime")
+}
+
+/// Mutable access to the fixture's outbox declaration.
+fn outbox_mut(model: &mut Model) -> &mut conseqa::spec::Outbox {
+    model
+        .data_models
+        .get_mut(&id("data.orders"))
+        .unwrap()
+        .outboxes
+        .get_mut(&id("outbox.order_events"))
+        .expect("the fixture declares outbox.order_events")
+}
+
+/// Reshapes the producer for the message/consumer route (§51): its
+/// transaction no longer deduplicates commits and holds only the
+/// outbox write, so repeated attempts may commit repeated writes and
+/// the discharge must come from message identity plus consumer
+/// collapse.
+fn make_producer_repeat_commits(model: &mut Model) {
+    let transaction = transaction_mut(model, "operation.create_order", "tx.create_order");
+
+    transaction.idempotency = IdempotencyGuarantee::NotDeduplicated;
+    transaction
+        .steps
+        .retain(|step| matches!(step, TransactionStep::WriteOutbox(_)));
+}
+
+#[test]
+fn repeated_outbox_writes_discharge_as_the_same_logical_message() {
+    let mut model = load_transactional_outbox();
+
+    make_producer_repeat_commits(&mut model);
+
+    assert!(validation::validate(&model).is_empty());
+
+    let IdempotencyVerdict::Proven { proof, .. } =
+        idempotency_verdict(&model, "operation.create_order", 0)
+    else {
+        panic!("route two should prove");
+    };
+
+    let IdempotencyProof::RetrySafePaths { paths } = proof else {
+        panic!("expected a path walk: {proof:#?}");
+    };
+
+    let safety = paths
+        .iter()
+        .flat_map(|path| path.effects.iter())
+        .find(|effect| effect.effect == id("effect.create_order.outbox_created"))
+        .map(|effect| &effect.safety)
+        .expect("the outbox write should be judged");
+
+    let EffectSafety::SameLogicalOutboxMessage {
+        outbox, consumers, ..
+    } = safety
+    else {
+        panic!("expected the message/consumer route: {safety:#?}");
+    };
+
+    assert_eq!(outbox, &id("outbox.order_events"));
+
+    assert_eq!(
+        consumers,
+        &vec![ConsumerCollapse::ProvenRequirement {
+            operation: id("operation.publish_order_event"),
+            input: id("input.publish_order_event.outbox"),
+        }]
+    );
+}
+
+#[test]
+fn unidentified_outbox_write_defeats_the_duplicate_discharge() {
+    let mut model = load_transactional_outbox();
+
+    make_producer_repeat_commits(&mut model);
+
+    outbox_mut(&mut model).message_identity = MessageIdentity::Unspecified;
+
+    let IdempotencyVerdict::Unproven { obstacles } =
+        idempotency_verdict(&model, "operation.create_order", 0)
+    else {
+        panic!("an unidentified duplicate write should not prove");
+    };
+
+    assert!(
+        obstacles.iter().any(|obstacle| matches!(
+            obstacle,
+            IdempotencyObstacle::OutboxWriteNotIdentified { outbox, schema, .. }
+                if outbox == &id("outbox.order_events") && schema == &id("schema.OrderCreated")
+        )),
+        "{obstacles:#?}"
+    );
+}
+
+#[test]
+fn outbox_consumer_without_a_keyed_requirement_blocks_the_cascade() {
+    let mut model = load_transactional_outbox();
+
+    make_producer_repeat_commits(&mut model);
+
+    model
+        .operations
+        .get_mut(&id("operation.publish_order_event"))
+        .unwrap()
+        .requirements
+        .idempotency
+        .clear();
+
+    let IdempotencyVerdict::Unproven { obstacles } =
+        idempotency_verdict(&model, "operation.create_order", 0)
+    else {
+        panic!("an uncollapsed consumer should block the discharge");
+    };
+
+    assert!(
+        obstacles.iter().any(|obstacle| matches!(
+            obstacle,
+            IdempotencyObstacle::OutboxConsumerNotKeyed { operation, input, .. }
+                if operation == &id("operation.publish_order_event")
+                    && input == &id("input.publish_order_event.outbox")
+        )),
+        "{obstacles:#?}"
+    );
+}
+
+#[test]
+fn at_most_once_outbox_delivery_collapses_the_consumer_and_its_own_key() {
+    let mut model = load_transactional_outbox();
+
+    make_producer_repeat_commits(&mut model);
+
+    outbox_runtime_mut(&mut model).delivery = conseqa::spec::DeliverySemantics::AtMostOnce;
+
+    // The producer's duplicate write collapses at the consumer through
+    // single delivery of the one logical message.
+    let IdempotencyVerdict::Proven { proof, .. } =
+        idempotency_verdict(&model, "operation.create_order", 0)
+    else {
+        panic!("single delivery should collapse the consumer");
+    };
+
+    let IdempotencyProof::RetrySafePaths { paths } = proof else {
+        panic!("expected a path walk: {proof:#?}");
+    };
+
+    assert!(
+        paths.iter().flat_map(|path| path.effects.iter()).any(|effect| {
+            matches!(
+                &effect.safety,
+                EffectSafety::SameLogicalOutboxMessage { consumers, .. }
+                    if consumers.iter().any(|consumer| matches!(
+                        consumer,
+                        ConsumerCollapse::SingleDelivery { .. }
+                    ))
+            )
+        }),
+        "{paths:#?}"
+    );
+
+    // And the relay's own requirement becomes vacuous: same-class
+    // messages are one logical message, delivered at most once.
+    let IdempotencyVerdict::Proven { proof, .. } =
+        idempotency_verdict(&model, "operation.publish_order_event", 0)
+    else {
+        panic!("the relay should prove vacuously");
+    };
+
+    assert!(
+        matches!(
+            proof,
+            IdempotencyProof::SingleOutboxDelivery { outbox, .. }
+                if outbox == id("outbox.order_events")
+        ),
+        "expected the single-delivery route"
+    );
+}
+
+#[test]
+fn outbox_serialization_needs_an_unbatched_dispatch() {
+    let mut model = load_transactional_outbox();
+
+    model
+        .operations
+        .get_mut(&id("operation.publish_order_event"))
+        .unwrap()
+        .requirements
+        .serialization
+        .push(SerializationRequirement {
+            key: input_key("input.publish_order_event.outbox", &["tenant_id"]),
+        });
+
+    // With the declared batching stage, no serialization conclusion
+    // survives: batch-internal overlap is intentionally opaque.
+    let report = verification::verify(&model);
+
+    let batched = report
+        .serialization
+        .iter()
+        .find(|check| check.operation == id("operation.publish_order_event"))
+        .expect("the relay declares serialization");
+
+    let SerializationVerdict::Unproven { obstacles } = &batched.verdict else {
+        panic!("a batched dispatch must not prove serialization");
+    };
+
+    assert!(
+        obstacles.iter().any(|obstacle| matches!(
+            obstacle,
+            SerializationObstacle::BatchingOverlapOpaque { .. }
+        )),
+        "{obstacles:#?}"
+    );
+
+    // Without it, the keyed partition, one owning member, and the
+    // serial pool carry the proof.
+    outbox_runtime_mut(&mut model).dispatch.batching = None;
+
+    let report = verification::verify(&model);
+
+    let unbatched = report
+        .serialization
+        .iter()
+        .find(|check| check.operation == id("operation.publish_order_event"))
+        .unwrap();
+
+    assert!(
+        matches!(
+            &unbatched.verdict,
+            SerializationVerdict::Proven {
+                proof: SerializationProof::OutboxRouted { partition_keys, .. },
+                scope: ProofScope::RuntimeDependent,
+            } if partition_keys.iter().all(|fact| fact.identity == KeyIdentity::SamePath)
+        ),
+        "{:#?}",
+        unbatched.verdict
+    );
+}
+
+#[test]
+fn unspecified_batch_ordering_stops_the_outbox_ordering_proof() {
+    let mut model = load_transactional_outbox();
+
+    outbox_runtime_mut(&mut model)
+        .dispatch
+        .batching
+        .as_mut()
+        .unwrap()
+        .ordering = conseqa::spec::BatchOrderingPreservation::Unspecified;
+
+    let report = verification::verify(&model);
+
+    let ordering = report
+        .ordering
+        .iter()
+        .find(|check| check.operation == id("operation.publish_order_event"))
+        .expect("the relay declares ordering");
+
+    let verification::OrderingVerdict::Unproven { obstacles } = &ordering.verdict else {
+        panic!("an unspecified batch stage must not pass the order through");
+    };
+
+    assert!(
+        obstacles.iter().any(|obstacle| matches!(
+            obstacle,
+            verification::OrderingObstacle::BatchOrderingUnspecified { .. }
+        )),
+        "{obstacles:#?}"
+    );
+}
+
+#[test]
+fn outbox_ordering_none_is_no_precedence_source() {
+    let mut model = load_transactional_outbox();
+
+    outbox_runtime_mut(&mut model).ordering = conseqa::spec::OutboxOrdering::None;
+
+    let report = verification::verify(&model);
+
+    let ordering = report
+        .ordering
+        .iter()
+        .find(|check| check.operation == id("operation.publish_order_event"))
+        .unwrap();
+
+    let verification::OrderingVerdict::Unproven { obstacles } = &ordering.verdict else {
+        panic!("`ordering: none` declares no precedence to preserve");
+    };
+
+    assert!(
+        obstacles.iter().any(|obstacle| matches!(
+            obstacle,
+            verification::OrderingObstacle::NoOutboxPrecedence { .. }
+        )),
+        "{obstacles:#?}"
+    );
+}
+
+#[test]
+fn removing_the_outbox_runtime_leaves_its_obligations_unproven() {
+    let mut model = load_transactional_outbox();
+
+    model.runtime.as_mut().unwrap().outboxes.clear();
+
+    assert!(validation::validate(&model).is_empty());
+
+    let report = verification::verify(&model);
+
+    // Ordering loses its precedence source and mechanism.
+    let ordering = report
+        .ordering
+        .iter()
+        .find(|check| check.operation == id("operation.publish_order_event"))
+        .unwrap();
+
+    assert!(
+        matches!(
+            &ordering.verdict,
+            verification::OrderingVerdict::Unproven { obstacles }
+                if obstacles.iter().any(|obstacle| matches!(
+                    obstacle,
+                    verification::OrderingObstacle::NoOutboxRuntime { .. }
+                ))
+        ),
+        "{:#?}",
+        ordering.verdict
+    );
+
+    // Guaranteed completion loses its retry driver.
+    let recoverability = report
+        .recoverability
+        .iter()
+        .find(|check| check.operation == id("operation.publish_order_event"))
+        .unwrap();
+
+    assert!(
+        matches!(
+            &recoverability.verdict,
+            RecoverabilityVerdict::Unproven { obstacles }
+                if obstacles.iter().any(|obstacle| matches!(
+                    obstacle,
+                    RecoverabilityObstacle::NoModeledRetryDriver { .. }
+                ))
+        ),
+        "{:#?}",
+        recoverability.verdict
+    );
+
+    // The relay's idempotency stands on L0 alone: the outbox identity
+    // pins the payload and the topic cascade still collapses.
+    assert!(matches!(
+        idempotency_verdict(&model, "operation.publish_order_event", 0),
+        IdempotencyVerdict::Proven { .. }
+    ));
+}
+
+#[test]
+fn outbox_recoverability_is_driven_by_at_least_once_outbox_delivery() {
+    let model = load_transactional_outbox();
+
+    let report = verification::verify(&model);
+
+    let recoverability = report
+        .recoverability
+        .iter()
+        .find(|check| check.operation == id("operation.publish_order_event"))
+        .unwrap();
+
+    let RecoverabilityVerdict::Proven { proof, .. } = &recoverability.verdict else {
+        panic!("guaranteed completion should prove: {recoverability:#?}");
+    };
+
+    assert!(
+        matches!(
+            proof,
+            RecoverabilityProof::Guaranteed {
+                driver: RetryDriver::AtLeastOnceOutboxDelivery { outbox, .. },
+                ..
+            } if outbox == &id("outbox.order_events")
+        ),
+        "{proof:#?}"
+    );
+}
+
+#[test]
+fn outbox_write_consuming_a_same_transaction_output_stays_class_fixed() {
+    let mut model = load_transactional_outbox();
+
+    // Reshape the producer so the outbox write's derivation reads a
+    // transaction output established earlier in the same transaction.
+    {
+        let transaction = transaction_mut(&mut model, "operation.create_order", "tx.create_order");
+
+        transaction.steps.insert(
+            0,
+            TransactionStep::EstablishTransactionOutput(EstablishTransactionOutput {
+                bind: id("output.create_order.echo"),
+                schema: id("schema.CreateOrderResponse"),
+                values: Derivation::Deterministic {
+                    from: vec![input_key("input.create_order.request", &["order_id"])],
+                },
+            }),
+        );
+
+        for step in &mut transaction.steps {
+            if let TransactionStep::WriteOutbox(write) = step {
+                write.values = Derivation::Deterministic {
+                    from: vec![
+                        input_key("input.create_order.request", &["request_id"]),
+                        output_ref("output.create_order.echo", &["order_id"]),
+                    ],
+                };
+            }
+        }
+    }
+
+    assert!(validation::validate(&model).is_empty());
+
+    assert!(matches!(
+        idempotency_verdict(&model, "operation.create_order", 0),
+        IdempotencyVerdict::Proven { .. }
+    ));
+}
+
+#[test]
+fn outbox_verification_report_round_trips_through_json() {
+    let model = load_transactional_outbox();
+
+    let report = verification::verify(&model);
+
+    let serialized = serde_json::to_string(&report).expect("report should serialize");
+
+    let reparsed: verification::VerificationReport =
+        serde_json::from_str(&serialized).expect("report should reparse");
+
+    assert_eq!(report, reparsed);
 }

@@ -1,0 +1,308 @@
+# The canonical transactional outbox (§70–§73 of the outbox revision):
+# create an order and admit OrderCreated to the data model's outbox in
+# one atomic commit; a relay consumes the outbox one logical message at
+# a time and publishes onto a keyed topic; a projector consumes the
+# topic.
+#
+# Everything declared proves. The producer discharges its duplicate
+# outbox write through the transaction's keyed commit (route one, §50);
+# the relay's own idempotency is keyed from the outbox message identity
+# that the producer's propagation carries; the relay's ordering rests
+# on the outbox runtime's keyed partitioning, partition ordering,
+# consistent-hash assignment, serial pool, and order-preserving
+# batching; its guaranteed completion is driven by at-least-once outbox
+# delivery.
+revision: 1
+services:
+  service.orders:
+    kind: backend
+  service.relay:
+    kind: worker
+  service.analytics:
+    kind: worker
+schemas:
+  schema.CreateOrderRequest:
+    kind: canonical
+    completeness: complete
+    fields:
+      request_id: string
+      order_id: uuid
+      tenant_id: uuid
+      amount: decimal
+  schema.CreateOrderResponse:
+    kind: canonical
+    completeness: complete
+    fields:
+      order_id: uuid
+  schema.RequestRejected:
+    kind: canonical
+    completeness: complete
+    fields:
+      reason: string
+  schema.Order:
+    kind: canonical
+    completeness: complete
+    fields:
+      order_id: uuid
+      tenant_id: uuid
+      amount: decimal
+  schema.OrderCreated:
+    kind: canonical
+    completeness: complete
+    fields:
+      event_id: string
+      order_id: uuid
+      tenant_id: uuid
+      amount: decimal
+  schema.OrderProjection:
+    kind: canonical
+    completeness: complete
+    fields:
+      event_id: string
+      order_id: uuid
+data_models:
+  data.orders:
+    objects:
+      object.order:
+        schema: schema.Order
+        identity:
+        - order_id
+    outboxes:
+      outbox.order_events:
+        messages:
+        - schema.OrderCreated
+        message_identity:
+          kind: keyed
+          mapping:
+            schema.OrderCreated:
+            - event_id
+  data.analytics:
+    objects:
+      object.order_projection:
+        schema: schema.OrderProjection
+        identity:
+        - order_id
+topics:
+  topic.order_events:
+    messages:
+    - schema.OrderCreated
+    message_identity:
+      kind: keyed
+      mapping:
+        schema.OrderCreated:
+        - event_id
+state_machines: {}
+operations:
+  operation.create_order:
+    service: service.orders
+    description: Create an order and admit OrderCreated to the outbox atomically.
+    inputs:
+      input.create_order.request:
+        kind: request
+        schema: schema.CreateOrderRequest
+        identity:
+          kind: keyed
+          fields:
+          - request_id
+        result:
+          ok: schema.CreateOrderResponse
+          err: schema.RequestRejected
+    program:
+      steps:
+      - kind: transaction
+        id: tx.create_order
+        data_model: data.orders
+        isolation: read_committed
+        idempotency:
+          kind: deduplicated_by
+          key:
+            components:
+            - source: input:input.create_order.request
+              path: request_id
+        steps:
+        - kind: insert
+          object: object.order
+          values:
+            kind: deterministic
+            from:
+            - source: input:input.create_order.request
+              path: order_id
+            - source: input:input.create_order.request
+              path: tenant_id
+            - source: input:input.create_order.request
+              path: amount
+        - kind: write_outbox
+          effect_id: effect.create_order.outbox_created
+          effect:
+            outbox: outbox.order_events
+            schema: schema.OrderCreated
+            idempotency_key_propagation:
+            - source:
+                components:
+                - source: input:input.create_order.request
+                  path: request_id
+              target:
+                components:
+                - source: effect:effect.create_order.outbox_created
+                  path: event_id
+          values:
+            kind: deterministic
+            from:
+            - source: input:input.create_order.request
+              path: request_id
+            - source: input:input.create_order.request
+              path: order_id
+            - source: input:input.create_order.request
+              path: tenant_id
+            - source: input:input.create_order.request
+              path: amount
+      - kind: return
+        request: input.create_order.request
+        outcome:
+          kind: ok
+          values:
+            kind: deterministic
+            from:
+            - source: input:input.create_order.request
+              path: order_id
+    requirements:
+      serialization: []
+      ordering: []
+      idempotency:
+      - key:
+          components:
+          - source: input:input.create_order.request
+            path: request_id
+        result: replay_consistent
+      recoverability:
+      - key:
+          components:
+          - source: input:input.create_order.request
+            path: request_id
+        completion: resumable
+  operation.publish_order_event:
+    service: service.relay
+    description: Relay one committed outbox message onto the order-events topic.
+    inputs:
+      input.publish_order_event.outbox:
+        kind: outbox
+        outbox: outbox.order_events
+        messages:
+          kind: only
+          schemas:
+          - schema.OrderCreated
+        acknowledge_on_success: true
+    program:
+      steps:
+      - kind: execute_effect
+        effect_id: effect.publish_order_event.created
+        effect:
+          kind: publication
+          topic: topic.order_events
+          schema: schema.OrderCreated
+          idempotency_key_propagation:
+          - source:
+              components:
+              - source: input:input.publish_order_event.outbox
+                path: event_id
+            target:
+              components:
+              - source: effect:effect.publish_order_event.created
+                path: event_id
+        values:
+          kind: deterministic
+          from:
+          - source: input:input.publish_order_event.outbox
+            path: event_id
+          - source: input:input.publish_order_event.outbox
+            path: order_id
+          - source: input:input.publish_order_event.outbox
+            path: tenant_id
+          - source: input:input.publish_order_event.outbox
+            path: amount
+      - kind: complete
+    requirements:
+      serialization: []
+      ordering:
+      - key:
+          source: input:input.publish_order_event.outbox
+          path: tenant_id
+      idempotency:
+      - key:
+          components:
+          - source: input:input.publish_order_event.outbox
+            path: event_id
+        result: unspecified
+      recoverability:
+      - key:
+          components:
+          - source: input:input.publish_order_event.outbox
+            path: event_id
+        completion: guaranteed
+  operation.project_order:
+    service: service.analytics
+    description: Project OrderCreated into the analytics store.
+    inputs:
+      input.project_order.created:
+        kind: subscription
+        topic: topic.order_events
+        messages:
+          kind: only
+          schemas:
+          - schema.OrderCreated
+        acknowledge_on_success: true
+    program:
+      steps:
+      - kind: transaction
+        id: tx.project_order
+        data_model: data.analytics
+        isolation: read_committed
+        idempotency:
+          kind: deduplicated_by
+          key:
+            components:
+            - source: input:input.project_order.created
+              path: event_id
+        steps:
+        - kind: insert
+          object: object.order_projection
+          values:
+            kind: deterministic
+            from:
+            - source: input:input.project_order.created
+              path: event_id
+            - source: input:input.project_order.created
+              path: order_id
+      - kind: complete
+    requirements:
+      serialization: []
+      ordering: []
+      idempotency:
+      - key:
+          components:
+          - source: input:input.project_order.created
+            path: event_id
+        result: unspecified
+      recoverability: []
+runtime:
+  outboxes:
+    operation.publish_order_event:
+      input.publish_order_event.outbox:
+        delivery: at_least_once
+        partitioning:
+          kind: keyed
+          mapping:
+            schema.OrderCreated:
+            - tenant_id
+        ordering: partition
+        dispatch:
+          pool: pool.outbox_workers
+          member_assignment:
+            kind: consistent_hash
+          batching:
+            ordering: preserved
+  execution_pools:
+    pool.outbox_workers:
+      member_concurrency:
+        kind: bounded
+        value: 1

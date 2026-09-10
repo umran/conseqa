@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::spec::{Id, ResultVariant};
 
-use super::{Derivation, Effect, SelectorValue, Transaction, ValueRef};
+use super::{Derivation, Effect, SelectorValue, Transaction, ValueRef, WriteOutboxEffect};
 
 /// The one explicit control structure of an operation.
 ///
@@ -571,6 +571,28 @@ impl OperationBlock {
                 }
 
                 _ => {}
+            }
+        }
+
+        out
+    }
+
+    /// Every transactional outbox-write declaration of the program,
+    /// with the inline transaction that carries it, in program order.
+    ///
+    /// Kept apart from [`effect_declarations`](Self::effect_declarations)
+    /// because a `write_outbox` step declares the specific
+    /// `OutboxWriteEffect` contract rather than the general effect
+    /// enum, and its one legal execution context — the containing
+    /// transaction — is part of what a consumer needs to know.
+    pub fn outbox_write_declarations(&self) -> Vec<(&Id, &WriteOutboxEffect)> {
+        let mut out = Vec::new();
+
+        for (_, transaction) in self.transactions() {
+            for inner in &transaction.steps {
+                if let super::TransactionStep::WriteOutbox(write) = inner {
+                    out.push((&transaction.id, write));
+                }
             }
         }
 

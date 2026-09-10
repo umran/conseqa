@@ -526,6 +526,7 @@ async fn bundles_fall_back_to_interfaces_before_analysis_and_use_summaries_after
                     messages: MessageSelector::Only(
                         [id("schema.OrderPaid")].into_iter().collect(),
                     ),
+                    acknowledge_on_success: None,
                 }),
             )]),
         }),

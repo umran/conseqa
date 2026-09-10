@@ -3745,3 +3745,414 @@ fn rejects_an_invalid_dedup_key_path_in_an_async_launch() {
         "{errors:#?}"
     );
 }
+
+// ---------------------------------------------------------------------
+// Transactional outboxes
+// ---------------------------------------------------------------------
+
+fn load_transactional_outbox() -> Model {
+    let path = fixture_path("transactional_outbox.yaml");
+
+    let source = fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("failed to read fixture `{}`: {error}", path.display()));
+
+    yaml::parse(&source).expect("transactional outbox fixture should parse")
+}
+
+/// The producer's `write_outbox` step, detached for reuse at sites
+/// that must reject it.
+fn detach_outbox_write(model: &mut Model) -> conseqa::spec::WriteOutboxEffect {
+    let transaction = transaction_mut(model, "operation.create_order", "tx.create_order");
+
+    let position = transaction
+        .steps
+        .iter()
+        .position(|step| matches!(step, TransactionStep::WriteOutbox(_)))
+        .expect("the fixture stages an outbox write");
+
+    let TransactionStep::WriteOutbox(write) = transaction.steps.remove(position) else {
+        unreachable!()
+    };
+
+    write
+}
+
+#[test]
+fn rejects_an_outbox_write_outside_a_transaction() {
+    let mut model = load_transactional_outbox();
+
+    let write = detach_outbox_write(&mut model);
+
+    program_mut(&mut model, "operation.create_order").steps.insert(
+        1,
+        OperationStep::ExecuteEffect(ExecuteEffect {
+            effect_id: write.effect_id.clone(),
+            effect: Effect::OutboxWrite(write.effect),
+            values: write.values,
+            bind: None,
+        }),
+    );
+
+    let errors = validation::validate(&model);
+
+    assert_eq!(
+        errors,
+        vec![ValidationError::OutboxWriteOutsideTransaction {
+            operation: id("operation.create_order"),
+            effect: id("effect.create_order.outbox_created"),
+        }]
+    );
+}
+
+#[test]
+fn rejects_an_outbox_write_launched_asynchronously() {
+    let mut model = load_transactional_outbox();
+
+    let write = detach_outbox_write(&mut model);
+
+    program_mut(&mut model, "operation.create_order").steps.insert(
+        1,
+        OperationStep::ExecuteEffectAsync(ExecuteEffectAsync {
+            handle: id("async.create_order.outbox"),
+            effect_id: write.effect_id.clone(),
+            effect: Effect::OutboxWrite(write.effect),
+            values: write.values,
+        }),
+    );
+
+    let errors = validation::validate(&model);
+
+    assert!(
+        errors.contains(&ValidationError::OutboxWriteOutsideTransaction {
+            operation: id("operation.create_order"),
+            effect: id("effect.create_order.outbox_created"),
+        }),
+        "{errors:#?}"
+    );
+}
+
+#[test]
+fn rejects_an_outbox_write_captured_as_an_intent() {
+    let mut model = load_transactional_outbox();
+
+    let write = detach_outbox_write(&mut model);
+
+    transaction_mut(&mut model, "operation.create_order", "tx.create_order")
+        .steps
+        .push(TransactionStep::EstablishEffectIntent(
+            conseqa::spec::EstablishEffectIntent {
+                bind: id("intent.create_order.outbox"),
+                effect_id: write.effect_id.clone(),
+                effect: Effect::OutboxWrite(write.effect),
+                values: write.values,
+            },
+        ));
+
+    let errors = validation::validate(&model);
+
+    assert_eq!(
+        errors,
+        vec![ValidationError::OutboxWriteCannotBeIntent {
+            transaction: id("tx.create_order"),
+            effect: id("effect.create_order.outbox_created"),
+        }]
+    );
+}
+
+#[test]
+fn rejects_an_outbox_of_another_data_model() {
+    let mut model = load_transactional_outbox();
+
+    // Move the outbox to the analytics data model; the producer's
+    // transaction still declares data.orders.
+    let outbox = model
+        .data_models
+        .get_mut(&id("data.orders"))
+        .unwrap()
+        .outboxes
+        .remove(&id("outbox.order_events"))
+        .unwrap();
+
+    model
+        .data_models
+        .get_mut(&id("data.analytics"))
+        .unwrap()
+        .outboxes
+        .insert(id("outbox.order_events"), outbox);
+
+    let errors = validation::validate(&model);
+
+    assert_eq!(
+        errors,
+        vec![ValidationError::OutboxOutsideDataModel {
+            transaction: id("tx.create_order"),
+            effect: id("effect.create_order.outbox_created"),
+            data_model: id("data.orders"),
+            outbox: id("outbox.order_events"),
+        }]
+    );
+}
+
+#[test]
+fn rejects_an_outbox_write_in_a_transaction_without_a_data_model() {
+    let mut model = load_transactional_outbox();
+
+    let transaction = transaction_mut(&mut model, "operation.create_order", "tx.create_order");
+
+    transaction.data_model = None;
+    transaction
+        .steps
+        .retain(|step| matches!(step, TransactionStep::WriteOutbox(_)));
+
+    let errors = validation::validate(&model);
+
+    assert_eq!(
+        errors,
+        vec![ValidationError::OutboxWriteMissingDataModel {
+            transaction: id("tx.create_order"),
+            effect: id("effect.create_order.outbox_created"),
+            outbox: id("outbox.order_events"),
+        }]
+    );
+}
+
+#[test]
+fn rejects_an_outbox_write_of_an_unadmitted_schema() {
+    let mut model = load_transactional_outbox();
+
+    let transaction = transaction_mut(&mut model, "operation.create_order", "tx.create_order");
+
+    for step in &mut transaction.steps {
+        if let TransactionStep::WriteOutbox(write) = step {
+            write.effect.schema = id("schema.OrderProjection");
+        }
+    }
+
+    let errors = validation::validate(&model);
+
+    assert!(
+        errors.contains(&ValidationError::OutboxWriteMessageNotAdmitted {
+            effect: id("effect.create_order.outbox_created"),
+            outbox: id("outbox.order_events"),
+            schema: id("schema.OrderProjection"),
+        }),
+        "{errors:#?}"
+    );
+}
+
+#[test]
+fn rejects_an_outbox_input_selecting_an_unadmitted_schema() {
+    let mut model = load_transactional_outbox();
+
+    let Some(Input::Outbox(input)) = model
+        .operations
+        .get_mut(&id("operation.publish_order_event"))
+        .unwrap()
+        .inputs
+        .get_mut(&id("input.publish_order_event.outbox"))
+    else {
+        panic!("the relay consumes the outbox");
+    };
+
+    input.messages =
+        MessageSelector::Only([id("schema.OrderProjection")].into_iter().collect());
+
+    let errors = validation::validate(&model);
+
+    assert!(
+        errors.contains(&ValidationError::OutboxInputMessageNotAdmitted {
+            input: id("input.publish_order_event.outbox"),
+            outbox: id("outbox.order_events"),
+            schema: id("schema.OrderProjection"),
+        }),
+        "{errors:#?}"
+    );
+}
+
+#[test]
+fn rejects_outbox_identity_defects() {
+    let mut model = load_transactional_outbox();
+
+    let outbox = model
+        .data_models
+        .get_mut(&id("data.orders"))
+        .unwrap()
+        .outboxes
+        .get_mut(&id("outbox.order_events"))
+        .unwrap();
+
+    let MessageIdentity::Keyed(key) = &mut outbox.message_identity else {
+        panic!("the fixture declares a keyed identity");
+    };
+
+    // An unadmitted mapped schema, and an empty tuple for the admitted
+    // one.
+    key.mapping.insert(id("schema.OrderProjection"), vec![path(&["event_id"])]);
+    key.mapping.insert(id("schema.OrderCreated"), Vec::new());
+
+    let errors = validation::validate(&model);
+
+    assert!(
+        errors.contains(&ValidationError::OutboxMessageIdentitySchemaNotAdmitted {
+            outbox: id("outbox.order_events"),
+            schema: id("schema.OrderProjection"),
+        }),
+        "{errors:#?}"
+    );
+
+    assert!(
+        errors.contains(&ValidationError::EmptyOutboxMessageIdentity {
+            outbox: id("outbox.order_events"),
+            schema: id("schema.OrderCreated"),
+        }),
+        "{errors:#?}"
+    );
+}
+
+fn outbox_runtime_mut(model: &mut Model) -> &mut conseqa::spec::OutboxRuntime {
+    model
+        .runtime
+        .as_mut()
+        .unwrap()
+        .outboxes
+        .get_mut(&id("operation.publish_order_event"))
+        .and_then(|inputs| inputs.get_mut(&id("input.publish_order_event.outbox")))
+        .unwrap()
+}
+
+#[test]
+fn rejects_partition_ordering_without_keyed_partitioning() {
+    let mut model = load_transactional_outbox();
+
+    outbox_runtime_mut(&mut model).partitioning = conseqa::spec::OutboxPartitioning::None;
+
+    let errors = validation::validate(&model);
+
+    assert_eq!(
+        errors,
+        vec![ValidationError::PartitionOrderingWithoutPartitioning {
+            input: id("input.publish_order_event.outbox"),
+        }]
+    );
+}
+
+#[test]
+fn rejects_partition_mapping_defects() {
+    let mut model = load_transactional_outbox();
+
+    // Admit a second schema through the outbox and the input, leaving
+    // it unmapped; map an unadmitted third one with an empty tuple.
+    model
+        .data_models
+        .get_mut(&id("data.orders"))
+        .unwrap()
+        .outboxes
+        .get_mut(&id("outbox.order_events"))
+        .unwrap()
+        .messages
+        .insert(id("schema.OrderProjection"));
+
+    let Some(Input::Outbox(input)) = model
+        .operations
+        .get_mut(&id("operation.publish_order_event"))
+        .unwrap()
+        .inputs
+        .get_mut(&id("input.publish_order_event.outbox"))
+    else {
+        panic!("the relay consumes the outbox");
+    };
+
+    input.messages = MessageSelector::All;
+
+    let runtime = outbox_runtime_mut(&mut model);
+
+    let conseqa::spec::OutboxPartitioning::Keyed(key) = &mut runtime.partitioning else {
+        panic!("the fixture partitions by key");
+    };
+
+    key.mapping.insert(id("schema.CreateOrderResponse"), Vec::new());
+
+    let errors = validation::validate(&model);
+
+    assert!(
+        errors.contains(&ValidationError::OutboxPartitionMissingSchema {
+            input: id("input.publish_order_event.outbox"),
+            outbox: id("outbox.order_events"),
+            schema: id("schema.OrderProjection"),
+        }),
+        "{errors:#?}"
+    );
+
+    assert!(
+        errors.contains(&ValidationError::OutboxPartitionSchemaNotAdmitted {
+            input: id("input.publish_order_event.outbox"),
+            outbox: id("outbox.order_events"),
+            schema: id("schema.CreateOrderResponse"),
+        }),
+        "{errors:#?}"
+    );
+
+    assert!(
+        errors.contains(&ValidationError::EmptyOutboxPartitionKey {
+            input: id("input.publish_order_event.outbox"),
+            schema: id("schema.CreateOrderResponse"),
+        }),
+        "{errors:#?}"
+    );
+}
+
+#[test]
+fn rejects_an_outbox_runtime_on_a_non_outbox_input() {
+    let mut model = load_transactional_outbox();
+
+    let declared = outbox_runtime_mut(&mut model).clone();
+
+    let runtime = model.runtime.as_mut().unwrap();
+
+    runtime.outboxes.clear();
+    runtime
+        .outboxes
+        .entry(id("operation.create_order"))
+        .or_default()
+        .insert(id("input.create_order.request"), declared);
+
+    let errors = validation::validate(&model);
+
+    assert_eq!(
+        errors,
+        vec![ValidationError::InvalidInputKind {
+            subject: id("input.create_order.request"),
+            input: id("input.create_order.request"),
+            expected: validation::InputKind::Outbox,
+            actual: validation::InputKind::Request,
+        }]
+    );
+}
+
+#[test]
+fn rejects_an_unknown_outbox_reference() {
+    let mut model = load_transactional_outbox();
+
+    let Some(Input::Outbox(input)) = model
+        .operations
+        .get_mut(&id("operation.publish_order_event"))
+        .unwrap()
+        .inputs
+        .get_mut(&id("input.publish_order_event.outbox"))
+    else {
+        panic!("the relay consumes the outbox");
+    };
+
+    input.outbox = id("outbox.missing");
+
+    let errors = validation::validate(&model);
+
+    assert!(
+        errors.contains(&ValidationError::UnknownReference {
+            subject: id("input.publish_order_event.outbox"),
+            reference: id("outbox.missing"),
+            expected: ReferenceKind::Outbox,
+        }),
+        "{errors:#?}"
+    );
+}

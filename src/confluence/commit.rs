@@ -251,6 +251,16 @@ pub fn skeleton_diagnostics(workspace: &WorkspaceState) -> Vec<DraftDiagnostic> 
         }
     }
 
+    for (operation, inputs) in &workspace.runtime.outboxes {
+        for (input, value) in inputs {
+            mutations.push(Mutation::PutOutboxRuntime {
+                operation: operation.clone(),
+                input: input.clone(),
+                value: value.clone(),
+            });
+        }
+    }
+
     for (id, value) in &workspace.runtime.routers {
         mutations.push(Mutation::PutRouter {
             id: id.clone(),
@@ -374,6 +384,19 @@ fn apply_mutation(
                 .insert(input.clone(), value.clone());
         }
 
+        Mutation::PutOutboxRuntime {
+            operation,
+            input,
+            value,
+        } => {
+            workspace
+                .runtime
+                .outboxes
+                .entry(operation.clone())
+                .or_default()
+                .insert(input.clone(), value.clone());
+        }
+
         Mutation::PutExecutionPool { id, value } => {
             workspace
                 .runtime
@@ -446,6 +469,23 @@ fn apply_mutation(
                     workspace
                         .runtime
                         .subscriptions
+                        .retain(|_, inputs| !inputs.is_empty());
+
+                    removed
+                }
+
+                SymbolKey::OutboxRuntime { operation, input } => {
+                    let removed = workspace
+                        .runtime
+                        .outboxes
+                        .get_mut(operation)
+                        .and_then(|inputs| inputs.remove(input))
+                        .is_some();
+
+                    // Same emptiness rule as subscription runtimes.
+                    workspace
+                        .runtime
+                        .outboxes
                         .retain(|_, inputs| !inputs.is_empty());
 
                     removed
@@ -735,6 +775,14 @@ fn check_patch(candidate: &WorkspaceState, patch: &SpecPatch) -> Vec<DraftDiagno
                 check_subscription_runtime(candidate, operation, input, value, &mut diagnostics);
             }
 
+            Mutation::PutOutboxRuntime {
+                operation,
+                input,
+                value,
+            } => {
+                check_outbox_runtime(candidate, operation, input, value, &mut diagnostics);
+            }
+
             Mutation::PutTopicRuntime { topic, value } => {
                 check_topic_runtime(candidate, topic, value, &mut diagnostics);
             }
@@ -964,7 +1012,54 @@ fn check_input(
                 }
             }
         }
+
+        Input::Outbox(declared) => {
+            let outbox = find_outbox(candidate, &declared.outbox);
+
+            if outbox.is_none() {
+                diagnostics.push(DraftDiagnostic::new(
+                    Some(SymbolKey::DataModel(declared.outbox.clone())),
+                    format!(
+                        "input {input_id} of {operation} consumes outbox {}, which no data model declares",
+                        declared.outbox
+                    ),
+                ));
+            }
+
+            if let (MessageSelector::Only(schemas), Some((_, outbox))) =
+                (&declared.messages, outbox)
+            {
+                for schema in schemas {
+                    if !outbox.messages.contains(schema) {
+                        diagnostics.push(DraftDiagnostic::new(
+                            Some(SymbolKey::Schema(schema.clone())),
+                            format!(
+                                "input {input_id} of {operation} selects {schema}, which outbox {} does not admit",
+                                declared.outbox
+                            ),
+                        ));
+                    }
+                }
+            }
+        }
     }
+}
+
+/// The named outbox and its owning data model, resolved across the
+/// candidate's data models.
+fn find_outbox<'a>(
+    candidate: &'a WorkspaceState,
+    outbox: &Id,
+) -> Option<(&'a Id, &'a crate::spec::Outbox)> {
+    candidate
+        .data_models
+        .iter()
+        .find_map(|(data_model_id, data_model)| {
+            data_model
+                .outboxes
+                .get(outbox)
+                .map(|declared| (data_model_id, declared))
+        })
 }
 
 fn check_program(
@@ -1017,6 +1112,26 @@ fn check_program(
                         });
                     }
                 }
+            }
+
+            // Legal only as a transaction's `write_outbox` step — the
+            // whole-model validator rejects this site — but its
+            // references are still checked so both defects surface at
+            // once.
+            Effect::OutboxWrite(write) => {
+                if find_outbox(candidate, &write.outbox).is_none() {
+                    diagnostics.push(DraftDiagnostic::new(
+                        Some(SymbolKey::DataModel(write.outbox.clone())),
+                        format!(
+                            "effect {site} of {operation} targets outbox {}, which no data model declares",
+                            write.outbox
+                        ),
+                    ));
+                }
+
+                require_schema(candidate, &write.schema, diagnostics, || {
+                    format!("effect {site} of {operation}")
+                });
             }
         }
     };
@@ -1148,6 +1263,55 @@ fn check_program(
                             require_schema(candidate, &establish.schema, diagnostics, || {
                                 format!("output {} of {operation}", establish.bind)
                             });
+                        }
+
+                        TransactionStep::WriteOutbox(write) => {
+                            effect_ids.push(write.effect_id.clone());
+
+                            require_schema(candidate, &write.effect.schema, diagnostics, || {
+                                format!("outbox write {} of {operation}", write.effect_id)
+                            });
+
+                            match find_outbox(candidate, &write.effect.outbox) {
+                                None => diagnostics.push(DraftDiagnostic::new(
+                                    Some(SymbolKey::DataModel(write.effect.outbox.clone())),
+                                    format!(
+                                        "outbox write {} of {operation} targets outbox {}, which no data model declares",
+                                        write.effect_id, write.effect.outbox
+                                    ),
+                                )),
+
+                                Some((owner, outbox)) => {
+                                    if transaction.data_model.as_ref() != Some(owner) {
+                                        diagnostics.push(DraftDiagnostic::new(
+                                            Some(SymbolKey::DataModel(owner.clone())),
+                                            format!(
+                                                "outbox write {} of {operation} targets outbox {} of data model {owner}, but transaction {} declares {}",
+                                                write.effect_id,
+                                                write.effect.outbox,
+                                                transaction.id,
+                                                transaction
+                                                    .data_model
+                                                    .as_ref()
+                                                    .map(|id| id.to_string())
+                                                    .unwrap_or_else(|| "no data model".to_string()),
+                                            ),
+                                        ));
+                                    }
+
+                                    if !outbox.messages.contains(&write.effect.schema) {
+                                        diagnostics.push(DraftDiagnostic::new(
+                                            Some(SymbolKey::Schema(write.effect.schema.clone())),
+                                            format!(
+                                                "outbox write {} of {operation} admits {}, which outbox {} does not admit",
+                                                write.effect_id,
+                                                write.effect.schema,
+                                                write.effect.outbox
+                                            ),
+                                        ));
+                                    }
+                                }
+                            }
                         }
 
                         _ => {}
@@ -1469,10 +1633,39 @@ fn check_storage_layout(
     }
 }
 
+/// The outbox runtime's gate checks: the boundary exists and is an
+/// outbox input, and the dispatch pool is declared. Partition-mapping
+/// shape is left to whole-model validation — unlike the transport
+/// scope invariant, a defect there poisons no sibling declaration.
+fn check_outbox_runtime(
+    candidate: &WorkspaceState,
+    operation: &Id,
+    input: &Id,
+    value: &crate::spec::OutboxRuntime,
+    diagnostics: &mut Vec<DraftDiagnostic>,
+) {
+    let subject = SymbolKey::OutboxRuntime {
+        operation: operation.clone(),
+        input: input.clone(),
+    };
+
+    check_boundary(
+        candidate,
+        subject.clone(),
+        operation,
+        input,
+        BoundaryKind::Outbox,
+        diagnostics,
+    );
+
+    check_pool(candidate, subject, &value.dispatch.pool, diagnostics);
+}
+
 #[derive(Clone, Copy)]
 enum BoundaryKind {
     Request,
     Subscription,
+    Outbox,
 }
 
 impl BoundaryKind {
@@ -1480,13 +1673,16 @@ impl BoundaryKind {
         match self {
             Self::Request => "request",
             Self::Subscription => "subscription",
+            Self::Outbox => "outbox",
         }
     }
 
     fn matches(self, input: &Input) -> bool {
         matches!(
             (self, input),
-            (Self::Request, Input::Request(_)) | (Self::Subscription, Input::Subscription(_))
+            (Self::Request, Input::Request(_))
+                | (Self::Subscription, Input::Subscription(_))
+                | (Self::Outbox, Input::Outbox(_))
         )
     }
 }

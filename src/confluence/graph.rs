@@ -52,6 +52,9 @@ pub enum EdgeKind {
     PublishesTopic,
     ConsumesTopic,
 
+    WritesOutbox,
+    ConsumesOutbox,
+
     ReadsObject,
     WritesObject,
 

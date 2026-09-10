@@ -63,8 +63,9 @@
 use serde::{Deserialize, Serialize};
 
 use crate::spec::{
-    DeliverySemantics, FieldPath, Id, Input, MemberAssignment, MemberConcurrency, Model, Operation,
-    OrderingRequirement, OrderingSemantics, SubscriptionRoutingKey, ValueRef, ValueSource,
+    BatchOrderingPreservation, DeliverySemantics, FieldPath, Id, Input, MemberAssignment,
+    MemberConcurrency, Model, Operation, OrderingRequirement, OrderingSemantics, OutboxInput,
+    OutboxOrdering, SubscriptionRoutingKey, ValueRef, ValueSource,
 };
 
 use crate::analyzer::{Diagnostic, DiagnosticCode, Evidence, Severity, VerificationCode};
@@ -73,8 +74,9 @@ use super::{ProofScope, RemedyLayer};
 use super::describe::describe_value_ref;
 use super::idempotency::{IdempotencyCheck, IdempotencyVerdict};
 use super::serialization::{
-    GroupingScope, MessageKeyFact, SerializationObstacle, admits_no_messages,
-    assignment_owns_one_member, grouping_facts, pool_is_serial,
+    GroupingScope, MessageKeyFact, OutboxPartitionKeyFact, SerializationObstacle,
+    admits_no_messages, admits_no_outbox_messages, assignment_owns_one_member, grouping_facts,
+    outbox_partition_facts, pool_is_serial,
 };
 
 /// The verdict for one declared ordering requirement.
@@ -140,13 +142,40 @@ pub enum OrderingProof {
         member_assignment: MemberAssignment,
         duplicates: DuplicateHandling,
     },
+
+    /// The outbox runtime's declared precedence, preserved by one
+    /// owning member at concurrency one, with any declared batching
+    /// stage explicitly order-preserving.
+    OutboxRoutedOrder {
+        input: Id,
+        outbox: Id,
+        pool: Id,
+
+        /// The outbox runtime precedence consumed.
+        precedence: OutboxPrecedence,
+
+        /// Why same-key deliveries share one outbox partition.
+        partition_keys: Vec<OutboxPartitionKeyFact>,
+
+        member_assignment: MemberAssignment,
+
+        /// The declared batch ordering-preservation fact, when a
+        /// batching stage exists. `None` records that no batching
+        /// stage is declared, so no batch obstacle exists to clear.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        batching: Option<BatchOrderingPreservation>,
+
+        duplicates: DuplicateHandling,
+    },
 }
 
 impl OrderingProof {
     pub fn scope(&self) -> ProofScope {
         match self {
             Self::NoAdmittedInvocations { .. } => ProofScope::L0Only,
-            Self::RoutedOrder { .. } => ProofScope::RuntimeDependent,
+            Self::RoutedOrder { .. } | Self::OutboxRoutedOrder { .. } => {
+                ProofScope::RuntimeDependent
+            }
         }
     }
 }
@@ -167,6 +196,21 @@ pub enum PrecedenceSource {
     /// The transport orders every message in scope, so same-key
     /// messages are ordered whatever the key. Still needs the
     /// mechanism to keep them on one member.
+    Global,
+}
+
+/// Where an outbox-preserved precedence comes from — deliberately the
+/// outbox's own vocabulary, not the subscription's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum OutboxPrecedence {
+    /// The runtime orders messages within each keyed partition, and
+    /// the ordering key is established to be the partition key.
+    Partition,
+
+    /// The runtime orders every message it consumes, so same-key
+    /// messages are ordered whatever the key. Still needs the keyed
+    /// partition mechanism to keep them on one member.
     Global,
 }
 
@@ -277,6 +321,40 @@ pub enum OrderingObstacle {
         pool: Id,
         declared: MemberConcurrency,
     },
+
+    /// The outbox input declares no runtime, so nothing says what
+    /// precedence exists or where invocations execute.
+    NoOutboxRuntime { input: Id },
+
+    /// The outbox runtime declares `ordering: none`: no usable
+    /// precedence exists for the mechanism to preserve.
+    NoOutboxPrecedence { input: Id, outbox: Id },
+
+    /// No keyed partitioning is declared, so same-key deliveries are
+    /// not established to share a keyed partition that a precedence
+    /// could reach execution through.
+    NoPartitionDomain { input: Id, outbox: Id },
+
+    /// The keyed partitioning declares no mapping for an admitted
+    /// schema.
+    OutboxPartitionMappingMissing { input: Id, outbox: Id, schema: Id },
+
+    /// The partition mapping maps a schema to an empty tuple.
+    EmptyOutboxPartitionKey { input: Id, outbox: Id, schema: Id },
+
+    /// The partition key is not established to carry the ordering key
+    /// for this schema.
+    OutboxPartitionKeyNotEquivalent {
+        input: Id,
+        outbox: Id,
+        schema: Id,
+        partition_key: FieldPath,
+    },
+
+    /// The dispatch declares a batching stage whose ordering
+    /// preservation is unspecified, so no evidence says the
+    /// established order survives batch processing.
+    BatchOrderingUnspecified { input: Id, pool: Id },
 }
 
 /// Checks every ordering requirement declared by the model. The
@@ -323,6 +401,17 @@ fn check_requirement(
 
     let subscription = match operation.inputs.get(input_id) {
         Some(Input::Subscription(subscription)) => subscription,
+
+        Some(Input::Outbox(outbox_input)) => {
+            return outbox_order_route(
+                model,
+                operation_id,
+                input_id,
+                outbox_input,
+                requirement,
+                idempotency,
+            );
+        }
 
         Some(Input::Request(_)) => {
             return OrderingVerdict::Unproven {
@@ -508,7 +597,39 @@ fn check_requirement(
     // Redelivery: dispatch must preserve the established precedence,
     // and a duplicate of a completed delivery is idempotency's
     // concern. The proof records which requirement answers for it.
-    let duplicates = match runtime.delivery {
+    let duplicates = duplicate_handling(operation_id, input_id, runtime.delivery, idempotency);
+
+    match (precedence, grouping, assignment) {
+        (Some(precedence), Some(grouping), Some((routing_key, member_assignment)))
+            if serial && obstacles.is_empty() =>
+        {
+            OrderingVerdict::proven(OrderingProof::RoutedOrder {
+                input: input_id.clone(),
+                topic: grouping.topic,
+                pool: pool_id,
+                precedence,
+                scope: grouping.scope,
+                message_keys: grouping.message_keys,
+                routing_key,
+                member_assignment,
+                duplicates,
+            })
+        }
+
+        _ => OrderingVerdict::Unproven { obstacles },
+    }
+}
+
+/// Who answers for the work a duplicate delivery does, from the
+/// delivery fact and the idempotency verdicts — shared by the
+/// subscription and outbox routes.
+fn duplicate_handling(
+    operation_id: &Id,
+    input_id: &Id,
+    delivery: DeliverySemantics,
+    idempotency: &[IdempotencyCheck],
+) -> DuplicateHandling {
+    match delivery {
         DeliverySemantics::AtMostOnce => DuplicateHandling::SingleDelivery,
 
         DeliverySemantics::AtLeastOnce | DeliverySemantics::Unspecified => {
@@ -530,21 +651,193 @@ fn check_requirement(
                 idempotency: coverage,
             }
         }
+    }
+}
+
+/// The outbox route: the runtime's declared precedence, the keyed
+/// partition domain identifying the ordering key, one owning member at
+/// concurrency one, and — where a batching stage exists — its declared
+/// order preservation (§60–§64 of the outbox revision).
+///
+/// A batching stage differs from the serialization side: `preserved`
+/// lets the established precedence pass through the stage, while
+/// `unspecified` stops the proof — the stage then provides no evidence
+/// that established order survives execution. Overlap within the
+/// batch is not this proof's concern; ordering constrains precedence
+/// of effect, not simultaneity.
+fn outbox_order_route(
+    model: &Model,
+    operation_id: &Id,
+    input_id: &Id,
+    input: &OutboxInput,
+    requirement: &OrderingRequirement,
+    idempotency: &[IdempotencyCheck],
+) -> OrderingVerdict {
+    if admits_no_outbox_messages(model, input) {
+        return OrderingVerdict::proven(OrderingProof::NoAdmittedInvocations {
+            input: input_id.clone(),
+        });
+    }
+
+    let Some(runtime) = model.outbox_runtime(operation_id, input_id) else {
+        return OrderingVerdict::Unproven {
+            obstacles: vec![OrderingObstacle::NoOutboxRuntime {
+                input: input_id.clone(),
+            }],
+        };
     };
 
-    match (precedence, grouping, assignment) {
-        (Some(precedence), Some(grouping), Some((routing_key, member_assignment)))
-            if serial && obstacles.is_empty() =>
-        {
-            OrderingVerdict::proven(OrderingProof::RoutedOrder {
+    let mut obstacles = Vec::new();
+
+    // The precedence the runtime establishes among consumed messages.
+    let precedence = match runtime.ordering {
+        OutboxOrdering::Partition => Some(OutboxPrecedence::Partition),
+        OutboxOrdering::Global => Some(OutboxPrecedence::Global),
+
+        OutboxOrdering::None => {
+            obstacles.push(OrderingObstacle::NoOutboxPrecedence {
                 input: input_id.clone(),
-                topic: grouping.topic,
+                outbox: input.outbox.clone(),
+            });
+
+            None
+        }
+    };
+
+    // The partition domain: why same-key deliveries stay together.
+    // Both precedence sources need it — `partition` because its
+    // guarantee is *about* the partition, `global` because a
+    // precedence over everything still has to survive into execution,
+    // and it only does when same-key deliveries reach one member.
+    let partitioned = match outbox_partition_facts(
+        model,
+        input_id,
+        input,
+        runtime,
+        &requirement.key.path,
+    ) {
+        Ok(facts) => Some(facts),
+
+        Err(partition_obstacles) => {
+            for obstacle in partition_obstacles {
+                obstacles.push(match obstacle {
+                    SerializationObstacle::NoPartitionDomain { input, outbox } => {
+                        OrderingObstacle::NoPartitionDomain { input, outbox }
+                    }
+
+                    SerializationObstacle::OutboxPartitionMappingMissing {
+                        input,
+                        outbox,
+                        schema,
+                    } => OrderingObstacle::OutboxPartitionMappingMissing {
+                        input,
+                        outbox,
+                        schema,
+                    },
+
+                    SerializationObstacle::EmptyOutboxPartitionKey {
+                        input,
+                        outbox,
+                        schema,
+                    } => OrderingObstacle::EmptyOutboxPartitionKey {
+                        input,
+                        outbox,
+                        schema,
+                    },
+
+                    SerializationObstacle::OutboxPartitionKeyNotEquivalent {
+                        input,
+                        outbox,
+                        schema,
+                        partition_key,
+                    } => OrderingObstacle::OutboxPartitionKeyNotEquivalent {
+                        input,
+                        outbox,
+                        schema,
+                        partition_key,
+                    },
+
+                    _ => OrderingObstacle::NoPartitionDomain {
+                        input: input_id.clone(),
+                        outbox: input.outbox.clone(),
+                    },
+                });
+            }
+
+            None
+        }
+    };
+
+    let pool_id = runtime.dispatch.pool.clone();
+
+    // The ownership leg: the partition's one active owning member.
+    let assignment = runtime.dispatch.member_assignment;
+
+    if !assignment_owns_one_member(assignment) {
+        obstacles.push(OrderingObstacle::MemberAssignmentNotExclusive {
+            input: input_id.clone(),
+            declared: assignment,
+        });
+    }
+
+    let mut serialization_obstacles = Vec::new();
+    let serial = pool_is_serial(model, input_id, &pool_id, &mut serialization_obstacles);
+
+    for obstacle in serialization_obstacles {
+        obstacles.push(match obstacle {
+            SerializationObstacle::PoolUndeclared { input, pool } => {
+                OrderingObstacle::PoolUndeclared { input, pool }
+            }
+
+            SerializationObstacle::MemberConcurrencyNotSerial {
+                input,
+                pool,
+                declared,
+            } => OrderingObstacle::MemberConcurrencyNotSerial {
+                input,
+                pool,
+                declared,
+            },
+
+            _ => OrderingObstacle::PoolUndeclared {
+                input: input_id.clone(),
+                pool: pool_id.clone(),
+            },
+        });
+    }
+
+    // The batching stage, judged explicitly: absent means no obstacle
+    // exists; `preserved` lets the precedence pass; `unspecified`
+    // provides no evidence that it survives.
+    let batching = runtime.dispatch.batching.as_ref().map(|batching| batching.ordering);
+
+    let batch_ok = match batching {
+        None | Some(BatchOrderingPreservation::Preserved) => true,
+
+        Some(BatchOrderingPreservation::Unspecified) => {
+            obstacles.push(OrderingObstacle::BatchOrderingUnspecified {
+                input: input_id.clone(),
+                pool: pool_id.clone(),
+            });
+
+            false
+        }
+    };
+
+    let duplicates = duplicate_handling(operation_id, input_id, runtime.delivery, idempotency);
+
+    match (precedence, partitioned) {
+        (Some(precedence), Some(partition_keys))
+            if serial && batch_ok && obstacles.is_empty() =>
+        {
+            OrderingVerdict::proven(OrderingProof::OutboxRoutedOrder {
+                input: input_id.clone(),
+                outbox: input.outbox.clone(),
                 pool: pool_id,
                 precedence,
-                scope: grouping.scope,
-                message_keys: grouping.message_keys,
-                routing_key,
-                member_assignment,
+                partition_keys,
+                member_assignment: assignment,
+                batching,
                 duplicates,
             })
         }
@@ -615,7 +908,14 @@ impl OrderingObstacle {
             | Self::NoSubscriptionRuntime { .. }
             | Self::RoutingAbsent { .. }
             | Self::PoolUndeclared { .. }
-            | Self::MemberConcurrencyNotSerial { .. } => RemedyLayer::Runtime,
+            | Self::MemberConcurrencyNotSerial { .. }
+            | Self::NoOutboxRuntime { .. }
+            | Self::NoOutboxPrecedence { .. }
+            | Self::NoPartitionDomain { .. }
+            | Self::OutboxPartitionMappingMissing { .. }
+            | Self::EmptyOutboxPartitionKey { .. }
+            | Self::OutboxPartitionKeyNotEquivalent { .. }
+            | Self::BatchOrderingUnspecified { .. } => RemedyLayer::Runtime,
         }
     }
 
@@ -770,6 +1070,78 @@ impl OrderingObstacle {
                          fact; overtaking on one member cannot be excluded."
                     ),
                 },
+            },
+
+            Self::NoOutboxRuntime { input } => Evidence {
+                subject: Some(input.clone()),
+                message: format!(
+                    "Outbox input `{input}` declares no runtime, so nothing says \
+                     what precedence its deliveries carry or that any order \
+                     survives into execution."
+                ),
+            },
+
+            Self::NoOutboxPrecedence { input, outbox } => Evidence {
+                subject: Some(outbox.clone()),
+                message: format!(
+                    "The outbox runtime of `{input}` on `{outbox}` declares \
+                     `ordering: none`, so there is no order for the execution \
+                     topology to preserve."
+                ),
+            },
+
+            Self::NoPartitionDomain { input, outbox } => Evidence {
+                subject: Some(outbox.clone()),
+                message: format!(
+                    "The outbox runtime of `{input}` on `{outbox}` declares no \
+                     keyed partitioning. A precedence only reaches execution when \
+                     same-key deliveries stay in one partition, and nothing \
+                     establishes that here."
+                ),
+            },
+
+            Self::OutboxPartitionMappingMissing {
+                input,
+                outbox,
+                schema,
+            } => Evidence {
+                subject: Some(outbox.clone()),
+                message: format!(
+                    "The partitioning in effect for `{input}` declares no partition \
+                     key for `{schema}`, which the input admits from `{outbox}`."
+                ),
+            },
+
+            Self::EmptyOutboxPartitionKey { outbox, schema, .. } => Evidence {
+                subject: Some(schema.clone()),
+                message: format!(
+                    "The partitioning declared for `{outbox}` maps `{schema}` to an \
+                     empty tuple, which names no partition."
+                ),
+            },
+
+            Self::OutboxPartitionKeyNotEquivalent {
+                input,
+                outbox,
+                schema,
+                partition_key,
+            } => Evidence {
+                subject: Some(schema.clone()),
+                message: format!(
+                    "For messages of `{schema}` on `{outbox}`, the partition key \
+                     `{partition_key}` is not established to carry the ordering key \
+                     of `{input}`, so same-key deliveries may land in different \
+                     partitions."
+                ),
+            },
+
+            Self::BatchOrderingUnspecified { input, pool } => Evidence {
+                subject: Some(input.clone()),
+                message: format!(
+                    "`{input}` dispatches to `{pool}` through a declared batching \
+                     stage whose ordering preservation is unspecified: no evidence \
+                     says the established order survives batch processing."
+                ),
             },
         }
     }

@@ -1,6 +1,8 @@
+pub mod outbox;
 pub mod request;
 pub mod subscription;
 
+pub use outbox::*;
 pub use request::*;
 use serde::{Deserialize, Serialize};
 pub use subscription::*;
@@ -10,4 +12,5 @@ pub use subscription::*;
 pub enum Input {
     Request(RequestInput),
     Subscription(SubscriptionInput),
+    Outbox(OutboxInput),
 }

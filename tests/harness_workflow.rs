@@ -976,6 +976,7 @@ fn planned_workspace(count: usize) -> WorkspaceState {
                         messages: MessageSelector::Only(
                             [id("schema.Event")].into_iter().collect(),
                         ),
+                        acknowledge_on_success: None,
                     }),
                 )]),
             }),

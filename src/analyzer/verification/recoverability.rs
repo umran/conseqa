@@ -149,7 +149,9 @@ impl RetryDriver {
     fn scope(&self) -> ProofScope {
         match self {
             // Delivery is a realization fact.
-            Self::AtLeastOnceDelivery { .. } => ProofScope::RuntimeDependent,
+            Self::AtLeastOnceDelivery { .. } | Self::AtLeastOnceOutboxDelivery { .. } => {
+                ProofScope::RuntimeDependent
+            }
 
             // A caller's `retry: may_repeat` is an L0 guarantee about
             // the request effect.
@@ -209,6 +211,10 @@ pub struct ArtifactAvailability {
 pub enum RetryDriver {
     /// The triggering subscription declares at-least-once delivery.
     AtLeastOnceDelivery { input: Id, topic: Id },
+
+    /// The triggering outbox input declares at-least-once delivery: an
+    /// unacknowledged committed message may be delivered again.
+    AtLeastOnceOutboxDelivery { input: Id, outbox: Id },
 
     /// A modeled caller declares a repeatable request effect
     /// targeting the triggering input.
@@ -551,6 +557,27 @@ fn analyze_path(
                         obstacles,
                     );
                 }
+
+                // A transactional outbox write consumes artifacts like
+                // a direct execution does; its context includes the
+                // artifacts earlier steps of the same transaction
+                // established, so a same-transaction output resolves
+                // through that transaction's own replay routes.
+                EffectSite::OutboxWrite { effect, values, .. } => {
+                    for root in values.roots() {
+                        if let ValueSource::TransactionOutput(artifact) = &root.source {
+                            require_artifact(
+                                &reference,
+                                effect,
+                                artifact,
+                                &context.artifacts,
+                                &mut artifacts,
+                                &mut reported,
+                                obstacles,
+                            );
+                        }
+                    }
+                }
             },
 
             TracedStep::Decision { .. } => {}
@@ -648,6 +675,19 @@ fn find_driver(
                 Ok(RetryDriver::AtLeastOnceDelivery {
                     input: input.clone(),
                     topic: subscription.topic.clone(),
+                })
+            } else {
+                Err(Some(delivery))
+            }
+        }
+
+        Some(Input::Outbox(outbox_input)) => {
+            let delivery = model.outbox_delivery(operation_id, input);
+
+            if delivery == DeliverySemantics::AtLeastOnce {
+                Ok(RetryDriver::AtLeastOnceOutboxDelivery {
+                    input: input.clone(),
+                    outbox: outbox_input.outbox.clone(),
                 })
             } else {
                 Err(Some(delivery))

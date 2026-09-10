@@ -55,6 +55,18 @@ export type Schema =
 
 export interface DataModel {
   objects: Record<Id, DataObject>;
+  /** Typed transactional message collections of this data model:
+   *  written only by a transaction's `write_outbox` step, atomically
+   *  with its commit, and consumed by outbox inputs. */
+  outboxes?: Record<Id, Outbox>;
+}
+
+/** A typed logical message collection owned by a data model — not a
+ *  topic: its producer is transaction-exclusive and its admission is
+ *  atomic with the containing commit. */
+export interface Outbox {
+  messages: Id[];
+  message_identity: MessageIdentity;
 }
 
 export interface DataObject {
@@ -155,6 +167,14 @@ export interface PublicationEffect {
   idempotency_key_propagation: IdempotencyKeyPropagation[];
 }
 
+/** Transactional admission of one message to a data-model outbox; its
+ *  only legal execution site is a transaction's `write_outbox` step. */
+export interface OutboxWriteEffect {
+  outbox: Id;
+  schema: Id;
+  idempotency_key_propagation: IdempotencyKeyPropagation[];
+}
+
 export interface RequestEffect {
   target: { operation: Id; input: Id };
   schema: Id;
@@ -172,7 +192,8 @@ export interface ExternalEffect {
 export type Effect =
   | ({ kind: "publication" } & PublicationEffect)
   | ({ kind: "request" } & RequestEffect)
-  | ({ kind: "external" } & ExternalEffect);
+  | ({ kind: "external" } & ExternalEffect)
+  | ({ kind: "outbox_write" } & OutboxWriteEffect);
 
 export type RequestIdentity =
   | { kind: "unspecified" }
@@ -184,7 +205,20 @@ export type DeliverySemantics = "unspecified" | "at_most_once" | "at_least_once"
 
 export type Input =
   | { kind: "request"; schema: Id; identity: RequestIdentity; result: ResultType }
-  | { kind: "subscription"; topic: Id; messages: MessageSelector };
+  | {
+      kind: "subscription";
+      topic: Id;
+      messages: MessageSelector;
+      /** Optional companion of the outbox declaration: absent is no
+       *  declared acknowledgement fact. */
+      acknowledge_on_success?: boolean | null;
+    }
+  | {
+      kind: "outbox";
+      outbox: Id;
+      messages: MessageSelector;
+      acknowledge_on_success: boolean;
+    };
 
 export type Literal =
   | { kind: "string"; value: string }
@@ -232,7 +266,8 @@ export type TransactionStep =
       effect_intents: Record<Id, TransitionEffectIntent>;
     }
   | { kind: "establish_effect_intent"; bind: Id; effect_id: Id; effect: Effect; values: Derivation }
-  | { kind: "establish_transaction_output"; bind: Id; schema: Id; values: Derivation };
+  | { kind: "establish_transaction_output"; bind: Id; schema: Id; values: Derivation }
+  | { kind: "write_outbox"; effect_id: Id; effect: OutboxWriteEffect; values: Derivation };
 
 /** An inline transaction: declared and executed at the program step
  *  that carries it. `id` is its stable logical identity. */
@@ -320,6 +355,7 @@ export interface Operation {
 export interface RuntimeModel {
   topics?: Record<Id, TopicRuntime>;
   subscriptions?: Record<Id, Record<Id, SubscriptionRuntime>>;
+  outboxes?: Record<Id, Record<Id, OutboxRuntime>>;
   execution_pools?: Record<Id, ExecutionPool>;
   routers?: Record<Id, Router>;
   storage_layouts?: Record<Id, StorageLayout>;
@@ -359,6 +395,31 @@ export interface SubscriptionRuntime {
 export interface SubscriptionDispatch {
   pool: Id;
   routing?: SubscriptionRouting | null;
+}
+
+/** Runtime facts for one outbox input: delivery, the outbox's one
+ *  grouping concept (partitioning), its own ordering vocabulary, and
+ *  dispatch. All four are declared together; absence of the whole
+ *  declaration is epistemic. */
+export interface OutboxRuntime {
+  delivery: DeliverySemantics;
+  partitioning: OutboxPartitioning;
+  ordering: OutboxOrdering;
+  dispatch: OutboxDispatch;
+}
+
+export type OutboxPartitioning =
+  | { kind: "none" }
+  | { kind: "keyed"; mapping: Record<Id, FieldPath[]> };
+
+export type OutboxOrdering = "none" | "global" | "partition";
+
+export interface OutboxDispatch {
+  pool: Id;
+  member_assignment: MemberAssignment;
+  /** An opaque batching stage over per-message logical invocations;
+   *  absent means no batching fact is declared. */
+  batching?: { ordering: "preserved" | "unspecified" } | null;
 }
 
 export interface SubscriptionRouting {

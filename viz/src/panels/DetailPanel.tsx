@@ -151,6 +151,7 @@ function Dispatch({ target }: { target: DetailTarget }) {
     case "schema": return <SchemaDetail id={id} />;
     case "data_model": return <DataModelDetail id={id} />;
     case "object": return <ObjectDetail dmId={entry.dataModel} id={id} />;
+    case "outbox": return <OutboxDetail dmId={entry.dataModel} id={id} />;
     case "machine": return <MachineDetail id={id} />;
     case "state": return <StateDetail mId={entry.machine} id={id} />;
     case "transition": return <TransitionDetail mId={entry.machine} id={id} />;
@@ -390,7 +391,11 @@ function OperationDetail({ id }: { id: Id }) {
           <List items={inputs.map(([iid, input]) => (
             <span key={iid} className="flex flex-wrap items-center gap-1.5">
               <IdLink id={iid} />
-              {input.kind === "request" ? <Tag variant="info">request</Tag> : <Tag variant="blue">sub ← {shortId(input.topic)}</Tag>}
+              {input.kind === "request"
+                ? <Tag variant="info">request</Tag>
+                : input.kind === "subscription"
+                  ? <Tag variant="blue">sub ← {shortId(input.topic)}</Tag>
+                  : <Tag variant="purple">outbox ← {shortId(input.outbox)}</Tag>}
             </span>
           ))} />
         </Section>
@@ -453,6 +458,57 @@ function TopicDetail({ id }: { id: Id }) {
       )}
       <Obligations obKey={id} />
       <Citations id={id} />
+    </Frame>
+  );
+}
+
+
+function OutboxDetail({ dmId, id }: { dmId: Id; id: Id }) {
+  const { model, graph } = useApp();
+  const outbox = model.data_models[dmId]?.outboxes?.[id];
+  if (!outbox) return <Frame kind="outbox" title={id} />;
+  const writes = graph.edges.filter((e): e is Extract<Edge, { kind: "outbox_write" }> => e.kind === "outbox_write" && e.to === id);
+  const consumers = graph.edges.filter((e): e is Extract<Edge, { kind: "outbox_consume" }> => e.kind === "outbox_consume" && e.from === id);
+  return (
+    <Frame
+      kind="outbox"
+      title={id}
+      subtitle={<span>outbox of <IdLink id={dmId} /></span>}
+      description={<span>A transactional message collection: a transaction on <IdLink id={dmId} /> may mutate its objects and admit messages here in one atomic commit.</span>}
+    >
+      <FactNote fact={messageIdentity(outbox.message_identity)} />
+      <Section title="message schemas" count={outbox.messages.length}>
+        <List items={outbox.messages.map((s) => <IdLink key={s} id={s} />)} />
+      </Section>
+      {outbox.message_identity.kind === "keyed" && (
+        <Section title="message identity mapping">
+          <KeyValue rows={Object.entries(outbox.message_identity.mapping).map(([schema, tuple]) => [shortId(schema), <Mono key={schema}>{tuple.map(pathText).join(", ")}</Mono>])} />
+        </Section>
+      )}
+      {writes.length > 0 && (
+        <Section title="writers" count={writes.length}>
+          <List items={writes.map((e) => (
+            <span key={e.id} className="flex flex-wrap items-center gap-1.5">
+              <IdLink id={e.operation} />
+              <Tag variant="purple">{shortId(e.schema)}</Tag>
+              {e.transaction && <Tag>atomic with {shortId(e.transaction)}</Tag>}
+            </span>
+          ))} />
+        </Section>
+      )}
+      {consumers.length > 0 && (
+        <Section title="consumers" count={consumers.length}>
+          <List items={consumers.map((e) => (
+            <span key={e.id} className="flex flex-wrap items-center gap-1.5">
+              <IdLink id={e.operation} />
+              <Tag>{e.delivery}</Tag>
+              {e.ordering && <Tag>ordering: {e.ordering}</Tag>}
+              {e.pool && <Tag>{shortId(e.pool)}</Tag>}
+            </span>
+          ))} />
+        </Section>
+      )}
+      <Obligations obKey={id} />
     </Frame>
   );
 }
@@ -640,6 +696,40 @@ function InputDetail({ opId, id }: { opId: Id; id: Id }) {
       </Frame>
     );
   }
+  if (input.kind === "outbox") {
+    const schemas = input.messages.kind === "all" ? null : input.messages.schemas;
+    const runtime = model.runtime?.outboxes?.[opId]?.[id];
+    const pool = runtime ? model.runtime?.execution_pools?.[runtime.dispatch.pool] : undefined;
+
+    return (
+      <Frame kind="input" title={id} subtitle={<span>outbox input of <IdLink id={opId} /></span>}>
+        <KeyValue rows={[
+          ["outbox", <IdLink key="o" id={input.outbox} />],
+          ["acknowledge on success", <Mono key="a">{String(input.acknowledge_on_success)}</Mono>],
+        ]} />
+        <Section title="consumed messages">
+          {schemas ? <List items={schemas.map((s) => <IdLink key={s} id={s} />)} /> : <Tag>all outbox messages</Tag>}
+        </Section>
+        {runtime ? (
+          <Section title="L1 · realization">
+            <KeyValue rows={[
+              ["pool", <IdLink key="p" id={runtime.dispatch.pool} />],
+              ["partitioning", <Mono key="pt">{runtime.partitioning.kind}</Mono>],
+              ["ordering", <Mono key="or">{runtime.ordering}</Mono>],
+              ["batching", <Mono key="b">{runtime.dispatch.batching ? runtime.dispatch.batching.ordering : "none declared"}</Mono>],
+            ]} />
+            <FactNote fact={delivery(runtime.delivery)} />
+            <FactNote fact={memberAssignment(runtime.dispatch.member_assignment)} />
+            {pool && <FactNote fact={memberConcurrency(pool.member_concurrency)} />}
+          </Section>
+        ) : (
+          <FactNote fact={delivery("unspecified")} />
+        )}
+        <Citations id={id} />
+      </Frame>
+    );
+  }
+
   const schemas = input.messages.kind === "all" ? null : input.messages.schemas;
   const runtime = model.runtime?.subscriptions?.[opId]?.[id];
   const pool = runtime ? model.runtime?.execution_pools?.[runtime.dispatch.pool] : undefined;
@@ -706,6 +796,15 @@ function EffectDetail({ id }: { id: Id }) {
           <FactNote fact={externalResult(e.result, e.idempotency)}>
             {e.result && <ResultContract result={e.result} />}
           </FactNote>
+        </>
+      )}
+      {e.kind === "outbox_write" && (
+        <>
+          <KeyValue rows={[["kind", <Tag key="k" variant="purple">outbox write</Tag>], ["outbox", <IdLink key="o" id={e.outbox} />], ["schema", <IdLink key="s" id={e.schema} />]]} />
+          <div className="text-xs text-kumo-subtle">
+            Executes only as a transaction step; the message is admitted atomically with that transaction's commit, and the write binds no result.
+          </div>
+          <Propagation items={e.idempotency_key_propagation} />
         </>
       )}
       {executors.length > 0 && (

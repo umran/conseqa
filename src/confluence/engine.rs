@@ -1572,6 +1572,10 @@ fn render_symbol(workspace: &WorkspaceState, key: &SymbolKey) -> Option<serde_js
             serde_json::to_value(workspace.data_models.get(data_model)?.objects.get(object)?)
         }
 
+        SymbolKey::Outbox { data_model, outbox } => {
+            serde_json::to_value(workspace.data_models.get(data_model)?.outboxes.get(outbox)?)
+        }
+
         SymbolKey::Topic(id) => serde_json::to_value(workspace.topics.get(id)?),
         SymbolKey::StateMachine(id) => serde_json::to_value(workspace.state_machines.get(id)?),
 
@@ -1606,6 +1610,10 @@ fn render_symbol(workspace: &WorkspaceState, key: &SymbolKey) -> Option<serde_js
             workspace.runtime.subscriptions.get(operation)?.get(input)?,
         ),
 
+        SymbolKey::OutboxRuntime { operation, input } => serde_json::to_value(
+            workspace.runtime.outboxes.get(operation)?.get(input)?,
+        ),
+
         SymbolKey::ExecutionPool(id) => {
             serde_json::to_value(workspace.runtime.execution_pools.get(id)?)
         }
@@ -1635,13 +1643,23 @@ fn render_symbol(workspace: &WorkspaceState, key: &SymbolKey) -> Option<serde_js
         SymbolKey::EffectSite { operation, effect } => {
             let program = workspace.operations.get(operation)?.program.as_ref()?;
 
-            let declaration = program
+            match program
                 .effect_declarations()
                 .into_iter()
-                .find_map(|(id, declared)| (id == effect).then_some(declared))?
-                .clone();
+                .find_map(|(id, declared)| (id == effect).then_some(declared))
+            {
+                Some(declaration) => serde_json::to_value(declaration.clone()),
 
-            serde_json::to_value(declaration)
+                None => serde_json::to_value(
+                    program
+                        .outbox_write_declarations()
+                        .into_iter()
+                        .find_map(|(_, write)| {
+                            (&write.effect_id == effect).then_some(write)
+                        })?
+                        .clone(),
+                ),
+            }
         }
 
         SymbolKey::Binding { operation, binding } => Ok(serde_json::json!({
@@ -1754,7 +1772,8 @@ fn slice_shared_symbols(snapshot: &WorkspaceSnapshot, operation: &Id) -> Vec<Sym
                     shared.insert(target.clone());
                 }
 
-                SymbolKey::DataObject { data_model, .. } => {
+                SymbolKey::DataObject { data_model, .. }
+                | SymbolKey::Outbox { data_model, .. } => {
                     shared.insert(target.clone());
                     shared.insert(SymbolKey::DataModel(data_model.clone()));
                 }
@@ -1803,6 +1822,18 @@ pub(crate) fn topology_symbols(workspace: &WorkspaceState) -> Vec<SymbolKey> {
         keys.push(SymbolKey::TopicRuntime(topic.clone()));
     }
 
+    // The outbox declarations, for the partition mappings written
+    // against their admitted schemas; the per-input outbox runtimes
+    // come through `runtime_inputs_of` below.
+    for (data_model_id, data_model) in &workspace.data_models {
+        for outbox in data_model.outboxes.keys() {
+            keys.push(SymbolKey::Outbox {
+                data_model: data_model_id.clone(),
+                outbox: outbox.clone(),
+            });
+        }
+    }
+
     for operation in workspace.operations.keys() {
         keys.push(SymbolKey::OperationInterface(operation.clone()));
         keys.extend(runtime_inputs_of(workspace, operation));
@@ -1848,6 +1879,22 @@ pub(crate) fn runtime_inputs_of(
                 if let Some(runtime) = workspace
                     .runtime
                     .subscriptions
+                    .get(operation)
+                    .and_then(|inputs| inputs.get(input_id))
+                {
+                    keys.push(SymbolKey::ExecutionPool(runtime.dispatch.pool.clone()));
+                }
+            }
+
+            Input::Outbox(_) => {
+                keys.push(SymbolKey::OutboxRuntime {
+                    operation: operation.clone(),
+                    input: input_id.clone(),
+                });
+
+                if let Some(runtime) = workspace
+                    .runtime
+                    .outboxes
                     .get(operation)
                     .and_then(|inputs| inputs.get(input_id))
                 {
