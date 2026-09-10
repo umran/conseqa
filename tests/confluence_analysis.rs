@@ -435,7 +435,7 @@ async fn context_bundles_slice_and_track() {
             repair.id,
             &BundleSpec {
                 operation: Some(id("operation.charge_payment")),
-                requirement: Some((RequirementFamily::Idempotency, 0)),
+                requirements: vec![(RequirementFamily::Idempotency, 0)],
                 include: Vec::new(),
             },
         )
@@ -465,7 +465,10 @@ async fn context_bundles_slice_and_track() {
     );
 
     // The evidence is the exact obligation under repair.
-    let evidence = bundle.analyzer_evidence.expect("evidence is attached");
+    let evidence = bundle
+        .analyzer_evidence
+        .first()
+        .expect("evidence is attached");
 
     assert_eq!(
         evidence["id"], "oblig.operation.charge_payment.idempotency.0",
@@ -573,7 +576,7 @@ async fn bundles_fall_back_to_interfaces_before_analysis_and_use_summaries_after
             early.id,
             &BundleSpec {
                 operation: Some(id("operation.gateway")),
-                requirement: None,
+                requirements: Vec::new(),
                 include: Vec::new(),
             },
         )
@@ -607,7 +610,7 @@ async fn bundles_fall_back_to_interfaces_before_analysis_and_use_summaries_after
             late.id,
             &BundleSpec {
                 operation: Some(id("operation.gateway")),
-                requirement: None,
+                requirements: Vec::new(),
                 include: Vec::new(),
             },
         )
@@ -671,7 +674,7 @@ async fn a_broken_program_is_rejected_in_session_then_repaired() {
             synth.id,
             &BundleSpec {
                 operation: Some(id("operation.create_order")),
-                requirement: None,
+                requirements: Vec::new(),
                 include: Vec::new(),
             },
         )

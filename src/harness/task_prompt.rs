@@ -6,7 +6,7 @@
 //! compactly — not buried in a huge prompt — and the repository is
 //! framed as evidence, never as authority (§86).
 
-use crate::confluence::{ContextBundle, TaskKind};
+use crate::confluence::{ContextBundle, InvalidationCause, InvalidationNote, TaskKind};
 
 /// The invariant contract, verbatim §89. Prepended to every task
 /// prompt.
@@ -104,8 +104,13 @@ the coordinator's. An operation declares no concurrency of its own: \
 where its invocations execute and how many run at once are facts about \
 the execution resource, declared in L1. If a shared symbol (a schema \
 field, a callee contract, a topic, a transition, an execution pool) \
-must change, file a `dependency_request` rather than editing it. Commit \
-one scoped `submit_patch`.",
+must change, file a `dependency_request` rather than editing it. \
+Peer operations are being synthesized concurrently: read a peer's \
+`interface` slice when you call it, and avoid whole-set queries \
+(`callers`, `consumers`, broad searches) unless their answer is truly \
+load-bearing — their tracked results change as peers commit, and a \
+changed answer invalidates this session. Commit one scoped \
+`submit_patch`.",
 
         TaskKind::RequirementDiscovery => "\
 ## Your task: requirement discovery
@@ -115,19 +120,25 @@ in the system, propose the correctness obligations correct execution \
 reasonably requires: serialization, ordering, idempotency, result \
 replay, and recoverability requirements. Tie each to its origin — an \
 explicit prompt obligation, a strongly implied requirement, or a \
-recommendation. Do not rewrite the program. Submit each proposal as a \
-`propose_requirements` mutation through `submit_patch` (see \
-`dsl_reference` for the shape).",
+recommendation. Do not rewrite the program. Prefer the context below \
+and `proof_summary`/`interface` reads over whole-set queries — peers \
+run concurrently and a changed tracked result invalidates this \
+session. Submit each proposal as a `propose_requirements` mutation \
+through `submit_patch` (see `dsl_reference` for the shape).",
 
         TaskKind::RequirementRepair => "\
 ## Your task: requirement repair
 
-Read the `requirement_report` for the requirement named in your \
-objective. Its structured obstacle tells you exactly what fact is \
-missing. Change this operation's program so the requirement becomes \
-provable — never by deleting or weakening the requirement. If the fix \
-needs a downstream or shared change, file a `dependency_request`. \
-Commit one scoped `submit_patch`, or report unresolved.",
+Your objective names every unproven requirement of this operation and \
+carries each one's analyzer obligation verbatim: the structured \
+obstacles tell you exactly which facts are missing. Revise this \
+operation's program once so they become provable together — the \
+obligations interact, and a revision made for one alone can break \
+another — never by deleting or weakening a requirement. Prefer the \
+context below over whole-set queries; peers repair concurrently. If \
+the fix needs a downstream or shared change, file a \
+`dependency_request`. Commit one scoped `submit_patch`, or report \
+unresolved.",
 
         TaskKind::SharedDependencyRepair => "\
 ## Your task: shared dependency repair
@@ -207,10 +218,14 @@ fn render_bundle(bundle: &ContextBundle) -> String {
         section.push_str("\n```\n\n");
     }
 
-    if let Some(evidence) = &bundle.analyzer_evidence {
-        section.push_str("### Analyzer obstacle to repair\n\n```json\n");
-        section.push_str(&pretty(evidence));
-        section.push_str("\n```\n\n");
+    if !bundle.analyzer_evidence.is_empty() {
+        section.push_str("### Analyzer obstacles to repair\n\n");
+
+        for evidence in &bundle.analyzer_evidence {
+            section.push_str("```json\n");
+            section.push_str(&pretty(evidence));
+            section.push_str("\n```\n\n");
+        }
     }
 
     if !bundle.prompt_evidence.is_empty() {
@@ -228,4 +243,72 @@ fn render_bundle(bundle: &ContextBundle) -> String {
 
 fn pretty(value: &serde_json::Value) -> String {
     serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
+}
+
+/// Renders what a replacement task inherits from its invalidated
+/// predecessor: the facts that moved, and — when the predecessor got as
+/// far as submitting — its rejected patch, so this session starts from
+/// review-and-resubmit instead of re-deriving everything. Appended to
+/// the replacement's prompt by the scheduler. The context above is
+/// fresh by construction (this task pins the current head), so relying
+/// on it while judging the draft cannot reintroduce the staleness that
+/// invalidated the predecessor.
+pub fn render_predecessor(note: &InvalidationNote) -> String {
+    let mut section = String::from("## A previous attempt was invalidated\n\n");
+
+    section.push_str(
+        "A prior session worked this same objective against an older snapshot \
+         and was invalidated because these observed facts changed:\n\n",
+    );
+
+    for cause in &note.causes {
+        section.push_str(&format!("- {}\n", describe_cause(cause)));
+    }
+
+    match &note.rejected_patch {
+        Some(patch) => {
+            let rendered = serde_json::to_value(patch)
+                .map(|value| pretty(&value))
+                .unwrap_or_else(|_| "(unrenderable)".to_string());
+
+            section.push_str(&format!(
+                "\nIt submitted this patch, which was refused because its context \
+                 had gone stale — not necessarily for any fault of content:\n\n\
+                 ```json\n{rendered}\n```\n\n\
+                 Judge it against the current context above, which is fresh: if \
+                 the changed facts do not alter the reasoning, resubmit it as is; \
+                 otherwise revise exactly what they invalidate. The draft is a \
+                 starting point, not a verdict — the gate has not fully validated \
+                 it. Read any symbol it references that is not already in your \
+                 context before committing.\n\n",
+            ));
+        }
+
+        None => {
+            section.push_str(
+                "\nIt was cancelled before submitting anything, so there is no \
+                 draft to inherit — but weigh the changed facts above while \
+                 reasoning; they are what moved.\n\n",
+            );
+        }
+    }
+
+    section
+}
+
+fn describe_cause(cause: &InvalidationCause) -> String {
+    match cause {
+        InvalidationCause::ChangedSymbol { symbol } => format!("{symbol} changed"),
+        InvalidationCause::RemovedSymbol { symbol } => format!("{symbol} was removed"),
+        InvalidationCause::ChangedQuery { query } => format!(
+            "the result of a graph query changed: {}",
+            serde_json::to_string(query).unwrap_or_else(|_| "(unrenderable)".to_string())
+        ),
+        InvalidationCause::ChangedSearch { .. } => {
+            "the result of a symbol search changed".to_string()
+        }
+        InvalidationCause::EngineRestart => {
+            "the engine restarted, losing live read tracking".to_string()
+        }
+    }
 }

@@ -24,6 +24,7 @@ use super::auth::{TaskToken, TokenMap};
 use super::commit::{
     CommitReceipt, CommitRecord, CommitRejection, CommitRequest, apply_patch,
 };
+use super::patch::SpecPatch;
 use super::events::{EngineEvent, EventBus, InvalidationCause};
 use super::graph_query::{self, GraphQuery, QueryResult};
 use super::invalidation::stale_causes;
@@ -140,9 +141,11 @@ pub struct BundleSpec {
     /// the bundle and its shared dependencies are sliced in (§94).
     pub operation: Option<Id>,
 
-    /// The requirement under repair; its analyzer obligation becomes
-    /// the bundle's evidence.
-    pub requirement: Option<(super::symbol::RequirementFamily, usize)>,
+    /// The requirements under repair; each one's analyzer obligation
+    /// becomes bundle evidence. Several, because one repair task
+    /// carries every unproven obligation of its operation — they are
+    /// discharged by one program and often by one revision.
+    pub requirements: Vec<(super::symbol::RequirementFamily, usize)>,
 
     /// Extra shared symbols the scheduler wants included.
     pub include: Vec<SymbolKey>,
@@ -169,10 +172,10 @@ pub struct ContextBundle {
 
     pub prompt_evidence: Vec<PromptEvidence>,
 
-    /// The analyzer obligation under repair, when one was requested
-    /// and analysis is ready.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub analyzer_evidence: Option<serde_json::Value>,
+    /// The analyzer obligations under repair, when requested and
+    /// analysis is ready.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub analyzer_evidence: Vec<serde_json::Value>,
 }
 
 struct TaskEntry {
@@ -184,6 +187,25 @@ struct TaskEntry {
     /// The capability token string, retained so an interactive
     /// session's token can be rolled to its successor task on commit.
     token: String,
+
+    /// Why the task was invalidated — and, when it got as far as
+    /// submitting, the rejected patch. The replacement task's session
+    /// starts warm from this instead of re-deriving everything: the
+    /// patch is data, not conversation state, so carrying it forward
+    /// preserves §2.6 (no stale facts latent in a conversation) while
+    /// salvaging the work product.
+    invalidation: Mutex<Option<InvalidationNote>>,
+}
+
+/// What a task's replacement inherits from the invalidated attempt.
+#[derive(Debug, Clone)]
+pub struct InvalidationNote {
+    /// The observed facts that no longer held.
+    pub causes: Vec<InvalidationCause>,
+
+    /// The patch the gate refused for staleness, when the attempt got
+    /// that far. `None` when the session was cancelled mid-reasoning.
+    pub rejected_patch: Option<SpecPatch>,
 }
 
 impl TaskEntry {
@@ -411,6 +433,14 @@ impl ConfluenceEngine {
     /// notified-out agent can still learn it was invalidated.
     pub fn task_status(&self, task: TaskId) -> Result<TaskState, EngineError> {
         Ok(*self.entry(task)?.state.lock())
+    }
+
+    /// What an invalidated task's replacement inherits: the causes,
+    /// and the rejected patch when the attempt submitted one. `None`
+    /// for tasks that were never invalidated. Available in every state
+    /// — it is read precisely after the task is terminal.
+    pub fn invalidation_note(&self, task: TaskId) -> Option<InvalidationNote> {
+        self.entry(task).ok()?.invalidation.lock().clone()
     }
 
     /// Every task this engine knows, for supervision and diagnostics.
@@ -959,7 +989,7 @@ impl ConfluenceEngine {
 
         let mut dependency_summaries = Vec::new();
         let mut operation_view = None;
-        let mut analyzer_evidence = None;
+        let mut analyzer_evidence = Vec::new();
 
         if let Some(operation) = &spec.operation {
             let draft = snapshot
@@ -1013,19 +1043,23 @@ impl ConfluenceEngine {
                 }
             }
 
-            if let (Some((family, index)), AnalysisState::Ready(analysis)) =
-                (&spec.requirement, self.inner.analysis.state(snapshot.revision))
+            if let AnalysisState::Ready(analysis) =
+                self.inner.analysis.state(snapshot.revision)
             {
-                let id = format!("oblig.{operation}.{family}.{index}");
+                for (family, index) in &spec.requirements {
+                    let id = format!("oblig.{operation}.{family}.{index}");
 
-                analyzer_evidence = analysis
-                    .obligations
-                    .obligations
-                    .iter()
-                    .find(|obligation| obligation.id == id)
-                    .map(|obligation| {
-                        serde_json::to_value(obligation).expect("obligation serializes")
-                    });
+                    if let Some(obligation) = analysis
+                        .obligations
+                        .obligations
+                        .iter()
+                        .find(|obligation| obligation.id == id)
+                    {
+                        analyzer_evidence.push(
+                            serde_json::to_value(obligation).expect("obligation serializes"),
+                        );
+                    }
+                }
             }
         }
 
@@ -1119,6 +1153,7 @@ fn recover_tasks(inner: &Arc<EngineInner>) -> Result<(), EngineError> {
             // Tokens are not persisted; a recovered task holds no live
             // capability and is invalidated regardless.
             token: String::new(),
+            invalidation: Mutex::new(None),
         });
 
         inner.tasks.write().insert(id, entry);
@@ -1157,6 +1192,7 @@ fn install_task(
         state: Mutex::new(TaskState::Running),
         read_set: Mutex::new(TaskReadSet::default()),
         token,
+        invalidation: Mutex::new(None),
     });
 
     inner.tasks.write().insert(handle.id, Arc::clone(&entry));
@@ -1238,7 +1274,36 @@ fn process_commit(
 
         match *state {
             TaskState::Running => *state = TaskState::Committing,
-            TaskState::Invalidated => return Err(CommitRejection::TaskInvalidated),
+
+            TaskState::Invalidated => {
+                drop(state);
+
+                // The sweep invalidated the task before this submission
+                // arrived (the cancel races an in-flight submit). The
+                // patch is still the attempt's work product: attach it
+                // to the note so the replacement inherits it.
+                {
+                    let mut note = entry.invalidation.lock();
+
+                    match note.as_mut() {
+                        Some(note) if note.rejected_patch.is_none() => {
+                            note.rejected_patch = Some(request.patch.clone());
+                        }
+
+                        None => {
+                            *note = Some(InvalidationNote {
+                                causes: Vec::new(),
+                                rejected_patch: Some(request.patch.clone()),
+                            });
+                        }
+
+                        _ => {}
+                    }
+                }
+
+                return Err(CommitRejection::TaskInvalidated);
+            }
+
             other => return Err(CommitRejection::TaskNotRunning { state: other }),
         }
     }
@@ -1270,6 +1335,13 @@ fn process_commit(
                 // status/reporting tools (§53); every other tool is
                 // refused by the state gate.
                 *entry.state.lock() = TaskState::Invalidated;
+
+                // The refused patch is the attempt's salvageable work
+                // product: the replacement session starts from it.
+                *entry.invalidation.lock() = Some(InvalidationNote {
+                    causes: rejection_causes(&rejection),
+                    rejected_patch: Some(request.patch.clone()),
+                });
 
                 let _ = inner.persistence.update_task_state(
                     request.task,
@@ -1526,6 +1598,13 @@ fn invalidate_stale_tasks(
 
             *state = TaskState::Invalidated;
         }
+
+        // Cancelled mid-reasoning: no patch to salvage, but the causes
+        // tell the replacement what moved under it.
+        *entry.invalidation.lock() = Some(InvalidationNote {
+            causes: causes.clone(),
+            rejected_patch: None,
+        });
 
         let _ = inner
             .persistence
