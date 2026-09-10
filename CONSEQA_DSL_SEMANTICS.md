@@ -467,7 +467,7 @@ Multiple input declarations do not mean that one invocation simultaneously recei
 
 Two kinds of names arise from inline declarations, and they are not the same thing.
 
-Some inline occurrences carry a **stable execution-site ID**: `Transaction.id`, `ExecuteEffect.effect_id`, `ExecuteEffectAsync.effect_id`, `EstablishEffectIntent.effect_id`. These IDs do not reference another declaration; each identifies the inline declaration itself — for keyed commit identity, value lineage, diagnostics, conformance, proof evidence, and visualization. A step's `StepLocation` (§16) is not a substitute: moving an inline transaction must not silently change its durable commit identity.
+Some inline occurrences carry a **stable execution-site ID**: `Transaction.id`, `ExecuteEffect.effect_id`, `ExecuteEffectAsync.effect_id`, `EstablishEffectIntent.effect_id`, and a `write_outbox` step's `effect_id` (§13.4). These IDs do not reference another declaration; each identifies the inline declaration itself — for keyed commit identity, value lineage, diagnostics, conformance, proof evidence, and visualization. A step's `StepLocation` (§16) is not a substitute: moving an inline transaction must not silently change its durable commit identity.
 
 **Bindings** name something produced by execution: a transaction read observation, a transaction output artifact, an effect-intent artifact, an effect result observation, an async handle. Bindings are immutable, single-producer, operation-local, and scoped by the program and transaction structure (§16). There is no rebinding and no shadowing; a binding is not mutable storage and not a durability guarantee. This is not a general variable system — bindings are semantic names whose meaning is determined by the construct that introduces them.
 
@@ -827,6 +827,7 @@ L1 describes selected facts about how the L0 machine is realized. It hangs off `
 runtime:
   topics:            <topic id>       -> TopicRuntime      { grouping?, ordering? }
   subscriptions:     <operation id>   -> <input id> -> SubscriptionRuntime
+  outboxes:          <operation id>   -> <input id> -> OutboxRuntime
   execution_pools:   <pool id>        -> ExecutionPool
   routers:           <router id>      -> Router
   storage_layouts:   <layout id>      -> StorageLayout
@@ -1220,6 +1221,7 @@ pool member counts          service-time distributions
 traffic and message rates   storage node counts
 key-frequency distributions replication factors
 capacity, queueing, latency failure probabilities
+batch sizes and wait times  runtime partition counts
 ```
 
 Given those, a simulator can evaluate hot execution members, hot storage partitions, routing skew, shared-pool contention, pool scaling, alternative routing keys, alternative partition keys, queue growth, latency, and request amplification — none of which become Conseqa semantics.
@@ -1419,7 +1421,7 @@ A publication declaration does **not** by itself imply:
 - eventual delivery,
 - or that the effect executes at all.
 
-Those properties require additional structure/facts.
+Those properties require additional structure/facts. Atomicity with a transaction, in particular, is precisely the outbox write's contract (§13.4); a publication deliberately does not carry it.
 
 ### Duplicate publication
 
@@ -1601,7 +1603,7 @@ An effect intent is not inherently synonymous with a durable database record. It
 
 ### `EstablishEffectIntent`
 
-An `establish_effect_intent` transaction step declares an effect contract, constructs one concrete logical effect instance from `values`, and atomically establishes that captured instance as the `EffectIntent` artifact named by `bind`:
+An `establish_effect_intent` transaction step declares an effect contract — a publication, request, or external contract; never an outbox write, whose admission is the commit's and cannot be deferred (§13.4) — constructs one concrete logical effect instance from `values`, and atomically establishes that captured instance as the `EffectIntent` artifact named by `bind`:
 
 ```yaml
 - kind: establish_effect_intent
@@ -2103,6 +2105,8 @@ A one-shot guard that makes a second attempt abort may establish at-most-once co
 
 V1 may use deterministic target/value provenance and mutation semantics where sufficient. If required facts are absent, natural replayability is `Unknown`.
 
+A `write_outbox` step does not by itself block the natural route. Natural replay's subject is the transaction's `DataObject` state and its artifacts; whether the admission a re-execution repeats is the *same logical message* is exactly the effect leg's judgment (§13.4, route two), surfaced as an effect occurrence of the same path — so a proof cannot rest on natural replay while the duplicate admission goes unjudged.
+
 ### Artifact replay after a transaction
 
 For an artifact required after a crash, V1 accepts either:
@@ -2229,6 +2233,11 @@ assumed:
      identity position a **single** component of `K` pins that
      position's field in **every** admitted schema: every field of
      `i`'s payload is replay-stable.
+   - `i` is an outbox input whose outbox declares a keyed message
+     identity (§5), under exactly the subscription clause's conditions
+     read against the outbox: every admitted schema mapped, each
+     identity position pinned by a single component of `K` in every
+     admitted schema.
 
    Same-class attempts are then presentations of one logical stimulus.
    The per-position single-component clause is what carries key
@@ -2627,9 +2636,11 @@ The rule follows: do not use an `EffectIntent` merely to transport arbitrary tra
 
 They may participate atomically in a transaction without belonging to the application `DataModel` namespace.
 
+An **outbox message is neither of them**: it is durable typed application message data, admitted to a `DataModel` outbox (§5), not a framework artifact. It enters no artifact context, is consumed by independent operations rather than by this operation's continuation, and is retained by the outbox itself rather than by `Commit(T,K)` — though a keyed commit still bounds how many admissions a class commits (§13.4).
+
 A transaction containing only framework artifact-establishment operations may therefore have `data_model: null`.
 
-Once a transaction reads, writes, locks, inserts, deletes, or transitions an application `DataObject`, its application transactional boundary must be declared.
+Once a transaction reads, writes, locks, inserts, deletes, or transitions an application `DataObject` — or admits a message to an outbox, which belongs to a data model in the same way — its application transactional boundary must be declared.
 
 Artifact durability depends on the replay mechanism:
 
@@ -2684,6 +2695,10 @@ The solver must preserve these distinctions:
 | **Object identity vs message identity** | `order_id` identifies the order, not the message about the order. |
 | **Key equality vs payload equality** | Class membership equates the governing key's components only; payload equality needs a declared stimulus identity pinned by that key. |
 | **Stimulus identity vs deduplication** | An identity fixes what the payload of a logical request or message is; only a mechanism limits how often work happens. |
+| **Outbox vs topic** | Same typed messages, same identity vocabulary; only an outbox's producer is transaction-exclusive, its admission atomic with the commit (§5, §13.4). |
+| **Commit deduplication vs outbox message identity** | `DeduplicatedBy` may prevent a second committed admission; `message_identity` says when two admissions are one logical message. Different questions, different discharge routes (§13.4). |
+| **Outbox message vs transaction artifact** | An outbox message is durable application data for independent consumers; an output or intent is a framework artifact for this program's continuation (§23). |
+| **Batch order preservation vs serialization** | `preserved` stops a later message overtaking an earlier one against an established order; batch-internal overlap stays unmodeled, so it is never a no-overlap fact (§10.3.2). |
 | **`execute_effect` vs `execute_effect_async`** | Synchronous completion dependency versus asynchronous initiation: only the first establishes `complete(A) < start(next)`. |
 | **Effect ID vs async handle** | Stable effect-site identity versus invocation-local synchronization artifact. |
 | **Launch vs completion** | Starting an effect does not imply it has completed; only synchronization establishes completion edges. |
