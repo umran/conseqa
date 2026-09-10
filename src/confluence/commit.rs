@@ -981,6 +981,7 @@ fn check_program(
     let mut transaction_ids = Vec::new();
     let mut effect_ids = Vec::new();
     let mut binding_ids = Vec::new();
+    let mut handle_ids = Vec::new();
 
     let check_effect = |site: &Id, effect: &Effect, diagnostics: &mut Vec<DraftDiagnostic>| {
         match effect {
@@ -1180,8 +1181,33 @@ fn check_program(
                 check_effect(&execute.effect_id, &execute.effect, diagnostics);
             }
 
+            OperationStep::ExecuteEffectAsync(execute) => {
+                effect_ids.push(execute.effect_id.clone());
+                handle_ids.push(execute.handle.clone());
+
+                check_effect(&execute.effect_id, &execute.effect, diagnostics);
+            }
+
             OperationStep::ExecuteEffectIntent(execute) => {
                 if let Some(bind) = &execute.bind {
+                    binding_ids.push(bind.clone());
+                }
+            }
+
+            OperationStep::ExecuteEffectIntentAsync(execute) => {
+                handle_ids.push(execute.handle.clone());
+            }
+
+            OperationStep::JoinAll(join) => {
+                for entry in &join.handles {
+                    if let Some(bind) = &entry.bind {
+                        binding_ids.push(bind.clone());
+                    }
+                }
+            }
+
+            OperationStep::Race(race) => {
+                if let Some(bind) = &race.bind {
                     binding_ids.push(bind.clone());
                 }
             }
@@ -1206,6 +1232,14 @@ fn check_program(
 
         let step_roots: Vec<&crate::spec::ValueRef> = match step {
             OperationStep::ExecuteEffect(execute) => {
+                let mut roots = execute.values.roots();
+
+                roots.extend(execute.effect.roots());
+
+                roots
+            }
+
+            OperationStep::ExecuteEffectAsync(execute) => {
                 let mut roots = execute.values.roots();
 
                 roots.extend(execute.effect.roots());
@@ -1241,6 +1275,7 @@ fn check_program(
         ("transaction", transaction_ids),
         ("effect", effect_ids),
         ("binding", binding_ids),
+        ("async handle", handle_ids),
     ] {
         let mut seen = std::collections::BTreeSet::new();
 

@@ -438,6 +438,13 @@ pub enum ResultGap {
 
     /// The effect contract yields no synchronous result.
     NoResultContract,
+
+    /// The result was bound by a `race`: which candidate completes
+    /// first is scheduling nondeterminism, so retries need not select
+    /// the same winner. Conservative — a future verifier may prove
+    /// stability when every possible winner yields replay-equivalent
+    /// results; V1 does not attempt that equivalence proof.
+    RaceWinnerNondeterministic { candidates: Vec<Id> },
 }
 
 /// The replay judgments of one bound result, per observed variant.
@@ -471,12 +478,27 @@ impl BoundResult {
 }
 
 /// What a path has made available so far: every established artifact
-/// with its replay route, and every bound result with its per-variant
-/// replay judgments.
+/// with its replay route, every bound result with its per-variant
+/// replay judgments, and every launched async handle with the
+/// judgment its result would carry if joined.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PathContext {
     pub artifacts: BTreeMap<Id, ArtifactReplay>,
     pub results: BTreeMap<Id, BoundResult>,
+    pub handles: BTreeMap<Id, AsyncLaunch>,
+}
+
+/// The analyzer's bookkeeping for one asynchronous launch: the
+/// underlying effect and the launch-time result judgment. A result
+/// bound by joining the handle has the same logical result the effect
+/// would have exposed synchronously (§43 of the async revision), so
+/// the judgment is computed at the launch — where the instance and any
+/// external deduplication key are evaluated — and surfaced at the
+/// barrier that binds it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AsyncLaunch {
+    pub effect: Id,
+    pub result: BoundResult,
 }
 
 /// Why every attempt in the class takes the same arm of a decision.
@@ -1133,6 +1155,127 @@ impl<'a> ReplayAnalysis<'a> {
                         Some(site.contract),
                         instance,
                         *bind,
+                    );
+                }
+
+                PathStep::ExecuteEffectAsync {
+                    location,
+                    handle,
+                    effect_id,
+                    effect,
+                    values,
+                } => {
+                    let contract = Some(EffectContract::from(*effect));
+                    let instance = self.direct_instance(&context, values);
+
+                    // The launch is a full effect attempt — the
+                    // instance is judged here, where the derivation is
+                    // evaluated — but binds no result. The judgment a
+                    // joined result would carry is computed now and
+                    // surfaced at the barrier that binds it.
+                    let result = self.result_replay(&context, effect_id, contract, &instance);
+
+                    self.push_effect(
+                        &mut context,
+                        &mut steps,
+                        location,
+                        EffectSite::Direct {
+                            effect: effect_id,
+                            values,
+                        },
+                        contract,
+                        instance,
+                        None,
+                    );
+
+                    context.handles.insert(
+                        (*handle).clone(),
+                        AsyncLaunch {
+                            effect: (*effect_id).clone(),
+                            result,
+                        },
+                    );
+                }
+
+                PathStep::ExecuteEffectIntentAsync {
+                    location,
+                    intent,
+                    handle,
+                } => {
+                    let Some(site) = self.intents.get(*intent).copied() else {
+                        continue;
+                    };
+
+                    let instance = self.intent_instance(&context, intent);
+
+                    let result =
+                        self.result_replay(&context, site.effect, Some(site.contract), &instance);
+
+                    self.push_effect(
+                        &mut context,
+                        &mut steps,
+                        location,
+                        EffectSite::Intent {
+                            intent,
+                            effect: site.effect,
+                        },
+                        Some(site.contract),
+                        instance,
+                        None,
+                    );
+
+                    context.handles.insert(
+                        (*handle).clone(),
+                        AsyncLaunch {
+                            effect: site.effect.clone(),
+                            result,
+                        },
+                    );
+                }
+
+                PathStep::JoinAll { handles, .. } => {
+                    // The barrier is not an effect attempt; it makes
+                    // each joined result-bearing effect's result
+                    // independently available, with exactly the
+                    // judgment the launch computed (§43).
+                    for entry in *handles {
+                        let (Some(bind), Some(launch)) =
+                            (&entry.bind, context.handles.get(&entry.handle))
+                        else {
+                            continue;
+                        };
+
+                        let result = launch.result.clone();
+
+                        context.results.insert(bind.clone(), result);
+                    }
+                }
+
+                PathStep::Race { handles, bind, .. } => {
+                    // First completion is scheduling nondeterminism:
+                    // a race-bound result is conservatively not
+                    // replay-stable, whatever each candidate's own
+                    // judgment (§44). The candidate set is recorded as
+                    // the binding's possible producers.
+                    let Some(bind) = bind else {
+                        continue;
+                    };
+
+                    let candidates: Vec<Id> = handles
+                        .iter()
+                        .filter_map(|handle| {
+                            context.handles.get(handle).map(|launch| launch.effect.clone())
+                        })
+                        .collect();
+
+                    let effect = candidates.first().cloned().unwrap_or_else(|| (*bind).clone());
+
+                    context.results.insert(
+                        (*bind).clone(),
+                        BoundResult::both(ResultReplay::Unstable {
+                            effect,
+                            gap: ResultGap::RaceWinnerNondeterministic { candidates },
+                        }),
                     );
                 }
 

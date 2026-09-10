@@ -407,7 +407,9 @@ This distinction is central to ambiguous-ordering analysis.
 
 An operation is a logical unit of application behavior owned by one service.
 
-Its declaration contains possible invocation sources, one explicit causal program, and requirements. Execution-local transactions, direct effects, transaction outputs, and effect intents are declared **at the program or transaction site that executes or establishes them**. They are not predeclared as operation-level capabilities or handles: the governing rule is that a semantic object existing because control reaches a particular execution site is declared at that site, and a separate shared declaration is kept only where the contract exists independently of any one execution occurrence — inputs, schemas, data models, topics, state machines and their transition side-effect contracts, and requirements.
+Its declaration contains possible invocation sources, one explicit causal program, and requirements. Execution-local transactions, direct effects, transaction outputs, effect intents, and async handles are declared **at the program or transaction site that executes or establishes them**. They are not predeclared as operation-level capabilities or handles: the governing rule is that a semantic object existing because control reaches a particular execution site is declared at that site, and a separate shared declaration is kept only where the contract exists independently of any one execution occurrence — inputs, schemas, data models, topics, state machines and their transition side-effect contracts, and requirements.
+
+The causal program may contain **explicit asynchronous effect lifetimes**: an `execute_effect_async` or `execute_effect_intent_async` step initiates an effect execution without waiting for it to complete, and `join_all` / `race` steps add explicit completion dependencies (§16). This is an L0 program semantic — intentional overlap between logical effects of one invocation — and is completely independent of L1 `ExecutionPool.member_concurrency`, which is runtime invocation capacity. Neither implies the other: a `bounded(1)` member may execute one invocation whose own program has several effects in flight, and a concurrent member may execute many invocations whose individual programs are entirely sequential.
 
 An operation declares **no execution-concurrency fact**. Runtime concurrency is a property of the execution resource an invocation is assigned to, not of the logical unit of behaviour, and is declared exclusively by `ExecutionPool.member_concurrency` (§10.5). There is deliberately no global execution gate hidden inside `Operation`: if serialization follows from runtime execution topology, the model should expose the routing and pool facts that realize it; if it follows from L0 locks or transactions, those proof routes remain available.
 
@@ -425,9 +427,11 @@ Multiple input declarations do not mean that one invocation simultaneously recei
 
 Two kinds of names arise from inline declarations, and they are not the same thing.
 
-Some inline occurrences carry a **stable execution-site ID**: `Transaction.id`, `ExecuteEffect.effect_id`, `EstablishEffectIntent.effect_id`. These IDs do not reference another declaration; each identifies the inline declaration itself — for keyed commit identity, value lineage, diagnostics, conformance, proof evidence, and visualization. A step's `StepLocation` (§16) is not a substitute: moving an inline transaction must not silently change its durable commit identity.
+Some inline occurrences carry a **stable execution-site ID**: `Transaction.id`, `ExecuteEffect.effect_id`, `ExecuteEffectAsync.effect_id`, `EstablishEffectIntent.effect_id`. These IDs do not reference another declaration; each identifies the inline declaration itself — for keyed commit identity, value lineage, diagnostics, conformance, proof evidence, and visualization. A step's `StepLocation` (§16) is not a substitute: moving an inline transaction must not silently change its durable commit identity.
 
-**Bindings** name something produced by execution: a transaction read observation, a transaction output artifact, an effect-intent artifact, an effect result observation. Bindings are immutable, single-producer, operation-local, and scoped by the program and transaction structure (§16). There is no rebinding and no shadowing; a binding is not mutable storage and not a durability guarantee. This is not a general variable system — bindings are semantic names whose meaning is determined by the construct that introduces them.
+**Bindings** name something produced by execution: a transaction read observation, a transaction output artifact, an effect-intent artifact, an effect result observation, an async handle. Bindings are immutable, single-producer, operation-local, and scoped by the program and transaction structure (§16). There is no rebinding and no shadowing; a binding is not mutable storage and not a durability guarantee. This is not a general variable system — bindings are semantic names whose meaning is determined by the construct that introduces them.
+
+An async launch therefore carries two independently meaningful names — `effect_id`, the stable identity of the inline effect occurrence, and `handle`, an invocation-local synchronization artifact naming one asynchronous execution occurrence. They may resemble one another for author convenience; they must never be conflated (§16).
 
 Every stable execution-site ID and every binding ID must be unique within the operation; the IDs live in the global namespace of §2, so two sites declaring one ID collide (`DuplicateId`). One inline transaction declaration is one transaction occurrence: two locations that genuinely execute transactions declare two inline transactions with distinct IDs. If authoring reuse is later desired, it belongs to a macro/template layer expanding before semantic analysis, not to a semantic transaction-call primitive.
 
@@ -435,9 +439,9 @@ Every stable execution-site ID and every binding ID must be unique within the op
 
 `operation.program` is the operation's single control structure: a block of steps executed in order, in which a decision — `match_result` over a bound effect result, or `branch` over an ordinary predicate — nests further blocks, and every reachable path ends at an explicit terminal: `return`, constructing a request input's declared result, or `complete`, returning nothing.
 
-The structure is acyclic by construction. There are no loops; iteration is deliberately deferred (§27).
+The structure is acyclic by construction. There are no loops; iteration is deliberately deferred (§27). Asynchronous effect steps introduce concurrent effect-completion edges but no loops: the operation remains a control-flow DAG plus effect-completion dependency edges, never a general cyclic concurrent state machine.
 
-An invocation traverses one path through the program: one arm at each decision, one terminal. Alternative paths exist only where a decision selects between them, and the DSL exposes what each decision rests on. There is no unexplained selection among alternative complete flows.
+An invocation traverses one acyclic **synchronous control path** through the program: one arm at each decision, one terminal. Asynchronous effect steps may initiate effect executions whose lifetimes overlap later control; synchronization steps add explicit completion dependencies to that control path (§16). The path statement is therefore not to be read as saying that every effect on the path completes sequentially. Alternative paths exist only where a decision selects between them, and the DSL exposes what each decision rests on. There is no unexplained selection among alternative complete flows.
 
 Control flow describes causality. It is not a durable workflow, a checkpoint, or a program counter: a retry traverses the same declared control from the first step, and what it re-encounters is judged by the transaction and effect replay rules (§16–§18).
 
@@ -1224,11 +1228,11 @@ An effect declaration is a contract describing what kind of logical work occurs.
 
 An operation-owned contract lives inline at its one execution or establishment site (§7); a transition-owned contract lives on the state-machine transition, shared by every operation applying it (§22). Either way the contract does not define how the values of a particular effect instance are computed. An effect instance is constructed at an execution or establishment site, and each such site declares the provenance of the values used to construct it:
 
-- a direct `execute_effect` program step declares the contract and `values` (§16);
+- a direct `execute_effect` or `execute_effect_async` program step declares the contract and `values` (§16);
 - an explicit `establish_effect_intent` transaction step declares the contract and `values` (§14);
 - a `transition` transaction step declares `effect_intents`, one intent binding and one derivation per side effect of the applied transition (§22).
 
-`execute_effect_intent` consumes an already-established effect instance and therefore declares no derivation: the instance's values were fixed at establishment (§14).
+`execute_effect_intent` and `execute_effect_intent_async` consume an already-established effect instance and therefore declare no derivation: the instance's values were fixed at establishment (§14). Async is an execution mode, not a new kind of effect: there is no `AsyncEffect` contract type, and an asynchronous launch uses exactly the same `Effect`, `Derivation`, and `effect_id` semantics as its synchronous counterpart.
 
 A contract's own value references — an external deduplication key, propagation components — are evaluated at the site's actual context: a direct effect's in the operation context immediately before the `execute_effect` step; an explicitly established intent's in the enclosing transaction context at the `establish_effect_intent` step, where they may use preceding transaction reads and outputs under the usual rules; a transition-owned effect's in the applying transaction context at the `transition` step (§22).
 
@@ -1240,7 +1244,9 @@ A synchronous effect may yield a first-class `Result<Ok, Err>` (§8.1). Which ef
 - a **request** inherits the result contract of the request input it targets, and never redeclares it (§13.2);
 - an **external** effect may declare `result: { ok, err }`, or declare none (§13.3).
 
-An execution site — `execute_effect` or `execute_effect_intent` — may **bind** the result under an operation-unique binding (`bind: result.charge_payment.card`). The result type is inferred from the contract, never restated at the site. A result-bearing effect may be executed without a binding when the result is deliberately ignored; an effect with no synchronous result must not declare one (validation: `EffectHasNoResult`). The binding is an attempt-local observation, not a transaction artifact, and its variant payloads are reached through `effect_result_ok` / `effect_result_err` inside a `match_result` on it (§11, §16).
+A synchronous execution site — `execute_effect` or `execute_effect_intent` — may **bind** the result under an operation-unique binding (`bind: result.charge_payment.card`). The result type is inferred from the contract, never restated at the site. A result-bearing effect may be executed without a binding when the result is deliberately ignored; an effect with no synchronous result must not declare one (validation: `EffectHasNoResult`). The binding is an attempt-local observation, not a transaction artifact, and its variant payloads are reached through `effect_result_ok` / `effect_result_err` inside a `match_result` on it (§11, §16).
+
+An **asynchronous** launch binds no result: at launch time the synchronous result need not exist yet, so `start effect A; use result(A) before A completed` is not representable. An asynchronously executed effect's result becomes available only through a synchronization step — a `join_all` entry's `bind`, or a `race`'s `bind` — under exactly the contract it would have had synchronously (§16).
 
 The returned result is a separate semantic object from the outgoing effect payload. Stable outgoing values do not by themselves prove a stable returned result; effect-result replay is judged on its own (§18).
 
@@ -1411,7 +1417,7 @@ If the establishing transaction is explicitly `DeduplicatedBy { key }`, the exac
 
 A program step executing an intent performs or attempts the work represented by the logical intent available to the current invocation. It consumes the **definitely available** binding (§16) and executes the exact captured instance.
 
-`ExecuteEffectIntent` is the modeled execution authority for the intent. Intent establishment alone does not execute the underlying effect.
+`ExecuteEffectIntent` is the modeled synchronous execution authority for the intent; `ExecuteEffectIntentAsync` (§16) is the additional asynchronous one, initiating the same exact captured instance without waiting for completion. Intent establishment alone does not execute the underlying effect, and the async authority alters no intent durability, replay, or recovery semantics.
 
 The effect instance was already constructed when the intent was established, so `ExecuteEffectIntent` declares no derivation and must never recompute or replace the intent's values.
 
@@ -1517,13 +1523,17 @@ The program is an `OperationBlock`: a sequence of steps executed in order. A dec
 
 - `transaction`
 - `execute_effect`
+- `execute_effect_async`
 - `execute_effect_intent`
+- `execute_effect_intent_async`
+- `join_all`
+- `race`
 - `match_result`
 - `branch`
 - `return`
 - `complete`
 
-No explicit recovery step exists for a transaction output or an effect intent; recovery is what re-encountering a keyed transaction does (§17). The analyzer may lower the block structure to a control-flow graph; the DSL declares the structure.
+No explicit recovery step exists for a transaction output or an effect intent; recovery is what re-encountering a keyed transaction does (§17). No loop or general task primitive is introduced by the asynchronous steps; asynchronous execution is permitted for effects and effect intents only — never for transactions, blocks, branches, or arbitrary program fragments — so the program language acquires no general shared-state concurrency semantics. The analyzer may lower the block structure to a control-flow graph, and the asynchronous steps additionally to a partial-order execution graph of effect-start and effect-completion events; the DSL declares the structure.
 
 ### `transaction`
 
@@ -1556,11 +1566,108 @@ A direct effect execution is not automatically durable or retry-safe. The verifi
 
 A transition side effect is never executed directly: it is established as an intent by the transition and executed through `execute_effect_intent` (§22).
 
+Ordinary sequential step order establishes `control(step_i) < control(step_i+1)`. For a synchronous effect execution, **completion is part of the step** and therefore precedes the next step: `execute_effect A` followed by `execute_effect B` establishes `complete(A) < start(B)`. This is normative: authors who write `execute_effect` keep the existing guarantee that the execution and any bound result occur before subsequent control, and no analyzer may infer asynchronous overlap from adjacent synchronous steps. Async behavior exists only where explicitly declared through `execute_effect_async`.
+
+### `execute_effect_async`
+
+Declares one logical effect contract and one asynchronous execution site.
+
+For `ExecuteEffectAsync(H, effect_id, E, D)`, reaching the step:
+
+1. declares the inline effect contract `E`;
+2. constructs one concrete logical effect instance according to `D`;
+3. initiates execution of that instance;
+4. establishes asynchronous handle `H`;
+5. permits control to proceed without waiting for the execution to complete.
+
+Contract and instance-construction semantics are otherwise identical to `execute_effect`: `effect_id` has exactly its existing meaning, `D` has exactly the existing `Derivation` semantics and is evaluated when the launch is reached, so the effect instance is **fully determined at launch** — later control or observations cannot change the launched payload, and synchronization never reevaluates `D`.
+
+For `execute_effect_async A` followed by step `B`, the program establishes only `start(A) < start(B)` — **not** `complete(A) < start(B)` — so A may overlap B. No completion relationship exists until a synchronization step declares one. Conseqa asserts nothing about the scheduling mechanism: no thread, task, future, event-loop, CPU-parallelism, or OS-scheduling semantics — only that the causal program does not require A to complete before subsequent control proceeds. L0 declares logical overlap eligibility; whether concrete runtime resources allow physical parallelism is an L1 and simulation question.
+
+The step binds no result (§13): `bind` at an async launch is invalid by construction, and the launched effect's result surfaces only at a synchronization step. Initially, direct asynchronous execution is legal for exactly the effect kinds legal for ordinary direct execution — publication, request, external; a future effect kind must explicitly declare whether direct asynchronous execution is legal rather than inheriting it from the `Effect` enum.
+
+An asynchronously launched effect participates in idempotency analysis as soon as its launch site is reachable, exactly as a synchronous execution would: not waiting for completion removes nothing from the operation's side-effect blast radius, and on operation retry the launch site may initiate the effect again, judged by the same instance-stability and downstream idempotency rules. Async launch is not a durable checkpoint, and none of the async primitives implies deduplication, exactly-once execution, retry suppression, replay stability, or effect-result consistency.
+
 ### `execute_effect_intent`
 
-Executes the referenced logical effect intent currently available to the invocation, and optionally binds its result (§14).
+Executes the referenced logical effect intent currently available to the invocation, and optionally binds its result (§14). The step is synchronous: the exact captured effect is executed and any declared result is available before following control. Authors opt into non-blocking execution only through `execute_effect_intent_async`.
 
 The intent may have been produced by an earlier transaction in this invocation, reconstructed by naturally replaying that transaction, or recovered from an explicitly keyed transaction commit.
+
+### `execute_effect_intent_async`
+
+Initiates execution of the exact logical effect instance captured by a definitely available `EffectIntent` binding, establishes an asynchronous handle, and permits control to continue without waiting for completion.
+
+There is no derivation: the intent's instance was fixed when the intent was established. The step is an additional execution authority for the intent (§14) and alters no `EffectIntent` durability, replay, or recovery semantics — natural reconstruction and keyed-commit recovery follow the existing rules, recovery of the intent does not make repeated async execution safe, and the operation terminal does not establish that the initiated effect completed.
+
+### Async handles
+
+An asynchronous launch introduces an operation-local **handle** identifying that particular in-flight effect execution occurrence, consumable only by synchronization steps.
+
+The handle is a semantic synchronization artifact, not application data: it has no schema, cannot be persisted, cannot be used as an idempotency key, cannot be returned from an operation, cannot be placed in a transaction, and does not identify the logical effect itself — `effect_id` does that (§7). It is not a `ValueSource`; application expressions cannot inspect it, and no decision can ask whether it has completed — there is no `is_complete(H)`, `poll(H)`, or `timeout(H)`.
+
+Handles follow the normal operation-local definite-availability discipline (`AsyncHandleNotAvailable`): a handle launched inside one arm of a decision is not available at a synchronization only some paths reach it from. As with existing bindings there are no forward references, no rebinding, no shadowing, and no implicit merge. Every handle ID is unique within the operation and participates in the global ID uniqueness discipline.
+
+One handle represents one execution occurrence produced by one traversal of its launch site. On operation retry the same launch site may be encountered again; the handle declaration does not deduplicate those executions across retries — it is an invocation-local synchronization artifact.
+
+### `join_all`
+
+A synchronization barrier over asynchronous executions:
+
+```yaml
+- kind: join_all
+  handles:
+    - handle: async.profile
+      bind: result.profile
+    - handle: async.orders
+      bind: result.orders
+```
+
+`join_all(H1..Hn)` does not complete until every referenced execution has completed: it establishes `complete(Hi) < continuation` for each joined handle, and **no relative completion order among them** — `async A; async B; join_all; C` supports `A < C` and `B < C` but neither `A < B` nor `B < A`. The barrier does not serialize its members: it implies no ordering, no non-overlap, and no shared execution resource among them. Textual launch order alone establishes no completion or externally observable effect order; where an operation requirement depends on one effect completing before another, a causal synchronization edge must establish it, so sequential `execute_effect A; execute_effect B` and `async A; async B; join_all` are **not interchangeable for ordering proofs**.
+
+Each entry may bind its effect's ordinary `Result` when the underlying effect is result-bearing; a result-less effect (a publication, an external effect declaring no result) must not declare one (`EffectHasNoResult`), and a result-bearing effect may be joined without a binding when its result is deliberately ignored. The result type is inferred from the underlying contract and never restated. `join_all` constructs no aggregate value: each bound result is an independent binding under the ordinary result-binding rules — no tuple algebra, collection result type, or combined error model exists — and subsequent control inspects them through ordinary `match_result` steps in whatever causal order it declares.
+
+An `Err` result is still a completed effect interaction: `join_all` does not short-circuit because one candidate returned `Err`; it keeps waiting for the rest, after which each result may be inspected. A fail-fast primitive would require separate semantics and is not implied.
+
+A `join_all` over one handle is valid and acts as the minimal await; an empty `join_all` is invalid (`EmptyJoinAll`). Joining a publication or other result-less effect is meaningful — it establishes that the attempt completed — it simply binds nothing.
+
+A result binding produced at `join_all` has the same logical result the effect would have exposed synchronously. Its replay stability therefore rests on the same facts — instance stability, target result-replay guarantees, external deduplication, error disposition (§18) — and the presence of other effects in the same barrier does not alter it.
+
+### `race`
+
+A first-completion barrier over asynchronous executions:
+
+```yaml
+- kind: race
+  handles:
+    - async.primary
+    - async.replica
+  bind: result.read
+```
+
+`race(H1..Hn)` completes when at least one referenced execution completes: for the winning completion `W` it establishes `complete(W) < continuation`, and **nothing about any other candidate**. A race requires at least two handles (`RaceRequiresTwoHandles`); the winning handle's identity is not exposed as an application value — no handle comparison, handle matching, dynamic task identity, or winner-dispatch control enters the expression language.
+
+`race` means **first completion, not first success**: if A completes first with `Err` and B later completes with `Ok`, a result-binding race observes A's `Err`. A `first_ok` primitive would require distinct semantics and does not exist.
+
+`race` provides **no cancellation** — this is normative. If A wins, Conseqa SHALL NOT infer that B was cancelled, aborted, did not execute, cannot later complete, or cannot produce side effects. Every candidate was initiated and remains part of the operation's side-effect cascade; a concrete implementation may attempt to cancel losing work, but Conseqa provides no cancellation guarantee, and a downstream load model must still account for every candidate's work even though the response critical path may approximate the first completion. A race loser is never pruned from the effect graph merely because its result is unused.
+
+Where `bind` is present, every raced handle must refer to a result-bearing effect and all candidates must expose **the same logical result contract** (`RaceResultContractMismatch`); the binding carries the exact result of whichever candidate completes first. Different effect kinds may be raced under a binding only when their contracts are identical — result-shape equality does not make their business behavior equivalent; the author is responsible for a meaningful architecture. A `race` without `bind` imposes no compatibility requirement and may synchronize result-less or heterogeneous effects: it means only "continue after the first referenced execution completes".
+
+If the winner is not statically determined, no particular candidate is established to precede the continuation: `race(A,B); C` does not prove `A < C`, because B may win.
+
+`race` does not consume or invalidate its handles: a later `join_all` may still wait on them — a race followed by a join distinguishes a first-completion dependency (the latency-sensitive continuation) from an all-completion dependency (work requiring both attempts). If a candidate already completed, joining it again requires no new effect execution; synchronization never re-executes an effect.
+
+A race-bound result introduces scheduling nondeterminism — which candidate completes first — so even when each candidate independently has replay-stable results, retries need not select the same winner. The verifier conservatively treats a race-bound result as **not established to be replay-stable**; a `match_result` or other replay-sensitive decision resting on it becomes an explicit replay obstacle. A future verifier may prove race-result stability by establishing that every possible winner yields replay-equivalent observable results; V1 does not attempt that equivalence proof, which is preferable to silently assuming deterministic scheduling.
+
+### Asynchronous effects and terminals
+
+An operation terminal does not implicitly join asynchronous executions. `async A; complete` is structurally meaningful: it establishes `start(A) < complete(operation control)` but not `complete(A) < complete(operation control)` — deliberate fire-and-forget, with no additional primitive. The terminal completes the declared synchronous control path only; with unresolved handles outstanding, Conseqa SHALL NOT infer that those effects completed, succeeded, failed, were cancelled, or will eventually complete, and no durability or eventual-completion guarantee follows from launch alone. Where durable rediscovery matters, the transaction/`EffectIntent` mechanisms must provide it — async execution is not durable rediscovery.
+
+For a request operation, `race(A,B) -> R; return R` makes the request result causally dependent on the race winner only; the loser may remain in flight beyond the terminal, so request latency and the lifetime cost of all initiated effects are distinct quantities — a major reason asynchronous execution is represented explicitly. Where a source-driven input uses `acknowledge_on_success`, successful completion — and therefore acknowledgement — may occur while launched effects remain unresolved; source acknowledgement is never silently turned into an implicit async join.
+
+Program reachability remains defined over synchronous control: no program step executes after a terminal, so `async A; complete; B` still makes B unreachable — a continuing asynchronous A does not make B reachable. Outstanding handles do not make an otherwise terminating path unterminated: they are launched side-effect executions, not additional control paths requiring terminals.
+
+Async overlap may invalidate a serialization argument that depended on sequential execution within one invocation — two asynchronously launched effects cannot be assumed not to overlap. Operation-level `SerializedBy(K)` requirements, however, continue to concern separate logical operation invocations under their existing definition (§9): async effects within one invocation are not additional operation invocations, and the two domains remain distinct.
 
 ### `match_result`
 
@@ -1621,24 +1728,34 @@ Validation establishes that the program is structurally coherent. It performs no
 1. **Termination.** Every reachable path ends at a `return` or `complete` (`ProgramNotTerminated`). A block whose last step is a decision terminates only if every arm of that decision terminates; a `branch` without `otherwise` never does.
 2. **Reachability.** No step follows a terminal — or a decision whose every arm terminates — in its block (`UnreachableProgramStep`, reported for the first dead step of a block).
 3. **Definite artifact availability.** A transaction artifact — transaction output or effect intent — may be consumed only at a program point where a transaction on **every** path reaching that point establishes or recovers it (`TransactionArtifactNotAvailable`). Consumers are: an `execute_effect_intent` of the intent; a `transaction_output` reference in an effect derivation, a branch condition, a `return` outcome, another transaction's commit key or body, or an effect contract's own roots at the site where they are evaluated (§13) — an external deduplication key, propagation components. Inside one transaction, a reference to an output that transaction establishes is satisfied by step order.
-4. **Definite result assignment.** A result binding may be matched or referenced only where an effect-executing step on every path reaching the point has bound it (`EffectResultNotBound`).
+4. **Definite result assignment.** A result binding may be matched or referenced only where a step on every path reaching the point has bound it (`EffectResultNotBound`). The binding steps are the synchronous effect executions and the synchronization barriers: an asynchronous launch binds no result, so a result from an asynchronously executed effect is **not** considered bound merely because its launch occurred — it becomes available only where a `join_all` or `race` produces it. This is fundamental to async soundness.
 5. **Variant scope.** `effect_result_ok:<r>` is legal only inside the `ok` arm of a `match_result` on `r`, `effect_result_err:<r>` only inside its `err` arm (`EffectResultVariantOutOfScope`). Field paths resolve against the variant's schema.
-6. **Result-binding contracts.** A binding is declared only by a step executing a result-bearing effect (`EffectHasNoResult`): a request, whose contract resolves through its target input; an external effect declaring `result`; never a publication.
+6. **Result-binding contracts.** A binding is declared only by a site observing a result-bearing effect (`EffectHasNoResult`): a request, whose contract resolves through its target input; an external effect declaring `result`; never a publication. For a `join_all` entry, the underlying effect is the joined handle's; for a `race`, every candidate must be result-bearing and all candidates must expose the same logical result contract (`RaceResultContractMismatch`) — absent `bind`, no compatibility requirement is imposed.
 7. **Return target.** `return.request` names an operation-owned **request** input (`InvalidInputKind` for a subscription). The outcome's derivation roots must be definitely available under rules 3–5.
-8. **Identity.** Every inline `Transaction.id`, inline `effect_id`, and binding ID is unique (`DuplicateId`, §7); an `execute_effect_intent` names an intent binding produced by this operation's program; every value reference respects §11 scope.
+8. **Identity.** Every inline `Transaction.id`, inline `effect_id`, binding ID, and async handle ID is unique (`DuplicateId`, §7); an `execute_effect_intent` or `execute_effect_intent_async` names an intent binding produced by this operation's program; every value reference respects §11 scope.
+9. **Definite handle availability.** A synchronization step waits only on handles bound by an async launch on every path reaching it (`AsyncHandleNotAvailable`); a handle is consumed by nothing else.
+10. **`join_all` shape.** The handle list is non-empty (`EmptyJoinAll`); every referenced handle exists and is operation-owned; no handle appears twice in one `join_all` (`DuplicateSynchronizationHandle`); every declared result binding is unique; a binding is declared only for a result-bearing underlying effect, its type inferred from the contract and never restated.
+11. **`race` shape.** At least two handles (`RaceRequiresTwoHandles`); every referenced handle exists and is operation-owned; no handle occurs twice in one race (`DuplicateSynchronizationHandle`); the result binding, when present, is unique and subject to rule 6's compatibility requirement.
 
-Rules 3–5 are a **forward definite-availability analysis** over the block structure, with producers discovered inline:
+An `execute_effect_async` additionally applies every structural rule already applicable to synchronous `execute_effect` — effect target resolution, schema compatibility, derivation validity, value-reference scope, idempotency-key reference validity, `effect_id` uniqueness, result-contract resolution — plus handle uniqueness and the requirement that the effect kind permits direct async execution. An `execute_effect_intent_async` requires an existing, definitely available intent binding and a unique handle, and resolves the underlying effect contract to determine result compatibility for later synchronization.
+
+Rules 3–5 and 9 are a **forward definite-availability analysis** over the block structure, with producers discovered inline:
 
 ```text
 before Read(bind=r): r unavailable
 after Read(bind=r):  r available inside the same transaction
 transaction exit:    r unavailable
 
-Available(entry)      = {}
-Available(after T)    = Available(before T) ∪ Artifacts(T)
-Available(after E→r)  = Available(before) ∪ {r}
-Available(join)       = ∩ Available(each predecessor that falls through)
+Available(entry)               = {}
+Available(after T)             = Available(before T) ∪ Artifacts(T)
+Available(after E→r)           = Available(before) ∪ {r}
+Available(after async launch H) = Available(before) ∪ {H}
+Available(after join_all)      = Available(before) ∪ ResultsBoundBy(join_all)
+Available(after race → R)      = Available(before) ∪ {R}
+Available(join)                = ∩ Available(each predecessor that falls through)
 ```
+
+No individual candidate result becomes available merely because it participated in a race; only the race's own binding does.
 
 `Artifacts(T)` is the transaction's explicitly bound outputs, its explicitly bound intents, and the transition intents it binds (§22). A predecessor arm that terminates imposes no constraint on the join. Variant selection is not joined at all: an arm selects its variant for its own extent only.
 
@@ -1650,7 +1767,7 @@ Operation requirements live outside the causal execution body, so program-produc
 
 ### Paths and path admission
 
-An invocation traverses one **path** through the program: the linear sequence of its steps, the arm taken at each decision, and the terminal reached. Verification analyzes the program path by path — a path is a linear sequence of steps plus the decisions that selected it — so the forward replay pass of §18 applies to each path unchanged, and what a decision rests on is judged where it is taken.
+An invocation traverses one **synchronous control path** through the program: the linear sequence of its steps, the arm taken at each decision, and the terminal reached. Asynchronous effect steps on the path initiate executions whose lifetimes overlap later control, and synchronization steps add explicit completion dependencies; the path remains the acyclic control skeleton those lifetimes hang off. Verification analyzes the program path by path — a path is a linear sequence of steps plus the decisions that selected it — so the forward replay pass of §18 applies to each path unchanged, and what a decision rests on is judged where it is taken. For simulation, a path with async steps lowers to a partial-order graph: each launch is an effect-start event with no immediate completion dependency on the next step, `join_all` a barrier requiring every corresponding completion event, `race` a barrier enabled by the first; Conseqa supplies the causal structure, the simulator the quantitative facts.
 
 A path is **admitted for input `i`** iff its terminal is `complete`, or `return` for `i`. A path returning another request input's result is not one an invocation of `i` completes. Admission is terminal-based; the DSL adds no explicit entry or path-admission concept associating a triggering input with a control entry. That association is open question 10 (§27) and is deliberately not resolved by inventing one: an operation with several request inputs distinguishes their paths by the `return` each takes, and a subscription-triggered invocation is admitted to every path ending at `complete`.
 
@@ -1665,9 +1782,11 @@ PathContext
     TransactionOutput O -> logical value, with its replay route
     EffectIntent E      -> logical effect intent, with its replay route
     result r            -> bound result, with its replay judgment
+    AsyncHandle H       -> launched effect execution, with the judgment
+                           its result would carry if joined
 ```
 
-This context is semantic bookkeeping, not a DSL workflow construct.
+This context is semantic bookkeeping, not a DSL workflow construct. The DSL exposes no handle analysis state; available/launched versus known-completed is analyzer bookkeeping used to determine synchronization and result availability.
 
 Artifact availability may arise from:
 
@@ -1675,7 +1794,7 @@ Artifact availability may arise from:
 2. deterministic reconstruction during natural transaction replay; or
 3. recovery from a prior `Commit(T,K)` for an explicitly deduplicated transaction.
 
-Transaction-read results are excluded: they remain local to the transaction execution that produced them. Result bindings enter the context at the step that binds them, with their replay judgment (§18); they are observations, not artifacts, and no route reconstructs or recovers them.
+Transaction-read results are excluded: they remain local to the transaction execution that produced them. Result bindings enter the context at the step that binds them — a synchronous execution, or the `join_all` / `race` barrier that produces them — with their replay judgment (§18); they are observations, not artifacts, and no route reconstructs or recovers them. A result bound at a `join_all` carries the judgment computed at its launch, where the instance and any external deduplication key were evaluated; a result bound by `race` is conservatively judged unstable, its candidate set recorded as the binding's possible producers — the binding's producer is the race step, not any one statically identifiable launch.
 
 ### Decision replay
 
@@ -1684,7 +1803,7 @@ A retry traverses declared control. Whether it takes the same arm at a decision 
 - for a `branch`: the condition is deterministic (not `unspecified` anywhere) **and** every root it observes is replay-stable under §18. The same roots then yield the same predicate value; or
 - for a `match_result`: the matched result is replay-stable under §18, so the variant is fixed across the class.
 
-Otherwise the checker reports the decision as **not established to replay**, naming the gap: the condition is `unspecified`; a condition root is unstable; the result is not bound before the decision on this path; or the result is unstable in the taken arm's variant — its instance not class-fixed, its request's schema not the target's, its target declaring no replay-consistent requirement for the input or one that is unproven, or an external boundary that is `not_deduplicated`, carries no deduplication fact, deduplicates by an unstable key, or whose observed `Err` is retryable or of unspecified disposition (§13.3). Instability is not proven; a different arm on retry may be legitimate. What that means for each obligation is stated in §9: an obstacle for idempotency and result replay, never for recoverability.
+Otherwise the checker reports the decision as **not established to replay**, naming the gap: the condition is `unspecified`; a condition root is unstable; the result is not bound before the decision on this path; or the result is unstable in the taken arm's variant — its instance not class-fixed, its request's schema not the target's, its target declaring no replay-consistent requirement for the input or one that is unproven, an external boundary that is `not_deduplicated`, carries no deduplication fact, deduplicates by an unstable key, or whose observed `Err` is retryable or of unspecified disposition (§13.3), or a result bound by `race`, whose winner is scheduling nondeterminism (§16). Instability is not proven; a different arm on retry may be legitimate. What that means for each obligation is stated in §9: an obstacle for idempotency and result replay, never for recoverability.
 
 ### Step locations
 
@@ -2347,6 +2466,17 @@ The solver must preserve these distinctions:
 | **Object identity vs message identity** | `order_id` identifies the order, not the message about the order. |
 | **Key equality vs payload equality** | Class membership equates the governing key's components only; payload equality needs a declared stimulus identity pinned by that key. |
 | **Stimulus identity vs deduplication** | An identity fixes what the payload of a logical request or message is; only a mechanism limits how often work happens. |
+| **`execute_effect` vs `execute_effect_async`** | Synchronous completion dependency versus asynchronous initiation: only the first establishes `complete(A) < start(next)`. |
+| **Effect ID vs async handle** | Stable effect-site identity versus invocation-local synchronization artifact. |
+| **Launch vs completion** | Starting an effect does not imply it has completed; only synchronization establishes completion edges. |
+| **`join_all` vs serialization** | A barrier after all completions establishes no order and no non-overlap among the joined candidates. |
+| **`race` vs cancellation** | First-completion synchronization says nothing about stopping, preventing, or undoing the losers. |
+| **`race` vs first-success** | The first completion may be an `Err`; a result-binding race observes it. |
+| **Async result vs handle** | The application result is unavailable until synchronization; the handle is never application data. |
+| **L0 async vs L1 member concurrency** | Intra-invocation logical effect overlap versus runtime invocation capacity; neither implies the other. |
+| **Operation terminal vs async completion** | An operation may finish while launched effects remain unresolved; the terminal neither joins nor cancels them. |
+| **Async launch vs durability** | Initiation provides no rediscovery guarantee; durable rediscovery needs transactions or effect intents. |
+| **Launch order vs effect order** | Textual async starts establish no completion or externally observable effect ordering. |
 
 ---
 

@@ -419,6 +419,28 @@ fn index_program(program: &crate::spec::OperationBlock) -> (ProgramIndex<'_>, Fx
     let mut bindings = FxHashMap::default();
     let mut effects: FxHashMap<&Id, EffectValues<'_>> = FxHashMap::default();
 
+    // Async handle → its launch, so a binding produced at a
+    // synchronization barrier resolves to the effect it observes.
+    let mut handles: FxHashMap<&Id, AsyncHandleSite<'_>> = FxHashMap::default();
+
+    for (_, step) in program.steps_with_locations() {
+        match step {
+            OperationStep::ExecuteEffectAsync(execute) => {
+                handles.insert(&execute.handle, AsyncHandleSite::Direct {
+                    effect: &execute.effect_id,
+                });
+            }
+
+            OperationStep::ExecuteEffectIntentAsync(execute) => {
+                handles.insert(&execute.handle, AsyncHandleSite::Intent {
+                    intent: &execute.intent,
+                });
+            }
+
+            _ => {}
+        }
+    }
+
     for (_, step) in program.steps_with_locations() {
         match step {
             OperationStep::Transaction(transaction) => {
@@ -501,11 +523,63 @@ fn index_program(program: &crate::spec::OperationBlock) -> (ProgramIndex<'_>, Fx
                 }
             }
 
+            OperationStep::ExecuteEffectAsync(execute) => {
+                effects.insert(
+                    &execute.effect_id,
+                    EffectValues {
+                        values: &execute.values,
+                        transaction: None,
+                    },
+                );
+            }
+
+            OperationStep::JoinAll(join) => {
+                for entry in &join.handles {
+                    let (Some(bind), Some(site)) = (&entry.bind, handles.get(&entry.handle))
+                    else {
+                        continue;
+                    };
+
+                    bindings.insert(bind, site.binding());
+                }
+            }
+
+            OperationStep::Race(race) => {
+                // The race result's possible producers are the whole
+                // candidate set; provenance walks through the first
+                // resolvable candidate, whose contract every candidate
+                // is validated to share.
+                let (Some(bind), Some(site)) = (
+                    &race.bind,
+                    race.handles.iter().find_map(|handle| handles.get(handle)),
+                ) else {
+                    continue;
+                };
+
+                bindings.insert(bind, site.binding());
+            }
+
             _ => {}
         }
     }
 
     (ProgramIndex { bindings }, effects)
+}
+
+/// The launch an async handle refers back to.
+#[derive(Clone, Copy)]
+enum AsyncHandleSite<'a> {
+    Direct { effect: &'a Id },
+    Intent { intent: &'a Id },
+}
+
+impl<'a> AsyncHandleSite<'a> {
+    fn binding(self) -> BindingSite<'a> {
+        match self {
+            Self::Direct { effect } => BindingSite::EffectResult { effect },
+            Self::Intent { intent } => BindingSite::IntentResult { intent },
+        }
+    }
 }
 
 fn provenance_roots(workspace: &WorkspaceState, operation: &Id, binding: &Id) -> Vec<ProvenanceRoot> {

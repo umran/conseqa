@@ -118,6 +118,13 @@ pub enum ValidationCode {
     EffectResultVariantOutOfScope,
     EffectHasNoResult,
 
+    EmptyJoinAll,
+    RaceRequiresTwoHandles,
+    DuplicateSynchronizationHandle,
+    AsyncHandleNotAvailable,
+    RaceResultContractMismatch,
+    EffectKindNotAsyncCapable,
+
     // L1 — runtime topology.
     EmptyRoutingKey,
     RoutingWithoutGrouping,

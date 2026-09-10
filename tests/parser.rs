@@ -2006,3 +2006,156 @@ runtime:
         assert_eq!(model, round_tripped);
     }
 }
+
+#[test]
+fn parses_asynchronous_effect_steps() {
+    let source = r#"
+revision: 1
+services:
+  service.read:
+    kind: backend
+schemas:
+  schema.Query:
+    kind: canonical
+    description: A read request.
+    completeness: complete
+    fields:
+      id: uuid
+  schema.Row:
+    kind: canonical
+    description: A read result.
+    completeness: complete
+    fields:
+      id: uuid
+  schema.Miss:
+    kind: canonical
+    description: A read failure.
+    completeness: complete
+    fields:
+      reason: string
+data_models: {}
+topics: {}
+state_machines: {}
+operations:
+  operation.hedged_read:
+    service: service.read
+    description: Race a primary and a replica read, then await both.
+    inputs:
+      input.hedged_read.request:
+        kind: request
+        schema: schema.Query
+        identity:
+          kind: unspecified
+        result:
+          ok: schema.Row
+          err: schema.Miss
+    program:
+      steps:
+      - kind: execute_effect_async
+        handle: async.primary
+        effect_id: effect.hedged_read.primary
+        effect:
+          kind: external
+          name: store-a
+          idempotency:
+            kind: unspecified
+          result:
+            ok: schema.Row
+            err: schema.Miss
+        values:
+          kind: unspecified
+      - kind: execute_effect_async
+        handle: async.replica
+        effect_id: effect.hedged_read.replica
+        effect:
+          kind: external
+          name: store-b
+          idempotency:
+            kind: unspecified
+          result:
+            ok: schema.Row
+            err: schema.Miss
+        values:
+          kind: unspecified
+      - kind: race
+        handles:
+        - async.primary
+        - async.replica
+        bind: result.read
+      - kind: join_all
+        handles:
+        - handle: async.primary
+        - handle: async.replica
+          bind: result.replica
+      - kind: match_result
+        result: result.read
+        ok:
+          steps:
+          - kind: return
+            request: input.hedged_read.request
+            outcome:
+              kind: ok
+              values:
+                kind: deterministic
+                from:
+                - source: effect_result_ok:result.read
+                  path: id
+        err:
+          steps:
+          - kind: return
+            request: input.hedged_read.request
+            outcome:
+              kind: err
+              values:
+                kind: unspecified
+    requirements:
+      serialization: []
+      ordering: []
+      idempotency: []
+      recoverability: []
+"#;
+
+    let model = yaml::parse(source).expect("the async program should parse");
+
+    let program = &model
+        .operations
+        .get(&Id("operation.hedged_read".into()))
+        .expect("the operation exists")
+        .program;
+
+    let OperationStep::ExecuteEffectAsync(primary) = &program.steps[0] else {
+        panic!("expected an async launch, found {:?}", program.steps[0]);
+    };
+
+    assert_eq!(primary.handle, Id("async.primary".into()));
+    assert_eq!(primary.effect_id, Id("effect.hedged_read.primary".into()));
+    assert!(matches!(primary.values, Derivation::Unspecified));
+
+    let OperationStep::Race(race) = &program.steps[2] else {
+        panic!("expected a race, found {:?}", program.steps[2]);
+    };
+
+    assert_eq!(
+        race.handles,
+        vec![Id("async.primary".into()), Id("async.replica".into())]
+    );
+    assert_eq!(race.bind, Some(Id("result.read".into())));
+
+    let OperationStep::JoinAll(join) = &program.steps[3] else {
+        panic!("expected a join_all, found {:?}", program.steps[3]);
+    };
+
+    assert_eq!(join.handles.len(), 2);
+    assert_eq!(join.handles[0].handle, Id("async.primary".into()));
+    assert_eq!(join.handles[0].bind, None);
+    assert_eq!(join.handles[1].bind, Some(Id("result.replica".into())));
+
+    // The async fan-out declares both effect sites.
+    assert_eq!(program.effect_declarations().len(), 2);
+
+    // The model survives a serialize/parse round trip unchanged.
+    let serialized = yaml::serialize(&model).expect("serializes");
+    let reparsed = yaml::parse(&serialized).expect("round trip parses");
+
+    assert_eq!(model, reparsed);
+}

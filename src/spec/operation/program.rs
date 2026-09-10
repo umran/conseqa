@@ -36,8 +36,26 @@ pub enum OperationStep {
     /// site: reaching the step constructs the instance and executes it.
     ExecuteEffect(ExecuteEffect),
 
+    /// Constructs and initiates the same logical effect instance an
+    /// `execute_effect` would, without waiting for the execution to
+    /// complete. Binds only an operation-local asynchronous handle.
+    ExecuteEffectAsync(ExecuteEffectAsync),
+
     /// Executes an already-established effect instance.
     ExecuteEffectIntent(ExecuteEffectIntent),
+
+    /// Initiates execution of the exact instance captured by an
+    /// established intent, without waiting for it to complete. Binds
+    /// only an operation-local asynchronous handle.
+    ExecuteEffectIntentAsync(ExecuteEffectIntentAsync),
+
+    /// Waits for every referenced asynchronous execution to complete,
+    /// optionally binding each result-bearing effect's result.
+    JoinAll(JoinAll),
+
+    /// Waits for the first referenced asynchronous execution to
+    /// complete — first completion, not first success.
+    Race(Race),
 
     /// Destructures a bound effect result into its `ok` and `err`
     /// arms.
@@ -86,6 +104,38 @@ pub struct ExecuteEffect {
     pub bind: Option<Id>,
 }
 
+/// Declares one logical effect contract and one asynchronous execution
+/// site.
+///
+/// Reaching the step evaluates `values`, constructs the concrete
+/// instance — fully determined at launch — and initiates its
+/// execution; control proceeds without waiting for completion. Only
+/// `start(effect) < start(next)` is established; no completion
+/// relationship exists until a synchronization step declares one.
+///
+/// The step binds no result: at launch the synchronous result need not
+/// exist yet. Results become available only through `join_all` or
+/// `race`. `effect_id` and `handle` are independently meaningful:
+/// the effect ID is the stable identity of the inline occurrence, the
+/// handle an invocation-local synchronization artifact.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExecuteEffectAsync {
+    /// Operation-local handle of this asynchronous execution
+    /// occurrence, consumed only by synchronization steps.
+    pub handle: Id,
+
+    /// Stable identity of this inline effect occurrence.
+    pub effect_id: Id,
+
+    /// The logical effect contract declared at this site.
+    pub effect: Effect,
+
+    /// Provenance of the complete outgoing logical effect instance,
+    /// evaluated when the launch is reached.
+    pub values: Derivation,
+}
+
 /// Executes an already-established effect instance; the values were
 /// fixed at establishment, so no derivation is declared here. The
 /// result binding follows the underlying effect contract exactly as
@@ -99,6 +149,69 @@ pub struct ExecuteEffectIntent {
 
     /// Binds the effect's synchronous result, allowed only when the
     /// underlying effect contract is result-bearing.
+    pub bind: Option<Id>,
+}
+
+/// Initiates execution of the exact effect instance captured by an
+/// established intent, without waiting for it to complete.
+///
+/// An additional execution authority for an `EffectIntent`: the
+/// captured instance is resolved and initiated, and control proceeds.
+/// It alters no intent durability, replay, or recovery semantics, and
+/// binds no result — results surface only at synchronization.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExecuteEffectIntentAsync {
+    /// The definitely available intent binding whose captured instance
+    /// this step initiates.
+    pub intent: Id,
+
+    /// Operation-local handle of this asynchronous execution
+    /// occurrence.
+    pub handle: Id,
+}
+
+/// A synchronization barrier over asynchronous executions: the
+/// continuation follows completion of every referenced execution.
+///
+/// No relative completion order among the joined executions is
+/// established, and the barrier does not serialize them. Each entry
+/// may independently bind its effect's ordinary `Result`; no aggregate
+/// value is constructed. An `Err` result is still a completed
+/// interaction, so the barrier never short-circuits on one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct JoinAll {
+    pub handles: Vec<AsyncJoin>,
+}
+
+/// One joined handle and, when the underlying effect is result-bearing
+/// and the result is not deliberately ignored, the binding under which
+/// its ordinary `Result` becomes available after the barrier. The
+/// result type is inferred from the underlying effect contract and
+/// never restated.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AsyncJoin {
+    pub handle: Id,
+    pub bind: Option<Id>,
+}
+
+/// A first-completion barrier over asynchronous executions: the
+/// continuation follows the first referenced execution to complete —
+/// first completion, not first success, so a winning `Err` is what a
+/// result-binding race observes.
+///
+/// Racing establishes nothing about the losing executions: they are
+/// not cancelled, remain part of the operation's side-effect blast
+/// radius, and may still be joined later — the race consumes no
+/// handle. Where `bind` is present, every candidate must expose the
+/// same logical result contract, and the binding carries the winner's
+/// exact result; the winning handle's identity is not exposed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Race {
+    pub handles: Vec<Id>,
     pub bind: Option<Id>,
 }
 
@@ -442,6 +555,10 @@ impl OperationBlock {
         for (_, step) in self.steps_with_locations() {
             match step {
                 OperationStep::ExecuteEffect(step) => {
+                    out.push((&step.effect_id, &step.effect));
+                }
+
+                OperationStep::ExecuteEffectAsync(step) => {
                     out.push((&step.effect_id, &step.effect));
                 }
 

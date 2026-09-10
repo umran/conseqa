@@ -299,6 +299,62 @@ pub enum ValidationError {
         effect: Id,
         result: Id,
     },
+
+    /// A `join_all` declares no handles; the barrier would wait on
+    /// nothing.
+    EmptyJoinAll {
+        operation: Id,
+        location: StepLocation,
+    },
+
+    /// A `race` declares fewer than two handles; a first-completion
+    /// barrier over one candidate is a `join_all`.
+    RaceRequiresTwoHandles {
+        operation: Id,
+        location: StepLocation,
+        count: usize,
+    },
+
+    /// One synchronization step references the same async handle more
+    /// than once.
+    DuplicateSynchronizationHandle {
+        operation: Id,
+        location: StepLocation,
+        handle: Id,
+        consumer: ProgramUse,
+    },
+
+    /// A synchronization step waits on an async handle that is not
+    /// definitely bound by an async launch on every path reaching it.
+    AsyncHandleNotAvailable {
+        operation: Id,
+        location: StepLocation,
+        handle: Id,
+        consumer: ProgramUse,
+    },
+
+    /// A result-binding `race` whose candidates do not all expose the
+    /// same logical result contract.
+    RaceResultContractMismatch {
+        operation: Id,
+        location: StepLocation,
+        bind: Id,
+        first: Id,
+        second: Id,
+    },
+
+    /// An `execute_effect_async` launches an effect whose kind does
+    /// not permit direct asynchronous execution.
+    ///
+    /// Every kind currently legal for direct execution is
+    /// async-capable, so no present model raises this; it exists so a
+    /// future effect kind must declare its answer rather than inherit
+    /// one.
+    EffectKindNotAsyncCapable {
+        operation: Id,
+        location: StepLocation,
+        effect: Id,
+    },
 }
 
 /// Where a program point consumes a value, for a diagnostic to name.
@@ -313,6 +369,12 @@ pub enum ProgramUse {
 
     /// The execution of an effect intent at the step.
     EffectIntent { intent: Id },
+
+    /// The `join_all` barrier at the step.
+    JoinAll,
+
+    /// The `race` barrier at the step.
+    Race,
 
     /// The `match_result` at the step.
     Match,
@@ -330,6 +392,8 @@ impl std::fmt::Display for ProgramUse {
             Self::Transaction { transaction } => write!(f, "transaction `{transaction}`"),
             Self::Effect { effect } => write!(f, "the execution of effect `{effect}`"),
             Self::EffectIntent { intent } => write!(f, "the execution of intent `{intent}`"),
+            Self::JoinAll => f.write_str("the `join_all` barrier"),
+            Self::Race => f.write_str("the `race` barrier"),
             Self::Match => f.write_str("the result match"),
             Self::Condition => f.write_str("the branch condition"),
             Self::Return { request } => write!(f, "the result returned for `{request}`"),
@@ -1307,6 +1371,141 @@ impl From<ValidationError> for Diagnostic {
                     message: "A publication produces no synchronous result, and an external \
                               effect produces one only when it declares a `result` contract; \
                               a request inherits its target input's contract."
+                        .to_string(),
+                }],
+            },
+
+            ValidationError::EmptyJoinAll {
+                operation,
+                location,
+            } => Diagnostic {
+                code: DiagnosticCode::Validation(ValidationCode::EmptyJoinAll),
+                severity: Severity::Error,
+                subject: Some(operation.clone()),
+                message: format!(
+                    "Program step `{location}` of `{operation}` is a `join_all` with no \
+                     handles."
+                ),
+                evidence: vec![Evidence {
+                    subject: Some(operation),
+                    message: "A `join_all` must reference at least one definitely available \
+                              async handle; an empty barrier waits on nothing."
+                        .to_string(),
+                }],
+            },
+
+            ValidationError::RaceRequiresTwoHandles {
+                operation,
+                location,
+                count,
+            } => Diagnostic {
+                code: DiagnosticCode::Validation(ValidationCode::RaceRequiresTwoHandles),
+                severity: Severity::Error,
+                subject: Some(operation.clone()),
+                message: format!(
+                    "Program step `{location}` of `{operation}` is a `race` over {count} \
+                     handle(s); a race requires at least two candidates."
+                ),
+                evidence: vec![Evidence {
+                    subject: Some(operation),
+                    message: "A first-completion barrier over fewer than two candidates \
+                              decides nothing; to await one handle, use a single-handle \
+                              `join_all`."
+                        .to_string(),
+                }],
+            },
+
+            ValidationError::DuplicateSynchronizationHandle {
+                operation,
+                location,
+                handle,
+                consumer,
+            } => Diagnostic {
+                code: DiagnosticCode::Validation(
+                    ValidationCode::DuplicateSynchronizationHandle,
+                ),
+                severity: Severity::Error,
+                subject: Some(operation.clone()),
+                message: format!(
+                    "Program step `{location}` of `{operation}` references async handle \
+                     `{handle}` more than once in {consumer}."
+                ),
+                evidence: vec![Evidence {
+                    subject: Some(handle),
+                    message: "Each handle identifies one asynchronous execution occurrence \
+                              and may appear at most once per synchronization step."
+                        .to_string(),
+                }],
+            },
+
+            ValidationError::AsyncHandleNotAvailable {
+                operation,
+                location,
+                handle,
+                consumer,
+            } => Diagnostic {
+                code: DiagnosticCode::Validation(ValidationCode::AsyncHandleNotAvailable),
+                severity: Severity::Error,
+                subject: Some(operation.clone()),
+                message: format!(
+                    "Program step `{location}` of `{operation}` waits on async handle \
+                     `{handle}` in {consumer}, but no async launch on every path reaching \
+                     that step binds it."
+                ),
+                evidence: vec![Evidence {
+                    subject: Some(handle),
+                    message: "An async handle follows the operation-local definite-availability \
+                              discipline: it may be synchronized only after the launch that \
+                              binds it, on every path reaching the synchronization."
+                        .to_string(),
+                }],
+            },
+
+            ValidationError::RaceResultContractMismatch {
+                operation,
+                location,
+                bind,
+                first,
+                second,
+            } => Diagnostic {
+                code: DiagnosticCode::Validation(
+                    ValidationCode::RaceResultContractMismatch,
+                ),
+                severity: Severity::Error,
+                subject: Some(operation.clone()),
+                message: format!(
+                    "Program step `{location}` of `{operation}` binds race result `{bind}`, \
+                     but candidate effects `{first}` and `{second}` do not expose the same \
+                     logical result contract."
+                ),
+                evidence: vec![Evidence {
+                    subject: Some(bind),
+                    message: "A result-binding race observes whichever candidate completes \
+                              first, so every candidate must be result-bearing with one \
+                              logical result contract; drop `bind` to race heterogeneous \
+                              effects."
+                        .to_string(),
+                }],
+            },
+
+            ValidationError::EffectKindNotAsyncCapable {
+                operation,
+                location,
+                effect,
+            } => Diagnostic {
+                code: DiagnosticCode::Validation(ValidationCode::EffectKindNotAsyncCapable),
+                severity: Severity::Error,
+                subject: Some(operation.clone()),
+                message: format!(
+                    "Program step `{location}` of `{operation}` launches effect `{effect}` \
+                     asynchronously, but its effect kind does not permit direct \
+                     asynchronous execution."
+                ),
+                evidence: vec![Evidence {
+                    subject: Some(effect),
+                    message: "Each effect kind explicitly declares whether \
+                              `execute_effect_async` may launch it; none becomes \
+                              async-capable merely by being an effect."
                         .to_string(),
                 }],
             },

@@ -125,8 +125,15 @@ struct ReferenceIndex<'a> {
     output_schemas: BTreeMap<&'a Id, &'a Id>,
 
     /// The effect each result binding observes: the executed effect,
-    /// or the effect of the executed intent.
+    /// or the effect of the executed intent. A `race` binding maps to
+    /// its first candidate — validation separately requires every
+    /// candidate to expose the same logical result contract, so any
+    /// candidate resolves the contract.
     result_bindings: BTreeMap<&'a Id, &'a Id>,
+
+    /// The underlying effect of each async handle: the launched inline
+    /// effect, or the effect captured by the launched intent.
+    handle_effects: BTreeMap<&'a Id, &'a Id>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -185,6 +192,32 @@ impl<'a> ReferenceIndex<'a> {
                         effect_contracts.insert(&step.effect_id, &step.effect);
                     }
 
+                    OperationStep::ExecuteEffectAsync(step) => {
+                        effect_contracts.insert(&step.effect_id, &step.effect);
+                    }
+
+                    _ => {}
+                }
+            }
+        }
+
+        // Handles before result bindings: a join or race binding
+        // resolves its effect through the handle it synchronizes.
+        let mut handle_effects: BTreeMap<&Id, &Id> = BTreeMap::new();
+
+        for operation in model.operations.values() {
+            for (_, step) in operation.program.steps_with_locations() {
+                match step {
+                    OperationStep::ExecuteEffectAsync(step) => {
+                        handle_effects.insert(&step.handle, &step.effect_id);
+                    }
+
+                    OperationStep::ExecuteEffectIntentAsync(step) => {
+                        if let Some(effect) = intent_effects.get(&step.intent) {
+                            handle_effects.insert(&step.handle, effect);
+                        }
+                    }
+
                     _ => {}
                 }
             }
@@ -209,6 +242,27 @@ impl<'a> ReferenceIndex<'a> {
                         }
                     }
 
+                    OperationStep::JoinAll(step) => {
+                        for entry in &step.handles {
+                            if let (Some(bind), Some(effect)) =
+                                (&entry.bind, handle_effects.get(&entry.handle))
+                            {
+                                result_bindings.insert(bind, effect);
+                            }
+                        }
+                    }
+
+                    OperationStep::Race(step) => {
+                        if let (Some(bind), Some(effect)) = (
+                            &step.bind,
+                            step.handles
+                                .first()
+                                .and_then(|handle| handle_effects.get(handle)),
+                        ) {
+                            result_bindings.insert(bind, effect);
+                        }
+                    }
+
                     _ => {}
                 }
             }
@@ -220,6 +274,7 @@ impl<'a> ReferenceIndex<'a> {
             effect_contracts,
             output_schemas,
             result_bindings,
+            handle_effects,
         }
     }
 
@@ -235,6 +290,11 @@ impl<'a> ReferenceIndex<'a> {
     /// The contract of an operation-owned inline effect.
     fn effect_contract(&self, effect: &Id) -> Option<&'a Effect> {
         self.effect_contracts.get(effect).copied()
+    }
+
+    /// The underlying effect an async handle's execution runs.
+    fn handle_effect(&self, handle: &Id) -> Option<&'a Id> {
+        self.handle_effects.get(handle).copied()
     }
 
     /// The schema an inline transaction-output binder declares.
@@ -393,6 +453,11 @@ fn is_program_local_error(error: &ValidationError) -> bool {
         | EffectResultNotBound { .. }
         | EffectResultVariantOutOfScope { .. }
         | EffectHasNoResult { .. }
+        | EmptyJoinAll { .. }
+        | RaceRequiresTwoHandles { .. }
+        | DuplicateSynchronizationHandle { .. }
+        | AsyncHandleNotAvailable { .. }
+        | EffectKindNotAsyncCapable { .. }
         | TransactionReadOutsideTransaction { .. }
         | TransactionReadOutOfOrder { .. }
         | TransactionReadFieldNotSelected { .. }
@@ -414,6 +479,7 @@ fn is_program_owned_kind(kind: ReferenceKind) -> bool {
         kind,
         ReferenceKind::EffectIntent
             | ReferenceKind::EffectResult
+            | ReferenceKind::AsyncHandle
             | ReferenceKind::TransactionOutput
             | ReferenceKind::Transaction
             | ReferenceKind::TransactionRead
@@ -1982,6 +2048,19 @@ fn validate_program_references(
                 validate_derivation_references(index, operation_id, context, &step.values, errors);
             }
 
+            OperationStep::ExecuteEffectAsync(step) => {
+                validate_effect_references(
+                    model,
+                    index,
+                    &step.effect_id,
+                    context,
+                    &step.effect,
+                    errors,
+                );
+
+                validate_derivation_references(index, operation_id, context, &step.values, errors);
+            }
+
             OperationStep::ExecuteEffectIntent(step) => {
                 expect_owned_reference(
                     index,
@@ -1991,6 +2070,43 @@ fn validate_program_references(
                     operation_id,
                     errors,
                 );
+            }
+
+            OperationStep::ExecuteEffectIntentAsync(step) => {
+                expect_owned_reference(
+                    index,
+                    operation_id,
+                    &step.intent,
+                    ReferenceKind::EffectIntent,
+                    operation_id,
+                    errors,
+                );
+            }
+
+            OperationStep::JoinAll(step) => {
+                for entry in &step.handles {
+                    expect_owned_reference(
+                        index,
+                        operation_id,
+                        &entry.handle,
+                        ReferenceKind::AsyncHandle,
+                        operation_id,
+                        errors,
+                    );
+                }
+            }
+
+            OperationStep::Race(step) => {
+                for handle in &step.handles {
+                    expect_owned_reference(
+                        index,
+                        operation_id,
+                        handle,
+                        ReferenceKind::AsyncHandle,
+                        operation_id,
+                        errors,
+                    );
+                }
             }
 
             OperationStep::MatchResult(step) => {
@@ -2456,7 +2572,31 @@ fn visit_declarations<'a>(
                     }
                 }
 
+                OperationStep::ExecuteEffectAsync(step) => {
+                    visit(&step.effect_id, ReferenceKind::Effect, Some(operation_id));
+
+                    visit(&step.handle, ReferenceKind::AsyncHandle, Some(operation_id));
+                }
+
                 OperationStep::ExecuteEffectIntent(step) => {
+                    if let Some(bind) = &step.bind {
+                        visit(bind, ReferenceKind::EffectResult, Some(operation_id));
+                    }
+                }
+
+                OperationStep::ExecuteEffectIntentAsync(step) => {
+                    visit(&step.handle, ReferenceKind::AsyncHandle, Some(operation_id));
+                }
+
+                OperationStep::JoinAll(step) => {
+                    for entry in &step.handles {
+                        if let Some(bind) = &entry.bind {
+                            visit(bind, ReferenceKind::EffectResult, Some(operation_id));
+                        }
+                    }
+                }
+
+                OperationStep::Race(step) => {
                     if let Some(bind) = &step.bind {
                         visit(bind, ReferenceKind::EffectResult, Some(operation_id));
                     }
@@ -2776,26 +2916,100 @@ fn effect_result_type<'a>(
 
 /// A result-bearing effect may be executed without binding its result;
 /// an effect without a synchronous result must not declare a binding.
+///
+/// A `join_all` entry's binding is judged against the joined handle's
+/// underlying effect, exactly as a synchronous binding would be. A
+/// result-binding `race` additionally requires every candidate to be
+/// result-bearing with one logical result contract.
 fn validate_result_bindings(model: &Model, index: &ReferenceIndex<'_>) -> Vec<ValidationError> {
     let mut errors = Vec::new();
 
     for (operation_id, operation) in &model.operations {
         for (location, step) in operation.program.steps_with_locations() {
-            let Some(result) = step_result_binding(step) else {
-                continue;
-            };
+            match step {
+                OperationStep::JoinAll(step) => {
+                    for entry in &step.handles {
+                        let (Some(bind), Some(effect)) =
+                            (&entry.bind, index.handle_effect(&entry.handle))
+                        else {
+                            continue;
+                        };
 
-            let Some(effect) = index.binding_effect(result) else {
-                continue;
-            };
+                        if effect_result_type(model, index, effect).is_none() {
+                            errors.push(ValidationError::EffectHasNoResult {
+                                operation: operation_id.clone(),
+                                location: location.clone(),
+                                effect: effect.clone(),
+                                result: bind.clone(),
+                            });
+                        }
+                    }
+                }
 
-            if effect_result_type(model, index, effect).is_none() {
-                errors.push(ValidationError::EffectHasNoResult {
-                    operation: operation_id.clone(),
-                    location,
-                    effect: effect.clone(),
-                    result: result.clone(),
-                });
+                OperationStep::Race(step) => {
+                    let Some(bind) = &step.bind else {
+                        // Without a binding no result compatibility
+                        // requirement is imposed: a result-less race
+                        // may synchronize heterogeneous effects.
+                        continue;
+                    };
+
+                    let mut first: Option<(&Id, &ResultType)> = None;
+
+                    for handle in &step.handles {
+                        let Some(effect) = index.handle_effect(handle) else {
+                            continue;
+                        };
+
+                        let Some(contract) = effect_result_type(model, index, effect) else {
+                            errors.push(ValidationError::EffectHasNoResult {
+                                operation: operation_id.clone(),
+                                location: location.clone(),
+                                effect: effect.clone(),
+                                result: bind.clone(),
+                            });
+
+                            continue;
+                        };
+
+                        match first {
+                            None => first = Some((effect, contract)),
+
+                            Some((first_effect, first_contract)) => {
+                                if contract != first_contract {
+                                    errors.push(
+                                        ValidationError::RaceResultContractMismatch {
+                                            operation: operation_id.clone(),
+                                            location: location.clone(),
+                                            bind: bind.clone(),
+                                            first: first_effect.clone(),
+                                            second: effect.clone(),
+                                        },
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+
+                _ => {
+                    let Some(result) = step_result_binding(step) else {
+                        continue;
+                    };
+
+                    let Some(effect) = index.binding_effect(result) else {
+                        continue;
+                    };
+
+                    if effect_result_type(model, index, effect).is_none() {
+                        errors.push(ValidationError::EffectHasNoResult {
+                            operation: operation_id.clone(),
+                            location,
+                            effect: effect.clone(),
+                            result: result.clone(),
+                        });
+                    }
+                }
             }
         }
     }
@@ -2807,12 +3021,14 @@ fn validate_result_bindings(model: &Model, index: &ReferenceIndex<'_>) -> Vec<Va
 
 /// What is definitely available at one program point: the transaction
 /// artifacts every path reaching it has established or recovered, the
-/// result bindings every path has bound, and the result variants the
-/// enclosing match arms have selected.
+/// result bindings every path has bound, the async handles every path
+/// has launched, and the result variants the enclosing match arms have
+/// selected.
 #[derive(Debug, Clone, Default)]
 struct Availability {
     artifacts: BTreeSet<Id>,
     bound: BTreeSet<Id>,
+    handles: BTreeSet<Id>,
     ok: BTreeSet<Id>,
     err: BTreeSet<Id>,
 }
@@ -2827,6 +3043,7 @@ impl Availability {
         Self {
             artifacts: both(&self.artifacts, &other.artifacts),
             bound: both(&self.bound, &other.bound),
+            handles: both(&self.handles, &other.handles),
             ok: both(&self.ok, &other.ok),
             err: both(&self.err, &other.err),
         }
@@ -2977,6 +3194,36 @@ impl<'a> ProgramValidator<'a> {
                 Some(state)
             }
 
+            OperationStep::ExecuteEffectAsync(step) => {
+                let consumer = ProgramUse::Effect {
+                    effect: step.effect_id.clone(),
+                };
+
+                if !step.effect.permits_direct_async() {
+                    self.errors.push(ValidationError::EffectKindNotAsyncCapable {
+                        operation: self.operation_id.clone(),
+                        location: location.clone(),
+                        effect: step.effect_id.clone(),
+                    });
+                }
+
+                // The instance is fully determined at launch: the
+                // derivation and the contract's own references are
+                // evaluated here, exactly as for a synchronous
+                // execution. Only the handle is bound — no result.
+                for root in step.values.roots() {
+                    self.require(&state, root, location, &consumer);
+                }
+
+                for root in step.effect.roots() {
+                    self.require(&state, root, location, &consumer);
+                }
+
+                state.handles.insert(step.handle.clone());
+
+                Some(state)
+            }
+
             OperationStep::ExecuteEffectIntent(step) => {
                 // The captured instance and its contract were fixed at
                 // establishment; the execution consumes the definitely
@@ -2997,6 +3244,84 @@ impl<'a> ProgramValidator<'a> {
                         });
                 }
 
+                if let Some(bind) = &step.bind {
+                    state.bound.insert(bind.clone());
+                }
+
+                Some(state)
+            }
+
+            OperationStep::ExecuteEffectIntentAsync(step) => {
+                if !state.artifacts.contains(&step.intent)
+                    && self
+                        .reported
+                        .insert((location.clone(), step.intent.clone()))
+                {
+                    self.errors
+                        .push(ValidationError::TransactionArtifactNotAvailable {
+                            operation: self.operation_id.clone(),
+                            location: location.clone(),
+                            artifact: step.intent.clone(),
+                            consumer: ProgramUse::EffectIntent {
+                                intent: step.intent.clone(),
+                            },
+                        });
+                }
+
+                state.handles.insert(step.handle.clone());
+
+                Some(state)
+            }
+
+            OperationStep::JoinAll(step) => {
+                if step.handles.is_empty() {
+                    self.errors.push(ValidationError::EmptyJoinAll {
+                        operation: self.operation_id.clone(),
+                        location: location.clone(),
+                    });
+                }
+
+                let mut seen: BTreeSet<&Id> = BTreeSet::new();
+
+                for entry in &step.handles {
+                    self.synchronize(
+                        &state,
+                        &entry.handle,
+                        &mut seen,
+                        location,
+                        ProgramUse::JoinAll,
+                    );
+                }
+
+                // Result bindings enter availability after the
+                // barrier: the join is what makes each joined
+                // result-bearing effect's result observable.
+                for entry in &step.handles {
+                    if let Some(bind) = &entry.bind {
+                        state.bound.insert(bind.clone());
+                    }
+                }
+
+                Some(state)
+            }
+
+            OperationStep::Race(step) => {
+                if step.handles.len() < 2 {
+                    self.errors.push(ValidationError::RaceRequiresTwoHandles {
+                        operation: self.operation_id.clone(),
+                        location: location.clone(),
+                        count: step.handles.len(),
+                    });
+                }
+
+                let mut seen: BTreeSet<&Id> = BTreeSet::new();
+
+                for handle in &step.handles {
+                    self.synchronize(&state, handle, &mut seen, location, ProgramUse::Race);
+                }
+
+                // The winner's result becomes available after the
+                // barrier; no candidate result does individually.
                 if let Some(bind) = &step.bind {
                     state.bound.insert(bind.clone());
                 }
@@ -3074,6 +3399,40 @@ impl<'a> ProgramValidator<'a> {
             }
 
             OperationStep::Complete => None,
+        }
+    }
+
+    /// Checks one handle reference of a synchronization step: it must
+    /// not repeat within the step, and must be definitely available.
+    fn synchronize<'h>(
+        &mut self,
+        state: &Availability,
+        handle: &'h Id,
+        seen: &mut BTreeSet<&'h Id>,
+        location: &StepLocation,
+        consumer: ProgramUse,
+    ) {
+        if !seen.insert(handle) {
+            self.errors
+                .push(ValidationError::DuplicateSynchronizationHandle {
+                    operation: self.operation_id.clone(),
+                    location: location.clone(),
+                    handle: handle.clone(),
+                    consumer,
+                });
+
+            return;
+        }
+
+        if !state.handles.contains(handle)
+            && self.reported.insert((location.clone(), handle.clone()))
+        {
+            self.errors.push(ValidationError::AsyncHandleNotAvailable {
+                operation: self.operation_id.clone(),
+                location: location.clone(),
+                handle: handle.clone(),
+                consumer,
+            });
         }
     }
 
@@ -3244,6 +3603,25 @@ fn validate_program_paths(
     for (_, step) in program.steps_with_locations() {
         match step {
             OperationStep::ExecuteEffect(step) => {
+                // The contract's own field paths — propagation
+                // components, an external deduplication key — are
+                // evaluated in the operation context immediately
+                // before the step, like the instance derivation.
+                validate_effect_paths(model, index, &step.effect_id, context, &step.effect, errors);
+
+                validate_derivation_paths(
+                    model,
+                    index,
+                    operation_id,
+                    context,
+                    &step.values,
+                    errors,
+                );
+            }
+
+            OperationStep::ExecuteEffectAsync(step) => {
+                validate_effect_paths(model, index, &step.effect_id, context, &step.effect, errors);
+
                 validate_derivation_paths(
                     model,
                     index,

@@ -11,8 +11,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::spec::{
-    Arm, Condition, Derivation, Effect, Id, OperationBlock, OperationStep, ResultOutcome,
-    ResultVariant, StepLocation, Transaction,
+    Arm, AsyncJoin, Condition, Derivation, Effect, Id, OperationBlock, OperationStep,
+    ResultOutcome, ResultVariant, StepLocation, Transaction,
 };
 
 /// One path through the program: its linear steps in order and the
@@ -42,6 +42,41 @@ pub enum PathStep<'a> {
     ExecuteEffectIntent {
         location: StepLocation,
         intent: &'a Id,
+        bind: Option<&'a Id>,
+    },
+
+    /// An asynchronous launch: the instance is constructed and its
+    /// execution initiated here, but control does not wait for it.
+    /// Only the handle is bound.
+    ExecuteEffectAsync {
+        location: StepLocation,
+        handle: &'a Id,
+        effect_id: &'a Id,
+        effect: &'a Effect,
+        values: &'a Derivation,
+    },
+
+    /// An asynchronous launch of an established intent's captured
+    /// instance.
+    ExecuteEffectIntentAsync {
+        location: StepLocation,
+        intent: &'a Id,
+        handle: &'a Id,
+    },
+
+    /// The all-completion barrier: continuation follows completion of
+    /// every referenced execution, and each entry may bind its
+    /// effect's result.
+    JoinAll {
+        location: StepLocation,
+        handles: &'a [AsyncJoin],
+    },
+
+    /// The first-completion barrier: continuation follows the first
+    /// referenced execution to complete.
+    Race {
+        location: StepLocation,
+        handles: &'a [Id],
         bind: Option<&'a Id>,
     },
 
@@ -217,6 +252,47 @@ fn walk<'a>(
                     prefix.push(PathStep::ExecuteEffectIntent {
                         location: location.clone(),
                         intent: &step.intent,
+                        bind: step.bind.as_ref(),
+                    });
+
+                    next.push(prefix);
+                }
+
+                OperationStep::ExecuteEffectAsync(step) => {
+                    prefix.push(PathStep::ExecuteEffectAsync {
+                        location: location.clone(),
+                        handle: &step.handle,
+                        effect_id: &step.effect_id,
+                        effect: &step.effect,
+                        values: &step.values,
+                    });
+
+                    next.push(prefix);
+                }
+
+                OperationStep::ExecuteEffectIntentAsync(step) => {
+                    prefix.push(PathStep::ExecuteEffectIntentAsync {
+                        location: location.clone(),
+                        intent: &step.intent,
+                        handle: &step.handle,
+                    });
+
+                    next.push(prefix);
+                }
+
+                OperationStep::JoinAll(step) => {
+                    prefix.push(PathStep::JoinAll {
+                        location: location.clone(),
+                        handles: &step.handles,
+                    });
+
+                    next.push(prefix);
+                }
+
+                OperationStep::Race(step) => {
+                    prefix.push(PathStep::Race {
+                        location: location.clone(),
+                        handles: &step.handles,
                         bind: step.bind.as_ref(),
                     });
 

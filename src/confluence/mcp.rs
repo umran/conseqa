@@ -1778,6 +1778,23 @@ Schema, topic, state-machine, input, and program declarations use the
 Conseqa model YAML structure, as JSON. Value references:
   {"source":"input:input.x.request","path":"order_id"}
 Derivations: {"kind":"unspecified"} or {"kind":"deterministic","from":[<value ref>...]}.
+
+ASYNC PROGRAM STEPS — launch effects without waiting, then synchronize:
+  {"kind":"execute_effect_async","handle":"async.x","effect_id":"effect.x",
+   "effect":<effect>, "values":<derivation>}
+    (same contract/derivation semantics as execute_effect; binds NO result,
+     only the operation-local handle. start(x) precedes the next step;
+     complete(x) is established only by a later join_all or race.)
+  {"kind":"execute_effect_intent_async","intent":"intent.x","handle":"async.x"}
+  {"kind":"join_all","handles":[{"handle":"async.a","bind":"result.a"},
+                                {"handle":"async.b"}]}
+    (waits for ALL; each entry may bind its effect's result — only there do
+     async results become available. No order among the joined effects.)
+  {"kind":"race","handles":["async.a","async.b"],"bind":"result.first"}
+    (waits for the FIRST completion — not first success; losers are not
+     cancelled and stay in the side-effect blast radius. bind requires every
+     candidate to expose the same result contract; omit bind otherwise.
+     At least two handles.)
 "#;
 
 /// The prose that introduces [`PROGRAM_EXAMPLE_JSON`] in the reference.
