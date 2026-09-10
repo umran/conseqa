@@ -75,9 +75,10 @@ The authoring loop:
 explains the semantics by topic; dsl_reference gives the exact JSON \
 shapes plus a worked program example.
 3. Author the shared skeleton yourself with submit_patch: services, \
-schemas, data models, topics, state machines, and one interface per \
-planned operation (its id, service, inputs, and request or \
-subscription contracts). Many small typed patches are normal. The \
+schemas, data models (outboxes included), topics, state machines, and \
+one interface per planned operation (its id, service, inputs, and \
+request, subscription, or outbox contracts). Many small typed patches \
+are normal. The \
 commit gate rejects a structurally broken patch with precise \
 diagnostics; fix it and resubmit in the same session.
 4. Only once that skeleton is complete for the whole system, hand the \
@@ -112,8 +113,9 @@ narrowly, yourself, or with another request_design pass.
 An unproven obligation carries a `remedy` saying which layer the \
 missing facts belong to. `runtime` means no program change can help: \
 the fix is the L1 runtime topology — transport grouping and ordering, \
-subscription delivery and dispatch, execution pools and their member \
-concurrency, request routers, storage layouts. Author it here, after \
+subscription delivery and dispatch, outbox delivery, partitioning, \
+ordering, and dispatch, execution pools and their member concurrency, \
+request routers, storage layouts. Author it here, after \
 the programs exist and verification has said what it has to discharge, \
 not while drafting the skeleton: L1 exists to make specific \
 requirements provable, and before you know which ones, declaring it is \
@@ -146,11 +148,12 @@ pub struct ReadSymbolParams {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct SearchSymbolsParams {
     /// Restrict to one symbol kind: service, schema, data_model,
-    /// data_object, topic, state_machine, transition, operation,
+    /// data_object, outbox, topic, state_machine, transition, operation,
     /// operation_interface, operation_program, operation_requirements,
-    /// topic_runtime, subscription_runtime, execution_pool, router,
-    /// storage_layout, input, transaction, effect_site, binding,
-    /// requirement, operation_summary, prompt_obligation.
+    /// topic_runtime, subscription_runtime, outbox_runtime,
+    /// execution_pool, router, storage_layout, input, transaction,
+    /// effect_site, binding, requirement, operation_summary,
+    /// prompt_obligation.
     #[serde(default)]
     pub kind: Option<String>,
 
