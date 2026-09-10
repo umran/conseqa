@@ -117,7 +117,7 @@ export function MachineView({ id, highlight }: { id: string; highlight: string |
       <div className="mx-auto max-w-[1240px] space-y-6 p-6">
         <header className="space-y-4 border-b border-kumo-hairline pb-5">
           <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
-            <Text variant="heading2" as="h1">{shortId(id)}</Text>
+            <Text variant="heading" size="lg" as="h1">{shortId(id)}</Text>
             <ClipboardText text={id} size="sm" tooltip={{ text: "Copy id", copiedText: "Copied" }} />
           </div>
           <dl className="flex flex-wrap gap-x-8 gap-y-3">

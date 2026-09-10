@@ -115,6 +115,10 @@ export type Edge = EdgeBase &
         via_transition: TransitionKey | null;
         /** Program steps executing the effect, as step locations. */
         executed_at: string[];
+        /** The subset of `executed_at` that launches the effect
+         *  asynchronously: initiation without a completion dependency
+         *  on the following step. */
+        async_executed_at: string[];
       }
     | {
         kind: "subscribe";
@@ -142,6 +146,8 @@ export type Edge = EdgeBase &
         retry: string;
         via_transition: TransitionKey | null;
         executed_at: string[];
+        /** The subset of `executed_at` launching asynchronously. */
+        async_executed_at: string[];
       }
     | {
         kind: "external";
@@ -149,6 +155,8 @@ export type Edge = EdgeBase &
         effect: Id;
         idempotency: string;
         executed_at: string[];
+        /** The subset of `executed_at` launching asynchronously. */
+        async_executed_at: string[];
       }
     | { kind: "client"; operation: Id; input: Id; schema: Id }
   );

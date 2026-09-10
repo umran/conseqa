@@ -159,6 +159,7 @@ function Dispatch({ target }: { target: DetailTarget }) {
     case "intent": return <IntentDetail entry={entry} id={id} />;
     case "output": return <OutputDetail entry={entry} id={id} />;
     case "binding": return <BindingDetail opId={entry.op} effectId={entry.effect} location={entry.location} id={id} />;
+    case "handle": return <HandleDetail opId={entry.op} effectId={entry.effect} location={entry.location} id={id} />;
     case "transaction": return <TransactionDetail opId={entry.op} id={id} />;
     case "pool": return <PoolDetail id={id} />;
     case "router": return <RouterDetail id={id} />;
@@ -206,7 +207,7 @@ function ProgramSummary({ opId, block, depth = 0 }: { opId: Id; block: Operation
             <div className="min-w-0">
               <span className="text-kumo-subtle">execute effect </span>
               <IdLink id={s.effect_id}>{shortId(s.effect_id)}</IdLink>
-              {s.bind && <span className="ml-1.5 text-kumo-inactive">binds <IdLink id={s.bind}>{shortId(s.bind)}</IdLink></span>}
+              {s.bind && <span className="ml-1.5 text-kumo-subtle">binds <IdLink id={s.bind}>{s.bind}</IdLink></span>}
               <div className="text-kumo-inactive">{effectSummary(model, index, s.effect_id)}</div>
             </div>
           </li>
@@ -218,7 +219,62 @@ function ProgramSummary({ opId, block, depth = 0 }: { opId: Id; block: Operation
             <div className="min-w-0">
               <span className="text-kumo-subtle">execute intent </span>
               <IdLink id={s.intent}>{shortId(s.intent)}</IdLink>
-              {s.bind && <span className="ml-1.5 text-kumo-inactive">binds <IdLink id={s.bind}>{shortId(s.bind)}</IdLink></span>}
+              {s.bind && <span className="ml-1.5 text-kumo-subtle">binds <IdLink id={s.bind}>{s.bind}</IdLink></span>}
+            </div>
+          </li>
+        );
+      case "execute_effect_async":
+        return (
+          <li key={i} className="flex items-start gap-2 text-xs">
+            {number}
+            <div className="min-w-0">
+              <span className="text-kumo-subtle">launch async </span>
+              <IdLink id={s.effect_id}>{shortId(s.effect_id)}</IdLink>
+              <span className="ml-1.5 text-kumo-subtle">binds handle <IdLink id={s.handle}>{s.handle}</IdLink></span>
+              <div className="text-kumo-inactive">{effectSummary(model, index, s.effect_id)}</div>
+            </div>
+          </li>
+        );
+      case "execute_effect_intent_async":
+        return (
+          <li key={i} className="flex items-start gap-2 text-xs">
+            {number}
+            <div className="min-w-0">
+              <span className="text-kumo-subtle">launch intent async </span>
+              <IdLink id={s.intent}>{shortId(s.intent)}</IdLink>
+              <span className="ml-1.5 text-kumo-subtle">binds handle <IdLink id={s.handle}>{s.handle}</IdLink></span>
+            </div>
+          </li>
+        );
+      case "join_all":
+        return (
+          <li key={i} className="flex items-start gap-2 text-xs">
+            {number}
+            <div className="min-w-0">
+              <span className="text-kumo-subtle">join_all </span>
+              {s.handles.map((entry, j) => (
+                <span key={entry.handle}>
+                  {j > 0 && <span className="text-kumo-inactive">, </span>}
+                  <IdLink id={entry.handle}>{entry.handle}</IdLink>
+                  {entry.bind && <span className="text-kumo-subtle"> binds <IdLink id={entry.bind}>{entry.bind}</IdLink></span>}
+                </span>
+              ))}
+            </div>
+          </li>
+        );
+      case "race":
+        return (
+          <li key={i} className="flex items-start gap-2 text-xs">
+            {number}
+            <div className="min-w-0">
+              <span className="text-kumo-subtle">race </span>
+              {s.handles.map((h, j) => (
+                <span key={h}>
+                  {j > 0 && <span className="text-kumo-inactive">, </span>}
+                  <IdLink id={h}>{h}</IdLink>
+                </span>
+              ))}
+              {s.bind && <span className="ml-1.5 text-kumo-subtle">winner binds <IdLink id={s.bind}>{s.bind}</IdLink></span>}
             </div>
           </li>
         );
@@ -789,7 +845,72 @@ function StepDetail({ opId, location }: { opId: Id; location: string }) {
           ]} />
         </Frame>
       );
+    case "execute_effect_async":
+      return (
+        <Frame kind="program step" title={`launch async · ${shortId(step.effect_id)}`} subtitle={sub}
+          description="Constructs and initiates the effect instance without waiting for it to complete; only the handle is bound, and the result becomes available only at a join_all or race.">
+          <KeyValue rows={[
+            ["effect", <IdLink key="e" id={step.effect_id} />],
+            ["handle", <IdLink key="h" id={step.handle} />],
+          ]} />
+          <Section title="instance provenance"><DerivationView value={step.values} /></Section>
+        </Frame>
+      );
+    case "execute_effect_intent_async":
+      return (
+        <Frame kind="program step" title={`launch intent async · ${shortId(step.intent)}`} subtitle={sub}
+          description="Initiates the exact instance the intent captured, without waiting for it to complete; only the handle is bound.">
+          <KeyValue rows={[
+            ["intent", <IdLink key="i" id={step.intent} />],
+            ["handle", <IdLink key="h" id={step.handle} />],
+          ]} />
+        </Frame>
+      );
+    case "join_all":
+      return (
+        <Frame kind="program step" title="join_all" subtitle={sub}
+          description="An all-completion barrier: the continuation follows completion of every referenced execution, with no order established among them. Each entry may bind its effect's ordinary result; an Err is still a completed interaction, so the barrier never short-circuits on one.">
+          <Section title="waits for" count={step.handles.length}>
+            <List items={step.handles.map((entry) => (
+              <span key={entry.handle} className="flex flex-wrap items-center gap-1.5">
+                <IdLink id={entry.handle} />
+                {entry.bind
+                  ? <span className="text-xs text-kumo-subtle">binds <IdLink id={entry.bind} /></span>
+                  : <Muted>no result bound</Muted>}
+              </span>
+            ))} />
+          </Section>
+        </Frame>
+      );
+    case "race":
+      return (
+        <Frame kind="program step" title="race" subtitle={sub}
+          description="A first-completion barrier: the continuation follows whichever candidate completes first — first completion, not first success, so a winning Err is what a result-binding race observes. Losing executions are not cancelled and remain part of the operation's side-effect blast radius.">
+          <Section title="candidates" count={step.handles.length}>
+            <List items={step.handles.map((h) => <IdLink key={h} id={h} />)} />
+          </Section>
+          <KeyValue rows={[
+            ["winner binds", step.bind ? <IdLink key="b" id={step.bind} /> : <Muted key="b">nothing — heterogeneous candidates may race unbound</Muted>],
+          ]} />
+        </Frame>
+      );
   }
+}
+
+/** An async handle: the operation-local synchronization artifact one
+ *  launch bound, consumable only by join_all and race. */
+function HandleDetail({ opId, effectId, location, id }: { opId: Id; effectId: Id | null; location: string; id: Id }) {
+  const { model, index } = useApp();
+  return (
+    <Frame kind="async handle" title={id} subtitle={<span>async handle in <IdLink id={opId} /></span>}
+      description="Identifies one asynchronous execution occurrence for later synchronization. It is not application data: it has no schema, cannot be persisted or returned, and does not identify the logical effect itself — the effect id does.">
+      <KeyValue rows={[
+        ["launches", effectId ? <IdLink key="e" id={effectId} /> : <Muted key="e">unresolved intent</Muted>],
+        ["which is", effectId ? effectSummary(model, index, effectId) : "—"],
+        ["launched at step", <Mono key="l">{location}</Mono>],
+      ]} />
+    </Frame>
+  );
 }
 
 function TransactionDetail({ opId, id }: { opId: Id; id: Id }) {
@@ -943,10 +1064,24 @@ function TxStepDetail({ opId, txId, stepIndex }: { opId: Id; txId: Id; stepIndex
 }
 
 function EdgeDetail({ edge: e }: { edge: Edge }) {
+  const asyncAt = "async_executed_at" in e ? new Set(e.async_executed_at) : new Set<string>();
+  const allAsync = "executed_at" in e && e.executed_at.length > 0 && asyncAt.size === e.executed_at.length;
   const executed = "executed_at" in e ? (
     <Section title="executed at program steps" count={e.executed_at.length}>
       {e.executed_at.length
-        ? <List items={e.executed_at.map((loc, i) => <Mono key={i}>step {loc}</Mono>)} />
+        ? (
+          <>
+            <List items={e.executed_at.map((loc, i) => (
+              <span key={i} className="inline-flex items-center gap-1.5">
+                <Mono>step {loc}</Mono>
+                {asyncAt.has(loc) && <Tag variant="blue">async launch</Tag>}
+              </span>
+            ))} />
+            {allAsync && (
+              <Muted>every execution is an asynchronous launch: control never waits for this effect to complete; completion is established only where a join_all or race declares it</Muted>
+            )}
+          </>
+        )
         : <span className="flex items-center gap-1.5"><Tag variant="warning">declared, not executed</Tag><Muted>no step of the program executes this effect</Muted></span>}
     </Section>
   ) : null;

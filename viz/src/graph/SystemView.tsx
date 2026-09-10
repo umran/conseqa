@@ -141,6 +141,12 @@ export function SystemView() {
       {graph.externals.length > 0 && <LegendLine color="var(--arch-edge-external)" label="external effect" />}
       {graph.client && <LegendLine color="var(--arch-edge-client)" label="client request" />}
       <LegendLine color="var(--arch-text-subtle)" label="declared, unexecuted" dashed />
+      {graph.edges.some(
+        (e) =>
+          "async_executed_at" in e &&
+          e.executed_at.length > 0 &&
+          e.async_executed_at.length === e.executed_at.length,
+      ) && <LegendLine color="var(--arch-text)" label="async launch — no completion dependency" dashed />}
       {drawRuntime && (
         <>
           <LegendChip color="var(--arch-l1)" label="L1 realization" />
@@ -203,9 +209,17 @@ export function SystemView() {
 
       {layout.edges.map(({ edge: e, d, labelAt }) => {
         const unexecuted = "executed_at" in e && e.executed_at.length === 0;
+        // Async only when every execution site is a launch: one
+        // synchronous site is a completion dependency, and the solid
+        // line is the honest summary.
+        const allAsync =
+          "async_executed_at" in e &&
+          e.executed_at.length > 0 &&
+          e.async_executed_at.length === e.executed_at.length;
         const dimmed = selection ? !related.has(e.id) : q ? !(matches(e.from) || matches(e.to)) : false;
         const classes = ["arch-edge", e.kind];
         if (unexecuted) classes.push("unexecuted");
+        if (allAsync) classes.push("async");
         if (dimmed) classes.push("dimmed");
         if (selection === e.id) classes.push("selected");
         return (

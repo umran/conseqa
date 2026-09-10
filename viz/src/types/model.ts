@@ -260,10 +260,29 @@ export interface OperationBlock {
   steps: OperationStep[];
 }
 
+/** One joined handle and, when the underlying effect is result-bearing,
+ *  the binding its result becomes available under after the barrier. */
+export interface AsyncJoin {
+  handle: Id;
+  bind: Id | null;
+}
+
 export type OperationStep =
   | ({ kind: "transaction" } & Transaction)
   | { kind: "execute_effect"; effect_id: Id; effect: Effect; values: Derivation; bind: Id | null }
+  /** Constructs and initiates the same instance an `execute_effect`
+   *  would, without waiting for completion; binds only the handle. */
+  | { kind: "execute_effect_async"; handle: Id; effect_id: Id; effect: Effect; values: Derivation }
   | { kind: "execute_effect_intent"; intent: Id; bind: Id | null }
+  /** Initiates the captured intent's exact instance asynchronously. */
+  | { kind: "execute_effect_intent_async"; intent: Id; handle: Id }
+  /** All-completion barrier: continues after every referenced
+   *  execution completes; entries may bind their effects' results. */
+  | { kind: "join_all"; handles: AsyncJoin[] }
+  /** First-completion barrier: continues after the first referenced
+   *  execution completes — first completion, not first success; the
+   *  losers are not cancelled. */
+  | { kind: "race"; handles: Id[]; bind: Id | null }
   | { kind: "match_result"; result: Id; ok: OperationBlock; err: OperationBlock }
   | { kind: "branch"; condition: Condition; then: OperationBlock; otherwise: OperationBlock | null }
   | { kind: "return"; request: Id; outcome: ResultOutcome }

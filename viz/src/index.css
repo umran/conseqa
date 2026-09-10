@@ -69,6 +69,11 @@ svg.arch-canvas text { font-size: 12px; fill: var(--arch-text); user-select: non
 .arch-edge.external { stroke: var(--arch-edge-external); }
 .arch-edge.client { stroke: var(--arch-edge-client); }
 .arch-edge.unexecuted { stroke-dasharray: 5 4; opacity: 0.7; }
+/* Every execution of the effect is an async launch: the line breaks —
+   there is no completion dependency on the following step — but keeps
+   its full colour, unlike the faded short dash of an unexecuted
+   declaration. */
+.arch-edge.async { stroke-dasharray: 10 5; }
 .arch-edge.dimmed { opacity: 0.12; }
 .arch-edge.selected { stroke-width: 2.6; }
 .arch-edge-hit { fill: none; stroke: transparent; stroke-width: 14; cursor: pointer; pointer-events: stroke; }

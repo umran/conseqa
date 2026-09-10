@@ -29,6 +29,10 @@ export type IndexEntry =
   | { kind: "output"; op: Id; schema: Id; transaction: Id }
   /** A result binding declared by a program step; `effect` is what it observes. */
   | { kind: "binding"; op: Id; effect: Id; location: string }
+  /** An async handle bound by a launch step: an operation-local
+   *  synchronization artifact naming one in-flight execution of
+   *  `effect`. `null` when the launched intent does not resolve. */
+  | { kind: "handle"; op: Id; effect: Id | null; location: string }
   | { kind: "transaction"; op: Id }
   // L1 — the declared runtime realization. Indexed last, so an L0 id
   // always wins a collision: the application machine is what a reader
@@ -91,8 +95,9 @@ export function findTransaction(op: Operation, id: Id): Transaction | null {
 export function operationEffects(op: Operation): [Id, Effect][] {
   const out: [Id, Effect][] = [];
   for (const { step } of walkProgram(op.program)) {
-    if (step.kind === "execute_effect") out.push([step.effect_id, step.effect]);
-    else if (step.kind === "transaction") {
+    if (step.kind === "execute_effect" || step.kind === "execute_effect_async") {
+      out.push([step.effect_id, step.effect]);
+    } else if (step.kind === "transaction") {
       for (const inner of step.steps) {
         if (inner.kind === "establish_effect_intent") out.push([inner.effect_id, inner.effect]);
       }
@@ -130,7 +135,7 @@ export function buildIndex(model: Model): ModelIndex {
     // effect occurrences, and the intent/output bindings their
     // producing sites introduce.
     for (const { step } of walkProgram(op.program)) {
-      if (step.kind === "execute_effect") {
+      if (step.kind === "execute_effect" || step.kind === "execute_effect_async") {
         put(step.effect_id, { kind: "effect", op: opId });
       } else if (step.kind === "transaction") {
         put(step.id, { kind: "transaction", op: opId });
@@ -155,8 +160,10 @@ export function buildIndex(model: Model): ModelIndex {
       }
     }
 
-    // Result bindings second: an intent execution's observed effect
-    // resolves through the intent binding registered above.
+    // Result bindings and async handles second: an intent execution's
+    // observed effect resolves through the intent binding registered
+    // above, and a barrier's binding through the handle its launch
+    // registered earlier in program order.
     for (const { location, step } of walkProgram(op.program)) {
       if (step.kind === "execute_effect" && step.bind) {
         put(step.bind, { kind: "binding", op: opId, effect: step.effect_id, location });
@@ -164,6 +171,34 @@ export function buildIndex(model: Model): ModelIndex {
         const intent = index.get(step.intent);
         if (intent?.kind === "intent") {
           put(step.bind, { kind: "binding", op: opId, effect: intent.effect, location });
+        }
+      } else if (step.kind === "execute_effect_async") {
+        put(step.handle, { kind: "handle", op: opId, effect: step.effect_id, location });
+      } else if (step.kind === "execute_effect_intent_async") {
+        const intent = index.get(step.intent);
+        put(step.handle, {
+          kind: "handle",
+          op: opId,
+          effect: intent?.kind === "intent" ? intent.effect : null,
+          location,
+        });
+      } else if (step.kind === "join_all") {
+        for (const entry of step.handles) {
+          const handle = index.get(entry.handle);
+          if (entry.bind && handle?.kind === "handle" && handle.effect) {
+            put(entry.bind, { kind: "binding", op: opId, effect: handle.effect, location });
+          }
+        }
+      } else if (step.kind === "race" && step.bind) {
+        // The race result's possible producers are the whole candidate
+        // set; the index attributes it to the first resolvable one,
+        // whose contract every candidate is validated to share.
+        for (const h of step.handles) {
+          const handle = index.get(h);
+          if (handle?.kind === "handle" && handle.effect) {
+            put(step.bind, { kind: "binding", op: opId, effect: handle.effect, location });
+            break;
+          }
         }
       }
     }
