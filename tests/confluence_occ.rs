@@ -1214,3 +1214,90 @@ fn recovery_restores_the_head_and_invalidates_active_tasks() {
 
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// An invalidated task leaves a note for its replacement: the causes,
+/// and — when the attempt got as far as submitting — the rejected
+/// patch, so the next session starts from review-and-resubmit instead
+/// of re-deriving the work (a warm restart).
+#[test]
+fn invalidation_notes_carry_causes_and_the_salvageable_patch() {
+    let engine = engine();
+
+    // Gate-side invalidation: the task read nothing that changed, so
+    // it survives the sweep and learns of the conflict only when its
+    // own submission hits the gate — with the patch in hand.
+    let a = task(
+        &engine,
+        TaskKind::OperationSynthesis,
+        WriteScope::operation_synthesis(id("operation.create_order")),
+    );
+
+    assert!(
+        engine.invalidation_note(a.id).is_none(),
+        "a running task has no note"
+    );
+
+    let interloper = task(&engine, TaskKind::Decompose, WriteScope::of([WriteGrant::All]));
+
+    submit(&engine, &interloper, vec![probe_program("operation.create_order", 1)])
+        .expect("the interloper commits");
+
+    let rejection = submit(&engine, &a, vec![probe_program("operation.create_order", 2)])
+        .expect_err("the write target moved under the task");
+
+    assert!(rejection.is_stale_context(), "{rejection:?}");
+    assert_eq!(engine.task_status(a.id).unwrap(), TaskState::Invalidated);
+
+    let note = engine
+        .invalidation_note(a.id)
+        .expect("a gate-invalidated task leaves a note");
+
+    assert!(
+        note.causes.iter().any(|cause| matches!(
+            cause,
+            InvalidationCause::ChangedSymbol { symbol }
+                if *symbol == SymbolKey::OperationProgram(id("operation.create_order"))
+        )),
+        "{:?}",
+        note.causes
+    );
+
+    let patch = note.rejected_patch.expect("the refused patch is salvaged");
+
+    assert_eq!(patch.mutations.len(), 1);
+
+    // Sweep-side invalidation: a task cancelled mid-reasoning has no
+    // patch to salvage, but the causes still travel.
+    let c = task(
+        &engine,
+        TaskKind::OperationSynthesis,
+        WriteScope::operation_synthesis(id("operation.create_order")),
+    );
+
+    engine
+        .read_symbol(c.id, &SymbolKey::OperationProgram(id("operation.transfer_stock")))
+        .expect("c observes a peer's program");
+
+    let interloper = task(&engine, TaskKind::Decompose, WriteScope::of([WriteGrant::All]));
+
+    submit(&engine, &interloper, vec![probe_program("operation.transfer_stock", 3)])
+        .expect("the second interloper commits");
+
+    assert_eq!(engine.task_status(c.id).unwrap(), TaskState::Invalidated);
+
+    let note = engine
+        .invalidation_note(c.id)
+        .expect("a swept task leaves a note");
+
+    assert!(note.rejected_patch.is_none(), "nothing was submitted");
+
+    assert!(
+        note.causes.iter().any(|cause| matches!(
+            cause,
+            InvalidationCause::ChangedSymbol { symbol }
+                if *symbol == SymbolKey::OperationProgram(id("operation.transfer_stock"))
+        )),
+        "{:?}",
+        note.causes
+    );
+}

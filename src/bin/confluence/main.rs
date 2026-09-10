@@ -608,6 +608,12 @@ struct DesignState {
     running: AtomicBool,
     started_at_revision: Mutex<Option<u64>>,
     last_report: Mutex<Option<RunReport>>,
+
+    /// Why the last run produced no report, when it errored out of the
+    /// workflow instead of finishing. Without this a failed run is
+    /// invisible at the MCP surface: `spec_status` would show the run
+    /// gone with the previous report still standing.
+    last_error: Mutex<Option<String>>,
 }
 
 /// The daemon's implementation of the MCP `request_design` trigger:
@@ -689,6 +695,7 @@ impl DesignLauncher for DaemonDesignLauncher {
         let state = Arc::clone(&self.state);
 
         *state.started_at_revision.lock() = Some(started_revision);
+        *state.last_error.lock() = None;
 
         tokio::spawn(async move {
             tracing::info!("concurrent design workflow started");
@@ -700,6 +707,7 @@ impl DesignLauncher for DaemonDesignLauncher {
                 }
                 Err(error) => {
                     tracing::error!("concurrent design workflow failed: {error}");
+                    *state.last_error.lock() = Some(error.to_string());
                 }
             }
 
@@ -727,11 +735,25 @@ impl DesignLauncher for DaemonDesignLauncher {
             .as_ref()
             .and_then(|report| serde_json::to_value(report).ok());
 
-        Some(serde_json::json!({
+        let mut body = serde_json::json!({
             "running": self.state.running.load(Ordering::SeqCst),
             "started_at_revision": *self.state.started_at_revision.lock(),
             "last_run": last_run,
-        }))
+        });
+
+        // A run that errored out produced no report; say so rather than
+        // letting it vanish behind the previous run's report.
+        if let Some(error) = self.state.last_error.lock().clone() {
+            body["last_run_failed"] = serde_json::json!({
+                "error": error,
+                "guidance": "The last design run aborted before finalizing. The model keeps \
+                             every commit the workers made; check spec_status's analysis \
+                             block for where it stands, and call request_design again to \
+                             resume from the current head.",
+            });
+        }
+
+        Some(body)
     }
 }
 

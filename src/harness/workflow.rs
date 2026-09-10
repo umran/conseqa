@@ -16,9 +16,9 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use crate::confluence::{
-    AnalysisState, BundleSpec, ConfluenceEngine, DependencyResolution, EvidenceRef,
-    PromptEvidence, PromptObligationStatus, RequirementFamily, SymbolVersion, TaskKind,
-    WriteGrant, WriteScope,
+    AnalysisSnapshot, AnalysisState, BundleSpec, ConfluenceEngine, DependencyRequest,
+    DependencyResolution, EvidenceRef, PromptEvidence, PromptObligationStatus,
+    RequirementFamily, SymbolKey, SymbolVersion, TaskKind, WriteGrant, WriteScope,
 };
 use crate::analyzer::verification::RemedyLayer;
 use crate::spec::{Id, Model, Revision};
@@ -348,7 +348,7 @@ impl Workflow {
                 write_scope: WriteScope::operation_synthesis(operation.clone()),
                 bundle: BundleSpec {
                     operation: Some(operation.clone()),
-                    requirement: None,
+                    requirements: Vec::new(),
                     include: Vec::new(),
                 },
                 prompt_evidence: self.prompt_evidence(),
@@ -396,7 +396,7 @@ impl Workflow {
                     write_scope: WriteScope::operation_synthesis(operation.clone()),
                     bundle: BundleSpec {
                         operation: Some(operation.clone()),
-                        requirement: None,
+                        requirements: Vec::new(),
                         include: Vec::new(),
                     },
                     prompt_evidence: self.prompt_evidence(),
@@ -412,22 +412,28 @@ impl Workflow {
         Ok(ran)
     }
 
-    /// Dispatches every open dependency request, concurrently.
+    /// Dispatches every open dependency request, grouped by target.
     ///
     /// A request is how work crosses a write scope: the filer named a
-    /// symbol it may not write and said what it needs. Each becomes one
-    /// task scoped to exactly that symbol — not to the skeleton at
-    /// large, since the ask is specific and a wider grant invites
+    /// symbol it may not write and said what it needs. Each *target*
+    /// becomes one task scoped to exactly that symbol — not one task
+    /// per request, since two concurrent tasks over the same symbol
+    /// are a guaranteed write-write conflict, and the asks are best
+    /// judged jointly as one coherent revision. Not the skeleton at
+    /// large either: the asks are specific, and a wider grant invites
     /// collateral edits nobody asked for.
     ///
     /// The outcome is read from the workspace rather than from the
     /// agent: a target whose version advanced was changed, one whose
-    /// version did not was not. Either way the request is settled, so a
-    /// declined ask cannot be dispatched forever. The filer's own work
-    /// is not resumed here — its obligation is still unproven, so the
-    /// next iteration rebuilds that task against the new head.
+    /// version did not was not. Every request against that target
+    /// settles with the same resolution — per-request attribution
+    /// against a shared symbol would misread a sibling ask's change as
+    /// one's own. Either way the requests are settled, so a declined
+    /// ask cannot be dispatched forever. The filer's own work is not
+    /// resumed here — its obligation is still unproven, so the next
+    /// iteration rebuilds that task against the new head.
     ///
-    /// Returns how many ran.
+    /// Returns how many tasks ran.
     async fn dispatch_dependency_requests(&self) -> Result<u32, WorkflowError> {
         let open = self.engine().open_dependency_requests();
 
@@ -435,28 +441,17 @@ impl Workflow {
             return Ok(0);
         }
 
-        let before: Vec<Option<SymbolVersion>> = open
+        let groups = group_dependency_requests(open);
+
+        let before: Vec<Option<SymbolVersion>> = groups
             .iter()
-            .map(|request| self.engine().symbol_version(&request.target))
+            .map(|(target, _)| self.engine().symbol_version(target))
             .collect();
 
-        let tasks: Vec<LogicalTask> = open
+        let tasks: Vec<LogicalTask> = groups
             .iter()
-            .map(|request| LogicalTask {
-                kind: TaskKind::SharedDependencyRepair,
-                objective: format!(
-                    "Apply this change to {}, or determine that it is not needed and \
-                     commit nothing:\n\n{}\n\nWhy it was asked for: {}",
-                    request.target, request.requested_change, request.reason
-                ),
-                write_scope: WriteScope::of([WriteGrant::TopLevelSymbol(request.target.clone())]),
-                bundle: BundleSpec {
-                    operation: None,
-                    requirement: None,
-                    include: vec![request.target.clone()],
-                },
-                prompt_evidence: self.prompt_evidence(),
-                interactive: false,
+            .map(|(target, requests)| {
+                dependency_repair_task(target, requests, self.prompt_evidence())
             })
             .collect();
 
@@ -464,16 +459,18 @@ impl Workflow {
 
         self.scheduler.run_many(tasks).await?;
 
-        for (request, before) in open.iter().zip(before) {
-            let resolution = if self.engine().symbol_version(&request.target) == before {
+        for ((target, requests), before) in groups.iter().zip(before) {
+            let resolution = if self.engine().symbol_version(target) == before {
                 DependencyResolution::Declined
             } else {
                 DependencyResolution::Applied
             };
 
-            self.engine()
-                .resolve_dependency_request(request.id, resolution)
-                .map_err(WorkflowError::Engine)?;
+            for request in requests {
+                self.engine()
+                    .resolve_dependency_request(request.id, resolution)
+                    .map_err(WorkflowError::Engine)?;
+            }
         }
 
         Ok(ran)
@@ -540,7 +537,7 @@ impl Workflow {
             write_scope: WriteScope::runtime_topology(),
             bundle: BundleSpec {
                 operation: None,
-                requirement: None,
+                requirements: Vec::new(),
                 include: crate::confluence::topology_symbols(
                     &self.engine().head_snapshot().workspace,
                 ),
@@ -576,7 +573,7 @@ impl Workflow {
                 write_scope: WriteScope::requirement_discovery(operation.clone()),
                 bundle: BundleSpec {
                     operation: Some(operation),
-                    requirement: None,
+                    requirements: Vec::new(),
                     include: Vec::new(),
                 },
                 prompt_evidence: self.prompt_evidence(),
@@ -597,7 +594,8 @@ impl Workflow {
     /// waiting on the runtime realization go to a single topology task
     /// holding the whole L1 grant — one writer, because a grouping key,
     /// its router and the pool it terminates at are one decision.
-    /// Everything else fans out per operation as before.
+    /// Everything else fans out one task per *operation*, each carrying
+    /// all of that operation's unproven obligations.
     ///
     /// Topology goes first, and a topology commit ends the round: it
     /// moves the head, which leaves both the unproven set and its
@@ -611,17 +609,21 @@ impl Workflow {
     ///
     /// Returns how many tasks ran.
     async fn repair_unproven(&self, revision: Revision) -> Result<u32, WorkflowError> {
-        let (runtime, application): (Vec<RepairTarget>, Vec<RepairTarget>) = self
-            .unproven_obligations(revision)?
-            .into_iter()
-            .partition(RepairTarget::is_runtime);
+        let AnalysisState::Ready(analysis) = self.engine().analysis_state(revision) else {
+            return Ok(0);
+        };
+
+        let (runtime, application): (Vec<RepairTarget>, Vec<RepairTarget>) =
+            unproven_targets(&analysis)
+                .into_iter()
+                .partition(RepairTarget::is_runtime);
 
         let mut ran = 0;
 
         if !runtime.is_empty() {
             let before = self.engine().head_revision();
 
-            ran += self.synthesize_topology(&runtime).await?;
+            ran += self.synthesize_topology(&runtime, &analysis).await?;
 
             if self.engine().head_revision() != before {
                 return Ok(ran);
@@ -633,21 +635,7 @@ impl Workflow {
             // would stop at the no-progress check with L0 work left.
         }
 
-        let tasks: Vec<LogicalTask> = application
-            .into_iter()
-            .map(|target| LogicalTask {
-                kind: TaskKind::RequirementRepair,
-                objective: format!("Make the {} provable.", target.label()),
-                write_scope: WriteScope::requirement_repair(target.operation.clone()),
-                bundle: BundleSpec {
-                    operation: Some(target.operation),
-                    requirement: Some((target.family, target.index)),
-                    include: Vec::new(),
-                },
-                prompt_evidence: self.prompt_evidence(),
-                interactive: false,
-            })
-            .collect();
+        let tasks = application_repair_tasks(application, &analysis, self.prompt_evidence());
 
         ran += tasks.len() as u32;
 
@@ -663,7 +651,11 @@ impl Workflow {
     /// router declarations as conflicting writes. Batching them also
     /// lets the author declare one grouping that discharges several
     /// requirements at once, which per-obligation tasks cannot see.
-    async fn synthesize_topology(&self, targets: &[RepairTarget]) -> Result<u32, WorkflowError> {
+    async fn synthesize_topology(
+        &self,
+        targets: &[RepairTarget],
+        analysis: &AnalysisSnapshot,
+    ) -> Result<u32, WorkflowError> {
         let listed = targets
             .iter()
             .map(|target| format!("- the {}", target.label()))
@@ -675,14 +667,16 @@ impl Workflow {
             objective: format!(
                 "Author the runtime topology that discharges these obligations, \
                  which are unproven for want of L1 facts alone:\n{listed}\n\n\
-                 Read each one's `requirement_report` for the specific missing \
-                 fact. Leave unproven anything the architecture does not \
-                 genuinely constrain."
+                 {}\n\n\
+                 Read `requirement_report` for anything the evidence leaves \
+                 unclear. Leave unproven anything the architecture does not \
+                 genuinely constrain.",
+                inline_obligations(targets, analysis)
             ),
             write_scope: WriteScope::runtime_topology(),
             bundle: BundleSpec {
                 operation: None,
-                requirement: None,
+                requirements: Vec::new(),
                 include: crate::confluence::topology_symbols(
                     &self.engine().head_snapshot().workspace,
                 ),
@@ -757,32 +751,7 @@ impl Workflow {
             return Ok(Vec::new());
         };
 
-        let mut targets = Vec::new();
-
-        for obligation in &analysis.obligations.obligations {
-            if obligation.status != crate::analyzer::report::Status::Unknown {
-                continue;
-            }
-
-            let crate::analyzer::report::Subject::Operation {
-                operation,
-                requirement: Some(index),
-            } = &obligation.subject
-            else {
-                continue;
-            };
-
-            if let Some(family) = repair_family(&obligation.property) {
-                targets.push(RepairTarget {
-                    operation: operation.clone(),
-                    family,
-                    index: *index,
-                    remedy: obligation.remedy,
-                });
-            }
-        }
-
-        Ok(targets)
+        Ok(unproven_targets(&analysis))
     }
 
     async fn incomplete(
@@ -1032,6 +1001,187 @@ impl RepairTarget {
     }
 }
 
+/// The unproven obligations of an analyzed revision, as repair targets.
+fn unproven_targets(analysis: &AnalysisSnapshot) -> Vec<RepairTarget> {
+    let mut targets = Vec::new();
+
+    for obligation in &analysis.obligations.obligations {
+        if obligation.status != crate::analyzer::report::Status::Unknown {
+            continue;
+        }
+
+        let crate::analyzer::report::Subject::Operation {
+            operation,
+            requirement: Some(index),
+        } = &obligation.subject
+        else {
+            continue;
+        };
+
+        if let Some(family) = repair_family(&obligation.property) {
+            targets.push(RepairTarget {
+                operation: operation.clone(),
+                family,
+                index: *index,
+                remedy: obligation.remedy,
+            });
+        }
+    }
+
+    targets
+}
+
+/// One target's analyzer obligation at the analyzed revision, as
+/// compact JSON.
+fn obligation_evidence(analysis: &AnalysisSnapshot, target: &RepairTarget) -> Option<String> {
+    let id = format!(
+        "oblig.{}.{}.{}",
+        target.operation, target.family, target.index
+    );
+
+    analysis
+        .obligations
+        .obligations
+        .iter()
+        .find(|obligation| obligation.id == id)
+        .and_then(|obligation| serde_json::to_string(obligation).ok())
+}
+
+/// The targets' obligations rendered for an objective, verbatim from
+/// the checker.
+///
+/// Inlined rather than left to the bundle or the `requirement_report`
+/// tool, because a repair task pins whatever head exists when it is
+/// created: mid-batch that head's analysis is pending, and analysis
+/// coalescing may drop it entirely, leaving the worker a report that
+/// answers "not finished yet" forever. The objective travels with the
+/// task, so the obstacle is always in hand.
+fn inline_obligations(targets: &[RepairTarget], analysis: &AnalysisSnapshot) -> String {
+    let rendered = targets
+        .iter()
+        .filter_map(|target| obligation_evidence(analysis, target))
+        .map(|json| format!("- {json}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    if rendered.is_empty() {
+        "Read each one's `requirement_report` for the specific missing fact.".to_string()
+    } else {
+        format!(
+            "Each one's analyzer obligation, verbatim from the checker at the \
+             revision that scheduled this task:\n{rendered}"
+        )
+    }
+}
+
+/// One repair task per operation, carrying every unproven obligation
+/// of that operation — never one per obligation. Concurrent tasks over
+/// one program are guaranteed write-write conflicts (the gate
+/// serializes them at the cost of a restarted session each), and the
+/// obligations trade off against each other: one revision often
+/// discharges several, which per-obligation workers cannot see. The
+/// same reasoning the topology author's batching follows.
+fn application_repair_tasks(
+    targets: Vec<RepairTarget>,
+    analysis: &AnalysisSnapshot,
+    prompt_evidence: Vec<PromptEvidence>,
+) -> Vec<LogicalTask> {
+    let mut by_operation: BTreeMap<Id, Vec<RepairTarget>> = BTreeMap::new();
+
+    for target in targets {
+        by_operation
+            .entry(target.operation.clone())
+            .or_default()
+            .push(target);
+    }
+
+    by_operation
+        .into_iter()
+        .map(|(operation, targets)| {
+            let listed = targets
+                .iter()
+                .map(|target| format!("- the {}", target.label()))
+                .collect::<Vec<_>>()
+                .join("\n");
+
+            LogicalTask {
+                kind: TaskKind::RequirementRepair,
+                objective: format!(
+                    "Make these requirements of {operation} provable, revising its \
+                     program once in a way that resolves them together:\n{listed}\n\n{}",
+                    inline_obligations(&targets, analysis)
+                ),
+                write_scope: WriteScope::requirement_repair(operation.clone()),
+                bundle: BundleSpec {
+                    operation: Some(operation),
+                    requirements: targets
+                        .iter()
+                        .map(|target| (target.family, target.index))
+                        .collect(),
+                    include: Vec::new(),
+                },
+                prompt_evidence: prompt_evidence.clone(),
+                interactive: false,
+            }
+        })
+        .collect()
+}
+
+/// Open requests grouped by target symbol, in canonical order.
+fn group_dependency_requests(
+    open: Vec<DependencyRequest>,
+) -> Vec<(SymbolKey, Vec<DependencyRequest>)> {
+    let mut groups: BTreeMap<SymbolKey, Vec<DependencyRequest>> = BTreeMap::new();
+
+    for request in open {
+        groups
+            .entry(request.target.clone())
+            .or_default()
+            .push(request);
+    }
+
+    groups.into_iter().collect()
+}
+
+/// The one repair task for a target symbol, carrying every ask against
+/// it.
+fn dependency_repair_task(
+    target: &SymbolKey,
+    requests: &[DependencyRequest],
+    prompt_evidence: Vec<PromptEvidence>,
+) -> LogicalTask {
+    let asks = requests
+        .iter()
+        .enumerate()
+        .map(|(index, request)| {
+            format!(
+                "{}. {}\n   Why it was asked for: {}",
+                index + 1,
+                request.requested_change,
+                request.reason
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    LogicalTask {
+        kind: TaskKind::SharedDependencyRepair,
+        objective: format!(
+            "Apply the requested change(s) to {target} below as one coherent \
+             revision — judging each on its merits — or determine that none is \
+             needed and commit nothing:\n\n{asks}"
+        ),
+        write_scope: WriteScope::of([WriteGrant::TopLevelSymbol(target.clone())]),
+        bundle: BundleSpec {
+            operation: None,
+            requirements: Vec::new(),
+            include: vec![target.clone()],
+        },
+        prompt_evidence,
+        interactive: false,
+    }
+}
+
 /// Every symbol id an operation owns: the operation and its inputs, plus
 /// the transactions, effects, intent and output bindings, and reads its
 /// program declares. A structural diagnostic's subject is usually one of
@@ -1156,17 +1306,171 @@ fn describe_gaps(gaps: &[crate::confluence::AssemblyGap]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::operation_owned_ids;
-    use crate::confluence::{DraftOperation, OperationInterfaceDraft};
+    use super::{
+        application_repair_tasks, dependency_repair_task, group_dependency_requests,
+        operation_owned_ids, unproven_targets,
+    };
+    use crate::analyzer::report::{Obligation, Property, ProverReport, Status, Subject};
+    use crate::analyzer::verification::VerificationReport;
+    use crate::confluence::{
+        AnalysisSnapshot, DependencyRequest, DependencyRequestId, DraftOperation,
+        OperationInterfaceDraft, SymbolKey, TaskId, WriteGrant, WriteScope,
+    };
     use crate::spec::{
         Derivation, Effect, EstablishEffectIntent, EstablishTransactionOutput, ExecuteEffectIntent,
         Id, IdempotencyGuarantee, OperationBlock, OperationStep, PublicationEffect, ResultOutcome,
-        Return, Transaction, TransactionIsolation, TransactionStep,
+        Return, Revision, Transaction, TransactionIsolation, TransactionStep,
     };
     use std::collections::BTreeMap;
 
     fn id(text: &str) -> Id {
         Id(text.to_string())
+    }
+
+    fn obligation(operation: &str, property: Property, family: &str, index: usize) -> Obligation {
+        Obligation {
+            id: format!("oblig.{operation}.{family}.{index}"),
+            property,
+            subject: Subject::Operation {
+                operation: id(operation),
+                requirement: Some(index),
+            },
+            status: Status::Unknown,
+            summary: format!("the {family} requirement #{index} of {operation}"),
+            scope: None,
+            remedy: None,
+            assumptions: Vec::new(),
+            evidence: Vec::new(),
+            counterexample: None,
+        }
+    }
+
+    fn analysis_with(obligations: Vec<Obligation>) -> AnalysisSnapshot {
+        AnalysisSnapshot {
+            revision: Revision(7),
+            verification: VerificationReport {
+                serialization: Vec::new(),
+                ordering: Vec::new(),
+                idempotency: Vec::new(),
+                result_replay: Vec::new(),
+                recoverability: Vec::new(),
+                notes: Vec::new(),
+            },
+            obligations: ProverReport {
+                format: 2,
+                model_revision: Some(7),
+                obligations,
+                notes: Vec::new(),
+            },
+            summaries: BTreeMap::new(),
+        }
+    }
+
+    fn request(target: SymbolKey, change: &str, reason: &str) -> DependencyRequest {
+        DependencyRequest {
+            id: DependencyRequestId::fresh(),
+            task: TaskId::fresh(),
+            target,
+            requested_change: change.to_string(),
+            reason: reason.to_string(),
+            evidence: Vec::new(),
+            resolution: None,
+        }
+    }
+
+    // Two unproven obligations on one operation become ONE repair task
+    // carrying both — never two concurrent writers of one program —
+    // with each obligation inlined verbatim so the worker holds its
+    // obstacles even when its own snapshot's analysis lags or was
+    // coalesced away.
+    #[test]
+    fn repair_tasks_merge_per_operation_and_inline_their_obligations() {
+        let analysis = analysis_with(vec![
+            obligation("operation.pay", Property::Serialization, "serialization", 0),
+            obligation("operation.pay", Property::Idempotency, "idempotency", 0),
+            obligation("operation.ship", Property::Ordering, "ordering", 0),
+        ]);
+
+        let targets = unproven_targets(&analysis);
+
+        assert_eq!(targets.len(), 3);
+
+        let tasks = application_repair_tasks(targets, &analysis, Vec::new());
+
+        assert_eq!(tasks.len(), 2, "one task per operation, not per obligation");
+
+        let pay = tasks
+            .iter()
+            .find(|task| task.bundle.operation == Some(id("operation.pay")))
+            .expect("operation.pay gets a task");
+
+        assert_eq!(
+            pay.write_scope,
+            WriteScope::requirement_repair(id("operation.pay"))
+        );
+
+        assert_eq!(pay.bundle.requirements.len(), 2);
+
+        for expected in [
+            "serialization requirement #0",
+            "idempotency requirement #0",
+            "oblig.operation.pay.serialization.0",
+            "oblig.operation.pay.idempotency.0",
+        ] {
+            assert!(
+                pay.objective.contains(expected),
+                "objective lacks `{expected}`:\n{}",
+                pay.objective
+            );
+        }
+    }
+
+    // Requests against one symbol are judged jointly by one task; the
+    // objective enumerates every ask with its reason.
+    #[test]
+    fn dependency_requests_group_by_target_into_one_task() {
+        let order = SymbolKey::Schema(id("schema.Order"));
+
+        let groups = group_dependency_requests(vec![
+            request(order.clone(), "add a tenant_id field", "serialization needs it"),
+            request(
+                SymbolKey::Topic(id("topic.events")),
+                "admit schema.Refund",
+                "refunds publish here",
+            ),
+            request(order.clone(), "widen status to an enum", "replay checks need it"),
+        ]);
+
+        assert_eq!(groups.len(), 2);
+
+        let (target, requests) = groups
+            .iter()
+            .find(|(target, _)| *target == order)
+            .expect("the schema group exists");
+
+        assert_eq!(requests.len(), 2);
+
+        let task = dependency_repair_task(target, requests, Vec::new());
+
+        assert_eq!(
+            task.write_scope,
+            WriteScope::of([WriteGrant::TopLevelSymbol(order.clone())])
+        );
+
+        assert_eq!(task.bundle.include, vec![order]);
+
+        for expected in [
+            "1. add a tenant_id field",
+            "2. widen status to an enum",
+            "serialization needs it",
+            "replay checks need it",
+        ] {
+            assert!(
+                task.objective.contains(expected),
+                "objective lacks `{expected}`:\n{}",
+                task.objective
+            );
+        }
     }
 
     // A structural diagnostic's subject is an owned symbol id — an effect

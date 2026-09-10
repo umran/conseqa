@@ -1085,7 +1085,7 @@ async fn operation_fanout_runs_agents_concurrently() {
             ))),
             bundle: conseqa::confluence::BundleSpec {
                 operation: Some(id(&format!("operation.worker{index}"))),
-                requirement: None,
+                requirements: Vec::new(),
                 include: Vec::new(),
             },
             prompt_evidence: Vec::new(),
@@ -1199,4 +1199,317 @@ async fn a_run_objective_reaches_every_worker_prompt() {
     );
 
     std::fs::remove_dir_all(&out_dir).ok();
+}
+
+/// A warm restart end to end through the scheduler: attempt 1 is
+/// invalidated after another commit moves its write target, and its
+/// submitted patch — the attempt's work product — reaches attempt 2's
+/// prompt along with the invalidation causes, so the replacement
+/// reviews and resubmits instead of re-deriving everything.
+#[tokio::test]
+async fn an_invalidated_attempt_hands_its_patch_to_the_replacement() {
+    let engine = ConfluenceEngine::in_memory(planned_workspace(1)).expect("engine starts");
+
+    let prompts: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let attempt_counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+    fn worker_program(marker: u32) -> OperationBlock {
+        OperationBlock {
+            steps: vec![
+                OperationStep::Transaction(conseqa::spec::Transaction {
+                    id: id(&format!("tx.worker0.probe{marker}")),
+                    data_model: None,
+                    isolation: conseqa::spec::TransactionIsolation::ReadCommitted,
+                    idempotency: conseqa::spec::IdempotencyGuarantee::NotDeduplicated,
+                    steps: Vec::new(),
+                }),
+                OperationStep::Complete,
+            ],
+        }
+    }
+
+    async fn try_commit(
+        engine: &ConfluenceEngine,
+        task: conseqa::confluence::TaskId,
+        base_revision: conseqa::spec::Revision,
+        mutations: Vec<Mutation>,
+    ) -> Result<conseqa::confluence::CommitReceipt, conseqa::confluence::CommitRejection> {
+        engine
+            .submit(CommitRequest {
+                task,
+                patch_id: PatchId::fresh(),
+                base_revision,
+                patch: SpecPatch { mutations },
+                client_nonce: Uuid::new_v4(),
+            })
+            .await
+            .expect("the sequencer runs")
+    }
+
+    let script: ScriptFn = {
+        let prompts = Arc::clone(&prompts);
+        let attempt_counter = Arc::clone(&attempt_counter);
+
+        Arc::new(move |engine, invocation| {
+            let prompts = Arc::clone(&prompts);
+            let attempt_counter = Arc::clone(&attempt_counter);
+
+            Box::pin(async move {
+                prompts.lock().unwrap().push(invocation.prompt.clone());
+
+                let attempt =
+                    attempt_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
+                let task = engine
+                    .resolve_token(&invocation.task_token)
+                    .expect("token resolves");
+
+                let base = engine
+                    .task_context(task)
+                    .expect("context")
+                    .snapshot_revision;
+
+                let patch =
+                    vec![Mutation::ReplaceOperationProgram {
+                        operation: id("operation.worker0"),
+                        program: worker_program(attempt as u32),
+                    }];
+
+                if attempt == 0 {
+                    // An interloper rewrites the same program first, so
+                    // this attempt's submission arrives stale.
+                    let interloper = engine
+                        .create_task(conseqa::confluence::CreateTask {
+                            kind: conseqa::confluence::TaskKind::Decompose,
+                            objective: "interlope".to_string(),
+                            write_scope: conseqa::confluence::WriteScope::of([
+                                conseqa::confluence::WriteGrant::All,
+                            ]),
+                            prompt_evidence: Vec::new(),
+                            budget: conseqa::confluence::TaskBudget::default(),
+                        })
+                        .expect("interloper task");
+
+                    try_commit(
+                        &engine,
+                        interloper.id,
+                        interloper.snapshot_revision,
+                        vec![Mutation::ReplaceOperationProgram {
+                            operation: id("operation.worker0"),
+                            program: worker_program(99),
+                        }],
+                    )
+                    .await
+                    .expect("the interloper commits");
+
+                    let rejection = try_commit(&engine, task, base, patch)
+                        .await
+                        .expect_err("the stale submission is refused");
+
+                    assert!(rejection.is_stale_context(), "{rejection:?}");
+                } else {
+                    try_commit(&engine, task, base, patch)
+                        .await
+                        .expect("the warm replacement commits");
+                }
+            })
+        })
+    };
+
+    let backend = Arc::new(ScriptedBackend {
+        engine: engine.clone(),
+        script,
+    });
+
+    let supervisor = Supervisor::new(
+        engine.clone(),
+        backend,
+        "http://127.0.0.1:0/mcp",
+        None,
+        std::env::temp_dir().join(format!("conseqa-warm-{}", Uuid::new_v4())),
+    );
+
+    let scheduler = Scheduler::new(
+        engine.clone(),
+        supervisor,
+        SchedulerPolicy {
+            max_attempts: 3,
+            ..Default::default()
+        },
+    );
+
+    let run = scheduler
+        .run(&conseqa::harness::LogicalTask {
+            kind: conseqa::confluence::TaskKind::OperationSynthesis,
+            objective: "synthesize worker0".to_string(),
+            write_scope: conseqa::confluence::WriteScope::operation_synthesis(id(
+                "operation.worker0",
+            )),
+            bundle: conseqa::confluence::BundleSpec {
+                operation: Some(id("operation.worker0")),
+                requirements: Vec::new(),
+                include: Vec::new(),
+            },
+            prompt_evidence: Vec::new(),
+            interactive: false,
+        })
+        .await
+        .expect("the scheduler runs");
+
+    assert!(run.committed(), "{run:?}");
+    assert!(!run.exhausted);
+    assert_eq!(run.attempts.len(), 2, "one invalidated attempt, one warm retry");
+
+    let prompts = prompts.lock().unwrap();
+
+    assert_eq!(prompts.len(), 2);
+
+    assert!(
+        !prompts[0].contains("A previous attempt was invalidated"),
+        "the first attempt starts cold"
+    );
+
+    // The replacement's prompt carries the causes and the salvaged
+    // patch: warm, not cold.
+    assert!(
+        prompts[1].contains("A previous attempt was invalidated"),
+        "{}",
+        prompts[1]
+    );
+
+    assert!(
+        prompts[1].contains("replace_operation_program"),
+        "the rejected patch rides into the replacement prompt:\n{}",
+        prompts[1]
+    );
+
+    assert!(
+        prompts[1].contains("operation_program(operation.worker0)"),
+        "the invalidation cause is named:\n{}",
+        prompts[1]
+    );
+}
+
+/// A session whose process fails is retried up to the attempt bound,
+/// and exhaustion is a recorded per-task outcome — the batch still
+/// returns, and a sibling's committed work survives.
+#[tokio::test]
+async fn attempt_exhaustion_is_reported_without_discarding_siblings() {
+    struct MixedBackend {
+        engine: ConfluenceEngine,
+    }
+
+    #[async_trait]
+    impl AgentBackend for MixedBackend {
+        fn name(&self) -> &str {
+            "mixed"
+        }
+
+        async fn run(
+            &self,
+            invocation: AgentInvocation,
+            _handle: AgentHandle,
+            _events: AgentEventSink,
+        ) -> Result<AgentExit, AgentBackendError> {
+            let metadata = AgentBackendMetadata {
+                name: "mixed".to_string(),
+                version: None,
+                session: None,
+            };
+
+            // worker0's sessions crash without committing; worker1's
+            // commit normally.
+            if invocation.prompt.contains("operation.worker0") {
+                return Ok(AgentExit {
+                    status: AgentExitStatus::Failed { code: Some(1) },
+                    session: None,
+                    final_message: None,
+                    usage: Default::default(),
+                    backend: metadata,
+                });
+            }
+
+            commit(
+                &self.engine,
+                &invocation,
+                vec![Mutation::ReplaceOperationProgram {
+                    operation: id("operation.worker1"),
+                    program: OperationBlock {
+                        steps: vec![OperationStep::Complete],
+                    },
+                }],
+            )
+            .await;
+
+            Ok(AgentExit {
+                status: AgentExitStatus::Completed,
+                session: None,
+                final_message: None,
+                usage: Default::default(),
+                backend: metadata,
+            })
+        }
+    }
+
+    let engine = ConfluenceEngine::in_memory(planned_workspace(2)).expect("engine starts");
+
+    let supervisor = Supervisor::new(
+        engine.clone(),
+        Arc::new(MixedBackend {
+            engine: engine.clone(),
+        }),
+        "http://127.0.0.1:0/mcp",
+        None,
+        std::env::temp_dir().join(format!("conseqa-exhaust-{}", Uuid::new_v4())),
+    );
+
+    let scheduler = Scheduler::new(
+        engine.clone(),
+        supervisor,
+        SchedulerPolicy {
+            max_attempts: 2,
+            ..Default::default()
+        },
+    );
+
+    let tasks: Vec<conseqa::harness::LogicalTask> = (0..2)
+        .map(|index| conseqa::harness::LogicalTask {
+            kind: conseqa::confluence::TaskKind::OperationSynthesis,
+            objective: format!("synthesize operation.worker{index}"),
+            write_scope: conseqa::confluence::WriteScope::operation_synthesis(id(&format!(
+                "operation.worker{index}"
+            ))),
+            bundle: conseqa::confluence::BundleSpec {
+                operation: Some(id(&format!("operation.worker{index}"))),
+                requirements: Vec::new(),
+                include: Vec::new(),
+            },
+            prompt_evidence: Vec::new(),
+            interactive: false,
+        })
+        .collect();
+
+    let runs = scheduler
+        .run_many(tasks)
+        .await
+        .expect("exhaustion is not a batch error");
+
+    assert_eq!(runs.len(), 2);
+
+    assert!(runs[0].exhausted, "{:?}", runs[0]);
+    assert!(!runs[0].committed());
+    assert_eq!(runs[0].attempts.len(), 2, "the crashing session was retried");
+
+    assert!(runs[1].committed(), "the sibling's work survives: {:?}", runs[1]);
+    assert!(!runs[1].exhausted);
+
+    // The sibling's commit is in the model.
+    assert!(
+        engine
+            .head_snapshot()
+            .workspace
+            .operations[&id("operation.worker1")]
+            .program
+            .is_some()
+    );
 }

@@ -50,13 +50,23 @@ impl SessionOutcome {
     /// Whether a fresh replacement task should be created: the task
     /// was invalidated, or the agent process failed without reaching a
     /// terminal architectural outcome.
+    ///
+    /// Invalidation is read from the engine's task state as well as
+    /// the watched event: a gate rejection invalidates synchronously,
+    /// and if the advisory event were missed (a lagged subscriber) the
+    /// state is still authoritative (§91). A failed process is matched
+    /// by the `Failed` state too, since the supervisor marks the task
+    /// before this outcome is built — matching only `is_active` here
+    /// would mean a crashed session was never retried at all.
     pub fn needs_replacement(&self) -> bool {
-        self.invalidated
-            || (self.task_state.is_active()
-                && matches!(
-                    self.agent_exit.status,
-                    AgentExitStatus::Failed { .. } | AgentExitStatus::TimedOut
-                ))
+        if self.invalidated || self.task_state == TaskState::Invalidated {
+            return true;
+        }
+
+        matches!(
+            self.agent_exit.status,
+            AgentExitStatus::Failed { .. } | AgentExitStatus::TimedOut
+        ) && (self.task_state.is_active() || self.task_state == TaskState::Failed)
     }
 }
 
