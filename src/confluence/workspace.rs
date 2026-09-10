@@ -15,9 +15,9 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 
 use crate::spec::{
-    DataModel, ExecutionSemantics, Id, IdempotencyRequirement, Input, Model, Operation,
-    OperationBlock, OperationRequirements, OrderingRequirement, RecoverabilityRequirement,
-    Revision, Schema, SerializationRequirement, Service, StateMachine, Topic,
+    DataModel, Id, IdempotencyRequirement, Input, Model, Operation, OperationBlock,
+    OperationRequirements, OrderingRequirement, RecoverabilityRequirement, Revision,
+    RuntimeModel, Schema, SerializationRequirement, Service, StateMachine, Topic,
 };
 
 use super::symbol::RequirementFamily;
@@ -45,9 +45,6 @@ impl AssemblyError {
 pub enum AssemblyGap {
     #[error("operation {operation} has no program")]
     MissingProgram { operation: Id },
-
-    #[error("operation {operation} has no execution facts")]
-    MissingExecution { operation: Id },
 }
 
 /// The authoritative shared architecture state at one revision.
@@ -69,6 +66,15 @@ pub struct WorkspaceState {
 
     pub operations: BTreeMap<Id, DraftOperation>,
 
+    /// The L1 runtime topology under authorship.
+    ///
+    /// Held flat rather than as an `Option`, so a coordinator can add
+    /// one pool without first deciding whether the system has a
+    /// runtime model at all. An empty runtime assembles to no runtime
+    /// model, keeping an L0-only workspace's output L0-only.
+    #[serde(default)]
+    pub runtime: RuntimeModel,
+
     pub prompt_obligations: BTreeMap<PromptObligationId, PromptObligation>,
     pub requirement_proposals: Vec<RequirementProposal>,
 
@@ -86,6 +92,7 @@ impl WorkspaceState {
             topics: BTreeMap::new(),
             state_machines: BTreeMap::new(),
             operations: BTreeMap::new(),
+            runtime: RuntimeModel::default(),
             prompt_obligations: BTreeMap::new(),
             requirement_proposals: Vec::new(),
             run_meta,
@@ -93,17 +100,20 @@ impl WorkspaceState {
     }
 
     /// Assembles a real `Model` from the workspace (§8). Succeeds only
-    /// when every draft carries a program and execution facts; the
-    /// error names every gap precisely. Structural validation is the
-    /// analyzer's judgment over the assembled model, never implied
-    /// here.
+    /// when every draft carries a program; the error names every gap
+    /// precisely. Structural validation is the analyzer's judgment
+    /// over the assembled model, never implied here.
+    ///
+    /// The runtime model is never a gap: L1 is optional, and a
+    /// workspace that declares no topology assembles to a valid
+    /// L0-only model.
     pub fn assemble_model(&self) -> Result<Model, AssemblyError> {
         let mut gaps = Vec::new();
         let mut operations = BTreeMap::new();
 
         for (id, draft) in &self.operations {
-            match (&draft.program, &draft.execution) {
-                (Some(program), Some(execution)) => {
+            match &draft.program {
+                Some(program) => {
                     operations.insert(
                         id.clone(),
                         Operation {
@@ -112,24 +122,13 @@ impl WorkspaceState {
                             inputs: draft.inputs.clone(),
                             program: program.clone(),
                             requirements: draft.requirements.clone(),
-                            execution: execution.clone(),
                         },
                     );
                 }
 
-                (program, execution) => {
-                    if program.is_none() {
-                        gaps.push(AssemblyGap::MissingProgram {
-                            operation: id.clone(),
-                        });
-                    }
-
-                    if execution.is_none() {
-                        gaps.push(AssemblyGap::MissingExecution {
-                            operation: id.clone(),
-                        });
-                    }
-                }
+                None => gaps.push(AssemblyGap::MissingProgram {
+                    operation: id.clone(),
+                }),
             }
         }
 
@@ -145,6 +144,7 @@ impl WorkspaceState {
             topics: self.topics.clone(),
             state_machines: self.state_machines.clone(),
             operations,
+            runtime: (!self.runtime.is_empty()).then(|| self.runtime.clone()),
         })
     }
 
@@ -164,6 +164,7 @@ impl WorkspaceState {
                 .iter()
                 .map(|(id, operation)| (id.clone(), DraftOperation::from_operation(operation)))
                 .collect(),
+            runtime: model.runtime.clone().unwrap_or_default(),
             prompt_obligations: BTreeMap::new(),
             requirement_proposals: Vec::new(),
             run_meta,
@@ -176,8 +177,8 @@ impl WorkspaceState {
 /// The interface — service, description, inputs — is established by
 /// decomposition before operation fanout, so callers can reason
 /// against a stable callee contract while the callee's program is
-/// still being synthesized. The program, execution facts, and
-/// requirements arrive through later scoped commits.
+/// still being synthesized. The program and requirements arrive
+/// through later scoped commits.
 ///
 /// This type is confluence-authoring metadata, not a DSL primitive.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -189,9 +190,6 @@ pub struct DraftOperation {
 
     /// None until the operation synthesis task commits.
     pub program: Option<OperationBlock>,
-
-    /// None until operation synthesis determines execution facts.
-    pub execution: Option<ExecutionSemantics>,
 
     /// The adopted requirements. Proposals and their provenance live
     /// on the workspace ([`RequirementProposal`]); adoption per run
@@ -208,7 +206,6 @@ impl DraftOperation {
             description: operation.description.clone(),
             inputs: operation.inputs.clone(),
             program: Some(operation.program.clone()),
-            execution: Some(operation.execution.clone()),
             requirements: operation.requirements.clone(),
             stage: OperationDraftStage::ReadyForAssembly,
         }
@@ -222,7 +219,6 @@ impl DraftOperation {
             description: interface.description,
             inputs: interface.inputs,
             program: None,
-            execution: None,
             requirements: OperationRequirements::default(),
             stage: OperationDraftStage::Planned,
         }
@@ -245,7 +241,7 @@ impl DraftOperation {
             return;
         }
 
-        self.stage = if self.program.is_none() || self.execution.is_none() {
+        self.stage = if self.program.is_none() {
             OperationDraftStage::Planned
         } else if self.has_requirements() {
             OperationDraftStage::RequirementsProposed
@@ -263,13 +259,13 @@ impl DraftOperation {
 
     /// Whether the draft carries everything assembly needs.
     pub fn assemblable(&self) -> bool {
-        self.program.is_some() && self.execution.is_some()
+        self.program.is_some()
     }
 }
 
 /// How far along an operation draft is. Authoring metadata for
 /// scheduling and diagnostics; assembly itself gates only on the
-/// presence of a program and execution facts.
+/// presence of a program.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OperationDraftStage {

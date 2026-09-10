@@ -73,7 +73,7 @@ use serde::{Deserialize, Serialize};
 use crate::spec::{
     Derivation, ErrorDisposition, ExternalEffect, FieldPath, Id, IdempotencyGuarantee,
     IdempotencyKey, Input, MessageIdentity, MessageSelector, Model, Operation, RequestIdentity,
-    ResultVariant, StepLocation, Transaction, TransactionStep, ValueRef, ValueSource,
+    ResultVariant, StepLocation, Transaction, TransactionStep, ValueRef, ValueSource, MessageIdentityKey, RequestIdentityKey,
 };
 
 use super::paths::{Decision, DecisionTaken, Path, PathStep, Terminal};
@@ -809,7 +809,7 @@ impl<'a> ReplayAnalysis<'a> {
     fn payload_stability(&self, declaration: &Input) -> Result<(), PayloadIdentityGap> {
         match declaration {
             Input::Request(request) => {
-                let RequestIdentity::Keyed { fields } = &request.identity else {
+                let RequestIdentity::Keyed(RequestIdentityKey { fields }) = &request.identity else {
                     return Err(PayloadIdentityGap::NotDeclared);
                 };
 
@@ -836,7 +836,7 @@ impl<'a> ReplayAnalysis<'a> {
                     .get(&subscription.topic)
                     .map(|topic| &topic.message_identity);
 
-                let Some(MessageIdentity::Keyed { mapping }) = identity else {
+                let Some(MessageIdentity::Keyed(MessageIdentityKey { mapping })) = identity else {
                     return Err(PayloadIdentityGap::NotDeclared);
                 };
 

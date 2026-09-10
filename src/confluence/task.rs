@@ -59,6 +59,7 @@ pub struct TaskSpec {
 #[serde(rename_all = "snake_case")]
 pub enum TaskKind {
     Decompose,
+    TopologySynthesis,
     OperationSynthesis,
     RequirementDiscovery,
     RequirementRepair,
@@ -70,6 +71,7 @@ impl fmt::Display for TaskKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
             Self::Decompose => "decompose",
+            Self::TopologySynthesis => "topology_synthesis",
             Self::OperationSynthesis => "operation_synthesis",
             Self::RequirementDiscovery => "requirement_discovery",
             Self::RequirementRepair => "requirement_repair",
@@ -123,7 +125,9 @@ impl fmt::Display for TaskState {
 
 /// The semantic write capabilities of one task. A scope is a set of
 /// grants because typical assignments pair them — operation synthesis
-/// holds the program and the execution facts of its operation.
+/// holds the program of its operation. Runtime topology is not its
+/// to write: where an invocation executes is an architectural
+/// decision about the whole system.
 ///
 /// The scheduler creates scopes; an agent can never select its own.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -161,9 +165,14 @@ pub enum WriteGrant {
 
     OperationRequirements(Id),
 
-    OperationExecution(Id),
-
     OperationInterface(Id),
+
+    /// Authority over the L1 runtime topology: topic runtimes,
+    /// subscription runtimes, execution pools, routers, and storage
+    /// layouts. Held separately from the skeleton so a run may hand
+    /// topology to a dedicated authority, though the coordinator holds
+    /// both by default.
+    RuntimeTopology,
 }
 
 impl WriteScope {
@@ -177,19 +186,36 @@ impl WriteScope {
         }
     }
 
-    /// The decomposer's scope: the shared skeleton, interfaces
-    /// included.
+    /// The decomposer's scope: the L0 shared skeleton.
+    ///
+    /// Deliberately not the runtime topology. L1 exists to discharge
+    /// serialization and ordering requirements, and at decomposition
+    /// no requirement has been discovered yet — authoring topology
+    /// there is guessing at facts the run has not established.
+    /// [`Self::runtime_topology`] holds it instead, once the unproven
+    /// set says what the runtime has to achieve.
     pub fn shared_skeleton() -> Self {
         Self::of([WriteGrant::SharedSkeleton])
     }
 
-    /// An operation-synthesis task's scope: the operation's program
-    /// and execution facts.
+    /// The topology author's scope: the whole L1 runtime model, and
+    /// nothing else.
+    ///
+    /// Held by one task at a time. Where invocations execute, what
+    /// groups them, and how many run at once are facts about the
+    /// system as a whole; splitting them per operation would let two
+    /// workers declare contradictory halves of one pool.
+    pub fn runtime_topology() -> Self {
+        Self::of([WriteGrant::RuntimeTopology])
+    }
+
+    /// An operation-synthesis task's scope: the operation's program.
+    ///
+    /// Deliberately not the runtime topology. Where an invocation
+    /// executes is an architectural decision about the whole system,
+    /// and one operation's synthesis is the wrong place to make it.
     pub fn operation_synthesis(operation: Id) -> Self {
-        Self::of([
-            WriteGrant::OperationProgram(operation.clone()),
-            WriteGrant::OperationExecution(operation),
-        ])
+        Self::of([WriteGrant::OperationProgram(operation)])
     }
 
     pub fn requirement_discovery(operation: Id) -> Self {
@@ -231,6 +257,15 @@ fn grant_covers(grant: &WriteGrant, mutation: &Mutation) -> bool {
                 | Mutation::PutPromptObligation { .. }
         ),
 
+        WriteGrant::RuntimeTopology => matches!(
+            mutation,
+            Mutation::PutTopicRuntime { .. }
+                | Mutation::PutSubscriptionRuntime { .. }
+                | Mutation::PutExecutionPool { .. }
+                | Mutation::PutRouter { .. }
+                | Mutation::PutStorageLayout { .. }
+        ),
+
         WriteGrant::TopLevelSymbol(symbol) => match mutation {
             Mutation::DeleteTopLevel { symbol: target } => symbol == target,
             other => other.write_target() == *symbol,
@@ -239,7 +274,6 @@ fn grant_covers(grant: &WriteGrant, mutation: &Mutation) -> bool {
         WriteGrant::Operation(operation) => match mutation {
             Mutation::PutOperationInterface { operation: target, .. }
             | Mutation::ReplaceOperationProgram { operation: target, .. }
-            | Mutation::ReplaceOperationExecution { operation: target, .. }
             | Mutation::ReplaceOperationRequirements { operation: target, .. }
             | Mutation::ProposeRequirements { operation: target, .. } => operation == target,
             _ => false,
@@ -255,11 +289,6 @@ fn grant_covers(grant: &WriteGrant, mutation: &Mutation) -> bool {
             Mutation::ReplaceOperationRequirements { operation: target, .. }
                 | Mutation::ProposeRequirements { operation: target, .. }
                 if operation == target
-        ),
-
-        WriteGrant::OperationExecution(operation) => matches!(
-            mutation,
-            Mutation::ReplaceOperationExecution { operation: target, .. } if operation == target
         ),
 
         WriteGrant::OperationInterface(operation) => matches!(
@@ -324,6 +353,12 @@ impl fmt::Display for DependencyRequestId {
 /// An out-of-scope change request: how an agent asks for a mutation it
 /// is not authorized to make itself (§19). The scheduler routes it to
 /// the symbol's owner or the coordinator.
+///
+/// Every write scope in the workflow is narrow, so this is the only way
+/// work crosses one. A program worker needing a schema field files one;
+/// so does the L1 topology author when no grouping key can carry a
+/// serialization key because the message schema does not carry the
+/// field at all.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DependencyRequest {
@@ -333,4 +368,36 @@ pub struct DependencyRequest {
     pub requested_change: String,
     pub reason: String,
     pub evidence: Vec<EvidenceRef>,
+
+    /// How the request was settled, or `None` while it is still open.
+    /// An open request blocks the run's success condition (§75).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolution: Option<DependencyResolution>,
+}
+
+/// How a dependency request was settled.
+///
+/// Determined by observing the target symbol, not by asking the
+/// repairing agent to self-report: a symbol whose version advanced was
+/// changed, and one whose version did not was not. That keeps the
+/// outcome a fact about the workspace rather than a claim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DependencyResolution {
+    /// The target symbol changed. Whether the change is the one asked
+    /// for is the requester's judgment on its next attempt.
+    Applied,
+
+    /// The repair ran and the target symbol did not change: the owner
+    /// judged no change was needed, or could not make one.
+    Declined,
+}
+
+impl fmt::Display for DependencyResolution {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Applied => "applied",
+            Self::Declined => "declined",
+        })
+    }
 }

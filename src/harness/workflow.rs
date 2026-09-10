@@ -16,9 +16,11 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use crate::confluence::{
-    AnalysisState, BundleSpec, ConfluenceEngine, EvidenceRef, PromptEvidence,
-    PromptObligationStatus, RequirementFamily, TaskKind, WriteScope,
+    AnalysisState, BundleSpec, ConfluenceEngine, DependencyResolution, EvidenceRef,
+    PromptEvidence, PromptObligationStatus, RequirementFamily, SymbolVersion, TaskKind,
+    WriteGrant, WriteScope,
 };
+use crate::analyzer::verification::RemedyLayer;
 use crate::spec::{Id, Model, Revision};
 
 use super::scheduler::{LogicalTask, Scheduler, SchedulerError};
@@ -130,6 +132,19 @@ impl Workflow {
                 return self.finalize(iterations - 1, None).await;
             }
 
+            // Cross-scope asks come first. A filed request means a
+            // worker is blocked on a symbol it may not write, and every
+            // phase below would reproduce that block — the topology
+            // author included, when no grouping key can carry a
+            // serialization key because the schema lacks the field.
+            //
+            // Always reconverge afterwards: an applied change moves the
+            // head, and a declined one still settles the request, so
+            // this cannot repeat.
+            if self.dispatch_dependency_requests().await? > 0 {
+                continue;
+            }
+
             // Phase 4: assembly and structural convergence.
             let revision = self.engine().head_revision();
             let analysis = self.await_analysis(revision).await?;
@@ -163,9 +178,14 @@ impl Workflow {
                     // repaired with the specific diagnostics as its
                     // obstacle, so the agent is told exactly what failed
                     // validation rather than resynthesizing it blind.
-                    let operations = self.operations_named_by(&errors);
+                    //
+                    // A diagnostic against an L1 declaration names no
+                    // operation and belongs to no operation's program,
+                    // so it is routed to the topology author instead.
+                    let (runtime, application) = self.split_diagnostics(&errors);
+                    let operations = self.operations_named_by(&application);
 
-                    if operations.is_empty() {
+                    if runtime.is_empty() && operations.is_empty() {
                         return self
                             .incomplete(
                                 revision,
@@ -181,7 +201,13 @@ impl Workflow {
                             .await;
                     }
 
-                    self.repair_validation(&operations, &errors).await?;
+                    if !runtime.is_empty() {
+                        self.repair_topology_validation(&runtime).await?;
+                    }
+
+                    if !operations.is_empty() {
+                        self.repair_validation(&operations, &application).await?;
+                    }
 
                     continue;
                 }
@@ -203,12 +229,34 @@ impl Workflow {
                         continue;
                     }
 
-                    // Phase 6–7: verify and repair the unproven.
+                    // Phase 6–7b: verify, then repair the unproven —
+                    // runtime obstacles through the topology author,
+                    // the rest per operation.
                     let repaired = self.repair_unproven(revision).await?;
 
                     if repaired == 0 {
                         // Nothing left to repair this iteration: either
                         // success or a stuck obstacle.
+                        return self.finalize(iterations, Some(revision)).await;
+                    }
+
+                    if self.engine().head_revision() == before
+                        && self.engine().open_dependency_requests().is_empty()
+                    {
+                        // Repair ran, committed nothing, and asked for
+                        // nothing. The next iteration would build the
+                        // same tasks from the same snapshot and reach
+                        // the same place, so the obstacle is stuck:
+                        // finalize with the gaps preserved rather than
+                        // spending the budget on identical work.
+                        // Per-task nondeterminism is the scheduler's
+                        // retry policy to absorb, not the fixpoint
+                        // loop's.
+                        //
+                        // A filed dependency request is progress even
+                        // with no commit behind it: the next iteration
+                        // dispatches it, and that may unblock the
+                        // repair that could not proceed here.
                         return self.finalize(iterations, Some(revision)).await;
                     }
                 }
@@ -296,7 +344,7 @@ impl Workflow {
             .iter()
             .map(|operation| LogicalTask {
                 kind: TaskKind::OperationSynthesis,
-                objective: format!("Synthesize the program and execution facts of {operation}."),
+                objective: format!("Synthesize the program of {operation}."),
                 write_scope: WriteScope::operation_synthesis(operation.clone()),
                 bundle: BundleSpec {
                     operation: Some(operation.clone()),
@@ -364,6 +412,148 @@ impl Workflow {
         Ok(ran)
     }
 
+    /// Dispatches every open dependency request, concurrently.
+    ///
+    /// A request is how work crosses a write scope: the filer named a
+    /// symbol it may not write and said what it needs. Each becomes one
+    /// task scoped to exactly that symbol — not to the skeleton at
+    /// large, since the ask is specific and a wider grant invites
+    /// collateral edits nobody asked for.
+    ///
+    /// The outcome is read from the workspace rather than from the
+    /// agent: a target whose version advanced was changed, one whose
+    /// version did not was not. Either way the request is settled, so a
+    /// declined ask cannot be dispatched forever. The filer's own work
+    /// is not resumed here — its obligation is still unproven, so the
+    /// next iteration rebuilds that task against the new head.
+    ///
+    /// Returns how many ran.
+    async fn dispatch_dependency_requests(&self) -> Result<u32, WorkflowError> {
+        let open = self.engine().open_dependency_requests();
+
+        if open.is_empty() {
+            return Ok(0);
+        }
+
+        let before: Vec<Option<SymbolVersion>> = open
+            .iter()
+            .map(|request| self.engine().symbol_version(&request.target))
+            .collect();
+
+        let tasks: Vec<LogicalTask> = open
+            .iter()
+            .map(|request| LogicalTask {
+                kind: TaskKind::SharedDependencyRepair,
+                objective: format!(
+                    "Apply this change to {}, or determine that it is not needed and \
+                     commit nothing:\n\n{}\n\nWhy it was asked for: {}",
+                    request.target, request.requested_change, request.reason
+                ),
+                write_scope: WriteScope::of([WriteGrant::TopLevelSymbol(request.target.clone())]),
+                bundle: BundleSpec {
+                    operation: None,
+                    requirement: None,
+                    include: vec![request.target.clone()],
+                },
+                prompt_evidence: self.prompt_evidence(),
+                interactive: false,
+            })
+            .collect();
+
+        let ran = tasks.len() as u32;
+
+        self.scheduler.run_many(tasks).await?;
+
+        for (request, before) in open.iter().zip(before) {
+            let resolution = if self.engine().symbol_version(&request.target) == before {
+                DependencyResolution::Declined
+            } else {
+                DependencyResolution::Applied
+            };
+
+            self.engine()
+                .resolve_dependency_request(request.id, resolution)
+                .map_err(WorkflowError::Engine)?;
+        }
+
+        Ok(ran)
+    }
+
+    /// Splits validation diagnostics into the L1 ones and the rest.
+    ///
+    /// Two signals mark an L1 diagnostic. A code raised only by runtime
+    /// validation is one outright. A generic code — an unknown
+    /// reference, an invalid field path — can come from either layer,
+    /// so it counts only when its subject is a symbol that exists
+    /// nowhere but the runtime model: a router, an execution pool, or a
+    /// storage layout. Topic ids are deliberately not runtime subjects,
+    /// since a topic is an L0 declaration and its runtime-specific
+    /// faults already carry L1 codes.
+    ///
+    /// The split is exclusive because `operations_named_by` falls back
+    /// to a substring match on the message, and an L1 diagnostic
+    /// routinely names the operation whose boundary it concerns. Left
+    /// in, it would spawn a program repair for an obstacle no program
+    /// can reach.
+    fn split_diagnostics(
+        &self,
+        errors: &[crate::confluence::AnalysisDiagnostic],
+    ) -> (
+        Vec<crate::confluence::AnalysisDiagnostic>,
+        Vec<crate::confluence::AnalysisDiagnostic>,
+    ) {
+        let head = self.engine().head_snapshot();
+        let runtime = &head.workspace.runtime;
+
+        let runtime_owned = |subject: &str| {
+            let id = Id(subject.to_string());
+
+            runtime.routers.contains_key(&id)
+                || runtime.execution_pools.contains_key(&id)
+                || runtime.storage_layouts.contains_key(&id)
+        };
+
+        errors.iter().cloned().partition(|error| {
+            error.runtime || error.subject.as_deref().is_some_and(runtime_owned)
+        })
+    }
+
+    /// Sends the L1 validation obstacles to the single topology
+    /// author. Returns how many tasks ran.
+    async fn repair_topology_validation(
+        &self,
+        errors: &[crate::confluence::AnalysisDiagnostic],
+    ) -> Result<u32, WorkflowError> {
+        let obstacle = errors
+            .iter()
+            .map(|error| format!("- {}", error.message))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let task = LogicalTask {
+            kind: TaskKind::TopologySynthesis,
+            objective: format!(
+                "The runtime topology does not pass structural validation. Revise \
+                 the L1 declarations so these obstacles are resolved, leaving the \
+                 application model unchanged:\n{obstacle}"
+            ),
+            write_scope: WriteScope::runtime_topology(),
+            bundle: BundleSpec {
+                operation: None,
+                requirement: None,
+                include: crate::confluence::topology_symbols(
+                    &self.engine().head_snapshot().workspace,
+                ),
+            },
+            prompt_evidence: self.prompt_evidence(),
+            interactive: false,
+        };
+
+        self.scheduler.run_many(vec![task]).await?;
+
+        Ok(1)
+    }
+
     /// Phase 5: one discovery task per operation with no declared
     /// requirements yet, run concurrently. Returns how many ran.
     async fn requirement_discovery(&self) -> Result<u32, WorkflowError> {
@@ -401,20 +591,53 @@ impl Workflow {
         Ok(ran)
     }
 
-    /// Phases 6–7: for every unproven obligation at `revision`, run one
-    /// requirement-scoped repair task, concurrently. Returns how many
-    /// ran.
+    /// Phases 6–7: repair every unproven obligation at `revision`.
+    ///
+    /// Obligations split by the layer their obstacles name. Those
+    /// waiting on the runtime realization go to a single topology task
+    /// holding the whole L1 grant — one writer, because a grouping key,
+    /// its router and the pool it terminates at are one decision.
+    /// Everything else fans out per operation as before.
+    ///
+    /// Topology goes first, and a topology commit ends the round: it
+    /// moves the head, which leaves both the unproven set and its
+    /// remedy classification stale. An obligation classified
+    /// `application` because one of its obstacles was an L0 one may
+    /// have had its runtime obstacles cleared in passing, or not — and
+    /// a repair task created now would pin a snapshot whose analysis
+    /// has not run, so it would carry no obstacle evidence either.
+    /// Re-verifying first costs one loop iteration and repairs against
+    /// facts that are actually current.
+    ///
+    /// Returns how many tasks ran.
     async fn repair_unproven(&self, revision: Revision) -> Result<u32, WorkflowError> {
-        let unproven = self.unproven_obligations(revision)?;
+        let (runtime, application): (Vec<RepairTarget>, Vec<RepairTarget>) = self
+            .unproven_obligations(revision)?
+            .into_iter()
+            .partition(RepairTarget::is_runtime);
 
-        let tasks: Vec<LogicalTask> = unproven
+        let mut ran = 0;
+
+        if !runtime.is_empty() {
+            let before = self.engine().head_revision();
+
+            ran += self.synthesize_topology(&runtime).await?;
+
+            if self.engine().head_revision() != before {
+                return Ok(ran);
+            }
+
+            // The author declined to change anything. Fall through:
+            // the application repairs may still make progress, and
+            // without them a run whose topology is genuinely finished
+            // would stop at the no-progress check with L0 work left.
+        }
+
+        let tasks: Vec<LogicalTask> = application
             .into_iter()
             .map(|target| LogicalTask {
                 kind: TaskKind::RequirementRepair,
-                objective: format!(
-                    "Make the {} requirement #{} of {} provable.",
-                    target.family, target.index, target.operation
-                ),
+                objective: format!("Make the {} provable.", target.label()),
                 write_scope: WriteScope::requirement_repair(target.operation.clone()),
                 bundle: BundleSpec {
                     operation: Some(target.operation),
@@ -426,11 +649,51 @@ impl Workflow {
             })
             .collect();
 
-        let ran = tasks.len() as u32;
+        ran += tasks.len() as u32;
 
         self.scheduler.run_many(tasks).await?;
 
         Ok(ran)
+    }
+
+    /// Runs the single L1 author over the obligations waiting on it.
+    ///
+    /// One task, not one per obligation: the runtime model is shared,
+    /// and two concurrent writers would each see the other's pool and
+    /// router declarations as conflicting writes. Batching them also
+    /// lets the author declare one grouping that discharges several
+    /// requirements at once, which per-obligation tasks cannot see.
+    async fn synthesize_topology(&self, targets: &[RepairTarget]) -> Result<u32, WorkflowError> {
+        let listed = targets
+            .iter()
+            .map(|target| format!("- the {}", target.label()))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let task = LogicalTask {
+            kind: TaskKind::TopologySynthesis,
+            objective: format!(
+                "Author the runtime topology that discharges these obligations, \
+                 which are unproven for want of L1 facts alone:\n{listed}\n\n\
+                 Read each one's `requirement_report` for the specific missing \
+                 fact. Leave unproven anything the architecture does not \
+                 genuinely constrain."
+            ),
+            write_scope: WriteScope::runtime_topology(),
+            bundle: BundleSpec {
+                operation: None,
+                requirement: None,
+                include: crate::confluence::topology_symbols(
+                    &self.engine().head_snapshot().workspace,
+                ),
+            },
+            prompt_evidence: self.prompt_evidence(),
+            interactive: false,
+        };
+
+        self.scheduler.run_many(vec![task]).await?;
+
+        Ok(1)
     }
 
     /// Waits for a revision's analysis to reach a terminal state,
@@ -453,7 +716,7 @@ impl Workflow {
         head.workspace
             .operations
             .iter()
-            .filter(|(_, draft)| draft.program.is_none() || draft.execution.is_none())
+            .filter(|(_, draft)| draft.program.is_none())
             .map(|(id, _)| id.clone())
             .collect()
     }
@@ -514,6 +777,7 @@ impl Workflow {
                     operation: operation.clone(),
                     family,
                     index: *index,
+                    remedy: obligation.remedy,
                 });
             }
         }
@@ -565,6 +829,7 @@ impl Workflow {
 
         let unmapped = self.unmapped_obligations();
         let all_proven = analysis.verification.all_proven();
+        let open_requests = self.engine().open_dependency_requests();
 
         let head = self.engine().head_snapshot();
 
@@ -587,23 +852,26 @@ impl Workflow {
                     .to_string(),
                 unresolved: vec!["the model has no operations".to_string()],
             }
-        } else if all_proven && unmapped.is_empty() {
+        } else if all_proven && unmapped.is_empty() && open_requests.is_empty() {
             RunStatus::Success {
                 revision: revision.0,
             }
         } else {
-            let mut unresolved = self.unproven_labels(revision);
-
-            unresolved.extend(unmapped);
+            let reason = if !all_proven {
+                "not every adopted obligation is proven".to_string()
+            } else if !unmapped.is_empty() {
+                "explicit prompt obligations remain unmapped".to_string()
+            } else {
+                // Proven and mapped, but a worker asked for a change
+                // nobody made. Reporting success here would present a
+                // design whose own authors said it was incomplete.
+                "dependency requests remain unresolved".to_string()
+            };
 
             RunStatus::Incomplete {
                 revision: revision.0,
-                reason: if all_proven {
-                    "explicit prompt obligations remain unmapped".to_string()
-                } else {
-                    "not every adopted obligation is proven".to_string()
-                },
-                unresolved,
+                reason,
+                unresolved: self.unresolved_labels(revision),
             }
         };
 
@@ -725,6 +993,16 @@ impl Workflow {
 
         labels.extend(self.unmapped_obligations());
 
+        // An open cross-scope ask is unfinished work by definition:
+        // some worker needed a change it could not make, and nothing
+        // has settled it (§75).
+        labels.extend(self.engine().open_dependency_requests().iter().map(|request| {
+            format!(
+                "unresolved dependency request on {}: {}",
+                request.target, request.requested_change
+            )
+        }));
+
         labels
     }
 }
@@ -735,6 +1013,23 @@ struct RepairTarget {
     operation: Id,
     family: RequirementFamily,
     index: usize,
+
+    /// Which layer the checker says the missing facts belong to.
+    /// `None` for families that do not classify their obstacles, read
+    /// as the application layer — the pre-existing behavior.
+    remedy: Option<RemedyLayer>,
+}
+
+impl RepairTarget {
+    /// Whether this obligation is waiting on the runtime topology
+    /// alone, so no program edit can discharge it.
+    fn is_runtime(&self) -> bool {
+        self.remedy == Some(RemedyLayer::Runtime)
+    }
+
+    fn label(&self) -> String {
+        format!("{} requirement #{} of {}", self.family, self.index, self.operation)
+    }
 }
 
 /// Every symbol id an operation owns: the operation and its inputs, plus

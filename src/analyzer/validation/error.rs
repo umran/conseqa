@@ -75,16 +75,6 @@ pub enum ValidationError {
         schema: Id,
     },
 
-    TopicKeySchemaNotOnTopic {
-        topic: Id,
-        schema: Id,
-    },
-
-    TopicKeyMissingSchema {
-        topic: Id,
-        schema: Id,
-    },
-
     /// A message-identity mapping names a schema the topic does not
     /// carry.
     MessageIdentitySchemaNotOnTopic {
@@ -110,6 +100,90 @@ pub enum ValidationError {
     /// A request input declares a keyed identity with no fields.
     EmptyRequestIdentity {
         input: Id,
+    },
+
+    /// A router declares a routing block whose key tuple is empty, so
+    /// it names no routing domain.
+    EmptyRoutingKey {
+        router: Id,
+    },
+
+    /// A subscription dispatch routes by `grouping_key`, but no keyed
+    /// grouping is in effect at either scope for that key to name.
+    RoutingWithoutGrouping {
+        operation: Id,
+        input: Id,
+        topic: Id,
+    },
+
+    /// A grouping key maps a schema the topic does not carry.
+    GroupingKeySchemaNotOnTopic {
+        subject: Id,
+        topic: Id,
+        schema: Id,
+    },
+
+    /// A grouping key leaves a carried schema unmapped, so messages of
+    /// it would belong to no group.
+    GroupingKeyMissingSchema {
+        subject: Id,
+        topic: Id,
+        schema: Id,
+    },
+
+    /// A grouping key maps a schema to an empty tuple.
+    EmptyGroupingKey {
+        subject: Id,
+        schema: Id,
+    },
+
+    /// Grouping-key tuple positions correspond across schemas, so
+    /// every mapped tuple must have the same arity.
+    GroupingKeyArityMismatch {
+        subject: Id,
+        schema: Id,
+        expected: usize,
+        actual: usize,
+    },
+
+    /// `ordering: within_group` is declared where no keyed grouping is
+    /// declared at the same scope, so no domain exists for the
+    /// guarantee to be interpreted over.
+    WithinGroupWithoutGrouping {
+        subject: Id,
+    },
+
+    /// A topic and one of its subscriptions both declare transport
+    /// semantics. The two scopes are exclusive.
+    TransportSemanticsAtBothScopes {
+        topic: Id,
+        operation: Id,
+        input: Id,
+    },
+
+    /// Two routers serve one request boundary. The initial model
+    /// admits at most one, so the assignment of a boundary to a pool
+    /// is unambiguous.
+    DuplicateRouterForBoundary {
+        first: Id,
+        second: Id,
+        operation: Id,
+        input: Id,
+    },
+
+    /// A storage layout declares an empty partition key, so it
+    /// identifies no partition.
+    EmptyPartitionKey {
+        layout: Id,
+    },
+
+    /// Two storage layouts map one data object. V1 admits at most one
+    /// primary layout per object.
+    DuplicateStorageLayoutForObject {
+        first: Id,
+        second: Id,
+        data_model: Id,
+        object: Id,
     },
 
     TransactionObjectOutsideDataModel {
@@ -388,6 +462,211 @@ impl From<ValidationError> for Diagnostic {
                 }
             }
 
+            ValidationError::EmptyRoutingKey { router } => Diagnostic {
+                code: DiagnosticCode::Validation(ValidationCode::EmptyRoutingKey),
+                severity: Severity::Error,
+                subject: Some(router.clone()),
+                message: format!(
+                    "`{router}` declares a routing block with an empty key, which \
+                     names no routing domain."
+                ),
+                evidence: vec![Evidence {
+                    subject: Some(router),
+                    message: "A routing key must name at least one field; omit the \
+                              routing block entirely to declare no member affinity."
+                        .to_string(),
+                }],
+            },
+
+            ValidationError::RoutingWithoutGrouping {
+                operation,
+                input,
+                topic,
+            } => Diagnostic {
+                code: DiagnosticCode::Validation(
+                    ValidationCode::RoutingWithoutGrouping,
+                ),
+                severity: Severity::Error,
+                subject: Some(input.clone()),
+                message: format!(
+                    "`{input}` of `{operation}` dispatches by `grouping_key`, but no \
+                     keyed grouping is in effect for `{topic}`."
+                ),
+                evidence: vec![Evidence {
+                    subject: Some(topic),
+                    message: "Declare a keyed `grouping` — on this topic's runtime, or \
+                              on this subscription if the topic declares no transport \
+                              semantics — or omit the routing block."
+                        .to_string(),
+                }],
+            },
+
+            ValidationError::GroupingKeySchemaNotOnTopic {
+                subject,
+                topic,
+                schema,
+            } => Diagnostic {
+                code: DiagnosticCode::Validation(ValidationCode::GroupingKeySchemaNotOnTopic),
+                severity: Severity::Error,
+                subject: Some(subject),
+                message: format!(
+                    "The grouping key maps `{schema}`, which `{topic}` does not carry."
+                ),
+                evidence: vec![Evidence {
+                    subject: Some(topic),
+                    message: "A grouping key may only map schemas the topic carries."
+                        .to_string(),
+                }],
+            },
+
+            ValidationError::GroupingKeyMissingSchema {
+                subject,
+                topic,
+                schema,
+            } => Diagnostic {
+                code: DiagnosticCode::Validation(ValidationCode::GroupingKeyMissingSchema),
+                severity: Severity::Error,
+                subject: Some(subject),
+                message: format!(
+                    "The grouping key leaves `{schema}`, carried by `{topic}`, unmapped."
+                ),
+                evidence: vec![Evidence {
+                    subject: Some(schema),
+                    message: "A grouping key must place every carried message in some \
+                              group; an unmapped schema would belong to none."
+                        .to_string(),
+                }],
+            },
+
+            ValidationError::EmptyGroupingKey { subject, schema } => Diagnostic {
+                code: DiagnosticCode::Validation(ValidationCode::EmptyGroupingKey),
+                severity: Severity::Error,
+                subject: Some(subject),
+                message: format!("The grouping key maps `{schema}` to an empty tuple."),
+                evidence: vec![Evidence {
+                    subject: Some(schema),
+                    message: "A grouping key tuple must name at least one field."
+                        .to_string(),
+                }],
+            },
+
+            ValidationError::GroupingKeyArityMismatch {
+                subject,
+                schema,
+                expected,
+                actual,
+            } => Diagnostic {
+                code: DiagnosticCode::Validation(ValidationCode::GroupingKeyArityMismatch),
+                severity: Severity::Error,
+                subject: Some(subject),
+                message: format!(
+                    "The grouping key maps `{schema}` to {actual} field(s), but other \
+                     schemas map {expected}."
+                ),
+                evidence: vec![Evidence {
+                    subject: Some(schema),
+                    message: "Tuple positions correspond across schemas, so every \
+                              mapped tuple shares one arity."
+                        .to_string(),
+                }],
+            },
+
+            ValidationError::WithinGroupWithoutGrouping { subject } => Diagnostic {
+                code: DiagnosticCode::Validation(ValidationCode::WithinGroupWithoutGrouping),
+                severity: Severity::Error,
+                subject: Some(subject.clone()),
+                message: "`ordering: within_group` is declared where no keyed grouping \
+                          is declared at the same scope."
+                    .to_string(),
+                evidence: vec![Evidence {
+                    subject: Some(subject),
+                    message: "Declare the grouping the guarantee is about, or use \
+                              `ordering: global` or `none`."
+                        .to_string(),
+                }],
+            },
+
+            ValidationError::TransportSemanticsAtBothScopes {
+                topic,
+                operation,
+                input,
+            } => Diagnostic {
+                code: DiagnosticCode::Validation(ValidationCode::TransportSemanticsAtBothScopes),
+                severity: Severity::Error,
+                subject: Some(input.clone()),
+                message: format!(
+                    "`{topic}` declares transport semantics for all its subscriptions, \
+                     and `{input}` of `{operation}` declares its own."
+                ),
+                evidence: vec![Evidence {
+                    subject: Some(topic),
+                    message: "Grouping and ordering are declared either once for the \
+                              topic or independently per subscription, never at both. \
+                              There is no override."
+                        .to_string(),
+                }],
+            },
+
+            ValidationError::DuplicateRouterForBoundary {
+                first,
+                second,
+                operation,
+                input,
+            } => Diagnostic {
+                code: DiagnosticCode::Validation(ValidationCode::DuplicateRouterForBoundary),
+                severity: Severity::Error,
+                subject: Some(second.clone()),
+                message: format!(
+                    "`{first}` and `{second}` both route the request boundary \
+                     `{operation}`/`{input}`."
+                ),
+                evidence: vec![Evidence {
+                    subject: Some(first),
+                    message: "One request boundary has at most one router, so its \
+                              execution-pool assignment is unambiguous."
+                        .to_string(),
+                }],
+            },
+
+            ValidationError::EmptyPartitionKey { layout } => Diagnostic {
+                code: DiagnosticCode::Validation(ValidationCode::EmptyPartitionKey),
+                severity: Severity::Error,
+                subject: Some(layout.clone()),
+                message: format!(
+                    "`{layout}` declares an empty partition key, which identifies no \
+                     physical partition."
+                ),
+                evidence: vec![Evidence {
+                    subject: Some(layout),
+                    message: "A partition key must name at least one field of the \
+                              object's schema."
+                        .to_string(),
+                }],
+            },
+
+            ValidationError::DuplicateStorageLayoutForObject {
+                first,
+                second,
+                data_model,
+                object,
+            } => Diagnostic {
+                code: DiagnosticCode::Validation(
+                    ValidationCode::DuplicateStorageLayoutForObject,
+                ),
+                severity: Severity::Error,
+                subject: Some(second.clone()),
+                message: format!(
+                    "`{first}` and `{second}` both declare a storage layout for \
+                     `{data_model}`/`{object}`."
+                ),
+                evidence: vec![Evidence {
+                    subject: Some(first),
+                    message: "V1 admits at most one primary storage layout per data \
+                              object."
+                        .to_string(),
+                }],
+            },
+
             ValidationError::InvalidFieldPath {
                 subject,
                 schema,
@@ -559,52 +838,6 @@ impl From<ValidationError> for Diagnostic {
                         message: format!(
                             "Topic does not declare schema `{schema}` as a message."
                         ),
-                    }],
-                }
-            }
-
-            ValidationError::TopicKeySchemaNotOnTopic {
-                topic,
-                schema,
-            } => {
-                Diagnostic {
-                    code: DiagnosticCode::Validation(
-                        ValidationCode::TopicKeySchemaNotOnTopic,
-                    ),
-                    severity: Severity::Error,
-                    subject: Some(topic.clone()),
-                    message: format!(
-                        "Topic `{topic}` defines an ordering key for schema \
-                         `{schema}`, but does not carry that schema."
-                    ),
-                    evidence: vec![Evidence {
-                        subject: Some(schema),
-                        message:
-                            "Ordering-key mappings may only reference message schemas carried by the topic."
-                                .to_string(),
-                    }],
-                }
-            }
-
-            ValidationError::TopicKeyMissingSchema {
-                topic,
-                schema,
-            } => {
-                Diagnostic {
-                    code: DiagnosticCode::Validation(
-                        ValidationCode::TopicKeyMissingSchema,
-                    ),
-                    severity: Severity::Error,
-                    subject: Some(topic.clone()),
-                    message: format!(
-                        "Keyed topic `{topic}` carries schema `{schema}` \
-                         but defines no ordering-key mapping for it."
-                    ),
-                    evidence: vec![Evidence {
-                        subject: Some(schema),
-                        message:
-                            "Every message schema carried by a keyed topic must define how its ordering key is obtained."
-                                .to_string(),
                     }],
                 }
             }

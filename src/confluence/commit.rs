@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::spec::{
-    Effect, ExecutionSemantics, Id, Input, MessageSelector, Model, Operation, OperationConcurrency,
+    Effect, Id, Input, MessageSelector, Model, Operation, TopicRuntime,
     OperationStep, Revision, Schema, StateMachineSubject, TransactionStep, TransitionSideEffect,
     TypeRef, ValueSource,
 };
@@ -219,6 +219,52 @@ pub fn skeleton_diagnostics(workspace: &WorkspaceState) -> Vec<DraftDiagnostic> 
         });
     }
 
+    // Whatever runtime topology already exists is checked here too.
+    // L1 is normally authored after the fan-out, once verification has
+    // said what it must discharge, so usually there is none yet. When
+    // an interactive author has declared some early, whole-model
+    // validation cannot reach it until every operation has a program —
+    // so without this it would go unchecked across the whole fan-out
+    // window, and a broken declaration is a mistake every concurrent
+    // worker inherits at once.
+    for (topic, value) in &workspace.runtime.topics {
+        mutations.push(Mutation::PutTopicRuntime {
+            topic: topic.clone(),
+            value: value.clone(),
+        });
+    }
+
+    for (id, value) in &workspace.runtime.execution_pools {
+        mutations.push(Mutation::PutExecutionPool {
+            id: id.clone(),
+            value: value.clone(),
+        });
+    }
+
+    for (operation, inputs) in &workspace.runtime.subscriptions {
+        for (input, value) in inputs {
+            mutations.push(Mutation::PutSubscriptionRuntime {
+                operation: operation.clone(),
+                input: input.clone(),
+                value: value.clone(),
+            });
+        }
+    }
+
+    for (id, value) in &workspace.runtime.routers {
+        mutations.push(Mutation::PutRouter {
+            id: id.clone(),
+            value: value.clone(),
+        });
+    }
+
+    for (id, value) in &workspace.runtime.storage_layouts {
+        mutations.push(Mutation::PutStorageLayout {
+            id: id.clone(),
+            value: value.clone(),
+        });
+    }
+
     let mut diagnostics = check_patch(workspace, &SpecPatch { mutations });
 
     for (operation, draft) in &workspace.operations {
@@ -311,20 +357,40 @@ fn apply_mutation(
             }
         }
 
-        Mutation::ReplaceOperationExecution {
-            operation,
-            execution,
-        } => match workspace.operations.get_mut(operation) {
-            Some(draft) => {
-                draft.execution = Some(execution.clone());
-                draft.recompute_stage();
-            }
+        Mutation::PutTopicRuntime { topic, value } => {
+            workspace.runtime.topics.insert(topic.clone(), value.clone());
+        }
 
-            None => diagnostics.push(DraftDiagnostic::new(
-                Some(SymbolKey::Operation(operation.clone())),
-                format!("operation {operation} is not declared; plan its interface first"),
-            )),
-        },
+        Mutation::PutSubscriptionRuntime {
+            operation,
+            input,
+            value,
+        } => {
+            workspace
+                .runtime
+                .subscriptions
+                .entry(operation.clone())
+                .or_default()
+                .insert(input.clone(), value.clone());
+        }
+
+        Mutation::PutExecutionPool { id, value } => {
+            workspace
+                .runtime
+                .execution_pools
+                .insert(id.clone(), value.clone());
+        }
+
+        Mutation::PutRouter { id, value } => {
+            workspace.runtime.routers.insert(id.clone(), value.clone());
+        }
+
+        Mutation::PutStorageLayout { id, value } => {
+            workspace
+                .runtime
+                .storage_layouts
+                .insert(id.clone(), value.clone());
+        }
 
         Mutation::ReplaceOperationRequirements {
             operation,
@@ -362,6 +428,39 @@ fn apply_mutation(
                 SymbolKey::Topic(id) => workspace.topics.remove(id).is_some(),
                 SymbolKey::StateMachine(id) => workspace.state_machines.remove(id).is_some(),
                 SymbolKey::Operation(id) => workspace.operations.remove(id).is_some(),
+
+                SymbolKey::TopicRuntime(id) => workspace.runtime.topics.remove(id).is_some(),
+
+                SymbolKey::SubscriptionRuntime { operation, input } => {
+                    let removed = workspace
+                        .runtime
+                        .subscriptions
+                        .get_mut(operation)
+                        .and_then(|inputs| inputs.remove(input))
+                        .is_some();
+
+                    // An empty per-operation map would keep
+                    // `RuntimeModel::is_empty` false, so a workspace
+                    // that now declares no runtime facts would still
+                    // assemble and export a `runtime:` block.
+                    workspace
+                        .runtime
+                        .subscriptions
+                        .retain(|_, inputs| !inputs.is_empty());
+
+                    removed
+                }
+
+                SymbolKey::ExecutionPool(id) => {
+                    workspace.runtime.execution_pools.remove(id).is_some()
+                }
+
+                SymbolKey::Router(id) => workspace.runtime.routers.remove(id).is_some(),
+
+                SymbolKey::StorageLayout(id) => {
+                    workspace.runtime.storage_layouts.remove(id).is_some()
+                }
+
                 SymbolKey::PromptObligation(id) => {
                     workspace.prompt_obligations.remove(id).is_some()
                 }
@@ -624,6 +723,26 @@ fn check_patch(candidate: &WorkspaceState, patch: &SpecPatch) -> Vec<DraftDiagno
                 check_requirement_roots(candidate, operation, &mut diagnostics);
             }
 
+            Mutation::PutRouter { id, value } => {
+                check_router(candidate, id, value, &mut diagnostics);
+            }
+
+            Mutation::PutSubscriptionRuntime {
+                operation,
+                input,
+                value,
+            } => {
+                check_subscription_runtime(candidate, operation, input, value, &mut diagnostics);
+            }
+
+            Mutation::PutTopicRuntime { topic, value } => {
+                check_topic_runtime(candidate, topic, value, &mut diagnostics);
+            }
+
+            Mutation::PutStorageLayout { id, value } => {
+                check_storage_layout(candidate, id, value, &mut diagnostics);
+            }
+
             _ => {}
         }
     }
@@ -667,8 +786,8 @@ fn check_patch(candidate: &WorkspaceState, patch: &SpecPatch) -> Vec<DraftDiagno
 /// operation, whose program was just written. Sibling operations are
 /// omitted — the draft state is not assemblable mid-fanout — so only the
 /// operation-local diagnostics of [`program_local_diagnostics`] are
-/// sound over it. Execution facts, which the reference and dataflow
-/// passes never read, are stubbed when the draft has none yet.
+/// sound over it. The runtime model rides along unchanged: the
+/// program-local passes never read it, and carrying it costs nothing.
 fn probe_model(candidate: &WorkspaceState, operation: &Id) -> Option<Model> {
     let draft = candidate.operations.get(operation)?;
     let program = draft.program.clone()?;
@@ -679,9 +798,6 @@ fn probe_model(candidate: &WorkspaceState, operation: &Id) -> Option<Model> {
         inputs: draft.inputs.clone(),
         program,
         requirements: draft.requirements.clone(),
-        execution: draft.execution.clone().unwrap_or(ExecutionSemantics {
-            concurrency: OperationConcurrency::Unspecified,
-        }),
     };
 
     let mut operations = std::collections::BTreeMap::new();
@@ -695,6 +811,7 @@ fn probe_model(candidate: &WorkspaceState, operation: &Id) -> Option<Model> {
         topics: candidate.topics.clone(),
         state_machines: candidate.state_machines.clone(),
         operations,
+        runtime: (!candidate.runtime.is_empty()).then(|| candidate.runtime.clone()),
     })
 }
 
@@ -1135,6 +1252,258 @@ fn check_program(
                 ));
             }
         }
+    }
+}
+
+/// A router must name a request boundary that exists and a pool the
+/// runtime declares.
+///
+/// Whole-model validation would catch both asynchronously; catching
+/// them at the gate lets the authoring agent fix them in the same
+/// session, which is the point of the draft checks.
+fn check_router(
+    candidate: &WorkspaceState,
+    router: &Id,
+    value: &crate::spec::Router,
+    diagnostics: &mut Vec<DraftDiagnostic>,
+) {
+    check_boundary(
+        candidate,
+        SymbolKey::Router(router.clone()),
+        &value.boundary.operation,
+        &value.boundary.input,
+        BoundaryKind::Request,
+        diagnostics,
+    );
+
+    check_pool(
+        candidate,
+        SymbolKey::Router(router.clone()),
+        &value.pool,
+        diagnostics,
+    );
+}
+
+fn check_subscription_runtime(
+    candidate: &WorkspaceState,
+    operation: &Id,
+    input: &Id,
+    value: &crate::spec::SubscriptionRuntime,
+    diagnostics: &mut Vec<DraftDiagnostic>,
+) {
+    let subject = SymbolKey::SubscriptionRuntime {
+        operation: operation.clone(),
+        input: input.clone(),
+    };
+
+    check_boundary(
+        candidate,
+        subject.clone(),
+        operation,
+        input,
+        BoundaryKind::Subscription,
+        diagnostics,
+    );
+
+    check_pool(candidate, subject.clone(), &value.dispatch.pool, diagnostics);
+
+    // The scope invariant, checked here rather than left to
+    // whole-model validation: a violation committed during fan-out
+    // poisons the head for every task, and the agent that caused it has
+    // already finished by the time analysis reports.
+    if !value.declares_transport_semantics() {
+        return;
+    }
+
+    let Some(Input::Subscription(subscription)) = candidate
+        .operations
+        .get(operation)
+        .and_then(|draft| draft.inputs.get(input))
+    else {
+        return;
+    };
+
+    if candidate
+        .runtime
+        .topics
+        .get(&subscription.topic)
+        .is_some_and(TopicRuntime::declares_transport_semantics)
+    {
+        diagnostics.push(DraftDiagnostic::new(
+            Some(subject),
+            format!(
+                "{} already declares transport semantics for every subscription of it, \
+                 so this one may not declare its own",
+                subscription.topic
+            ),
+        ));
+    }
+}
+
+/// A topic runtime's grouping must be well formed, and it may not
+/// claim the topic scope while subscriptions of that topic hold it.
+fn check_topic_runtime(
+    candidate: &WorkspaceState,
+    topic: &Id,
+    value: &TopicRuntime,
+    diagnostics: &mut Vec<DraftDiagnostic>,
+) {
+    let subject = SymbolKey::TopicRuntime(topic.clone());
+
+    if !candidate.topics.contains_key(topic) {
+        diagnostics.push(DraftDiagnostic::new(
+            Some(subject.clone()),
+            format!("topic {topic} is not declared"),
+        ));
+
+        return;
+    }
+
+    if value.ordering == Some(crate::spec::OrderingSemantics::WithinGroup)
+        && value.grouping.is_none()
+    {
+        diagnostics.push(DraftDiagnostic::new(
+            Some(subject.clone()),
+            "ordering `within_group` needs a grouping at the same scope to be \
+             interpreted over"
+                .to_string(),
+        ));
+    }
+
+    if !value.declares_transport_semantics() {
+        return;
+    }
+
+    for (operation, inputs) in &candidate.runtime.subscriptions {
+        for (input, runtime) in inputs {
+            if !runtime.declares_transport_semantics() {
+                continue;
+            }
+
+            let Some(Input::Subscription(subscription)) = candidate
+                .operations
+                .get(operation)
+                .and_then(|draft| draft.inputs.get(input))
+            else {
+                continue;
+            };
+
+            if &subscription.topic == topic {
+                diagnostics.push(DraftDiagnostic::new(
+                    Some(subject.clone()),
+                    format!(
+                        "{input} of {operation} already declares its own transport \
+                         semantics for {topic}, so the topic may not declare them for \
+                         every subscription"
+                    ),
+                ));
+            }
+        }
+    }
+}
+
+/// A storage layout must name a declared object and carry a key.
+fn check_storage_layout(
+    candidate: &WorkspaceState,
+    layout: &Id,
+    value: &crate::spec::StorageLayout,
+    diagnostics: &mut Vec<DraftDiagnostic>,
+) {
+    let subject = SymbolKey::StorageLayout(layout.clone());
+
+    if value.partition_key.is_empty() {
+        diagnostics.push(DraftDiagnostic::new(
+            Some(subject.clone()),
+            "a partition key must name at least one field".to_string(),
+        ));
+    }
+
+    let declared = candidate
+        .data_models
+        .get(&value.object.data_model)
+        .is_some_and(|data_model| data_model.objects.contains_key(&value.object.object));
+
+    if !declared {
+        diagnostics.push(DraftDiagnostic::new(
+            Some(subject),
+            format!(
+                "data object {}/{} is not declared",
+                value.object.data_model, value.object.object
+            ),
+        ));
+    }
+}
+
+#[derive(Clone, Copy)]
+enum BoundaryKind {
+    Request,
+    Subscription,
+}
+
+impl BoundaryKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Request => "request",
+            Self::Subscription => "subscription",
+        }
+    }
+
+    fn matches(self, input: &Input) -> bool {
+        matches!(
+            (self, input),
+            (Self::Request, Input::Request(_)) | (Self::Subscription, Input::Subscription(_))
+        )
+    }
+}
+
+fn check_boundary(
+    candidate: &WorkspaceState,
+    subject: SymbolKey,
+    operation: &Id,
+    input: &Id,
+    expected: BoundaryKind,
+    diagnostics: &mut Vec<DraftDiagnostic>,
+) {
+    let Some(draft) = candidate.operations.get(operation) else {
+        diagnostics.push(DraftDiagnostic::new(
+            Some(subject),
+            format!("operation {operation} is not declared; plan its interface first"),
+        ));
+
+        return;
+    };
+
+    let Some(declared) = draft.inputs.get(input) else {
+        diagnostics.push(DraftDiagnostic::new(
+            Some(subject),
+            format!("{operation} declares no input {input}"),
+        ));
+
+        return;
+    };
+
+    if !expected.matches(declared) {
+        diagnostics.push(DraftDiagnostic::new(
+            Some(subject),
+            format!(
+                "{input} of {operation} is not a {} input",
+                expected.label()
+            ),
+        ));
+    }
+}
+
+fn check_pool(
+    candidate: &WorkspaceState,
+    subject: SymbolKey,
+    pool: &Id,
+    diagnostics: &mut Vec<DraftDiagnostic>,
+) {
+    if !candidate.runtime.execution_pools.contains_key(pool) {
+        diagnostics.push(DraftDiagnostic::new(
+            Some(subject),
+            format!("execution pool {pool} is not declared"),
+        ));
     }
 }
 

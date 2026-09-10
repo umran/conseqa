@@ -29,7 +29,13 @@ export type IndexEntry =
   | { kind: "output"; op: Id; schema: Id; transaction: Id }
   /** A result binding declared by a program step; `effect` is what it observes. */
   | { kind: "binding"; op: Id; effect: Id; location: string }
-  | { kind: "transaction"; op: Id };
+  | { kind: "transaction"; op: Id }
+  // L1 — the declared runtime realization. Indexed last, so an L0 id
+  // always wins a collision: the application machine is what a reader
+  // means by a bare id.
+  | { kind: "pool" }
+  | { kind: "router" }
+  | { kind: "storage_layout" };
 
 export type ModelIndex = Map<Id, IndexEntry>;
 
@@ -170,6 +176,11 @@ export function buildIndex(model: Model): ModelIndex {
       }
     }
   }
+
+  const runtime = model.runtime ?? {};
+  for (const id of Object.keys(runtime.execution_pools ?? {})) put(id, { kind: "pool" });
+  for (const id of Object.keys(runtime.routers ?? {})) put(id, { kind: "router" });
+  for (const id of Object.keys(runtime.storage_layouts ?? {})) put(id, { kind: "storage_layout" });
 
   return index;
 }

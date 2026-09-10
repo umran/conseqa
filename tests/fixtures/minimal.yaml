@@ -19,11 +19,16 @@ topics:
     order_events:
         messages:
             - OrderCreated
-        ordering:
-            kind: unordered
         message_identity:
             kind: unspecified
 
 state_machines: {}
 
 operations: {}
+
+# This transport neither groups nor orders — both facts are simply
+# absent. Transport facts are L1 because they describe the realization
+# rather than the logical channel.
+runtime:
+    topics:
+        order_events: {}

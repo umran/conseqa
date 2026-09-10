@@ -18,8 +18,7 @@ use conseqa::confluence::{
     TaskKind, TaskState, WorkspaceSnapshot, WorkspaceState, WriteGrant, WriteScope,
 };
 use conseqa::spec::{
-    DeliverySemantics, DispatchRouting, DispatchSemantics, ExecutionSemantics, Id, Input,
-    LaneConcurrency, MessageSelector, OperationBlock, OperationConcurrency, OperationStep,
+    ExecutionPool, Id, Input, MemberConcurrency, MessageSelector, OperationBlock, OperationStep,
     Revision, SubscriptionInput, TransactionStep,
 };
 use uuid::Uuid;
@@ -72,9 +71,27 @@ async fn ready(engine: &ConfluenceEngine, revision: Revision) -> AnalysisState {
         .expect("analysis reaches a terminal state")
 }
 
-fn execution(bound: u32) -> ExecutionSemantics {
-    ExecutionSemantics {
-        concurrency: OperationConcurrency::Bounded(NonZeroU32::new(bound).expect("non-zero")),
+/// A runtime-topology write: the modern stand-in for a change that
+/// belongs to the model but to no operation's summarized contract.
+fn put_pool(name: &str, bound: u32) -> Mutation {
+    Mutation::PutExecutionPool {
+        id: id(name),
+        value: ExecutionPool {
+            member_concurrency: MemberConcurrency::Bounded(
+                NonZeroU32::new(bound).expect("non-zero"),
+            ),
+        },
+    }
+}
+
+/// Replaces an operation's program with a bare terminal — a real
+/// semantic change to the operation, used where a test needs one.
+fn truncate_program(operation: &str) -> Mutation {
+    Mutation::ReplaceOperationProgram {
+        operation: id(operation),
+        program: OperationBlock {
+            steps: vec![OperationStep::Complete],
+        },
     }
 }
 
@@ -84,20 +101,13 @@ async fn commits_publish_before_analysis_finishes() {
 
     let a = task(
         &engine,
-        TaskKind::OperationSynthesis,
-        WriteScope::operation_synthesis(id("operation.create_order")),
+        TaskKind::TopologySynthesis,
+        WriteScope::runtime_topology(),
     );
 
-    let receipt = submit(
-        &engine,
-        &a,
-        vec![Mutation::ReplaceOperationExecution {
-            operation: id("operation.create_order"),
-            execution: execution(2),
-        }],
-    )
-    .await
-    .expect("the commit is accepted without waiting for verification");
+    let receipt = submit(&engine, &a, vec![put_pool("pool.spare", 2)])
+        .await
+        .expect("the commit is accepted without waiting for verification");
 
     // The head is already published...
     assert_eq!(engine.head_revision(), receipt.revision);
@@ -124,20 +134,13 @@ async fn analysis_is_tagged_per_revision_and_summaries_abstract_implementations(
 
     let a = task(
         &engine,
-        TaskKind::OperationSynthesis,
-        WriteScope::operation_synthesis(id("operation.create_order")),
+        TaskKind::TopologySynthesis,
+        WriteScope::runtime_topology(),
     );
 
-    let receipt = submit(
-        &engine,
-        &a,
-        vec![Mutation::ReplaceOperationExecution {
-            operation: id("operation.create_order"),
-            execution: execution(2),
-        }],
-    )
-    .await
-    .expect("the commit is accepted");
+    let receipt = submit(&engine, &a, vec![put_pool("pool.spare", 2)])
+        .await
+        .expect("the commit is accepted");
 
     let AnalysisState::Ready(after) = ready(&engine, receipt.revision).await else {
         panic!("the new head verifies");
@@ -147,9 +150,10 @@ async fn analysis_is_tagged_per_revision_and_summaries_abstract_implementations(
     assert_eq!(before.revision, first);
     assert_eq!(after.revision, receipt.revision);
 
-    // The execution-concurrency change touched no summarized contract
-    // or proof of create_order, so its summary hash is unchanged —
-    // the module-boundary abstraction of §41.
+    // The runtime-topology change touched no summarized contract or
+    // proof of create_order, so its summary hash is unchanged — the
+    // module-boundary abstraction of §41. A summary abstracts over the
+    // realization as much as over the implementation.
     let summary_before = &before.summaries[&id("operation.create_order")];
     let summary_after = &after.summaries[&id("operation.create_order")];
 
@@ -190,10 +194,13 @@ async fn draft_heads_report_precise_assembly_gaps_until_programs_arrive() {
 
     assert!(gaps_json.contains("missing_program"), "{gaps_json}");
     assert!(gaps_json.contains("operation.noop"), "{gaps_json}");
-    assert!(gaps_json.contains("missing_execution"), "{gaps_json}");
 
-    // Committing the program and execution facts makes the head
-    // assemblable, and only then does the full validator run.
+    // A program is the only thing assembly waits for. The runtime
+    // model is never a gap: L1 is optional, so a workspace declaring
+    // no topology assembles to a valid L0-only model.
+    //
+    // Committing the program makes the head assemblable, and only then
+    // does the full validator run.
     let a = task(
         &engine,
         TaskKind::OperationSynthesis,
@@ -203,18 +210,7 @@ async fn draft_heads_report_precise_assembly_gaps_until_programs_arrive() {
     let receipt = submit(
         &engine,
         &a,
-        vec![
-            Mutation::ReplaceOperationProgram {
-                operation: id("operation.noop"),
-                program: OperationBlock {
-                    steps: vec![OperationStep::Complete],
-                },
-            },
-            Mutation::ReplaceOperationExecution {
-                operation: id("operation.noop"),
-                execution: execution(1),
-            },
-        ],
+        vec![truncate_program("operation.noop")],
     )
     .await
     .expect("the synthesis commit is accepted");
@@ -361,16 +357,9 @@ async fn requirement_reports_serve_verdicts_and_guard_repairs() {
         WriteScope::operation_synthesis(id("operation.charge_payment")),
     );
 
-    submit(
-        &engine,
-        &writer,
-        vec![Mutation::ReplaceOperationExecution {
-            operation: id("operation.charge_payment"),
-            execution: execution(2),
-        }],
-    )
-    .await
-    .expect("the writer commits");
+    submit(&engine, &writer, vec![truncate_program("operation.charge_payment")])
+        .await
+        .expect("the writer commits");
 
     assert_eq!(
         engine.task_status(repair.id).unwrap(),
@@ -418,10 +407,7 @@ async fn proof_summaries_are_read_through_tracked_reads() {
     submit(
         &engine,
         &writer,
-        vec![Mutation::ReplaceOperationExecution {
-            operation: id("operation.apply_payment"),
-            execution: execution(2),
-        }],
+        vec![truncate_program("operation.apply_payment")],
     )
     .await
     .expect("the writer commits");
@@ -540,13 +526,6 @@ async fn bundles_fall_back_to_interfaces_before_analysis_and_use_summaries_after
                     messages: MessageSelector::Only(
                         [id("schema.OrderPaid")].into_iter().collect(),
                     ),
-                    delivery: DeliverySemantics::AtLeastOnce,
-                    dispatch: DispatchSemantics {
-                        routing: DispatchRouting::ByTopicKey,
-                        lane_concurrency: LaneConcurrency::Bounded(
-                            NonZeroU32::new(1).expect("non-zero"),
-                        ),
-                    },
                 }),
             )]),
         }),
@@ -575,7 +554,6 @@ async fn bundles_fall_back_to_interfaces_before_analysis_and_use_summaries_after
             ],
         });
 
-        draft.execution = Some(execution(1));
         draft.recompute_stage();
     }
 

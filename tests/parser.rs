@@ -6,11 +6,12 @@ use std::{
 use conseqa::{
     parser::yaml,
     spec::{
-        CompletionRequirement, Condition, Derivation, Effect, ErrorDisposition, ErrorResultType,
-        Field, FieldPath, Id, IdempotencyGuarantee, Input, LaneConcurrency, Literal,
-        MessageIdentity, Model, OperationStep, RequestIdentity, ResultOutcome, ResultVariant,
-        ScalarType, Schema, SchemaCompleteness, SelectorValue, ServiceKind, TopicOrdering,
-        Transaction, TransactionStep, TransitionSideEffect, TypeRef, ValueSource,
+        CompletionRequirement, Condition, DeliverySemantics, Derivation, Effect, ErrorDisposition,
+        ErrorResultType, Field, FieldPath, Id, IdempotencyGuarantee, Input, Literal,
+        MemberAssignment, MemberConcurrency, MessageIdentity, Model, OperationStep,
+        RequestIdentity, ResultOutcome, ResultVariant, ScalarType, Schema, SchemaCompleteness,
+        SelectorValue, ServiceKind, SubscriptionRoutingKey, OrderingSemantics, Transaction,
+        TransactionStep, TransitionSideEffect, TypeRef, ValueSource,
     },
 };
 
@@ -100,7 +101,14 @@ fn parses_minimal_model() {
 
     assert!(order_events.messages.contains(&Id("OrderCreated".into())));
 
-    assert_eq!(order_events.ordering, TopicOrdering::Unordered);
+    // Transport facts are L1: the logical channel says what it carries,
+    // the runtime says how it groups and orders.
+    let runtime = model
+        .topic_runtime(&Id("order_events".into()))
+        .expect("the fixture declares a topic runtime");
+
+    assert_eq!(runtime.ordering, None);
+    assert!(runtime.grouping.is_none());
 }
 
 #[test]
@@ -172,25 +180,33 @@ fn parses_keyed_topic_model() {
         [Id("OrderEvent".into())].into_iter().collect()
     );
 
-    let TopicOrdering::Keyed(key) = &topic.ordering else {
-        panic!("order_events should use keyed ordering");
-    };
+    let runtime = model
+        .topic_runtime(&Id("order_events".into()))
+        .expect("the fixture declares a topic runtime");
+
+    assert_eq!(runtime.ordering, Some(OrderingSemantics::WithinGroup));
+
+    let key = runtime
+        .grouping
+        .as_ref()
+        .expect("order_events should declare a keyed grouping");
 
     let order_event_key = key
         .mapping
         .get(&Id("OrderEvent".into()))
-        .expect("OrderEvent should define its topic ordering key");
+        .expect("OrderEvent should define its grouping key");
 
-    assert_eq!(order_event_key.0, vec!["order_id".to_string()]);
+    assert_eq!(order_event_key, &vec![FieldPath(vec!["order_id".to_string()])]);
 
-    // The ordering key and the message identity are separate
-    // declarations: order_id sequences events for an order, event_id
+    // The grouping key and the message identity are separate
+    // declarations: order_id groups events for an order, event_id
     // identifies one logical message.
-    let MessageIdentity::Keyed { mapping } = &topic.message_identity else {
+    let MessageIdentity::Keyed(identity) = &topic.message_identity else {
         panic!("order_events should declare a keyed message identity");
     };
 
-    let order_event_identity = mapping
+    let order_event_identity = identity
+        .mapping
         .get(&Id("OrderEvent".into()))
         .expect("OrderEvent should define its message identity");
 
@@ -216,28 +232,28 @@ fn flash_checkout_parses_stimulus_identities() {
         panic!("create_order input should be a request");
     };
 
-    let RequestIdentity::Keyed { fields } = &request.identity else {
+    let RequestIdentity::Keyed(identity) = &request.identity else {
         panic!("create_order request should declare a keyed identity");
     };
 
-    assert_eq!(fields.len(), 1);
-    assert_eq!(fields[0].0, vec!["idempotency_key".to_string()]);
+    assert_eq!(identity.fields.len(), 1);
+    assert_eq!(identity.fields[0].0, vec!["idempotency_key".to_string()]);
 
     let topic = model
         .topics
         .get(&Id("topic.order_events".into()))
         .expect("order_events topic should exist");
 
-    let MessageIdentity::Keyed { mapping } = &topic.message_identity else {
+    let MessageIdentity::Keyed(identity) = &topic.message_identity else {
         panic!("order_events should declare a keyed message identity");
     };
 
     // Every carried schema is identified by its event_id.
-    assert_eq!(mapping.len(), 6);
+    assert_eq!(identity.mapping.len(), 6);
 
-    for identity in mapping.values() {
-        assert_eq!(identity.len(), 1);
-        assert_eq!(identity[0].0, vec!["event_id".to_string()]);
+    for tuple in identity.mapping.values() {
+        assert_eq!(tuple.len(), 1);
+        assert_eq!(tuple[0].0, vec!["event_id".to_string()]);
     }
 }
 
@@ -357,8 +373,8 @@ fn flash_checkout_parses_nested_semantics() {
 
     let model = yaml::parse(&source).expect("flash checkout fixture should parse");
 
-    // Subscription + MessageSelector + DispatchSemantics +
-    // LaneConcurrency.
+    // The subscription input is purely logical: a topic and a message
+    // selector, nothing about delivery or dispatch.
     let reserve_inventory = model
         .operations
         .get(&Id("operation.reserve_inventory".into()))
@@ -373,8 +389,40 @@ fn flash_checkout_parses_nested_semantics() {
         panic!("reserve_inventory input should be a subscription");
     };
 
-    let LaneConcurrency::Bounded(concurrency) = subscription.dispatch.lane_concurrency else {
-        panic!("subscription lane concurrency should be bounded");
+    assert_eq!(subscription.topic, Id("topic.order_events".into()));
+
+    // Delivery and dispatch parse into the runtime model, addressed by
+    // the (operation, input) pair the L0 boundary already establishes.
+    let runtime = model
+        .subscription_runtime(
+            &Id("operation.reserve_inventory".into()),
+            &Id("input.reserve_inventory.created".into()),
+        )
+        .expect("reserve_inventory should declare a subscription runtime");
+
+    // The topic declares transport semantics, so the subscription
+    // declares none of its own: the two scopes are exclusive.
+    assert!(runtime.grouping.is_none());
+    assert!(runtime.ordering.is_none());
+
+    assert_eq!(runtime.delivery, DeliverySemantics::AtLeastOnce);
+    assert_eq!(runtime.dispatch.pool, Id("pool.order_workers".into()));
+
+    let routing = runtime
+        .dispatch
+        .routing
+        .as_ref()
+        .expect("the dispatch should declare routing");
+
+    assert_eq!(routing.key, SubscriptionRoutingKey::GroupingKey);
+    assert_eq!(routing.member_assignment, MemberAssignment::ConsistentHash);
+
+    let pool = model
+        .execution_pool(&Id("pool.order_workers".into()))
+        .expect("the target pool should be declared");
+
+    let MemberConcurrency::Bounded(concurrency) = pool.member_concurrency else {
+        panic!("pool member concurrency should be bounded");
     };
 
     assert_eq!(concurrency.get(), 1);
@@ -998,9 +1046,6 @@ operations:
       ordering: []
       idempotency: []
       recoverability: []
-    execution:
-      concurrency:
-        kind: unspecified
 ",
     );
 
@@ -1691,4 +1736,273 @@ fn shorthand_selector_values_serialize_into_the_canonical_form() {
     let reparsed = yaml::parse(&serialized).expect("serialized model should parse");
 
     assert_eq!(model, reparsed);
+}
+
+// ---------------------------------------------------------------------------
+// The two canonical surfaces of the hierarchical model
+// ---------------------------------------------------------------------------
+
+/// An L0-only model is a complete Conseqa model: no runtime topology is
+/// required, and the collections a model does not use may be omitted.
+#[test]
+fn an_l0_only_model_parses_with_no_runtime_block() {
+    let source = "
+revision: 1
+
+topics:
+  topic.order_events:
+    messages:
+      - schema.OrderCreated
+    message_identity:
+      kind: keyed
+      mapping:
+        schema.OrderCreated:
+          - event_id
+";
+
+    let model = yaml::parse(source).expect("an L0-only model should parse");
+
+    assert!(model.runtime.is_none());
+    assert!(model.services.is_empty());
+    assert!(model.operations.is_empty());
+
+    // With no runtime there are no transport facts at all, and the
+    // topic is in neither declaration scope.
+    assert!(model.topic_runtime(&Id("topic.order_events".into())).is_none());
+    assert!(!model.topic_scoped_transport(&Id("topic.order_events".into())));
+}
+
+/// The canonical runtime-enriched surface: every L1 primitive in one
+/// block, in the exact serialized shape the semantics document
+/// documents and external tools must be able to read.
+#[test]
+fn the_canonical_runtime_block_parses_and_round_trips() {
+    let source = "
+revision: 1
+
+runtime:
+  topics:
+    topic.order_events:
+      grouping:
+        schema.OrderCreated: [order_id]
+      ordering: within_group
+
+  execution_pools:
+    pool.order_workers:
+      member_concurrency:
+        kind: bounded
+        value: 1
+    pool.message_reads:
+      member_concurrency:
+        kind: bounded
+        value: 32
+
+  subscriptions:
+    op.process_order:
+      input.events:
+        delivery: at_least_once
+        dispatch:
+          pool: pool.order_workers
+          routing:
+            key: grouping_key
+            member_assignment:
+              kind: consistent_hash
+
+  routers:
+    router.get_messages:
+      boundary:
+        operation: op.get_messages
+        input: input.request
+      pool: pool.message_reads
+      routing:
+        key:
+          - channel_id
+        member_assignment:
+          kind: consistent_hash
+
+    router.health:
+      boundary:
+        operation: op.health
+        input: input.request
+      pool: pool.message_reads
+
+  storage_layouts:
+    layout.messages:
+      object:
+        data_model: data.chat
+        object: object.message
+      partition_key:
+        - channel_id
+        - bucket
+";
+
+    let model = yaml::parse(source).expect("the canonical runtime block should parse");
+
+    let runtime = model.runtime.as_ref().expect("a runtime model");
+
+    assert_eq!(runtime.execution_pools.len(), 2);
+    assert_eq!(runtime.routers.len(), 2);
+    assert_eq!(runtime.storage_layouts.len(), 1);
+
+    // Routing is optional, and absence is the whole statement: the
+    // health boundary names a pool and no member affinity.
+    assert!(runtime.routers[&Id("router.health".into())].routing.is_none());
+
+    let get_messages = runtime.routers[&Id("router.get_messages".into())]
+        .routing
+        .as_ref()
+        .expect("a routing declaration");
+
+    assert_eq!(get_messages.key, vec![FieldPath(vec!["channel_id".into()])]);
+    assert_eq!(get_messages.member_assignment, MemberAssignment::ConsistentHash);
+
+    // A routing key and a partition key may name the same field without
+    // becoming the same concept.
+    let layout = &runtime.storage_layouts[&Id("layout.messages".into())];
+
+    assert_eq!(
+        layout.partition_key,
+        vec![
+            FieldPath(vec!["channel_id".into()]),
+            FieldPath(vec!["bucket".into()]),
+        ]
+    );
+
+    // External tools read L1 from the serialized surface alone, so it
+    // must round-trip.
+    let round_tripped = yaml::parse(&yaml::serialize(&model).expect("serializes"))
+        .expect("re-parses");
+
+    assert_eq!(model, round_tripped);
+}
+
+/// The second declaration mode on the wire: the topic declares no
+/// transport semantics and each subscription declares its own pair,
+/// so two subscribers of one channel may group differently.
+#[test]
+fn subscription_scoped_transport_semantics_parse() {
+    let source = "
+revision: 1
+
+schemas:
+  schema.Event:
+    kind: canonical
+    completeness: complete
+    fields:
+      account_id: uuid
+      region_id: uuid
+
+topics:
+  topic.events:
+    messages:
+      - schema.Event
+    message_identity:
+      kind: unspecified
+
+runtime:
+  execution_pools:
+    pool.accounts:
+      member_concurrency: { kind: bounded, value: 1 }
+    pool.regions:
+      member_concurrency: { kind: bounded, value: 1 }
+
+  subscriptions:
+    op.process_accounts:
+      input.events:
+        delivery: at_least_once
+        grouping:
+          schema.Event: [account_id]
+        ordering: within_group
+        dispatch:
+          pool: pool.accounts
+          routing:
+            key: grouping_key
+            member_assignment: { kind: consistent_hash }
+
+    op.process_regions:
+      input.events:
+        delivery: at_least_once
+        grouping:
+          schema.Event: [region_id]
+        dispatch:
+          pool: pool.regions
+          routing:
+            key: grouping_key
+            member_assignment: { kind: consistent_hash }
+";
+
+    let model = yaml::parse(source).expect("subscription-scoped semantics should parse");
+
+    // The topic declares nothing, so it is not in topic-scoped mode.
+    assert!(!model.topic_scoped_transport(&Id("topic.events".into())));
+
+    let accounts = model
+        .subscription_runtime(
+            &Id("op.process_accounts".into()),
+            &Id("input.events".into()),
+        )
+        .expect("a subscription runtime");
+
+    assert_eq!(accounts.ordering, Some(OrderingSemantics::WithinGroup));
+
+    // Grouping and ordering are independent: one subscriber orders
+    // within its groups, the other only groups.
+    let regions = model
+        .subscription_runtime(&Id("op.process_regions".into()), &Id("input.events".into()))
+        .expect("a subscription runtime");
+
+    assert_eq!(regions.ordering, None);
+
+    assert!(
+        regions.grouping.is_some(),
+        "grouping without ordering is a complete declaration, not half a pair"
+    );
+
+    let round_tripped = yaml::parse(&yaml::serialize(&model).expect("serializes"))
+        .expect("re-parses");
+
+    assert_eq!(model, round_tripped);
+}
+
+/// Both member assignments are on the wire, and the enum stays tagged
+/// so a third stays additive.
+#[test]
+fn member_assignments_round_trip() {
+    for (spelling, expected) in [
+        ("consistent_hash", MemberAssignment::ConsistentHash),
+        ("round_robin", MemberAssignment::RoundRobin),
+    ] {
+        let source = format!(
+            "
+revision: 1
+
+runtime:
+  execution_pools:
+    pool.p:
+      member_concurrency: {{ kind: bounded, value: 1 }}
+
+  routers:
+    router.r:
+      boundary: {{ operation: op.x, input: input.request }}
+      pool: pool.p
+      routing:
+        key: [order_id]
+        member_assignment: {{ kind: {spelling} }}
+"
+        );
+
+        let model = yaml::parse(&source).expect("parses");
+
+        let router = &model.runtime.as_ref().expect("a runtime").routers[&Id("router.r".into())];
+
+        assert_eq!(
+            router.routing.as_ref().expect("routing").member_assignment,
+            expected
+        );
+
+        let round_tripped =
+            yaml::parse(&yaml::serialize(&model).expect("serializes")).expect("re-parses");
+
+        assert_eq!(model, round_tripped);
+    }
 }

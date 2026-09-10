@@ -108,6 +108,20 @@ the new head.
 drafting, validation errors, or the verification verdict with exactly \
 which obligations are proven and which are not. Fix what it names — \
 narrowly, yourself, or with another request_design pass.
+
+An unproven obligation carries a `remedy` saying which layer the \
+missing facts belong to. `runtime` means no program change can help: \
+the fix is the L1 runtime topology — transport grouping and ordering, \
+subscription delivery and dispatch, execution pools and their member \
+concurrency, request routers, storage layouts. Author it here, after \
+the programs exist and verification has said what it has to discharge, \
+not while drafting the skeleton: L1 exists to make specific \
+requirements provable, and before you know which ones, declaring it is \
+guesswork. Serialization and ordering are proven almost entirely from \
+this layer — a grouping domain owned by one pool member whose \
+concurrency is bounded(1) is what proves same-key invocations never \
+overlap. Never invent topology to make a proof pass; leaving a \
+requirement unproven is a legitimate outcome.
 7. export_spec delivers the result: the canonical YAML, the \
 verification report, and a self-contained interactive HTML \
 visualization, written to a directory you choose — show these to the \
@@ -134,7 +148,8 @@ pub struct SearchSymbolsParams {
     /// Restrict to one symbol kind: service, schema, data_model,
     /// data_object, topic, state_machine, transition, operation,
     /// operation_interface, operation_program, operation_requirements,
-    /// operation_execution, input, transaction, effect_site, binding,
+    /// topic_runtime, subscription_runtime, execution_pool, router,
+    /// storage_layout, input, transaction, effect_site, binding,
     /// requirement, operation_summary, prompt_obligation.
     #[serde(default)]
     pub kind: Option<String>,
@@ -1008,7 +1023,7 @@ impl ConseqaMcp {
             .workspace
             .operations
             .iter()
-            .filter(|(_, draft)| draft.program.is_none() || draft.execution.is_none())
+            .filter(|(_, draft)| draft.program.is_none())
             .map(|(id, _)| id.to_string())
             .collect();
 
@@ -1210,7 +1225,7 @@ impl ConseqaMcp {
         let unfinished: Vec<String> = workspace
             .operations
             .iter()
-            .filter(|(_, draft)| draft.program.is_none() || draft.execution.is_none())
+            .filter(|(_, draft)| draft.program.is_none())
             .map(|(id, _)| id.to_string())
             .collect();
 
@@ -1314,7 +1329,7 @@ impl ConseqaMcp {
                         .iter()
                         .map(|gap| gap.to_string())
                         .collect::<Vec<_>>(),
-                    "guidance": "Give every operation a program and execution facts — \
+                    "guidance": "Give every operation a program — \
                                  spec_status shows the same gaps — then export again.",
                 }));
             }
@@ -1425,7 +1440,7 @@ fn analysis_json(state: &AnalysisState) -> serde_json::Value {
             "state": "draft",
             "assembly_gaps": gaps.iter().map(|gap| gap.to_string()).collect::<Vec<_>>(),
             "guidance": "The model is still a draft: the listed operations need programs \
-                         and execution facts before the validator can run.",
+                         before the validator can run.",
         }),
 
         AnalysisState::ValidationFailed { errors } => serde_json::json!({
@@ -1674,7 +1689,11 @@ SYMBOL KEYS — {"kind": K, "value": V}:
   {"kind":"operation_interface","value":"operation.checkout"}
   {"kind":"operation_program","value":"operation.checkout"}
   {"kind":"operation_requirements","value":"operation.checkout"}
-  {"kind":"operation_execution","value":"operation.checkout"}
+  {"kind":"topic_runtime","value":"topic.order_events"}
+  {"kind":"subscription_runtime","value":{"operation":"operation.x","input":"input.x.events"}}
+  {"kind":"execution_pool","value":"pool.order_workers"}
+  {"kind":"router","value":"router.checkout"}
+  {"kind":"storage_layout","value":"layout.order"}
   {"kind":"input","value":{"operation":"operation.x","input":"input.x.request"}}
   {"kind":"transaction","value":{"operation":"operation.x","transaction":"tx.y"}}
   {"kind":"effect_site","value":{"operation":"operation.x","effect":"effect.y"}}
@@ -1699,13 +1718,11 @@ PATCH — {"mutations": [<mutation>, ...]}; each mutation {"kind": K, ...}:
   {"kind":"put_service","id":"service.x","value":{"kind":"backend"}}
   {"kind":"put_schema","id":"schema.X","value":<schema declaration>}
   {"kind":"put_data_model","id":"data.x","value":{"objects":{...}}}
-  {"kind":"put_topic","id":"topic.x","value":{"messages":[...],"ordering":...,"message_identity":...}}
+  {"kind":"put_topic","id":"topic.x","value":{"messages":[...],"message_identity":...}}
   {"kind":"put_state_machine","id":"machine.x","value":{...}}
   {"kind":"put_operation_interface","operation":"operation.x",
    "value":{"service":"service.x","description":"...","inputs":{...}}}
   {"kind":"replace_operation_program","operation":"operation.x","program":{"steps":[...]}}
-  {"kind":"replace_operation_execution","operation":"operation.x",
-   "execution":{"concurrency":{"kind":"unbounded"}}}
   {"kind":"replace_operation_requirements","operation":"operation.x","requirements":{...}}
   {"kind":"propose_requirements","operation":"operation.x","proposals":[
      {"requirement":{"family":"idempotency","requirement":{"key":{"components":[...]},
@@ -1713,6 +1730,46 @@ PATCH — {"mutations": [<mutation>, ...]}; each mutation {"kind": K, ...}:
       "origin":{"kind":"explicit_prompt","obligation":"obl.x"}}]}
     (origins: explicit_prompt {obligation}; strongly_implied {rationale, evidence};
      recommended {rationale, evidence})
+L1 RUNTIME TOPOLOGY (all shared-skeleton writes; L1 is optional):
+  {"kind":"put_topic_runtime","topic":"topic.x",
+   "value":{"grouping":{"schema.Event":[["order_id"]]},"ordering":"within_group"}}
+    (grouping: a per-schema key mapping, or omitted for no grouping;
+     ordering: "none" | "global" | "within_group", or omitted.
+     Omitting `ordering` declares nothing and leaves the scope open;
+     writing "none" is an explicit negative and claims the scope.
+     Grouping and ordering are INDEPENDENT facts sharing one declaration
+     scope. A topic declaring either supplies both to every subscription
+     of it, and no subscription of that topic may declare its own; a topic
+     declaring neither leaves each subscription to declare its own pair.
+     Never both scopes — there is no inheritance and no override.
+     `within_group` requires a keyed grouping at the same scope.)
+  {"kind":"put_execution_pool","id":"pool.x",
+   "value":{"member_concurrency":{"kind":"bounded","value":1}}}
+    (member_concurrency kinds: unspecified | unbounded | bounded{value})
+  {"kind":"put_router","id":"router.x",
+   "value":{"boundary":{"operation":"operation.x","input":"input.x.request"},
+            "pool":"pool.x",
+            "routing":{"key":["order_id"],
+                       "member_assignment":{"kind":"consistent_hash"}}}}
+    (member_assignment: consistent_hash | round_robin. Omit "routing"
+     entirely to assign the boundary to a pool and declare no member
+     affinity; that is not the same as round_robin, which states that
+     affinity is known NOT to exist. Neither proves serialization or
+     ordering, but they are different facts.)
+  {"kind":"put_subscription_runtime","operation":"operation.x","input":"input.x.events",
+   "value":{"delivery":"at_least_once",
+            "dispatch":{"pool":"pool.x",
+                        "routing":{"key":"grouping_key",
+                                   "member_assignment":{"kind":"consistent_hash"}}}}}
+    (delivery: unspecified | at_most_once | at_least_once.
+     Add "grouping" and "ordering" here — as a pair, same shapes as on a
+     topic runtime — only when the subscribed topic declares neither.
+     routing key: grouping_key, which routes by the effective grouping
+     domain and so requires a keyed grouping in effect at one scope.)
+  {"kind":"put_storage_layout","id":"layout.x",
+   "value":{"object":{"data_model":"data.x","object":"object.y"},
+            "partition_key":["channel_id","bucket"]}}
+
   {"kind":"put_prompt_obligation","id":"obl.x","value":{"source_span":"...",
    "normalized_intent":"...","targets":["operation.x"],"status":{"kind":"unmapped"}}}
   {"kind":"delete_top_level","symbol":<symbol key>}   (coordinator-only)
@@ -1875,9 +1932,7 @@ fn guide_lookup(topic: &str) -> String {
 mod tests {
     use std::collections::BTreeMap;
 
-    use crate::spec::{
-        ExecutionSemantics, Id, Model, Operation, OperationBlock, OperationConcurrency, Revision,
-    };
+    use crate::spec::{Id, Model, Operation, OperationBlock, Revision};
 
     /// The worked example in `dsl_reference` must be a genuinely valid
     /// program: it parses as an operation program and passes the same
@@ -1896,9 +1951,6 @@ mod tests {
             inputs: BTreeMap::new(),
             program,
             requirements: Default::default(),
-            execution: ExecutionSemantics {
-                concurrency: OperationConcurrency::Unspecified,
-            },
         };
 
         let mut operations = BTreeMap::new();
@@ -1912,6 +1964,7 @@ mod tests {
             topics: BTreeMap::new(),
             state_machines: BTreeMap::new(),
             operations,
+            runtime: None,
         };
 
         let diagnostics =
@@ -1940,6 +1993,7 @@ mod tests {
             "Effect intents",
             "Value references",
             "Operation requirements",
+            "L1 — runtime topology and realization semantics",
         ] {
             assert!(toc.contains(expected), "toc lacks `{expected}`:\n{toc}");
         }
@@ -1958,11 +2012,13 @@ mod tests {
 
     #[test]
     fn a_subsection_topic_returns_its_enclosing_section() {
-        let section = super::guide_lookup("dispatch routing");
+        let section = super::guide_lookup("SubscriptionRuntime");
 
         assert!(
-            section.contains("Dispatch routing"),
-            "a `###` header match should return its section:\n{section}"
+            section.contains("L1 — runtime topology")
+                && section.contains("ExecutionPool")
+                && section.contains("MemberAssignment"),
+            "a `###` header match should return its whole enclosing section:\n{section}"
         );
     }
 

@@ -43,6 +43,7 @@ use crate::spec::{
     Derivation, Id, IdempotencyKey, Model, Operation, ResultReplayRequirement, ResultVariant,
 };
 
+use super::ProofScope;
 use super::describe::{
     decision_gap_sentence, describe_decision, describe_path, governing_key_evidence, unstable_roots,
 };
@@ -78,10 +79,20 @@ pub struct ResultReplayCheck {
 pub enum ResultReplayVerdict {
     Proven {
         proof: ResultReplayProof,
+        scope: ProofScope,
     },
     Unproven {
         obstacles: Vec<ResultReplayObstacle>,
     },
+}
+
+impl ResultReplayVerdict {
+    fn proven(proof: ResultReplayProof) -> Self {
+        Self::Proven {
+            scope: proof.scope(),
+            proof,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -99,6 +110,16 @@ pub enum ResultReplayProof {
     /// its decisions, so each class reaches one terminal, whose payload
     /// is replay-deterministic over the cited roots.
     ClassFixedResult { returns: Vec<ReturnedResult> },
+}
+
+impl ResultReplayProof {
+    /// Result replay is decided entirely from the program: which
+    /// terminal a class reaches and what the returned payload is
+    /// derived from. No route consults a runtime fact, so every
+    /// result-replay proof is L0-only.
+    pub fn scope(&self) -> ProofScope {
+        ProofScope::L0Only
+    }
 }
 
 /// One returning path's argument.
@@ -247,11 +268,9 @@ fn check_requirement(
     };
 
     if analysis.admits_no_attempts() {
-        return ResultReplayVerdict::Proven {
-            proof: ResultReplayProof::NoAdmittedInvocations {
-                input: analysis.input().clone(),
-            },
-        };
+        return ResultReplayVerdict::proven(ResultReplayProof::NoAdmittedInvocations {
+            input: analysis.input().clone(),
+        });
     }
 
     let input = analysis.input();
@@ -266,11 +285,9 @@ fn check_requirement(
         .collect();
 
     if sites.is_empty() {
-        return ResultReplayVerdict::Proven {
-            proof: ResultReplayProof::NoReturnedResult {
-                input: input.clone(),
-            },
-        };
+        return ResultReplayVerdict::proven(ResultReplayProof::NoReturnedResult {
+            input: input.clone(),
+        });
     }
 
     let mut obstacles = Vec::new();
@@ -328,9 +345,7 @@ fn check_requirement(
     }
 
     if obstacles.is_empty() {
-        ResultReplayVerdict::Proven {
-            proof: ResultReplayProof::ClassFixedResult { returns },
-        }
+        ResultReplayVerdict::proven(ResultReplayProof::ClassFixedResult { returns })
     } else {
         ResultReplayVerdict::Unproven {
             obstacles: super::idempotency::dedupe(obstacles, ResultReplayObstacle::site),

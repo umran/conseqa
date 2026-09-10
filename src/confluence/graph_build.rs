@@ -308,6 +308,50 @@ impl<'w> Builder<'w> {
                 SemanticHash::of(obligation),
             );
         }
+
+        self.add_runtime_nodes();
+    }
+
+    /// The L1 topology. Every runtime symbol is shared, so it lives
+    /// here beside the rest of the skeleton rather than under any one
+    /// operation — a subscription runtime included, despite naming an
+    /// operation and an input.
+    fn add_runtime_nodes(&mut self) {
+        let runtime = &self.workspace.runtime;
+
+        for (id, topic_runtime) in &runtime.topics {
+            self.add_node(
+                SymbolKey::TopicRuntime(id.clone()),
+                SemanticHash::of(topic_runtime),
+            );
+        }
+
+        for (operation, inputs) in &runtime.subscriptions {
+            for (input, subscription) in inputs {
+                self.add_node(
+                    SymbolKey::SubscriptionRuntime {
+                        operation: operation.clone(),
+                        input: input.clone(),
+                    },
+                    SemanticHash::of(subscription),
+                );
+            }
+        }
+
+        for (id, pool) in &runtime.execution_pools {
+            self.add_node(SymbolKey::ExecutionPool(id.clone()), SemanticHash::of(pool));
+        }
+
+        for (id, router) in &runtime.routers {
+            self.add_node(SymbolKey::Router(id.clone()), SemanticHash::of(router));
+        }
+
+        for (id, layout) in &runtime.storage_layouts {
+            self.add_node(
+                SymbolKey::StorageLayout(id.clone()),
+                SemanticHash::of(layout),
+            );
+        }
     }
 
     fn add_operation_nodes(
@@ -385,10 +429,6 @@ impl<'w> Builder<'w> {
             );
         }
 
-        self.add_node(
-            SymbolKey::OperationExecution(operation.clone()),
-            SemanticHash::of(&draft.execution),
-        );
     }
 
     fn add_shared_edges(&mut self) {
@@ -530,6 +570,118 @@ impl<'w> Builder<'w> {
                 }
             }
         }
+
+        self.add_runtime_edges();
+    }
+
+    /// What each L1 declaration references. Without these, a query for
+    /// what depends on a topic would miss its transport ordering, and a
+    /// pool would look unreferenced however many boundaries target it.
+    fn add_runtime_edges(&mut self) {
+        let runtime = &self.workspace.runtime;
+
+        let topic_runtimes: Vec<(Id, Vec<Id>)> = runtime
+            .topics
+            .iter()
+            .map(|(id, topic_runtime)| {
+                let schemas = topic_runtime
+                    .grouping
+                    .as_ref()
+                    .map(|key| key.mapping.keys().cloned().collect())
+                    .unwrap_or_default();
+
+                (id.clone(), schemas)
+            })
+            .collect();
+
+        for (topic, schemas) in topic_runtimes {
+            let from = self.node_ids[&SymbolKey::TopicRuntime(topic.clone())];
+
+            self.link(from, EdgeKind::References, &SymbolKey::Topic(topic));
+
+            for schema in schemas {
+                self.link(from, EdgeKind::References, &SymbolKey::Schema(schema));
+            }
+        }
+
+        let subscriptions: Vec<(Id, Id, Id, Vec<Id>)> = runtime
+            .subscriptions
+            .iter()
+            .flat_map(|(operation, inputs)| {
+                inputs.iter().map(move |(input, subscription)| {
+                    let schemas = subscription
+                        .grouping
+                        .as_ref()
+                        .map(|key| key.mapping.keys().cloned().collect())
+                        .unwrap_or_default();
+
+                    (
+                        operation.clone(),
+                        input.clone(),
+                        subscription.dispatch.pool.clone(),
+                        schemas,
+                    )
+                })
+            })
+            .collect();
+
+        for (operation, input, pool, schemas) in subscriptions {
+            let from = self.node_ids[&SymbolKey::SubscriptionRuntime {
+                operation: operation.clone(),
+                input: input.clone(),
+            }];
+
+            self.link(from, EdgeKind::References, &SymbolKey::Input { operation, input });
+            self.link(from, EdgeKind::References, &SymbolKey::ExecutionPool(pool));
+
+            // A subscription-scoped grouping key names schemas of its
+            // own, exactly as a topic-scoped one does.
+            for schema in schemas {
+                self.link(from, EdgeKind::References, &SymbolKey::Schema(schema));
+            }
+        }
+
+        let routers: Vec<(Id, Id, Id, Id)> = runtime
+            .routers
+            .iter()
+            .map(|(id, router)| {
+                (
+                    id.clone(),
+                    router.boundary.operation.clone(),
+                    router.boundary.input.clone(),
+                    router.pool.clone(),
+                )
+            })
+            .collect();
+
+        for (router, operation, input, pool) in routers {
+            let from = self.node_ids[&SymbolKey::Router(router)];
+
+            self.link(from, EdgeKind::References, &SymbolKey::Input { operation, input });
+            self.link(from, EdgeKind::References, &SymbolKey::ExecutionPool(pool));
+        }
+
+        let layouts: Vec<(Id, Id, Id)> = runtime
+            .storage_layouts
+            .iter()
+            .map(|(id, layout)| {
+                (
+                    id.clone(),
+                    layout.object.data_model.clone(),
+                    layout.object.object.clone(),
+                )
+            })
+            .collect();
+
+        for (layout, data_model, object) in layouts {
+            let from = self.node_ids[&SymbolKey::StorageLayout(layout)];
+
+            self.link(
+                from,
+                EdgeKind::References,
+                &SymbolKey::DataObject { data_model, object },
+            );
+        }
     }
 
     fn add_operation_edges(
@@ -548,7 +700,6 @@ impl<'w> Builder<'w> {
             SymbolKey::OperationInterface(operation.clone()),
             SymbolKey::OperationProgram(operation.clone()),
             SymbolKey::OperationRequirements(operation.clone()),
-            SymbolKey::OperationExecution(operation.clone()),
         ] {
             self.link(operation_node, EdgeKind::Contains, &part);
         }

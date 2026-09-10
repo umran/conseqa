@@ -115,6 +115,21 @@ fn run(args: &Args) -> Result<(), String> {
                 let parsed: report::ProverReport = serde_json::from_str(&raw)
                     .map_err(|error| format!("cannot parse {}: {error}", path.display()))?;
 
+                // A report only carries the vocabulary of the format
+                // that produced it. Format 3 added a field rather than
+                // removing one, so a stale format-2 report still
+                // deserializes cleanly — and would render assumptions
+                // describing a proof model that no longer exists.
+                if parsed.format != report::FORMAT {
+                    return Err(format!(
+                        "{} is report format {}, but this build reads format {}; \
+                         regenerate it with `conseqa <model> --report <path>`",
+                        path.display(),
+                        parsed.format,
+                        report::FORMAT
+                    ));
+                }
+
                 if let Some(revision) = parsed.model_revision
                     && revision != model.revision.0
                 {

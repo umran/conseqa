@@ -1,5 +1,5 @@
 {
-  "format": 2,
+  "format": 4,
   "model_revision": 1,
   "obligations": [
     {
@@ -14,10 +14,12 @@
       },
       "status": "proven",
       "summary": "Invocations of operation.apply_payment sharing key input.apply_payment.captured.order_id never overlap.",
+      "scope": "runtime_dependent",
       "assumptions": [
-        "topic.order_events routes same-key deliveries of input.apply_payment.captured onto one lane (keyed ordering + by_topic_key dispatch)",
-        "for schema.PaymentCaptured, the topic key order_id is the serialization key field",
-        "lane concurrency bounded(1) prevents overlap within the lane"
+        "topic.order_events declares a keyed grouping for every subscription of it, and input.apply_payment.captured dispatches into pool.order_workers by that grouping key, so same-key deliveries share one routing domain",
+        "for schema.PaymentCaptured, the grouping key order_id is the serialization key field",
+        "consistent_hash assignment gives each routing domain one owning pool member at a time, and transfers that ownership safely when membership changes",
+        "pool.order_workers bounds each member to one simultaneously active invocation, so the owning member runs same-key invocations one at a time"
       ],
       "evidence": []
     },
@@ -33,12 +35,15 @@
       },
       "status": "proven",
       "summary": "Invocations of operation.apply_payment sharing key input.apply_payment.captured.order_id take effect in their semantic order.",
+      "scope": "runtime_dependent",
       "assumptions": [
-        "topic.order_events orders same-key messages (keyed ordering); that order is the precedence",
-        "for schema.PaymentCaptured, the topic key order_id is the ordering key field",
-        "by_topic_key dispatch keeps same-key deliveries of input.apply_payment.captured in one lane, which dispatches them in delivery order",
-        "lane concurrency bounded(1) stops a later invocation overtaking an earlier one",
-        "a failed delivery is re-dispatched at the head of its lane, so a redelivery precedes every later message",
+        "the transport for topic.order_events orders messages within a group; that order is the precedence",
+        "topic.order_events declares a keyed grouping for every subscription of it",
+        "for schema.PaymentCaptured, the grouping key order_id is the ordering key field",
+        "input.apply_payment.captured dispatches by the grouping key, so same-key deliveries belong to the one routing domain the grouping established",
+        "consistent_hash assignment gives each routing domain one owning pool member at a time, and transfers that ownership safely when membership changes",
+        "pool.order_workers bounds each member to one simultaneously active invocation, so a later invocation cannot overtake an earlier one",
+        "dispatch preserves the transport's established same-key precedence when admitting invocations, including across failure-driven redelivery and ownership reassignment",
         "a duplicate of a completed delivery repeats an invocation that already took effect in order; its work is idempotency requirement #0's obligation (proven)"
       ],
       "evidence": []
@@ -55,6 +60,7 @@
       },
       "status": "proven",
       "summary": "Repeated attempts at operation.apply_payment sharing the declared key produce the effects of a single invocation.",
+      "scope": "l0_only",
       "assumptions": [
         "tx.apply_payment commits are deduplicated by input.apply_payment.captured.event_id, stable across the attempt class",
         "duplicate executions of effect.order.paid publish the same logical message under topic.order_events's message identity (intent intent.apply_payment.order_paid is recovered from tx.apply_payment's keyed commit)",
@@ -75,6 +81,7 @@
       },
       "status": "proven",
       "summary": "An interrupted invocation of operation.apply_payment is re-driven until it reaches a terminal of its program.",
+      "scope": "runtime_dependent",
       "assumptions": [
         "input.apply_payment.captured redelivers via topic.order_events at least once, re-driving interrupted invocations",
         "tx.apply_payment resolves on re-encounter through its keyed commit (input.apply_payment.captured.event_id)",
@@ -94,10 +101,12 @@
       },
       "status": "proven",
       "summary": "Invocations of operation.charge_payment sharing key input.charge_payment.reserved.order_id never overlap.",
+      "scope": "runtime_dependent",
       "assumptions": [
-        "topic.order_events routes same-key deliveries of input.charge_payment.reserved onto one lane (keyed ordering + by_topic_key dispatch)",
-        "for schema.InventoryReserved, the topic key order_id is the serialization key field",
-        "lane concurrency bounded(1) prevents overlap within the lane"
+        "topic.order_events declares a keyed grouping for every subscription of it, and input.charge_payment.reserved dispatches into pool.payment_workers by that grouping key, so same-key deliveries share one routing domain",
+        "for schema.InventoryReserved, the grouping key order_id is the serialization key field",
+        "consistent_hash assignment gives each routing domain one owning pool member at a time, and transfers that ownership safely when membership changes",
+        "pool.payment_workers bounds each member to one simultaneously active invocation, so the owning member runs same-key invocations one at a time"
       ],
       "evidence": []
     },
@@ -113,12 +122,15 @@
       },
       "status": "proven",
       "summary": "Invocations of operation.charge_payment sharing key input.charge_payment.reserved.order_id take effect in their semantic order.",
+      "scope": "runtime_dependent",
       "assumptions": [
-        "topic.order_events orders same-key messages (keyed ordering); that order is the precedence",
-        "for schema.InventoryReserved, the topic key order_id is the ordering key field",
-        "by_topic_key dispatch keeps same-key deliveries of input.charge_payment.reserved in one lane, which dispatches them in delivery order",
-        "lane concurrency bounded(1) stops a later invocation overtaking an earlier one",
-        "a failed delivery is re-dispatched at the head of its lane, so a redelivery precedes every later message",
+        "the transport for topic.order_events orders messages within a group; that order is the precedence",
+        "topic.order_events declares a keyed grouping for every subscription of it",
+        "for schema.InventoryReserved, the grouping key order_id is the ordering key field",
+        "input.charge_payment.reserved dispatches by the grouping key, so same-key deliveries belong to the one routing domain the grouping established",
+        "consistent_hash assignment gives each routing domain one owning pool member at a time, and transfers that ownership safely when membership changes",
+        "pool.payment_workers bounds each member to one simultaneously active invocation, so a later invocation cannot overtake an earlier one",
+        "dispatch preserves the transport's established same-key precedence when admitting invocations, including across failure-driven redelivery and ownership reassignment",
         "a duplicate of a completed delivery repeats an invocation that already took effect in order; its work is idempotency requirement #0's obligation (unproven)"
       ],
       "evidence": []
@@ -184,6 +196,7 @@
       },
       "status": "proven",
       "summary": "Every attempt at operation.create_order sharing the declared key returns an equivalent result.",
+      "scope": "l0_only",
       "assumptions": [
         "the returned ok payload is derived deterministically from output.create_order.order_id, output.create_order.status",
         "output.create_order is recovered from tx.create_order.new's keyed commit on every retry"
@@ -202,6 +215,7 @@
       },
       "status": "proven",
       "summary": "An interrupted invocation of operation.create_order can be resumed to reach a terminal of its program.",
+      "scope": "l0_only",
       "assumptions": [
         "tx.create_order.new resolves on re-encounter through its keyed commit (input.create_order.request.idempotency_key)",
         "artifact intent.create_order.publish_created is recovered from tx.create_order.new's keyed commit on resumption",
@@ -221,10 +235,12 @@
       },
       "status": "proven",
       "summary": "Invocations of operation.reserve_inventory sharing key input.reserve_inventory.created.order_id never overlap.",
+      "scope": "runtime_dependent",
       "assumptions": [
-        "topic.order_events routes same-key deliveries of input.reserve_inventory.created onto one lane (keyed ordering + by_topic_key dispatch)",
-        "for schema.OrderCreated, the topic key order_id is the serialization key field",
-        "lane concurrency bounded(1) prevents overlap within the lane"
+        "topic.order_events declares a keyed grouping for every subscription of it, and input.reserve_inventory.created dispatches into pool.order_workers by that grouping key, so same-key deliveries share one routing domain",
+        "for schema.OrderCreated, the grouping key order_id is the serialization key field",
+        "consistent_hash assignment gives each routing domain one owning pool member at a time, and transfers that ownership safely when membership changes",
+        "pool.order_workers bounds each member to one simultaneously active invocation, so the owning member runs same-key invocations one at a time"
       ],
       "evidence": []
     },
@@ -240,12 +256,15 @@
       },
       "status": "proven",
       "summary": "Invocations of operation.reserve_inventory sharing key input.reserve_inventory.created.order_id take effect in their semantic order.",
+      "scope": "runtime_dependent",
       "assumptions": [
-        "topic.order_events orders same-key messages (keyed ordering); that order is the precedence",
-        "for schema.OrderCreated, the topic key order_id is the ordering key field",
-        "by_topic_key dispatch keeps same-key deliveries of input.reserve_inventory.created in one lane, which dispatches them in delivery order",
-        "lane concurrency bounded(1) stops a later invocation overtaking an earlier one",
-        "a failed delivery is re-dispatched at the head of its lane, so a redelivery precedes every later message",
+        "the transport for topic.order_events orders messages within a group; that order is the precedence",
+        "topic.order_events declares a keyed grouping for every subscription of it",
+        "for schema.OrderCreated, the grouping key order_id is the ordering key field",
+        "input.reserve_inventory.created dispatches by the grouping key, so same-key deliveries belong to the one routing domain the grouping established",
+        "consistent_hash assignment gives each routing domain one owning pool member at a time, and transfers that ownership safely when membership changes",
+        "pool.order_workers bounds each member to one simultaneously active invocation, so a later invocation cannot overtake an earlier one",
+        "dispatch preserves the transport's established same-key precedence when admitting invocations, including across failure-driven redelivery and ownership reassignment",
         "a duplicate of a completed delivery repeats an invocation that already took effect in order; its work is idempotency requirement #0's obligation (unproven)"
       ],
       "evidence": []

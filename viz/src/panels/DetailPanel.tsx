@@ -6,17 +6,19 @@ import type { ReactNode } from "react";
 import { pathText, shortId } from "../lib/ids";
 import {
   artifactRetention, commitGuarantee, delivery, externalIdempotency, externalResult, inheritedResult,
-  isolation, laneConcurrency, messageIdentity, requestIdentity, requestResult, resultBinding,
-  routing, topicOrdering, transactionOutput,
+  isolation, messageIdentity, requestIdentity, requestResult, resultBinding,
+  memberAssignment, memberConcurrency, requestRouting, subscriptionRouting,
+  transactionOutput, transportGrouping, transportOrdering,
 } from "../lib/explain";
 import {
   effectDef, effectResultType, effectSummary, findTransaction, intentExecutors, operationEffects,
   walkProgram, type IndexEntry, type LocatedStep,
 } from "../lib/index";
 import { propertyMatchesRequirement } from "../lib/obligations";
+import { accessKeysToPartition, objectAccesses, partitionKeyOf } from "../lib/runtime";
 import { hashes } from "../lib/route";
-import { concurrencyText, conditionText } from "../lib/text";
-import { useApp, useObligationsAt, type DetailTarget } from "../state/AppState";
+import { conditionText } from "../lib/text";
+import { useApp, useCitations, useObligationsAt, type DetailTarget } from "../state/AppState";
 import { CLIENT_NODE_ID, EXTERNAL_PREFIX, type Edge } from "../types/graph";
 import type { Id, IdempotencyKeyPropagation, OperationBlock, RequirementKind, ResultType } from "../types/model";
 import { ObligationCard } from "./ObligationCard";
@@ -58,6 +60,26 @@ function Obligations({ obKey, filter }: { obKey: string; filter?: (ob: ReturnTyp
   if (!obs.length) return null;
   return (
     <Section title="prover obligations" count={obs.length}>
+      {obs.map((ob) => (
+        <ObligationCard key={ob.id} ob={ob} />
+      ))}
+    </Section>
+  );
+}
+
+/** The verdicts whose reasoning names this declaration.
+ *
+ *  On an L1 fact this is the list a change to the topology would put
+ *  back in question — the reason proof scope is recorded at all. */
+function Citations({ id }: { id: Id }) {
+  const obs = useCitations(id);
+  if (!obs.length) return null;
+  return (
+    <Section title="proofs resting on this" count={obs.length}>
+      <p className="text-xs leading-relaxed text-kumo-subtle">
+        Each of these cites this declaration in its reasoning. Change it and they are the verdicts
+        to re-examine.
+      </p>
       {obs.map((ob) => (
         <ObligationCard key={ob.id} ob={ob} />
       ))}
@@ -115,6 +137,7 @@ function Dispatch({ target }: { target: DetailTarget }) {
     const edge = graph.edges.find((e) => e.id === id);
     if (edge) return <EdgeDetail edge={edge} />;
   }
+  if (ctx.access) return <AccessDetail operation={ctx.access.operation} object={ctx.access.object} />;
   if (id === CLIENT_NODE_ID) return <ClientDetail />;
   if (id.startsWith(EXTERNAL_PREFIX)) return <ExternalDetail name={id.slice(EXTERNAL_PREFIX.length)} />;
 
@@ -137,6 +160,9 @@ function Dispatch({ target }: { target: DetailTarget }) {
     case "output": return <OutputDetail entry={entry} id={id} />;
     case "binding": return <BindingDetail opId={entry.op} effectId={entry.effect} location={entry.location} id={id} />;
     case "transaction": return <TransactionDetail opId={entry.op} id={id} />;
+    case "pool": return <PoolDetail id={id} />;
+    case "router": return <RouterDetail id={id} />;
+    case "storage_layout": return <StorageLayoutDetail id={id} />;
   }
 }
 
@@ -298,9 +324,6 @@ function OperationDetail({ id }: { id: Id }) {
       <Button variant="secondary" size="xs" icon={ArrowSquareOutIcon} onClick={() => navigateTo(hashes.op(id))}>
         open operation page
       </Button>
-      <Section title="execution">
-        <KeyValue rows={[["concurrency", concurrencyText(op.execution.concurrency)]]} />
-      </Section>
       <Section title="program" count={walkProgram(op.program).length}>
         <div className="rounded-md border border-kumo-hairline bg-kumo-elevated/40 p-2.5">
           <ProgramSummary opId={id} block={op.program} />
@@ -341,18 +364,20 @@ function OperationDetail({ id }: { id: Id }) {
 function TopicDetail({ id }: { id: Id }) {
   const { model, graph } = useApp();
   const topic = model.topics[id];
+  const topicRuntime = model.runtime?.topics?.[id];
   const pubs = graph.edges.filter((e): e is Extract<Edge, { kind: "publish" }> => e.kind === "publish" && e.to === id);
   const subs = graph.edges.filter((e): e is Extract<Edge, { kind: "subscribe" }> => e.kind === "subscribe" && e.from === id);
   return (
     <Frame kind="topic" title={id} subtitle={<span>topic</span>}>
-      <FactNote fact={topicOrdering(topic.ordering)} />
+      <FactNote fact={transportGrouping(topicRuntime?.grouping)} />
+      <FactNote fact={transportOrdering(topicRuntime?.ordering)} />
       <FactNote fact={messageIdentity(topic.message_identity)} />
       <Section title="message schemas" count={topic.messages.length}>
         <List items={topic.messages.map((s) => <IdLink key={s} id={s} />)} />
       </Section>
-      {topic.ordering.kind === "keyed" && (
-        <Section title="ordering key mapping">
-          <KeyValue rows={Object.entries(topic.ordering.mapping).map(([schema, path]) => [shortId(schema), <Mono key={schema}>{pathText(path)}</Mono>])} />
+      {topicRuntime?.grouping && (
+        <Section title="transport grouping key mapping">
+          <KeyValue rows={Object.entries(topicRuntime.grouping).map(([schema, tuple]) => [shortId(schema), <Mono key={schema}>{tuple.map(pathText).join(", ")}</Mono>])} />
         </Section>
       )}
       {topic.message_identity.kind === "keyed" && (
@@ -367,10 +392,11 @@ function TopicDetail({ id }: { id: Id }) {
       )}
       {subs.length > 0 && (
         <Section title="subscribers" count={subs.length}>
-          <List items={subs.map((e) => <span key={e.id} className="flex flex-wrap items-center gap-1.5"><IdLink id={e.operation} /><Tag>{e.delivery}</Tag><Tag>{e.routing}</Tag></span>)} />
+          <List items={subs.map((e) => <span key={e.id} className="flex flex-wrap items-center gap-1.5"><IdLink id={e.operation} /><Tag>{e.delivery}</Tag>{e.pool && <Tag>{shortId(e.pool)}</Tag>}</span>)} />
         </Section>
       )}
       <Obligations obKey={id} />
+      <Citations id={id} />
     </Frame>
   );
 }
@@ -417,9 +443,39 @@ function DataModelDetail({ id }: { id: Id }) {
 function ObjectDetail({ dmId, id }: { dmId: Id; id: Id }) {
   const { model } = useApp();
   const obj = model.data_models[dmId].objects[id];
+  // A storage layout is L1: it says how this object is partitioned, which
+  // is neither its identity nor a routing key. Absent means no such fact.
+  const layout = Object.entries(model.runtime?.storage_layouts ?? {}).find(
+    ([, l]) => l.object.object === id,
+  );
+  const touchers = [...(objectAccesses(model).get(id)?.keys() ?? [])];
   return (
     <Frame kind="data object" title={id} subtitle={<span>persistent object in <IdLink id={dmId} /></span>}>
       <KeyValue rows={[["schema", <IdLink key="s" id={obj.schema} />], ["identity", <Mono key="i">{obj.identity.map(pathText).join(", ")}</Mono>]]} />
+      <Section title="L1 · storage">
+        {layout ? (
+          <>
+            <KeyValue rows={[
+              ["layout", <IdLink key="l" id={layout[0]} />],
+              ["partition key", <Mono key="k">{layout[1].partition_key.map(pathText).join(", ")}</Mono>],
+            ]} />
+            <p className="text-xs leading-relaxed text-kumo-subtle">
+              Partitioned. A partition key says where rows live; it is not the object's identity and
+              not a routing key, and no serialization or ordering proof rests on it.
+            </p>
+          </>
+        ) : (
+          <p className="text-xs leading-relaxed text-kumo-subtle">
+            No storage layout declared. Drawn unpartitioned because that is all the model says — not
+            a claim that the store is unpartitioned.
+          </p>
+        )}
+      </Section>
+      {touchers.length > 0 && (
+        <Section title="accessed by" count={touchers.length}>
+          <List items={touchers.map((op) => <IdLink key={op} id={op} />)} />
+        </Section>
+      )}
       <Obligations obKey={`${dmId}/${id}`} />
     </Frame>
   );
@@ -499,6 +555,10 @@ function InputDetail({ opId, id }: { opId: Id; id: Id }) {
   const { model } = useApp();
   const input = model.operations[opId].inputs[id];
   if (input.kind === "request") {
+    const routers = Object.entries(model.runtime?.routers ?? {});
+    const routed = routers.find(([, r]) => r.boundary.operation === opId && r.boundary.input === id);
+    const routerPool = routed ? model.runtime?.execution_pools?.[routed[1].pool] : undefined;
+
     return (
       <Frame kind="input" title={id} subtitle={<span>request input of <IdLink id={opId} /></span>}>
         <KeyValue rows={[
@@ -507,19 +567,47 @@ function InputDetail({ opId, id }: { opId: Id; id: Id }) {
         ]} />
         <FactNote fact={requestIdentity(input.identity)} />
         <FactNote fact={requestResult()} />
+        {routed && (
+          <Section title="L1 · realization">
+            <KeyValue rows={[
+              ["router", <IdLink key="r" id={routed[0]} />],
+              ["pool", <IdLink key="p" id={routed[1].pool} />],
+            ]} />
+            <FactNote fact={requestRouting(routed[1].routing?.key)} />
+            {routed[1].routing && (
+              <FactNote fact={memberAssignment(routed[1].routing.member_assignment)} />
+            )}
+            {routerPool && <FactNote fact={memberConcurrency(routerPool.member_concurrency)} />}
+          </Section>
+        )}
+        <Citations id={id} />
       </Frame>
     );
   }
   const schemas = input.messages.kind === "all" ? null : input.messages.schemas;
+  const runtime = model.runtime?.subscriptions?.[opId]?.[id];
+  const pool = runtime ? model.runtime?.execution_pools?.[runtime.dispatch.pool] : undefined;
+
   return (
     <Frame kind="input" title={id} subtitle={<span>subscription of <IdLink id={opId} /></span>}>
       <KeyValue rows={[["topic", <IdLink key="t" id={input.topic} />]]} />
-      <FactNote fact={delivery(input.delivery)} />
-      <FactNote fact={routing(input.dispatch.routing)} />
-      <FactNote fact={laneConcurrency(input.dispatch.lane_concurrency)} />
       <Section title="consumed messages">
         {schemas ? <List items={schemas.map((s) => <IdLink key={s} id={s} />)} /> : <Tag>all topic messages</Tag>}
       </Section>
+      {runtime ? (
+        <Section title="L1 · realization">
+          <KeyValue rows={[["pool", <IdLink key="p" id={runtime.dispatch.pool} />]]} />
+          <FactNote fact={delivery(runtime.delivery)} />
+          <FactNote fact={subscriptionRouting(runtime.dispatch.routing?.key)} />
+          {runtime.dispatch.routing && (
+            <FactNote fact={memberAssignment(runtime.dispatch.routing.member_assignment)} />
+          )}
+          {pool && <FactNote fact={memberConcurrency(pool.member_concurrency)} />}
+        </Section>
+      ) : (
+        <FactNote fact={delivery("unspecified")} />
+      )}
+      <Citations id={id} />
     </Frame>
   );
 }
@@ -878,7 +966,7 @@ function EdgeDetail({ edge: e }: { edge: Edge }) {
     case "subscribe":
       return (
         <Frame kind="subscription edge" title={<span><IdLink id={e.from} /> → <IdLink id={e.operation} /></span>}>
-          <KeyValue rows={[["input", <IdLink key="i" id={e.input} />], ["delivery", <Tag key="d">{e.delivery}</Tag>], ["routing", <Tag key="r">{e.routing}</Tag>], ["lane concurrency", e.lane_concurrency]]} />
+          <KeyValue rows={[["input", <IdLink key="i" id={e.input} />], ["delivery", <Tag key="d">{e.delivery}</Tag>], ["routing", <Tag key="r">{e.routing ?? "none"}</Tag>], ["pool", e.pool ? <IdLink key="p" id={e.pool} /> : "—"]]} />
           <Section title="consumed messages" count={e.schemas.length}><List items={e.schemas.map((s) => <IdLink key={s} id={s} />)} /></Section>
         </Frame>
       );
@@ -927,6 +1015,127 @@ function ExternalDetail({ name }: { name: string }) {
       <Section title="invoked by" count={edges.length}>
         <List items={edges.map((e) => <span key={e.id} className="flex flex-wrap items-center gap-1.5"><IdLink id={e.operation} /> via <IdLink id={e.effect} /><Tag>{e.idempotency}</Tag></span>)} />
       </Section>
+    </Frame>
+  );
+}
+
+// ---------------------------------------------------------------------
+// L1 — the declared runtime realization
+// ---------------------------------------------------------------------
+
+function PoolDetail({ id }: { id: Id }) {
+  const { model, graph } = useApp();
+  const pool = model.runtime?.execution_pools?.[id];
+  const node = graph.runtime.execution_pools.find((p) => p.id === id);
+  if (!pool) return <Frame kind="execution pool" title={id} />;
+  const assigned = node?.assigned ?? [];
+  return (
+    <Frame
+      kind="execution pool"
+      title={id}
+      subtitle={<span>L1 · a population of interchangeable members</span>}
+      description="How many members there are is not a conseqa fact: pool cardinality is an external scenario input, and every proof here is about one member's behaviour, not the population's size."
+    >
+      <FactNote fact={memberConcurrency(pool.member_concurrency)} />
+      {assigned.length > 0 && (
+        <Section title="boundaries assigned" count={assigned.length}>
+          <p className="text-xs leading-relaxed text-kumo-subtle">
+            These share an execution population. Sharing a pool relates their members, not their
+            routing domains — no serialization follows from it on its own.
+          </p>
+          <List
+            items={assigned.map((b) => (
+              <span key={`${b.operation}/${b.input}`} className="flex flex-wrap items-center gap-1.5">
+                <IdLink id={b.operation} />
+                <span className="text-kumo-inactive">·</span>
+                <IdLink id={b.input} />
+              </span>
+            ))}
+          />
+        </Section>
+      )}
+      <Citations id={id} />
+    </Frame>
+  );
+}
+
+function RouterDetail({ id }: { id: Id }) {
+  const { model } = useApp();
+  const router = model.runtime?.routers?.[id];
+  if (!router) return <Frame kind="router" title={id} />;
+  const pool = model.runtime?.execution_pools?.[router.pool];
+  return (
+    <Frame
+      kind="router"
+      title={id}
+      subtitle={<span>L1 · realization of a request boundary</span>}
+      description="A router decides which member of its pool owns an invocation domain. It does not make requests ordered, and it carries no queue: what it establishes is affinity, and only when it declares a routing key."
+    >
+      <KeyValue rows={[
+        ["operation", <IdLink key="o" id={router.boundary.operation} />],
+        ["input", <IdLink key="i" id={router.boundary.input} />],
+        ["pool", <IdLink key="p" id={router.pool} />],
+      ]} />
+      <FactNote fact={requestRouting(router.routing?.key)} />
+      {router.routing && <FactNote fact={memberAssignment(router.routing.member_assignment)} />}
+      {pool && <FactNote fact={memberConcurrency(pool.member_concurrency)} />}
+      <Citations id={id} />
+    </Frame>
+  );
+}
+
+function StorageLayoutDetail({ id }: { id: Id }) {
+  const { model } = useApp();
+  const layout = model.runtime?.storage_layouts?.[id];
+  if (!layout) return <Frame kind="storage layout" title={id} />;
+  const touchers = [...(objectAccesses(model).get(layout.object.object)?.keys() ?? [])];
+  return (
+    <Frame
+      kind="storage layout"
+      title={id}
+      subtitle={<span>L1 · how one object is partitioned</span>}
+      description="A partition key is neither the object's identity nor a routing key. It says where rows live, and nothing about which member executes an invocation or in what order — no proof of serialization or ordering rests on it."
+    >
+      <KeyValue rows={[
+        ["data model", <IdLink key="d" id={layout.object.data_model} />],
+        ["object", <IdLink key="o" id={layout.object.object} />],
+        ["partition key", <Mono key="k">{layout.partition_key.map(pathText).join(", ")}</Mono>],
+      ]} />
+      {touchers.length > 0 && (
+        <Section title="operations touching the object" count={touchers.length}>
+          <List items={touchers.map((op) => <IdLink key={op} id={op} />)} />
+        </Section>
+      )}
+      <Citations id={id} />
+    </Frame>
+  );
+}
+
+/** One operation's access to one object: whether it keys to the object's
+ *  partition, which is the fact the access edge carries. */
+function AccessDetail({ operation, object }: { operation: Id; object: Id }) {
+  const { model } = useApp();
+  const predicates = objectAccesses(model).get(object)?.get(operation) ?? [];
+  const key = partitionKeyOf(model, object);
+  const keyed = key !== null && accessKeysToPartition(predicates, key);
+  return (
+    <Frame
+      kind="data access"
+      title={<span><IdLink id={operation}>{shortId(operation)}</IdLink> → <IdLink id={object}>{shortId(object)}</IdLink></span>}
+      subtitle={<span>{predicates.length} access{predicates.length === 1 ? "" : "es"} in <IdLink id={operation} /></span>}
+    >
+      <KeyValue rows={[
+        ["object", <IdLink key="o" id={object} />],
+        ["storage", key ? <Mono key="k">partitioned by {key.map(pathText).join(", ")}</Mono> : <Tag key="u">unpartitioned</Tag>],
+        ["access", <Tag key="a" variant={keyed ? "success" : "warning"}>{keyed ? "keys to partition" : key ? "crosses partitions" : "no partition to key"}</Tag>],
+      ]} />
+      <p className="text-xs leading-relaxed text-kumo-subtle">
+        {key === null
+          ? "The object declares no storage layout, so there is no partition for the access to key to."
+          : keyed
+            ? "Every selector on this path pins the partition key, so the access stays within one partition."
+            : "At least one selector on this path does not pin the partition key, so the access is not confined to one partition."}
+      </p>
     </Frame>
   );
 }

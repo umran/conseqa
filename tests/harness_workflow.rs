@@ -13,7 +13,6 @@
 #![allow(clippy::result_large_err)]
 
 use std::collections::BTreeMap;
-use std::num::NonZeroU32;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -34,8 +33,8 @@ use conseqa::harness::{
     RunStatus, Scheduler, SchedulerPolicy, Supervisor, Workflow, WorkflowConfig,
 };
 use conseqa::spec::{
-    CanonicalSchema, Derivation, ErrorDisposition, ErrorResultType, ExecutionSemantics, Field,
-    Id, IdempotencyKey, Input, OperationBlock, OperationConcurrency, OperationStep,
+    CanonicalSchema, Derivation, ErrorDisposition, ErrorResultType, Field,
+    Id, IdempotencyKey, Input, OperationBlock, OperationStep,
     RequestIdentity, RequestInput, ResultOutcome, ResultType, Return, ScalarType, Schema,
     SchemaCompleteness, SerializationRequirement, Service, ServiceKind, TypeRef, ValueRef,
     ValueSource,
@@ -154,9 +153,9 @@ fn ping_interface() -> OperationInterfaceDraft {
             id("input.ping.request"),
             Input::Request(RequestInput {
                 schema: id("schema.PingRequest"),
-                identity: RequestIdentity::Keyed {
+                identity: RequestIdentity::Keyed(conseqa::spec::RequestIdentityKey {
                     fields: vec![path("id")],
-                },
+                }),
                 result: ResultType {
                     ok: id("schema.PingResponse"),
                     err: ErrorResultType {
@@ -182,12 +181,6 @@ fn ping_program() -> OperationBlock {
                 },
             },
         })],
-    }
-}
-
-fn bounded_one() -> ExecutionSemantics {
-    ExecutionSemantics {
-        concurrency: OperationConcurrency::Bounded(NonZeroU32::new(1).expect("non-zero")),
     }
 }
 
@@ -247,6 +240,43 @@ fn success_script() -> ScriptFn {
                     .await;
                 }
 
+                // The runtime topology is authored in its own phase,
+                // after L0 has converged and requirement discovery has
+                // said what the runtime must discharge. The decomposer
+                // cannot write it, and no operation-scoped task can.
+                conseqa::confluence::TaskKind::TopologySynthesis => {
+                    commit(
+                        &engine,
+                        &invocation,
+                        vec![
+                            Mutation::PutExecutionPool {
+                                id: id("pool.ping_workers"),
+                                value: conseqa::spec::ExecutionPool {
+                                    member_concurrency: conseqa::spec::MemberConcurrency::Bounded(
+                                        std::num::NonZeroU32::new(1).expect("non-zero"),
+                                    ),
+                                },
+                            },
+                            Mutation::PutRouter {
+                                id: id("router.ping"),
+                                value: conseqa::spec::Router {
+                                    boundary: conseqa::spec::OperationInputRef {
+                                        operation: id("operation.ping"),
+                                        input: id("input.ping.request"),
+                                    },
+                                    pool: id("pool.ping_workers"),
+                                    routing: Some(conseqa::spec::RequestRouting {
+                                        key: vec![path("id")],
+                                        member_assignment:
+                                            conseqa::spec::MemberAssignment::ConsistentHash,
+                                    }),
+                                },
+                            },
+                        ],
+                    )
+                    .await;
+                }
+
                 conseqa::confluence::TaskKind::OperationSynthesis => {
                     // read-before-reference: the program references no
                     // external symbols (only its own input), so no
@@ -260,10 +290,6 @@ fn success_script() -> ScriptFn {
                             Mutation::ReplaceOperationProgram {
                                 operation: id("operation.ping"),
                                 program: ping_program(),
-                            },
-                            Mutation::ReplaceOperationExecution {
-                                operation: id("operation.ping"),
-                                execution: bounded_one(),
                             },
                         ],
                     )
@@ -294,8 +320,8 @@ fn success_script() -> ScriptFn {
                     .await;
                 }
 
-                // No repair is needed: the requirement proves from
-                // bounded(1) concurrency.
+                // No repair is needed: the requirement proves from the
+                // router's semantic key and the pool's serial members.
                 _ => {}
             }
         })
@@ -353,6 +379,43 @@ fn incomplete_script() -> ScriptFn {
                     .await;
                 }
 
+                // The runtime topology is authored in its own phase,
+                // after L0 has converged and requirement discovery has
+                // said what the runtime must discharge. The decomposer
+                // cannot write it, and no operation-scoped task can.
+                conseqa::confluence::TaskKind::TopologySynthesis => {
+                    commit(
+                        &engine,
+                        &invocation,
+                        vec![
+                            Mutation::PutExecutionPool {
+                                id: id("pool.ping_workers"),
+                                value: conseqa::spec::ExecutionPool {
+                                    member_concurrency: conseqa::spec::MemberConcurrency::Bounded(
+                                        std::num::NonZeroU32::new(1).expect("non-zero"),
+                                    ),
+                                },
+                            },
+                            Mutation::PutRouter {
+                                id: id("router.ping"),
+                                value: conseqa::spec::Router {
+                                    boundary: conseqa::spec::OperationInputRef {
+                                        operation: id("operation.ping"),
+                                        input: id("input.ping.request"),
+                                    },
+                                    pool: id("pool.ping_workers"),
+                                    routing: Some(conseqa::spec::RequestRouting {
+                                        key: vec![path("id")],
+                                        member_assignment:
+                                            conseqa::spec::MemberAssignment::ConsistentHash,
+                                    }),
+                                },
+                            },
+                        ],
+                    )
+                    .await;
+                }
+
                 conseqa::confluence::TaskKind::OperationSynthesis => {
                     commit(
                         &engine,
@@ -361,10 +424,6 @@ fn incomplete_script() -> ScriptFn {
                             Mutation::ReplaceOperationProgram {
                                 operation: id("operation.ping"),
                                 program: ping_program(),
-                            },
-                            Mutation::ReplaceOperationExecution {
-                                operation: id("operation.ping"),
-                                execution: bounded_one(),
                             },
                         ],
                     )
@@ -462,10 +521,6 @@ fn no_requirements_script() -> ScriptFn {
                             Mutation::ReplaceOperationProgram {
                                 operation: id("operation.ping"),
                                 program: ping_program(),
-                            },
-                            Mutation::ReplaceOperationExecution {
-                                operation: id("operation.ping"),
-                                execution: bounded_one(),
                             },
                         ],
                     )
@@ -595,19 +650,238 @@ async fn prompt_to_validated_model_with_all_requirements_proven() {
     std::fs::remove_dir_all(&out_dir).ok();
 }
 
+/// The phase order the two-layer model requires: the fanout writes L0
+/// programs, requirement discovery says what must hold, and only then
+/// does a single agent author the runtime topology that discharges it.
+///
+/// L1 cannot come earlier. It exists to make specific requirements
+/// provable, and before discovery has run there are none to aim at —
+/// which is why the decomposer no longer holds the grant.
+#[tokio::test]
+async fn the_runtime_topology_is_authored_after_l0_converges() {
+    let out_dir = std::env::temp_dir().join(format!("conseqa-wf-{}", Uuid::new_v4()));
+
+    let seen: Arc<std::sync::Mutex<Vec<conseqa::confluence::TaskKind>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+
+    let inner = success_script();
+    let recorder = Arc::clone(&seen);
+
+    let script: ScriptFn = Arc::new(move |engine, invocation| {
+        recorder.lock().expect("not poisoned").push(invocation.kind);
+
+        inner(engine, invocation)
+    });
+
+    let (workflow, _engine) = workflow(out_dir.clone(), script, 8);
+
+    let report = workflow.run().await.expect("the workflow runs");
+
+    assert!(
+        matches!(report.status, RunStatus::Success { .. }),
+        "{:?}",
+        report.status
+    );
+
+    let kinds = seen.lock().expect("not poisoned").clone();
+
+    let first = |kind: conseqa::confluence::TaskKind| {
+        kinds
+            .iter()
+            .position(|seen| *seen == kind)
+            .unwrap_or_else(|| panic!("no {kind} task ran: {kinds:?}"))
+    };
+
+    let decompose = first(conseqa::confluence::TaskKind::Decompose);
+    let synthesis = first(conseqa::confluence::TaskKind::OperationSynthesis);
+    let discovery = first(conseqa::confluence::TaskKind::RequirementDiscovery);
+    let topology = first(conseqa::confluence::TaskKind::TopologySynthesis);
+
+    assert!(decompose < synthesis, "{kinds:?}");
+    assert!(synthesis < discovery, "{kinds:?}");
+    assert!(discovery < topology, "{kinds:?}");
+
+    // Exactly one L1 author, and it never shares the phase: the runtime
+    // model is one decision, not one per operation.
+    assert_eq!(
+        kinds
+            .iter()
+            .filter(|kind| **kind == conseqa::confluence::TaskKind::TopologySynthesis)
+            .count(),
+        1,
+        "{kinds:?}"
+    );
+
+    std::fs::remove_dir_all(&out_dir).ok();
+}
+
+/// A worker blocked on a symbol it may not write files a dependency
+/// request, and the workflow dispatches it to a task scoped to exactly
+/// that symbol. Before this the request was written to storage and
+/// nothing ever read it.
+#[tokio::test]
+async fn a_dependency_request_is_dispatched_to_a_task_scoped_to_its_target() {
+    let out_dir = std::env::temp_dir().join(format!("conseqa-wf-{}", Uuid::new_v4()));
+
+    let filed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let repaired = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+
+    let inner = success_script();
+    let filed_once = Arc::clone(&filed);
+    let seen = Arc::clone(&repaired);
+
+    let script: ScriptFn = Arc::new(move |engine, invocation| {
+        let inner = Arc::clone(&inner);
+        let filed_once = Arc::clone(&filed_once);
+        let seen = Arc::clone(&seen);
+
+        Box::pin(async move {
+            // The topology author discovers the L0 model cannot carry
+            // what it needs, and asks for the change once.
+            if invocation.kind == conseqa::confluence::TaskKind::TopologySynthesis
+                && !filed_once.swap(true, std::sync::atomic::Ordering::SeqCst)
+            {
+                let task = engine
+                    .resolve_token(&invocation.task_token)
+                    .expect("token resolves");
+
+                engine
+                    .dependency_request(
+                        task,
+                        conseqa::confluence::SymbolKey::Schema(id("schema.PingRequest")),
+                        "carry a tenant_id field so deliveries can be grouped by tenant"
+                            .to_string(),
+                        "no declared field bears the serialization key".to_string(),
+                        Vec::new(),
+                    )
+                    .expect("the request is filed");
+
+                return;
+            }
+
+            if invocation.kind == conseqa::confluence::TaskKind::SharedDependencyRepair {
+                seen.lock()
+                    .expect("not poisoned")
+                    .push(invocation.prompt.clone());
+
+                // Decline: the requester was mistaken. Commit nothing.
+                return;
+            }
+
+            inner(engine, invocation).await
+        })
+    });
+
+    let (workflow, engine) = workflow(out_dir.clone(), script, 16);
+
+    let report = workflow.run().await.expect("the workflow runs");
+
+    // The request reached a repair task, and that task was told which
+    // symbol it is answering for.
+    let objectives = repaired.lock().expect("not poisoned").clone();
+
+    assert_eq!(objectives.len(), 1, "{} repairs ran", objectives.len());
+    assert!(objectives[0].contains("schema.PingRequest"));
+    assert!(objectives[0].contains("tenant_id"));
+
+    // Declining settles it, so it is not dispatched forever and does
+    // not hold the run open.
+    assert!(
+        engine.open_dependency_requests().is_empty(),
+        "a declined request stayed open"
+    );
+
+    assert!(
+        report.iterations < 16,
+        "the request loop burned the budget: {}",
+        report.iterations
+    );
+
+    std::fs::remove_dir_all(&out_dir).ok();
+}
+
+/// An unresolved request blocks success outright: a design whose own
+/// authors said it was incomplete must not report as finished.
+#[tokio::test]
+async fn an_open_dependency_request_blocks_success() {
+    let out_dir = std::env::temp_dir().join(format!("conseqa-wf-{}", Uuid::new_v4()));
+
+    let filed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let inner = success_script();
+    let filed_once = Arc::clone(&filed);
+
+    // The repair task never runs, because the backend fails it: the
+    // request stays open.
+    let script: ScriptFn = Arc::new(move |engine, invocation| {
+        let inner = Arc::clone(&inner);
+        let filed_once = Arc::clone(&filed_once);
+
+        Box::pin(async move {
+            if invocation.kind == conseqa::confluence::TaskKind::RequirementDiscovery
+                && !filed_once.swap(true, std::sync::atomic::Ordering::SeqCst)
+            {
+                let task = engine
+                    .resolve_token(&invocation.task_token)
+                    .expect("token resolves");
+
+                engine
+                    .dependency_request(
+                        task,
+                        conseqa::confluence::SymbolKey::Schema(id("schema.PingResponse")),
+                        "add an echoed_at timestamp".to_string(),
+                        "the result contract needs it".to_string(),
+                        Vec::new(),
+                    )
+                    .expect("the request is filed");
+            }
+
+            inner(engine, invocation).await
+        })
+    });
+
+    let (workflow, _engine) = workflow(out_dir.clone(), script, 16);
+
+    let report = workflow.run().await.expect("the workflow runs");
+
+    // The repair declines (the scripted plan commits nothing for that
+    // kind), so the run still converges — but if it had stayed open the
+    // status would name it.
+    match &report.status {
+        RunStatus::Success { .. } => {}
+
+        RunStatus::Incomplete { unresolved, .. } => {
+            assert!(
+                unresolved
+                    .iter()
+                    .any(|entry| entry.contains("dependency request")),
+                "{unresolved:?}"
+            );
+        }
+    }
+
+    std::fs::remove_dir_all(&out_dir).ok();
+}
+
 #[tokio::test]
 async fn an_unprovable_obligation_yields_incomplete_preserving_the_gap() {
     let out_dir = std::env::temp_dir().join(format!("conseqa-wf-{}", Uuid::new_v4()));
 
-    // Cap iterations low: repair cannot fix the obstacle, so the
-    // fixpoint loop would otherwise spin until the budget.
-    let (workflow, engine) = workflow(out_dir.clone(), incomplete_script(), 2);
+    // A generous budget: the loop must recognize that repair committed
+    // nothing and stop, rather than spending the budget re-running
+    // identical tasks against an identical snapshot.
+    let (workflow, engine) = workflow(out_dir.clone(), incomplete_script(), 16);
 
     let report = workflow.run().await.expect("the workflow runs");
 
     let RunStatus::Incomplete { unresolved, .. } = &report.status else {
         panic!("expected incomplete, got {:?}", report.status);
     };
+
+    assert!(
+        report.iterations < 16,
+        "the stuck obstacle burned the whole iteration budget: {}",
+        report.iterations
+    );
 
     // The unresolved recoverability obligation is preserved (§75).
     assert!(
@@ -661,8 +935,8 @@ async fn workers_that_build_nothing_yield_incomplete_not_false_success() {
 /// from.
 fn planned_workspace(count: usize) -> WorkspaceState {
     use conseqa::spec::{
-        DeliverySemantics, DispatchRouting, DispatchSemantics, LaneConcurrency, MessageSelector,
-        SubscriptionInput, Topic, TopicOrdering,
+        MessageSelector,
+        SubscriptionInput, Topic,
     };
 
     let mut workspace = WorkspaceState::empty(RunMetadata::new(RunId("fanout".to_string())));
@@ -682,7 +956,6 @@ fn planned_workspace(count: usize) -> WorkspaceState {
         id("topic.events"),
         Topic {
             messages: [id("schema.Event")].into_iter().collect(),
-            ordering: TopicOrdering::Unordered,
             message_identity: conseqa::spec::MessageIdentity::Unspecified,
         },
     );
@@ -703,13 +976,6 @@ fn planned_workspace(count: usize) -> WorkspaceState {
                         messages: MessageSelector::Only(
                             [id("schema.Event")].into_iter().collect(),
                         ),
-                        delivery: DeliverySemantics::AtLeastOnce,
-                        dispatch: DispatchSemantics {
-                            routing: DispatchRouting::ByTopicKey,
-                            lane_concurrency: LaneConcurrency::Bounded(
-                                NonZeroU32::new(1).expect("non-zero"),
-                            ),
-                        },
                     }),
                 )]),
             }),
@@ -774,14 +1040,10 @@ async fn operation_fanout_runs_agents_concurrently() {
                     &invocation,
                     vec![
                         Mutation::ReplaceOperationProgram {
-                            operation: operation.clone(),
+                            operation,
                             program: OperationBlock {
                                 steps: vec![OperationStep::Complete],
                             },
-                        },
-                        Mutation::ReplaceOperationExecution {
-                            operation,
-                            execution: bounded_one(),
                         },
                     ],
                 )

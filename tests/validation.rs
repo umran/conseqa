@@ -5,14 +5,18 @@ use std::{
 };
 
 use conseqa::{
+    analyzer::Diagnostic,
     analyzer::validation::{self, ProgramUse, ReferenceKind, ValidationError},
     parser::yaml,
     spec::{
         Arm, Branch, Condition, Derivation, Effect, EstablishTransactionOutput, ExecuteEffect,
         FieldPath, Id, IdempotencyGuarantee, Input, Literal, MessageIdentity, MessageSelector,
         Model, OperationBlock, OperationStep, RequestEffect, RequestIdentity, RequestTarget,
-        ResultOutcome, ResultVariant, RetrySemantics, Return, Schema, SchemaFragment, SelectorValue,
-        StateTransition, StepHop, StepLocation, TopicOrdering, Transaction, TransactionIsolation,
+        DataObjectRef, ExecutionPool, MemberAssignment, MemberConcurrency,
+        OperationInputRef,
+        RequestRouting, ResultOutcome, ResultVariant, RetrySemantics, Return, Router, RuntimeModel,
+        Schema, SchemaFragment, SelectorValue, StateTransition, StepHop, StepLocation,
+        StorageLayout, SubscriptionRoutingKey, OrderingSemantics, Transaction, TransactionIsolation,
         TransactionStep, TransitionEffectIntent, ValueRef, ValueSource,
     },
 };
@@ -81,6 +85,18 @@ fn fixture_path(name: &str) -> PathBuf {
         .join("tests")
         .join("fixtures")
         .join(name)
+}
+
+/// The order-events topic's runtime, for tests that perturb the
+/// transport grouping domain.
+fn topic_runtime(model: &mut Model) -> &mut conseqa::spec::TopicRuntime {
+    model
+        .runtime
+        .as_mut()
+        .expect("the fixture declares a runtime model")
+        .topics
+        .get_mut(&id("topic.order_events"))
+        .expect("the order-events topic declares a runtime")
 }
 
 fn load_flash_checkout() -> Model {
@@ -372,13 +388,11 @@ fn rejects_publication_schema_not_carried_by_topic() {
 }
 
 #[test]
-fn rejects_keyed_topic_missing_schema_mapping() {
+fn rejects_grouping_key_missing_schema_mapping() {
     let mut model = load_flash_checkout();
 
-    let topic = model.topics.get_mut(&id("topic.order_events")).unwrap();
-
-    let TopicOrdering::Keyed(key) = &mut topic.ordering else {
-        panic!("expected keyed topic");
+    let Some(key) = &mut topic_runtime(&mut model).grouping else {
+        panic!("expected a keyed grouping");
     };
 
     key.mapping.remove(&id("schema.PaymentCaptured"));
@@ -387,7 +401,8 @@ fn rejects_keyed_topic_missing_schema_mapping() {
 
     assert_eq!(
         errors,
-        vec![ValidationError::TopicKeyMissingSchema {
+        vec![ValidationError::GroupingKeyMissingSchema {
+            subject: id("topic.order_events"),
             topic: id("topic.order_events"),
             schema: id("schema.PaymentCaptured"),
         }]
@@ -395,25 +410,24 @@ fn rejects_keyed_topic_missing_schema_mapping() {
 }
 
 #[test]
-fn rejects_topic_key_for_schema_not_on_topic() {
+fn rejects_grouping_key_for_schema_not_on_topic() {
     let mut model = load_flash_checkout();
 
-    let topic = model.topics.get_mut(&id("topic.order_events")).unwrap();
-
-    let TopicOrdering::Keyed(key) = &mut topic.ordering else {
-        panic!("expected keyed topic");
+    let Some(key) = &mut topic_runtime(&mut model).grouping else {
+        panic!("expected a keyed grouping");
     };
 
     key.mapping.insert(
         id("schema.CancelOrderRequest"),
-        FieldPath(vec!["order_id".to_owned()]),
+        vec![FieldPath(vec!["order_id".to_owned()])],
     );
 
     let errors = validation::validate(&model);
 
     assert_eq!(
         errors,
-        vec![ValidationError::TopicKeySchemaNotOnTopic {
+        vec![ValidationError::GroupingKeySchemaNotOnTopic {
+            subject: id("topic.order_events"),
             topic: id("topic.order_events"),
             schema: id("schema.CancelOrderRequest"),
         }]
@@ -1444,7 +1458,9 @@ fn rejects_empty_request_identity() {
         panic!("create_order input should be a request");
     };
 
-    request.identity = RequestIdentity::Keyed { fields: Vec::new() };
+    request.identity = RequestIdentity::Keyed(conseqa::spec::RequestIdentityKey {
+        fields: Vec::new(),
+    });
 
     let errors = validation::validate(&model);
 
@@ -1470,9 +1486,9 @@ fn rejects_unresolvable_request_identity_field() {
         panic!("create_order input should be a request");
     };
 
-    request.identity = RequestIdentity::Keyed {
+    request.identity = RequestIdentity::Keyed(conseqa::spec::RequestIdentityKey {
         fields: vec![FieldPath(vec!["does_not_exist".to_owned()])],
-    };
+    });
 
     let errors = validation::validate(&model);
 
@@ -1491,11 +1507,11 @@ fn order_events_message_identity(
 ) -> &mut std::collections::BTreeMap<Id, Vec<FieldPath>> {
     let topic = model.topics.get_mut(&id("topic.order_events")).unwrap();
 
-    let MessageIdentity::Keyed { mapping } = &mut topic.message_identity else {
+    let MessageIdentity::Keyed(identity) = &mut topic.message_identity else {
         panic!("order_events should declare a keyed message identity");
     };
 
-    mapping
+    &mut identity.mapping
 }
 
 #[test]
@@ -2613,4 +2629,538 @@ fn program_local_diagnostics_do_not_fault_a_request_to_an_absent_operation() {
                 && !diagnostic.message.contains("input.absent")),
         "cross-operation references must be left to the gate's other checks:\n{diagnostics:#?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// L1 — runtime topology
+//
+// Every L1 declaration hangs off an L0 one, and validation checks those
+// anchors, the pools routing terminates at, and the field paths keys
+// are written against. Whether the declared topology *proves* anything
+// is verification's judgment, never validation's.
+// ---------------------------------------------------------------------------
+
+fn runtime(model: &mut Model) -> &mut RuntimeModel {
+    model.runtime.as_mut().expect("the fixture declares a runtime")
+}
+
+#[test]
+fn an_l0_only_model_is_structurally_valid() {
+    // The refactor's first acceptance criterion: L0 stands alone.
+    let mut model = load_flash_checkout();
+
+    model.runtime = None;
+
+    assert!(validation::validate(&model).is_empty());
+}
+
+#[test]
+fn a_router_must_name_a_request_boundary() {
+    let mut model = load_flash_checkout();
+
+    runtime(&mut model).routers.insert(
+        id("router.wrong_kind"),
+        Router {
+            boundary: OperationInputRef {
+                operation: id("operation.reserve_inventory"),
+                input: id("input.reserve_inventory.created"),
+            },
+            pool: id("pool.checkout_api"),
+            routing: None,
+        },
+    );
+
+    let errors = validation::validate(&model);
+
+    assert!(
+        errors.iter().any(|error| matches!(
+            error,
+            ValidationError::InvalidInputKind { input, .. }
+                if input == &id("input.reserve_inventory.created")
+        )),
+        "{errors:#?}"
+    );
+}
+
+#[test]
+fn a_router_key_must_be_non_empty_and_resolve_against_the_request_schema() {
+    let mut model = load_flash_checkout();
+
+    runtime(&mut model)
+        .routers
+        .get_mut(&id("router.create_order"))
+        .expect("the fixture routes create_order")
+        .routing = Some(RequestRouting {
+        key: Vec::new(),
+        member_assignment: MemberAssignment::ConsistentHash,
+    });
+
+    assert!(
+        validation::validate(&model)
+            .iter()
+            .any(|error| matches!(error, ValidationError::EmptyRoutingKey { .. }))
+    );
+
+    runtime(&mut model)
+        .routers
+        .get_mut(&id("router.create_order"))
+        .unwrap()
+        .routing = Some(RequestRouting {
+        key: vec![path(&["not_a_field"])],
+        member_assignment: MemberAssignment::ConsistentHash,
+    });
+
+    assert!(
+        validation::validate(&model).iter().any(|error| matches!(
+            error,
+            ValidationError::InvalidFieldPath { subject, .. }
+                if subject == &id("router.create_order")
+        ))
+    );
+}
+
+#[test]
+fn one_request_boundary_admits_at_most_one_router() {
+    let mut model = load_flash_checkout();
+
+    runtime(&mut model).routers.insert(
+        id("router.create_order_again"),
+        Router {
+            boundary: OperationInputRef {
+                operation: id("operation.create_order"),
+                input: id("input.create_order.request"),
+            },
+            pool: id("pool.checkout_api"),
+            routing: None,
+        },
+    );
+
+    assert!(
+        validation::validate(&model).iter().any(|error| matches!(
+            error,
+            ValidationError::DuplicateRouterForBoundary { first, second, .. }
+                if first == &id("router.create_order")
+                    && second == &id("router.create_order_again")
+        ))
+    );
+}
+
+#[test]
+fn routing_must_terminate_at_a_declared_pool() {
+    let mut model = load_flash_checkout();
+
+    runtime(&mut model)
+        .routers
+        .get_mut(&id("router.create_order"))
+        .unwrap()
+        .pool = id("pool.missing");
+
+    assert!(
+        validation::validate(&model).iter().any(|error| matches!(
+            error,
+            ValidationError::UnknownReference { reference, expected, .. }
+                if reference == &id("pool.missing")
+                    && *expected == ReferenceKind::ExecutionPool
+        ))
+    );
+}
+
+#[test]
+fn grouping_key_routing_requires_a_grouping_domain() {
+    // `grouping_key` names the effective grouping domain, so one has
+    // to exist. A validation error rather than a silent unproven
+    // verdict, because the declaration would otherwise refer to
+    // nothing.
+    let mut model = load_flash_checkout();
+
+    runtime(&mut model)
+        .topics
+        .get_mut(&id("topic.order_events"))
+        .unwrap()
+        .grouping = None;
+
+    assert!(
+        validation::validate(&model).iter().any(|error| matches!(
+            error,
+            ValidationError::RoutingWithoutGrouping { topic, .. }
+                if topic == &id("topic.order_events")
+        ))
+    );
+}
+
+#[test]
+fn an_unordered_transport_may_still_group() {
+    // Grouping and ordering are independent facts. A transport that
+    // orders nothing may still group by a key — the shape of an
+    // unordered queue with consistent-hash workers — and that grouping
+    // is enough for serialization to reason about, with no ordering
+    // guarantee anywhere.
+    let mut model = load_flash_checkout();
+
+    runtime(&mut model)
+        .topics
+        .get_mut(&id("topic.order_events"))
+        .unwrap()
+        .ordering = Some(OrderingSemantics::None);
+
+    assert!(
+        validation::validate(&model).is_empty(),
+        "grouping without ordering is a valid declaration"
+    );
+}
+
+#[test]
+fn within_group_requires_a_grouping_at_the_same_scope() {
+    let mut model = load_flash_checkout();
+
+    let topic = runtime(&mut model)
+        .topics
+        .get_mut(&id("topic.order_events"))
+        .unwrap();
+
+    topic.grouping = None;
+    topic.ordering = Some(OrderingSemantics::WithinGroup);
+
+    assert!(
+        validation::validate(&model).iter().any(|error| matches!(
+            error,
+            ValidationError::WithinGroupWithoutGrouping { subject }
+                if subject == &id("topic.order_events")
+        ))
+    );
+}
+
+#[test]
+fn transport_semantics_may_not_be_declared_at_both_scopes() {
+    // The scopes are exclusive: a topic declaring transport semantics
+    // supplies them to every subscription, and none may declare its
+    // own. There is no override rule to resolve.
+    let mut model = load_flash_checkout();
+
+    let subscription = runtime(&mut model)
+        .subscriptions
+        .get_mut(&id("operation.reserve_inventory"))
+        .and_then(|inputs| inputs.get_mut(&id("input.reserve_inventory.created")))
+        .expect("the fixture declares it");
+
+    subscription.ordering = Some(OrderingSemantics::Global);
+
+    assert!(
+        validation::validate(&model).iter().any(|error| matches!(
+            error,
+            ValidationError::TransportSemanticsAtBothScopes { topic, input, .. }
+                if topic == &id("topic.order_events")
+                    && input == &id("input.reserve_inventory.created")
+        ))
+    );
+}
+
+/// A validation error against an L1 declaration is marked as one, so
+/// the coordinator routes it to the topology author. An L1 error names
+/// a topic, router, or pool rather than an operation, and without this
+/// flag it reaches no repair target at all.
+#[test]
+fn runtime_validation_errors_are_marked_as_runtime() {
+    let mut model = load_flash_checkout();
+
+    let subscription = runtime(&mut model)
+        .subscriptions
+        .get_mut(&id("operation.reserve_inventory"))
+        .and_then(|inputs| inputs.get_mut(&id("input.reserve_inventory.created")))
+        .expect("the fixture declares it");
+
+    subscription.ordering = Some(OrderingSemantics::Global);
+
+    let diagnostics = validation::validate(&model);
+
+    assert!(
+        !diagnostics.is_empty(),
+        "the both-scopes declaration is rejected"
+    );
+
+    assert!(
+        diagnostics
+            .iter()
+            .all(|error| Diagnostic::from(error.clone()).code.is_runtime()),
+        "{diagnostics:?}"
+    );
+}
+
+/// An L0 error is not marked as a runtime one: routing it to the
+/// topology author would hand it to a scope that cannot fix it.
+#[test]
+fn application_validation_errors_are_not_marked_as_runtime() {
+    let mut model = load_flash_checkout();
+
+    model.topics.remove(&id("topic.order_events"));
+
+    let diagnostics = validation::validate(&model);
+
+    assert!(!diagnostics.is_empty(), "the dangling topic is rejected");
+
+    assert!(
+        diagnostics
+            .iter()
+            .any(|error| !Diagnostic::from(error.clone()).code.is_runtime()),
+        "{diagnostics:?}"
+    );
+}
+
+#[test]
+fn grouping_and_ordering_are_each_present_or_absent() {
+    // There is no half a declaration to write. A grouping is its own
+    // presence, and an absent ordering is `none`, so "groups without
+    // ordering" is a complete statement — the unordered-queue shape —
+    // rather than an unpaired one needing a rule to reject it.
+    let mut model = load_flash_checkout();
+
+    let topic = runtime(&mut model)
+        .topics
+        .get_mut(&id("topic.order_events"))
+        .unwrap();
+
+    topic.ordering = Some(OrderingSemantics::None);
+
+    assert!(validation::validate(&model).is_empty());
+
+    // And the reverse: a precedence with no grouping of its own, which
+    // §11 of the patch admits because global order needs no key.
+    let topic = runtime(&mut model)
+        .topics
+        .get_mut(&id("topic.order_events"))
+        .unwrap();
+
+    topic.grouping = None;
+    topic.ordering = Some(OrderingSemantics::Global);
+
+    // Only the routing declaration objects, because `grouping_key`
+    // routing has lost the domain it names — not the transport
+    // declaration itself.
+    let errors = validation::validate(&model);
+
+    assert!(
+        errors.iter().all(|error| matches!(
+            error,
+            ValidationError::RoutingWithoutGrouping { .. }
+        )),
+        "{errors:#?}"
+    );
+}
+
+#[test]
+fn a_storage_layout_must_name_an_object_and_carry_a_resolving_partition_key() {
+    let mut model = load_flash_checkout();
+
+    runtime(&mut model)
+        .storage_layouts
+        .get_mut(&id("layout.order"))
+        .expect("the fixture lays out the order object")
+        .partition_key = Vec::new();
+
+    assert!(
+        validation::validate(&model)
+            .iter()
+            .any(|error| matches!(error, ValidationError::EmptyPartitionKey { .. }))
+    );
+
+    runtime(&mut model)
+        .storage_layouts
+        .get_mut(&id("layout.order"))
+        .unwrap()
+        .partition_key = vec![path(&["not_a_field"])];
+
+    assert!(
+        validation::validate(&model).iter().any(|error| matches!(
+            error,
+            ValidationError::InvalidFieldPath { subject, .. } if subject == &id("layout.order")
+        ))
+    );
+
+    runtime(&mut model).storage_layouts.insert(
+        id("layout.absent"),
+        StorageLayout {
+            object: DataObjectRef {
+                data_model: id("data.checkout"),
+                object: id("object.missing"),
+            },
+            partition_key: vec![path(&["order_id"])],
+        },
+    );
+
+    assert!(
+        validation::validate(&model).iter().any(|error| matches!(
+            error,
+            ValidationError::UnknownReference { reference, expected, .. }
+                if reference == &id("object.missing")
+                    && *expected == ReferenceKind::DataObject
+        ))
+    );
+}
+
+#[test]
+fn one_data_object_admits_at_most_one_storage_layout() {
+    let mut model = load_flash_checkout();
+
+    runtime(&mut model).storage_layouts.insert(
+        id("layout.order_again"),
+        StorageLayout {
+            object: DataObjectRef {
+                data_model: id("data.checkout"),
+                object: id("object.order"),
+            },
+            partition_key: vec![path(&["order_id"])],
+        },
+    );
+
+    assert!(
+        validation::validate(&model).iter().any(|error| matches!(
+            error,
+            ValidationError::DuplicateStorageLayoutForObject { first, second, .. }
+                if first == &id("layout.order") && second == &id("layout.order_again")
+        ))
+    );
+}
+
+#[test]
+fn l1_identifiers_share_the_one_global_namespace() {
+    let mut model = load_flash_checkout();
+
+    let pool = runtime(&mut model)
+        .execution_pools
+        .remove(&id("pool.checkout_api"))
+        .expect("the fixture declares it");
+
+    // A pool taking a topic's ID collides, exactly as two topics would.
+    runtime(&mut model)
+        .execution_pools
+        .insert(id("topic.order_events"), pool);
+
+    assert!(
+        validation::validate(&model).iter().any(|error| matches!(
+            error,
+            ValidationError::DuplicateId { id: duplicate, .. }
+                if duplicate == &id("topic.order_events")
+        ))
+    );
+}
+
+#[test]
+fn a_subscription_runtime_must_name_a_subscription_boundary() {
+    let mut model = load_flash_checkout();
+
+    let dispatch = conseqa::spec::SubscriptionDispatch {
+        pool: id("pool.order_workers"),
+        routing: Some(conseqa::spec::SubscriptionRouting {
+            key: SubscriptionRoutingKey::GroupingKey,
+            member_assignment: MemberAssignment::ConsistentHash,
+        }),
+    };
+
+    runtime(&mut model)
+        .subscriptions
+        .entry(id("operation.create_order"))
+        .or_default()
+        .insert(
+            id("input.create_order.request"),
+            conseqa::spec::SubscriptionRuntime {
+                delivery: conseqa::spec::DeliverySemantics::AtLeastOnce,
+                grouping: None,
+                ordering: None,
+                dispatch,
+            },
+        );
+
+    assert!(
+        validation::validate(&model).iter().any(|error| matches!(
+            error,
+            ValidationError::InvalidInputKind { input, .. }
+                if input == &id("input.create_order.request")
+        ))
+    );
+}
+
+#[test]
+fn a_subscription_groups_only_the_schemas_it_admits() {
+    // Regression. The topic-scope coverage rule was applied at
+    // subscription scope, forcing a subscription to map a schema its
+    // own selector filters out — impossible on a heterogeneous topic
+    // where that schema has no comparable field.
+    let mut model = load_flash_checkout();
+
+    let topic = runtime(&mut model)
+        .topics
+        .get_mut(&id("topic.order_events"))
+        .unwrap();
+
+    topic.grouping = None;
+    topic.ordering = None;
+
+    let everything = conseqa::spec::GroupingKey {
+        mapping: [
+            "schema.InventoryReserved",
+            "schema.OrderCancelled",
+            "schema.OrderCreated",
+            "schema.OrderPaid",
+            "schema.PaymentCaptured",
+            "schema.PaymentFailed",
+        ]
+        .into_iter()
+        .map(|schema| (id(schema), vec![path(&["order_id"])]))
+        .collect(),
+    };
+
+    for (operation, input) in [
+        ("operation.charge_payment", "input.charge_payment.reserved"),
+        ("operation.apply_payment", "input.apply_payment.captured"),
+    ] {
+        let subscription = runtime(&mut model)
+            .subscriptions
+            .get_mut(&id(operation))
+            .and_then(|inputs| inputs.get_mut(&id(input)))
+            .expect("the fixture declares it");
+
+        subscription.grouping = Some(everything.clone());
+        subscription.ordering = Some(OrderingSemantics::WithinGroup);
+    }
+
+    // reserve_inventory admits only OrderCreated, so that is all its
+    // grouping has to place in a group.
+    let subscription = runtime(&mut model)
+        .subscriptions
+        .get_mut(&id("operation.reserve_inventory"))
+        .and_then(|inputs| inputs.get_mut(&id("input.reserve_inventory.created")))
+        .expect("the fixture declares it");
+
+    subscription.grouping = Some(conseqa::spec::GroupingKey {
+        mapping: [(id("schema.OrderCreated"), vec![path(&["order_id"])])]
+            .into_iter()
+            .collect(),
+    });
+
+    subscription.ordering = Some(OrderingSemantics::WithinGroup);
+
+    assert!(
+        validation::validate(&model).is_empty(),
+        "{:#?}",
+        validation::validate(&model)
+    );
+}
+
+#[test]
+fn a_bounded_member_concurrency_of_zero_is_unrepresentable() {
+    // `NonZeroU32` carries the rule; there is nothing for validation to
+    // check, and nothing an author can write that would need checking.
+    let json = serde_json::to_string(&ExecutionPool {
+        member_concurrency: MemberConcurrency::Bounded(
+            std::num::NonZeroU32::new(1).expect("non-zero"),
+        ),
+    })
+    .expect("serializes");
+
+    assert_eq!(json, r#"{"member_concurrency":{"kind":"bounded","value":1}}"#);
+
+    let zero: Result<ExecutionPool, _> =
+        serde_json::from_str(r#"{"member_concurrency":{"kind":"bounded","value":0}}"#);
+
+    assert!(zero.is_err(), "a bound of zero must not deserialize");
 }

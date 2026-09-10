@@ -17,7 +17,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::Serialize;
 
 use crate::spec::{
-    Effect, Id, Input, MessageSelector, Model, OperationStep, TransactionStep, TransitionSideEffect,
+    Effect, Id, Input, MemberConcurrency, MessageSelector, Model, OperationStep, TransactionStep,
+    TransitionSideEffect,
 };
 
 pub const CLIENT_NODE_ID: &str = "@client";
@@ -28,6 +29,10 @@ pub struct Graph {
     pub operations: Vec<OperationNode>,
     pub topics: Vec<TopicNode>,
     pub externals: Vec<ExternalNode>,
+
+    /// The declared L1 runtime topology, empty when the model
+    /// describes only application semantics.
+    pub runtime: RuntimeView,
 
     /// Present only when at least one request input is externally
     /// invokable.
@@ -67,7 +72,55 @@ pub struct OperationNode {
     pub machines: Vec<Id>,
 
     pub requirements: RequirementBadges,
-    pub concurrency: String,
+}
+
+/// The runtime realization, as flat lists the front end can render
+/// beside the application graph.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct RuntimeView {
+    pub execution_pools: Vec<ExecutionPoolNode>,
+    pub routers: Vec<RouterNode>,
+    pub storage_layouts: Vec<StorageLayoutNode>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ExecutionPoolNode {
+    pub id: Id,
+    pub member_concurrency: String,
+
+    /// Operation inputs assigned to this pool, request and
+    /// subscription alike — the shared execution population made
+    /// visible.
+    pub assigned: Vec<BoundaryRef>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct BoundaryRef {
+    pub operation: Id,
+    pub input: Id,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RouterNode {
+    pub id: Id,
+    pub operation: Id,
+    pub input: Id,
+    pub pool: Id,
+
+    /// The semantic routing key, empty when the router declares no
+    /// routing at all.
+    pub routing_key: Vec<String>,
+
+    /// `None` when the router declares no routing.
+    pub member_assignment: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct StorageLayoutNode {
+    pub id: Id,
+    pub data_model: Id,
+    pub object: Id,
+    pub partition_key: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -81,7 +134,16 @@ pub struct RequirementBadges {
 #[derive(Debug, Clone, Serialize)]
 pub struct TopicNode {
     pub id: Id,
+
+    /// Topic-scoped transport facts. In subscription-scoped mode both
+    /// read `none` and each subscribe edge carries its own.
     pub ordering: String,
+    pub grouping: String,
+
+    /// Whether the topic declares transport semantics for all its
+    /// subscriptions, or leaves each to declare its own.
+    pub topic_scoped_transport: bool,
+
     pub messages: Vec<Id>,
 }
 
@@ -134,8 +196,22 @@ pub enum EdgeDetail {
         schemas: Vec<Id>,
 
         delivery: String,
-        routing: String,
-        lane_concurrency: String,
+
+        /// The transport facts in force for this subscription,
+        /// resolved from whichever scope declares them.
+        grouping: String,
+        ordering: String,
+
+        /// The dispatch routing key, or `none` when the dispatch
+        /// declares no member affinity. Absent entirely when the
+        /// subscription has no declared runtime.
+        routing: Option<String>,
+
+        /// The execution pool deliveries are assigned to, when a
+        /// runtime declares one.
+        pool: Option<Id>,
+
+        member_assignment: Option<String>,
     },
 
     /// A request effect from `operation` to another operation's
@@ -253,13 +329,37 @@ pub fn extract(model: &Model) -> Graph {
                         id: next_edge_id(),
                         from: sub.topic.to_string(),
                         to: op_id.to_string(),
-                        detail: EdgeDetail::Subscribe {
-                            operation: op_id.clone(),
-                            input: input_id.clone(),
-                            schemas,
-                            delivery: to_tag(&sub.delivery),
-                            routing: to_tag(&sub.dispatch.routing),
-                            lane_concurrency: concurrency_label(&sub.dispatch.lane_concurrency),
+                        detail: {
+                            let runtime = model.subscription_runtime(op_id, input_id);
+
+                            EdgeDetail::Subscribe {
+                                operation: op_id.clone(),
+                                input: input_id.clone(),
+                                schemas,
+                                delivery: to_tag(&model.delivery(op_id, input_id)),
+                                grouping: grouping_label(
+                                    model
+                                        .effective_grouping(op_id, input_id, &sub.topic)
+                                        .as_ref(),
+                                ),
+                                ordering: ordering_label(model.effective_ordering(
+                                    op_id,
+                                    input_id,
+                                    &sub.topic,
+                                )),
+                                routing: runtime.map(|runtime| match &runtime.dispatch.routing {
+                                    Some(routing) => to_tag(&routing.key),
+                                    None => "none".to_string(),
+                                }),
+                                pool: runtime.map(|runtime| runtime.dispatch.pool.clone()),
+                                member_assignment: runtime.and_then(|runtime| {
+                                    runtime
+                                        .dispatch
+                                        .routing
+                                        .as_ref()
+                                        .map(|routing| to_tag(&routing.member_assignment))
+                                }),
+                            }
                         },
                     });
                 }
@@ -398,7 +498,6 @@ pub fn extract(model: &Model) -> Graph {
                 idempotency: op.requirements.idempotency.len(),
                 recoverability: op.requirements.recoverability.len(),
             },
-            concurrency: operation_concurrency_label(&op.execution.concurrency),
         });
     }
 
@@ -422,7 +521,18 @@ pub fn extract(model: &Model) -> Graph {
         .iter()
         .map(|(id, topic)| TopicNode {
             id: id.clone(),
-            ordering: topic_ordering_label(&topic.ordering),
+            ordering: model
+                .topic_runtime(id)
+                .and_then(|runtime| runtime.ordering)
+                .map(ordering_label)
+                .unwrap_or_else(|| "none".to_string()),
+            grouping: model
+                .topic_runtime(id)
+                .map(|runtime| grouping_label(runtime.grouping.as_ref()))
+                .unwrap_or_else(|| "none".to_string()),
+            // Whether these facts govern every subscription of the
+            // topic, or each declares its own.
+            topic_scoped_transport: model.topic_scoped_transport(id),
             messages: topic.messages.iter().cloned().collect(),
         })
         .collect();
@@ -440,6 +550,7 @@ pub fn extract(model: &Model) -> Graph {
         operations,
         topics,
         externals,
+        runtime: runtime_view(model),
         client: client_used.then(|| ClientNode {
             id: CLIENT_NODE_ID.to_string(),
         }),
@@ -606,21 +717,91 @@ fn to_tag<T: serde::Serialize>(value: &T) -> String {
     }
 }
 
-fn concurrency_label(value: &crate::spec::LaneConcurrency) -> String {
+fn member_concurrency_label(value: MemberConcurrency) -> String {
     match value {
-        crate::spec::LaneConcurrency::Unspecified => "unspecified".to_string(),
-        crate::spec::LaneConcurrency::Bounded(n) => format!("bounded({n})"),
-        crate::spec::LaneConcurrency::Unbounded => "unbounded".to_string(),
+        MemberConcurrency::Unspecified => "unspecified".to_string(),
+        MemberConcurrency::Bounded(n) => format!("bounded({n})"),
+        MemberConcurrency::Unbounded => "unbounded".to_string(),
     }
 }
 
-fn operation_concurrency_label(value: &crate::spec::OperationConcurrency) -> String {
-    match value {
-        crate::spec::OperationConcurrency::Unspecified => "unspecified".to_string(),
-        crate::spec::OperationConcurrency::Bounded(n) => {
-            format!("bounded({n})")
+/// The runtime topology, with each pool carrying the boundaries
+/// assigned to it — the fact that two boundaries share an execution
+/// population is otherwise only implicit.
+fn runtime_view(model: &Model) -> RuntimeView {
+    let Some(runtime) = &model.runtime else {
+        return RuntimeView::default();
+    };
+
+    let mut assignments: BTreeMap<&Id, Vec<BoundaryRef>> = BTreeMap::new();
+
+    for (operation, inputs) in &runtime.subscriptions {
+        for (input, subscription) in inputs {
+            assignments
+                .entry(&subscription.dispatch.pool)
+                .or_default()
+                .push(BoundaryRef {
+                    operation: operation.clone(),
+                    input: input.clone(),
+                });
         }
-        crate::spec::OperationConcurrency::Unbounded => "unbounded".to_string(),
+    }
+
+    for router in runtime.routers.values() {
+        assignments
+            .entry(&router.pool)
+            .or_default()
+            .push(BoundaryRef {
+                operation: router.boundary.operation.clone(),
+                input: router.boundary.input.clone(),
+            });
+    }
+
+    RuntimeView {
+        execution_pools: runtime
+            .execution_pools
+            .iter()
+            .map(|(id, pool)| ExecutionPoolNode {
+                id: id.clone(),
+                member_concurrency: member_concurrency_label(pool.member_concurrency),
+                assigned: assignments.get(id).cloned().unwrap_or_default(),
+            })
+            .collect(),
+
+        routers: runtime
+            .routers
+            .iter()
+            .map(|(id, router)| RouterNode {
+                id: id.clone(),
+                operation: router.boundary.operation.clone(),
+                input: router.boundary.input.clone(),
+                pool: router.pool.clone(),
+                routing_key: router
+                    .routing
+                    .as_ref()
+                    .map(|routing| routing.key.iter().map(ToString::to_string).collect())
+                    .unwrap_or_default(),
+                member_assignment: router
+                    .routing
+                    .as_ref()
+                    .map(|routing| to_tag(&routing.member_assignment)),
+            })
+            .collect(),
+
+        storage_layouts: runtime
+            .storage_layouts
+            .iter()
+            .map(|(id, layout)| StorageLayoutNode {
+                id: id.clone(),
+                data_model: layout.object.data_model.clone(),
+                object: layout.object.object.clone(),
+                partition_key: layout
+                    .partition_key
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect(),
+            })
+            .collect(),
     }
 }
 
@@ -632,12 +813,18 @@ fn idempotency_label(value: &crate::spec::IdempotencyGuarantee) -> String {
     }
 }
 
-fn topic_ordering_label(value: &crate::spec::TopicOrdering) -> String {
+fn ordering_label(value: crate::spec::OrderingSemantics) -> String {
     match value {
-        crate::spec::TopicOrdering::Unspecified => "unspecified".to_string(),
-        crate::spec::TopicOrdering::Unordered => "unordered".to_string(),
-        crate::spec::TopicOrdering::Global => "global".to_string(),
-        crate::spec::TopicOrdering::Keyed(_) => "keyed".to_string(),
+        crate::spec::OrderingSemantics::None => "none".to_string(),
+        crate::spec::OrderingSemantics::Global => "global".to_string(),
+        crate::spec::OrderingSemantics::WithinGroup => "within_group".to_string(),
+    }
+}
+
+fn grouping_label(value: Option<&crate::spec::GroupingKey>) -> String {
+    match value {
+        Some(_) => "keyed".to_string(),
+        None => "none".to_string(),
     }
 }
 

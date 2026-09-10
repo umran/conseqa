@@ -11,12 +11,39 @@ This document defines what an Conseqa declaration means, what it does **not** me
 
 Conseqa describes a **logical architecture**, not a deployment manifest and not executable code.
 
-A declaration belongs to one of three semantic categories:
+### Two semantic layers
+
+The model is hierarchical. A declaration belongs to exactly one of two layers:
+
+| Layer | What it describes | Where it lives |
+|---|---|---|
+| **L0 — abstract application semantics** | The application machine: services, schemas, data models, topics as logical channels, state machines, operations, programs, transactions, effects, and correctness requirements. | The model root (§2–§23) |
+| **L1 — runtime topology and realization semantics** | Selected facts about how that machine is realized: transport ordering, subscription delivery and dispatch, request routing, execution-resource topology and concurrency, storage partitioning. | `Model.runtime` (§10) |
+
+The governing rule:
+
+> **L0 says what application machine exists and what properties it requires. L1 says how invocations and persistent data are arranged in a particular runtime realization of that machine.**
+
+L1 is **optional**. An L0-only model is complete, structurally valid, and analyzable; it simply has fewer facts from which its obligations can be discharged. Removing L1 from a valid model never makes it invalid — it only makes proofs that consumed runtime facts unavailable.
+
+The analyzer reasons across both layers: an L0 obligation may well be discharged from L1 facts. Every proof therefore records its **scope** (§25.1): `l0_only` when no L1 fact was required, `runtime_dependent` when at least one was. A runtime-dependent proof holds of the declared realization and must be re-examined whenever that realization changes.
+
+### A layer is not a correctness layer
+
+Semantic layer and semantic category are independent. A declaration does not move to L1 merely because infrastructure implements it.
+
+`isolation: serializable` is L0: Conseqa treats serializable transaction execution as an abstract primitive of the application machine and need not expose MVCC, SSI, or database lock managers. The same holds for explicit locks, transaction `deduplicated_by`, `RequestEffect.retry`, effect idempotency, message identity, request identity, and unique claims. Their implementation mechanisms lie below Conseqa's semantic floor.
+
+Conversely, topic transport ordering and execution-member concurrency are L1 despite being invisible to a caller. **Correctness relevance does not determine semantic layer.**
+
+### Semantic category
+
+Independently of layer, a declaration belongs to one of three semantic categories:
 
 | Category | Meaning | Examples |
 |---|---|---|
-| **Structural fact** | Describes what the modeled program can do or how entities relate. | operations, programs, effects, transactions, transaction outputs, result contracts, schemas |
-| **Implementation guarantee / assumption** | A fact the model claims the implementation or external system provides. The verifier may rely on it, subject to implementation conformance. | topic ordering, delivery semantics, dispatch routing, transaction isolation, locks, effect idempotency, concurrency bounds, request/message identity |
+| **Structural fact** | Describes what the modeled program can do or how entities relate. | operations, programs, effects, transactions, transaction outputs, result contracts, schemas, execution-pool identity |
+| **Implementation guarantee / assumption** | A fact the model claims the implementation or external system provides. The verifier may rely on it, subject to implementation conformance. | topic transport ordering, delivery semantics, member assignment, member concurrency, transaction isolation, locks, effect idempotency, request/message identity |
 | **Requirement / obligation** | A property the architecture says must hold. It is **not** a guarantee merely because it is declared. The verifier must prove it from facts and structure. | operation serialization, operation ordering, operation idempotency, result replay consistency, recoverability |
 
 A structurally valid model is therefore not necessarily a safe model. Validation establishes that declarations are coherent and references are meaningful. Verification establishes whether the declared requirements follow from the declared facts and architecture.
@@ -72,7 +99,9 @@ Where two readings of a shorthand could collide — a schema named for a scalar,
 
 ### `Model`
 
-`Model` is the root semantic object. It contains:
+`Model` is the root semantic object, in two layers:
+
+**L0 — the abstract application machine**, directly on the root, so a model that describes only application behaviour stays concise:
 
 - services,
 - schemas,
@@ -81,6 +110,8 @@ Where two readings of a shorthand could collide — a schema named for a scalar,
 - state machines,
 - operations,
 - and a revision.
+
+**L1 — one runtime realization of that machine**, under `runtime` (§10). Optional: `runtime` may be absent entirely, and each of its collections may be omitted independently.
 
 The collections describe one architecture snapshot.
 
@@ -294,7 +325,7 @@ Nothing else is weakened by the removal:
 
 - transaction isolation, explicit locks, lock ordering, object identity, selector overlap, transaction conflicts, operation serialization, and operation ordering keep their declared meanings;
 - `serializable` continues to mean transaction serializability under §17 and must **not** be reinterpreted as linearizability;
-- no V1 verifier emits a verdict on object linearizability, and none infers it — from serializable isolation, locks, operation serialization, or topic ordering. Those facts retain only their own semantics.
+- no V1 verifier emits a verdict on object linearizability, and none infers it — from serializable isolation, locks, operation serialization, or transport ordering. Those facts retain only their own semantics.
 
 The scope rule for this iteration is:
 
@@ -304,54 +335,17 @@ Object-history requirements are to be reconsidered, as a coherent family rather 
 
 ---
 
-## 6. Topics and ordering
+## 6. Topics as logical channels
+
+A topic is an L0 declaration: it defines a logical message channel — which messages it may carry, and what identifies one of them.
+
+It carries **no grouping or ordering fact**. How a transport groups a topic's messages, and what precedence it establishes among them, are properties of the realization rather than of the logical channel: the same channel may be realized grouped or not, ordered or not, and two subscribers of it may even differ. Those facts live in L1 (§10.2), at one of two scopes.
 
 ### `Topic.messages`
 
 `messages` is the set of schemas that may be published to the topic.
 
 Membership means the topic is allowed to carry that schema. It does not assert that such a message is ever published.
-
-### `Topic.ordering`
-
-Ordering is a **guarantee provided by the topic abstraction**.
-
-#### `unspecified`
-
-No usable ordering fact is declared.
-
-#### `unordered`
-
-No message-order guarantee is provided.
-
-The verifier may not rely on observed publication or delivery order.
-
-#### `global`
-
-All messages accepted by the topic participate in one logical ordered sequence.
-
-This is an ordering guarantee at the topic boundary. It does not by itself serialize consumer execution.
-
-#### `keyed`
-
-Messages sharing the same logical key participate in one ordered sequence for that key.
-
-Messages with different keys need not be ordered relative to one another.
-
-### `TopicKey.mapping`
-
-For every message schema carried by a keyed topic, the mapping identifies the field that represents the topic's logical key.
-
-Different schemas may map differently named fields into the same logical key domain.
-
-For example:
-
-- `OrderCreated.order_id`
-- `OrderCancelled.id`
-
-may both represent the same logical `order` key domain if the topic mapping says so.
-
-The mapping establishes key-domain equivalence; it does not itself establish causal precedence between independently produced messages.
 
 ### `Topic.message_identity`
 
@@ -371,19 +365,19 @@ The guarantee is one statement over the mapped population:
 
 Three consequences are deliberate:
 
-1. Two publications sharing an identity are attempts at publishing one logical message. The declaration says nothing about how often that message is delivered; delivery semantics remain those of §8.2 — which already speak of "the same logical message" being redelivered, and here gain their payload-level anchor.
+1. Two publications sharing an identity are attempts at publishing one logical message. The declaration says nothing about how often that message is delivered; delivery is a realization fact (§10.3) — which already speaks of "the same logical message" being redelivered, and here gains its payload-level anchor.
 2. Because equal identity implies same schema, cross-schema identity collisions are excluded. An architect must not place two schemas in one identity domain if distinct logical messages of those schemas can share the identity value.
-3. The mapping may cover a subset of the carried schemas. This is a deliberate asymmetry with the ordering key: keyed ordering must route every carried message, while identity is meaningful knowledge per schema.
+3. The mapping may cover a subset of the carried schemas. This is a deliberate asymmetry with the transport's grouping key (§10.2), which must place every carried message in some group, while identity is meaningful knowledge per schema.
 
-The message identity is not the ordering key, and it is not object identity. On an order-events topic, `order_id` correctly orders the messages of one order and identifies the *order*; it does not identify the *message*, because `OrderCreated` and `OrderPaid` for one order share it while being different logical messages. The message identity of such a topic is an `event_id`.
+The message identity is not the transport's grouping key, and it is not object identity. On an order-events topic, `order_id` correctly orders the messages of one order and identifies the *order*; it does not identify the *message*, because `OrderCreated` and `OrderPaid` for one order share it while being different logical messages. The message identity of such a topic is an `event_id`.
 
 Where the publishing operations are modeled, a declared message identity is a checkable claim: a publisher whose publication payload is replay-deterministic under a key propagated into the identity fields (§12, §13) conforms to it. V1 does not perform that check; the declaration is relied on exactly as external-effect idempotency is, subject to §1.3.
 
 Declaring an identity is subject to the §26 authoring rule: declare it only if you are willing for a correctness proof to rely on "same identity value implies same payload". A producer that stamps a fresh timestamp into each publication attempt does not provide the guarantee.
 
-### Topic order is not execution serialization
+### Transport order is not execution serialization
 
-A topic ordering guarantee describes the order in which messages are logically observed by the subscription abstraction.
+A transport ordering guarantee (§10.2) describes the order in which messages are logically observed by the subscription abstraction.
 
 It does **not** imply:
 
@@ -392,11 +386,11 @@ It does **not** imply:
 - that effects produced by the consumer cannot overtake one another,
 - or that independent producers had a meaningful business-level happens-before relationship.
 
-To carry topic ordering through operation execution, dispatch and concurrency facts must also support it.
+To carry transport ordering through operation execution, routing and member-concurrency facts must also support it (§10.6).
 
 ### Ordered transport does not invent business order
 
-If two independent upstream producers concurrently publish messages for the same logical key, a keyed topic may impose a transport sequence between them. That sequence is a real transport order, but it does not prove that either message was semantically required to precede the other.
+If two independent upstream producers concurrently publish messages for the same logical key, a keyed transport may impose a sequence between them. That sequence is a real transport order, but it does not prove that either message was semantically required to precede the other.
 
 The verifier must distinguish:
 
@@ -413,7 +407,9 @@ This distinction is central to ambiguous-ordering analysis.
 
 An operation is a logical unit of application behavior owned by one service.
 
-Its declaration contains possible invocation sources, one explicit causal program, requirements, and execution facts. Execution-local transactions, direct effects, transaction outputs, and effect intents are declared **at the program or transaction site that executes or establishes them**. They are not predeclared as operation-level capabilities or handles: the governing rule is that a semantic object existing because control reaches a particular execution site is declared at that site, and a separate shared declaration is kept only where the contract exists independently of any one execution occurrence — inputs, schemas, data models, topics, state machines and their transition side-effect contracts, requirements, and execution guarantees.
+Its declaration contains possible invocation sources, one explicit causal program, and requirements. Execution-local transactions, direct effects, transaction outputs, and effect intents are declared **at the program or transaction site that executes or establishes them**. They are not predeclared as operation-level capabilities or handles: the governing rule is that a semantic object existing because control reaches a particular execution site is declared at that site, and a separate shared declaration is kept only where the contract exists independently of any one execution occurrence — inputs, schemas, data models, topics, state machines and their transition side-effect contracts, and requirements.
+
+An operation declares **no execution-concurrency fact**. Runtime concurrency is a property of the execution resource an invocation is assigned to, not of the logical unit of behaviour, and is declared exclusively by `ExecutionPool.member_concurrency` (§10.5). There is deliberately no global execution gate hidden inside `Operation`: if serialization follows from runtime execution topology, the model should expose the routing and pool facts that realize it; if it follows from L0 locks or transactions, those proof routes remain available.
 
 `description` is documentation only and has no proof semantics.
 
@@ -512,15 +508,16 @@ For a request contract, the disposition describes whether an error returned by t
 
 ## 8.2 Subscription input
 
-A subscription declares invocation from a topic.
+A subscription declares invocation from a topic. That is its whole L0 content:
 
-Its semantics are the combination of:
+- the topic, and
+- the selected message schemas.
 
-- topic,
-- selected message schemas,
-- delivery semantics,
-- dispatch routing,
-- lane concurrency.
+It means:
+
+> A logical message admitted through this subscription may invoke this operation.
+
+How often the transport delivers such a message, and where those deliveries execute, are realization facts. They are declared by a **subscription runtime** (§10.3) against the `(operation, input)` pair this input already establishes — no new L0 primitive is needed to name the boundary.
 
 ### `MessageSelector::all`
 
@@ -531,88 +528,6 @@ Every schema carried by the topic may invoke this operation through this subscri
 Only the listed topic message schemas may invoke through this subscription.
 
 It does not restrict what other schemas the topic itself may carry.
-
-### Delivery semantics
-
-#### `unspecified`
-
-Duplicate/loss behavior is unknown.
-
-#### `at_most_once`
-
-The same logical message is delivered no more than once.
-
-Loss may still occur.
-
-This is not an exactly-once guarantee.
-
-#### `at_least_once`
-
-A successfully published logical message may be delivered more than once.
-
-Therefore duplicate operation invocation must be considered possible.
-
-The current declaration is primarily a duplicate-delivery fact. It does not encode retry timing, retry count, backoff, or a bounded eventual-delivery liveness guarantee.
-
-### Dispatch routing
-
-Dispatch routing says how deliveries are assigned to logical execution lanes.
-
-#### `unspecified`
-
-No lane-affinity fact is available.
-
-#### `unconstrained`
-
-No useful affinity between related deliveries and lanes is guaranteed.
-
-#### `single_lane`
-
-Every delivery for this subscription enters one logical lane.
-
-This creates affinity, but does not alone imply serial execution; lane concurrency still matters.
-
-#### `by_topic_key`
-
-Deliveries sharing the topic's logical ordering key enter the same logical lane.
-
-This preserves same-key affinity. It is meaningful only in conjunction with a topic ordering/key model that establishes the relevant key domain.
-
-It does not itself imply that the lane processes one invocation at a time.
-
-### Lane concurrency
-
-A logical lane dispatches its deliveries in the order they entered it, and it does not advance past an incomplete delivery: a delivery leaves the lane only when its invocation has completed, and a failed attempt is re-dispatched at the head of the lane before any later delivery. Affinity therefore preserves the topic's delivery order within a lane, through redelivery included; whether dispatched invocations may overlap is the lane's concurrency. A transport whose lane skips a failed delivery and redelivers it later does not conform to this declaration.
-
-#### `bounded(n)`
-
-At most `n` operation invocations from the same logical lane may be simultaneously active.
-
-`bounded(1)` is the important serialization case: invocations in one lane cannot overlap.
-
-#### `unbounded`
-
-No finite per-lane concurrency bound is declared.
-
-#### `unspecified`
-
-No per-lane concurrency fact is available.
-
-### Topic order + routing + lane concurrency
-
-A common proof pattern for same-key ordered serial execution is:
-
-`keyed topic order`
-→ `by_topic_key dispatch`
-→ `lane concurrency = 1`
-
-Each declaration contributes a different fact:
-
-- the topic establishes an observed same-key sequence,
-- routing keeps that key on one lane,
-- concurrency one prevents overlap on that lane.
-
-None of the three should be silently substituted for another.
 
 ---
 
@@ -632,7 +547,22 @@ Different keys may execute concurrently unless constrained elsewhere.
 
 Serialization establishes mutual exclusion/non-overlap. It does **not** establish which same-key invocation should come first.
 
-Thus a lock, single-lane execution, or another mechanism may prove serialization without proving ordering.
+Thus a keyed routing domain on a serial pool member, a lock, or another mechanism may prove serialization without proving ordering.
+
+The requirement is L0: it constrains the application machine. What discharges it is usually L1, and always in one shape:
+
+```
+semantic key equivalence
+    -> routing-domain equivalence
+    -> member ownership
+    -> member concurrency
+```
+
+V1 accepts three routes. **Vacuous population**: the key's subscription input admits no message schemas, so the constrained population is empty by declaration — the only `l0_only` route. **Request-routed**: a `Router` serves the key's request boundary, every component of its semantic routing key carries the same logical value as the requirement key (§4), its `MemberAssignment` gives that domain one active owning member including through handoff, and the target pool declares `member_concurrency = bounded(1)`. **Subscription-routed**: the same argument on the delivery side, with `key: grouping_key` naming the effective grouping domain (§10.2) and the requirement key established to carry the grouping key for every admitted schema.
+
+**No ordering fact participates in any of them.** Serialization is about non-overlap; a grouping domain is the whole of what a transport has to supply for it. That is the main reason grouping is declared independently of ordering — an unordered transport that still groups by key serializes, and the model can say so without claiming an order it does not provide.
+
+Four things are deliberately not credited. A **shared pool** is a shared execution population, not a shared routing domain: two boundaries assigned to one pool, even under equal-looking keys, borrow nothing from each other. **Routing absence** yields the target population and no member-affinity fact at all. A **routing key wider than the requirement key** partitions same-key invocations across domains, so equality of the requirement key implies nothing. And `bounded(n)` with `n > 1` permits overlap wherever it appears.
 
 ### `OrderingRequirement`
 
@@ -651,7 +581,17 @@ Arbitrarily serializing concurrent inputs can satisfy a serialization requiremen
 
 Where preserving the required order entails preventing later invocations from overtaking earlier ones, the proof must also establish the necessary execution serialization.
 
-V1 recognizes one precedence source: the order the key's subscription topic declares (§6) — a keyed topic's per-key order, when the ordering key is established to carry the topic key for every admitted schema (the key identity of §4), or a global topic's order for any key. A request input has no precedence source, and a key not sourced from an input selects no population; both are unproven. The mechanism is the §8.2 composition: same-key deliveries enter one lane (`by_topic_key` on a keyed topic, or `single_lane`), a lane dispatches in delivery order and re-dispatches a failed delivery at its head, and lane concurrency `bounded(1)` stops overtaking. Redelivery therefore cannot invert the precedence: a failure-driven redelivery precedes every later message of its lane, and a duplicate of an already completed message is a repeated attempt at a logical invocation that took effect in order — what that attempt does is the idempotency requirement's obligation, not ordering's, and the proof records which requirement answers for it or that none does. Vacuously discharged: a subscription admitting no message schemas.
+V1 recognizes one precedence source: the effective transport ordering (§10.2–§10.3) — `within_group`, or `global`. A request input has no precedence source at all, and a key not sourced from an input selects no population; both are unproven.
+
+That request inputs have none is worth stating plainly: a router keyed exactly like the requirement, on a pool whose members are serial, does establish serialization — and still no ordering, because arrival order of unmodeled callers is not a logical precedence. There is nothing for the mechanism to preserve. A separate precedence source would be required.
+
+The mechanism is the §10 composition, and it is the serialization argument plus a precedence: the requirement key is established to be the effective grouping key for every admitted schema, `key: grouping_key` routes by that same domain, `MemberAssignment` gives it one active owning member, and `member_concurrency = bounded(1)` stops a later invocation overtaking an earlier one.
+
+Every leg is interrogated, not merely cited. The routing key is matched exhaustively, the member assignment is checked to give a domain one active owning member, and the pool's concurrency is checked to be `bounded(1)` — so a future routing key or assignment with weaker guarantees cannot be carried into a proof as though it were the one this rule was written for. Where a boundary is routed two ways, or a topic and its subscription both declare transport semantics, there is no single set of facts to reason from and the verifier refuses rather than reading whichever half it finds first.
+
+Both precedence sources require that same grouping identity, and for the same reason: a precedence only reaches execution if same-key deliveries stay together. `within_group` needs it because its guarantee is *about* the group. `global` needs it because an order over everything is still lost the moment two same-key deliveries land on different members. So the grouping evidence is established once and cited by either — serialization proves on the grouping alone, and ordering is that argument with a precedence added.
+
+This is why an ordering proof is strictly stronger than a serialization one over the same key, and why dispatch alone can never supply it: dispatch preserves precedence, it does not create any (§10.3.1). Dispatch additionally carries the order-preservation obligation of §10.3, so redelivery cannot invert the precedence: a failure-driven redelivery cannot be overtaken by a later message of its domain, and a duplicate of an already completed message is a repeated attempt at a logical invocation that took effect in order — what that attempt does is the idempotency requirement's obligation, not ordering's, and the proof records which requirement answers for it or that none does. Vacuously discharged: a subscription admitting no message schemas.
 
 ### Serialization versus ordering
 
@@ -660,7 +600,7 @@ These terms are deliberately separate:
 - **serialization**: same-key invocations do not overlap;
 - **ordering**: the correct same-key precedence is preserved.
 
-A FIFO mutex may provide both if its acquisition order is proven to correspond to the required input order. A non-FIFO mutex may provide serialization without providing the required ordering.
+A FIFO mutex may provide both if its acquisition order is proven to correspond to the required input order. A non-FIFO mutex may provide serialization without providing the required ordering. Likewise a routing domain on a serial pool member provides serialization; it provides ordering only when a transport precedence exists for the mechanism to preserve.
 
 ### `IdempotencyRequirement`
 
@@ -771,14 +711,14 @@ In addition to resumability, the architecture must guarantee that the logical in
 
 This is a liveness obligation and additionally requires a modeled retry driver, such as:
 
-- `delivery: at_least_once` on the triggering subscription, or
-- an inbound `RequestEffect` whose `retry` is `may_repeat`.
+- `delivery: at_least_once` on the triggering subscription's runtime (§10.3) — an L1 fact, so a proof taking this route is `runtime_dependent`; or
+- an inbound `RequestEffect` whose `retry` is `may_repeat` — an L0 guarantee, so that route stays `l0_only`.
 
 An inbound repeatable request may be declared among a modeled caller's effects or as a state-machine transition side effect, which is a `RequestEffect` under §22. Both driver facts re-drive the *same logical invocation*: a redelivery is another delivery of one logical message, and `may_repeat` repeats one logical request, so the re-driven attempt carries the same payload and hence the same key.
 
 Two cautions apply.
 
-First, the driver facts in the current DSL are duplicate-delivery facts, not bounded-liveness facts. §8.2 states that `at_least_once` "does not encode retry timing, retry count, backoff, or a bounded eventual-delivery liveness guarantee." A `guaranteed` proof is therefore conditional on the delivery abstraction genuinely redelivering until the invocation succeeds, in the sense of §1.3.
+First, the driver facts in the current DSL are duplicate-delivery facts, not bounded-liveness facts. §10.3 states that `at_least_once` "encodes no retry timing, retry count, backoff, or bounded eventual-delivery liveness guarantee." A `guaranteed` proof is therefore conditional on the delivery abstraction genuinely redelivering until the invocation succeeds, in the sense of §1.3.
 
 Second, a request input alone supplies no driver. The caller is outside the model, so `guaranteed` on a request-only operation is normally not dischargeable unless the calling side is itself modeled as a `may_repeat` request effect.
 
@@ -795,29 +735,354 @@ Neither implies exactly-once external execution. Driving the program to a termin
 
 ---
 
-## 10. Operation execution concurrency
+## 10. L1 — runtime topology and realization semantics
 
-### `ExecutionSemantics.concurrency`
+L1 describes selected facts about how the L0 machine is realized. It hangs off `Model.runtime` and is entirely optional; absence of any L1 declaration is epistemic — no fact — never an assertion that the realization lacks the property.
 
-This is an **implementation fact**, not an operation requirement.
+```
+runtime:
+  topics:            <topic id>       -> TopicRuntime      { grouping?, ordering? }
+  subscriptions:     <operation id>   -> <input id> -> SubscriptionRuntime
+  execution_pools:   <pool id>        -> ExecutionPool
+  routers:           <router id>      -> Router
+  storage_layouts:   <layout id>      -> StorageLayout
+```
 
-#### `bounded(n)`
+Every L1 identifier lives in the one global namespace L0 identifiers do: a pool may not take a topic's id.
 
-At most `n` invocations of the logical deployed operation may be simultaneously active across the operation as a whole.
+### What makes a fact worth declaring in L1
 
-This is a global operation bound, distinct from subscription lane concurrency.
+Not "some proof consumes it". L1 has two consumers, and the analyzer is only the first.
 
-A bound greater than one does not prove same-key serialization.
+The second is the external quantitative layer (§10.9): a scenario supplies member counts, traffic rates, key-frequency distributions and service times, and evaluates the architecture for hot members, hot partitions, routing skew, shared-pool contention and queue growth. That analysis reads the same declarations the verifier does, and it reads some the verifier ignores entirely.
 
-#### `unbounded`
+So a realization fact belongs in L1 when it **changes what the realization does** and is **qualitative rather than a number**. `member_assignment: round_robin` (§10.6) is the clearest case: no correctness proof consumes it, and a simulator cannot proceed without it. The numbers stay outside — that boundary is §10.5 and §10.9, and it does not move.
 
-No finite global concurrency bound is declared.
+The corollary matters as much: correctness-inertness is not a reason to leave a fact out, and neither is proof-relevance a reason to let a *number* in.
 
-This does not mean infinitely many invocations literally execute; it means the verifier cannot rely on a finite global cap.
+An operation declares **no** execution concurrency of its own. There is no `OperationRuntime`, no execution-lane abstraction, and no lane concurrency anywhere. All runtime execution concurrency is declared in exactly one place: `ExecutionPool.member_concurrency` (§10.5).
 
-#### `unspecified`
+### 10.1 The two things routing is, and the many things it is not
 
-No global concurrency fact is available.
+Routing has exactly two semantic components, and they are independent dimensions rather than alternative modes:
+
+```
+invocation
+    |  evaluate semantic routing key
+    v
+routing domain
+    |  member assignment
+    v
+execution-pool member
+```
+
+A **routing key** is a *semantic value derived from an L0 invocation*. Its only job is to define routing-domain identity:
+
+> `routing_key(A) = routing_key(B)`  ⟹  `routing_domain(A) = routing_domain(B)`
+
+A routing key is **not** an execution-pool member id, a worker id, a process id, a physical shard id, a storage partition id, or a host id. It stays stable as the realization changes: `account_id = 42` may be owned by member 17 today and member 31 after a rebalance, and neither the key nor the identity of its routing domain changes. `MemberAssignment` — and only it — performs the mapping onto runtime topology.
+
+Consequently the model contains **no** `unspecified`, `unconstrained`, or `single_member` routing variant:
+
+- **Absence expresses epistemic absence.** A router or dispatch with no `routing` block says "invocations of this boundary execute within this pool", and nothing more. The analyzer infers no member affinity of any kind — not round-robin, not random, not one member.
+- **"All invocations map to one member" is an ordinary outcome**, not a category of routing. If a model ever needs a single domain for every invocation, that should come from an ordinary key expression capable of producing one constant domain.
+
+The governing design rule: *if a case can be represented as an ordinary value of a more fundamental semantic dimension, it is not promoted into a special routing variant.*
+
+### 10.2 Grouping and ordering
+
+Two independent transport facts, declared at exactly one of two scopes.
+
+**Grouping** describes the runtime equivalence domains a transport puts messages into:
+
+```yaml
+grouping:
+  schema.OrderCreated: [account_id]
+  schema.OrderCancelled: [account_id]
+```
+
+means
+
+> `grouping_key(A) = grouping_key(B)`  ⟹  `runtime_group(A) = runtime_group(B)`
+
+and nothing further. Not ordering, not serialization, not member assignment, not execution affinity, not uniqueness, not storage-partition identity. Each of those is its own declared fact.
+
+Its presence *is* the declaration: a transport either groups by a key or it does not, so there is no `none` to spell — omitting `grouping` says the transport establishes no domain.
+
+Different schemas may map differently named fields into one domain, so the mapping is per schema; tuple positions correspond across schemas, so every mapped tuple shares one arity, and the mapping must cover every message the topic carries — an unmapped schema would belong to no group at all.
+
+**Ordering** describes the precedence the transport establishes, independently of how it groups:
+
+```yaml
+ordering: within_group
+```
+
+| | Meaning |
+|---|---|
+| omitted | No precedence is declared at this scope, and the scope stays open. |
+| `none` | An explicit "this transport orders nothing" — a declaration, so it claims the scope like any other. |
+| `global` | One precedence relation across every message in scope. Stronger than per-group order, and it needs no grouping key of its own. |
+| `within_group` | Precedence among messages of the same declared grouping domain. Requires a grouping at the same scope, since otherwise there is no domain the guarantee could be interpreted over. |
+
+Neither implies globally ordered *execution*. A transport precedence reaches execution only if the topology preserves it (§10.6).
+
+#### Why they are separate
+
+Bundling a grouping key inside a keyed-ordering variant overconstrains the model and forces unrelated consumers to depend on an ordering declaration merely to recover a domain. A realization may provide grouping without ordering, ordering without grouping, or both, and the model must be able to say which.
+
+The serialization verifier is the sharp case: it needs only
+
+```
+same K  ->  same runtime group
+```
+
+and no transport precedence whatever. An unordered queue with consistent-hash workers is an ordinary architecture, and with the two facts separate it is stated as it is — `grouping: keyed`, `ordering: none` — instead of claiming an order the transport does not provide in order to reach the key.
+
+#### One scope, exclusively
+
+For a given topic, grouping and ordering are declared **either** once at the topic runtime **or** independently at each subscription runtime, and never at both.
+
+```
+topic-scoped                          subscription-scoped
+
+TopicRuntime:  grouping, ordering     TopicRuntime:  neither
+Subscription A: neither               Subscription A: grouping, ordering
+Subscription B: neither               Subscription B: grouping, ordering
+```
+
+Topic-scoped is the shape of a runtime that imposes one domain on the topic as a whole — a partitioned log, canonically. Every subscription of that topic observes those semantics, and none may substitute another.
+
+Subscription-scoped is the shape of a publication that fans out into independently configured queues or transport paths. Two subscribers of one logical channel may then group differently — one by `account_id`, another by `region_id` — where a topic-wide declaration would be false of both.
+
+The two are not a default and an override. They are different declaration modes, and validation rejects a model that uses both for one topic. That is why omitting `ordering` and writing `ordering: none` differ: the first declares nothing and leaves the scope open, the second is an explicit negative and claims the scope. Collapsing them would let a subscription say "I have no precedence" and silently inherit the topic's — exactly the override this model exists to prevent.
+
+A topic-scoped grouping serves every subscription of the topic, so it must place every carried message in a group. A subscription-scoped one only has to cover what its own `MessageSelector` admits: requiring more would be unsatisfiable on a heterogeneous topic where a filtered-out schema has no comparable field. There is deliberately **no inheritance, no override, and no fallback chain**, because each of those would make the effective semantics depend on implicit precedence between declarations, allow partial overrides, let grouping and ordering come from different scopes, and turn proof provenance into something a reader has to reconstruct. A model validates into one mode before analysis begins, so §10.3's resolution is a lookup and not a decision.
+
+The two fields stay flat on their owning object rather than inside a `TransportSemantics` wrapper: the wrapper would carry no independent meaning, and the scope owner already says the facts belong together.
+
+### 10.3 Effective semantics
+
+For a subscription `S` of topic `T`:
+
+```
+if T declares transport semantics:
+    EffectiveGrouping(S) = T.grouping
+    EffectiveOrdering(S) = T.ordering
+else:
+    EffectiveGrouping(S) = S.grouping
+    EffectiveOrdering(S) = S.ordering
+```
+
+Every proof records which scope it read, so a reader tracing a verdict knows which declaration to look at and which one changing would invalidate it.
+
+### 10.3.1 `SubscriptionRuntime`
+
+```
+runtime.subscriptions[<operation>][<input>]:
+  delivery: unspecified | at_most_once | at_least_once
+  grouping: ...          # subscription-scoped mode only
+  ordering: ...
+  dispatch:
+    pool: <execution pool id>
+    routing:                       # optional
+      key: grouping_key
+      member_assignment: { kind: consistent_hash }
+```
+
+The referenced input must be an L0 subscription input.
+
+#### Delivery semantics
+
+**`unspecified`** — duplicate/loss behaviour is unknown.
+
+**`at_most_once`** — the same logical message is delivered no more than once. Loss may still occur. This is not an exactly-once guarantee.
+
+**`at_least_once`** — a successfully published logical message may be delivered more than once, so duplicate operation invocation must be considered possible. This is primarily a duplicate-delivery fact; it encodes no retry timing, retry count, backoff, or bounded eventual-delivery liveness guarantee.
+
+#### `SubscriptionDispatch`
+
+Dispatch is where transport semantics become execution topology, and it is deliberately not the same thing as grouping. `pool` names the execution population deliveries are assigned to; there is no lane abstraction and no lane-concurrency field, because how much may execute there is the pool's business (§10.5).
+
+```
+message
+    |  runtime grouping / ordering semantics
+    v
+SubscriptionDispatch
+    |  member assignment
+    v
+ExecutionPool member
+```
+
+`routing` is optional. Omitted, the only available fact is that deliveries execute within the pool.
+
+#### `key: grouping_key`
+
+Routes by the effective grouping domain, whichever scope declared it. Referencing the domain rather than restating its field mapping is what gives the analyzer grouping/routing-domain identity for free and keeps the two from drifting apart; it requires a keyed grouping to be in effect.
+
+#### Dispatch preserves precedence, and never invents it
+
+Where a precedence exists, dispatch must preserve it when admitting invocations to execution — including through failure-driven redelivery and ownership reassignment. A conforming runtime must not:
+
+1. establish delivery A before B within one effective group;
+2. leave A semantically incomplete;
+3. admit B in a manner that permits B to overtake A contrary to the declared guarantee.
+
+This order-preservation responsibility is what replaces the logical-lane semantics of the previous model. It is a preservation obligation only: dispatch contributes no precedence of its own, so a routing declaration alone proves no ordering.
+
+### 10.4 `Router`
+
+```
+runtime.routers[<router>]:
+  boundary: { operation: <operation>, input: <input> }
+  pool: <execution pool id>
+  routing:                              # optional
+    key: [ <field path>, ... ]          # non-empty
+    member_assignment: { kind: consistent_hash }
+```
+
+A router describes how invocations entering through one L0 **request** input are assigned into a pool. It does not choose which operation executes — the L0 request boundary already determines that. It answers exactly one question:
+
+> Which member of the target execution pool owns the semantic routing domain of this request invocation?
+
+The key is evaluated against the request input's schema. Two invocations of one router belong to the same routing domain exactly when their evaluated key tuples are equal.
+
+One request boundary has at most one router.
+
+#### A router without routing
+
+```yaml
+routers:
+  router.health:
+    boundary: { operation: op.health, input: input.request }
+    pool: pool.web
+```
+
+means "requests through this boundary execute within `pool.web`", and provides no member-affinity fact. This is the sole representation of unspecified member routing.
+
+### 10.5 `ExecutionPool`
+
+```
+runtime.execution_pools[<pool>]:
+  member_concurrency: unspecified | unbounded | bounded{ value }
+```
+
+A pool identifies **a logical population of interchangeable runtime members capable of executing the operation invocations assigned to that pool**. It establishes two things: runtime population identity, and the qualitative execution concurrency of each member.
+
+#### Pool identity
+
+If two execution paths target the same pool, they share one logical runtime execution population — a request router and a subscription dispatch alike. This fact is meaningful even though Conseqa never declares pool cardinality.
+
+If they target different pools, they target distinct logical populations. That implies **nothing** about physical hosts, processes, deployments, availability zones, or failure domains; those remain outside L1.
+
+#### `member_concurrency`
+
+**`bounded(n)`** — at most `n` operation invocations assigned to one member of the pool may simultaneously be active. The bound applies across *all* invocations assigned to that member, irrespective of operation or ingress mechanism.
+
+**`bounded(1)`** is the important serialization case: one pool member executes at most one invocation at a time.
+
+**`unbounded`** — no finite member-level execution bound may be assumed.
+
+**`unspecified`** — no usable fact about simultaneous execution on one member.
+
+Unlike routing, member concurrency has genuine semantic value in distinguishing an unknown resource from an explicitly unconstrained one, so it keeps both negative states.
+
+#### Cardinality is external
+
+A pool carries no member count, replica count, CPU, memory, autoscaling rule, host count, or container count. An external simulation scenario may instantiate `DataWorkers.members = 16` or `= 128` against the same Conseqa architecture, along with traffic rates, key-frequency distributions, service-time distributions, capacity, queueing, and latency. Those values never become Conseqa semantics.
+
+### 10.6 `MemberAssignment`
+
+```
+member_assignment: { kind: consistent_hash }
+```
+
+A member assignment describes how a routing domain is assigned to a member of an execution pool. The name is deliberate: the semantic relation is `semantic routing domain -> runtime execution-pool member`, and assignment accommodates ownership and handoff, which "placement" does not.
+
+#### `consistent_hash`
+
+> Equal routing domains are owned by the same execution-pool member during a stable ownership epoch.
+
+Different routing domains may be assigned to the same member. Conseqa prescribes no hash function, virtual-node count, membership-discovery mechanism, or choice between Ketama and rendezvous hashing. The declaration specifies semantic assignment behaviour, not implementation mechanics.
+
+#### `round_robin`
+
+> Each invocation goes to the next member in rotation, irrespective of routing domain.
+
+No correctness proof consumes it. It earns its place anyway, for two reasons.
+
+The first is that it is a **primary input to the external analysis** L1 exists to feed (§10.9). Consistent-hash and round-robin over one pool, at one cardinality, under one workload, behave completely differently: hashing a skewed key distribution concentrates load on the members owning the hot domains, while rotation spreads load evenly and destroys locality. Hot members and routing skew are exactly what a simulator is asked to find, and it cannot find them without knowing which assignment is in force. A model that could not distinguish the two would be handing that analysis a coin flip.
+
+The second is diagnostic. Omitting the routing block says *nothing is known* about member affinity; `round_robin` says *affinity is known not to exist*. A serialization or ordering requirement over such a boundary is then refused with a reason — "rotation puts same-key invocations on different members" — rather than for want of a declaration nobody has made. An author reading the first is told to go and find out; reading the second, to change the architecture.
+
+A routing key declared alongside it still names domains, and those domains keep their own identity. This assignment simply does not respect them.
+
+This is the "explicit negative routing guarantee" the initial model deferred (§27), admitted now that there is a use for the distinction. It is emphatically *not* the `unconstrained` routing variant that model declined: routing keys still have exactly two components, and absence still means absence. What changed is that the *assignment* dimension gained a second ordinary value.
+
+#### Safe ownership transfer is normative
+
+Any member assignment used to establish keyed serialization **must preserve exclusive ownership through reassignment**. If routing domain `K` moves from member A to member B, a conforming runtime must not permit A and B to execute `K` in a manner that violates the declared one-owner semantics.
+
+Draining, leases, generation fencing, coordinated handoff, and partition-ownership protocols are conforming mechanisms. Conseqa models the resulting guarantee, not the mechanism. A rebalance that silently invalidates *one routing domain → one current owning member* while the runtime still claims conformance is a non-conforming implementation, not a modeling gap.
+
+### 10.7 `StorageLayout`
+
+```
+runtime.storage_layouts[<layout>]:
+  object: { data_model: <data model>, object: <object> }
+  partition_key: [ <field path>, ... ]     # non-empty
+```
+
+A storage layout describes physical partition identity for one L0 data object. V1 admits at most one primary layout per object.
+
+**Object identity and storage identity are distinct.** Object identity answers "which logical object instance is this?"; the layout answers "into which physical partition is that instance mapped?". The following is entirely valid, and the analyzer never substitutes one for the other:
+
+```
+DataObject identity:   message_id
+StorageLayout key:     (channel_id, bucket)
+```
+
+**A partition key is not a routing key.** They may reference the same underlying fields without becoming the same concept: a router key defines an execution-affinity domain, a partition key defines physical storage partition identity. They may also deliberately differ —
+
+```
+Router routing key:       channel_id
+StorageLayout key:        (channel_id, bucket)
+```
+
+— meaning all work for one channel shares an execution-affinity domain while the channel's data stays distributed across partitions. Conseqa never infers equivalence between routing-domain identity and storage-partition identity merely because their key expressions coincide.
+
+A layout implies nothing about database vendor, node count, replication factor, replica placement, consistency level, partition capacity, latency, or availability.
+
+### 10.8 `Service` has no execution-topology meaning
+
+A service is an L0 grouping. No inference may be made that same service implies same pool, same process, same deployment, same runtime member, or that different services imply execution isolation.
+
+Same-service operations may target different pools. Different-service operations may share one pool. Until `Service` acquires stronger normative semantics, it remains independent of runtime placement.
+
+### 10.9 The external analysis boundary
+
+L1 describes semantic topology, qualitatively. Everything countable stays outside it, supplied by a scenario evaluated *against* a Conseqa architecture:
+
+```text
+pool member counts          service-time distributions
+traffic and message rates   storage node counts
+key-frequency distributions replication factors
+capacity, queueing, latency failure probabilities
+```
+
+Given those, a simulator can evaluate hot execution members, hot storage partitions, routing skew, shared-pool contention, pool scaling, alternative routing keys, alternative partition keys, queue growth, latency, and request amplification — none of which become Conseqa semantics.
+
+The division works because the declarations are qualitative and the scenario is quantitative. One architecture:
+
+```text
+Router GetMessages:  routing key = channel_id, member_assignment = consistent_hash
+                     pool = MessageReads
+ExecutionPool MessageReads:  member_concurrency = bounded(32)
+StorageLayout Message:       partition_key = (channel_id, bucket)
+```
+
+can be run against `MessageReads.members = 16` or `= 128`, against a uniform `channel_id` or a Zipf one, without a word of it changing. And when the scenario moves `channel_id` domain X from member 17 to member 31, the routing domain keeps its identity — that is §10.1's point, and it is what lets the same declarations serve both consumers.
+
+This is also why L1 carries facts no proof reads. A member assignment is inert to the verifier and decisive to the simulator: under a skewed key distribution, consistent-hash concentrates load on the members owning the hot domains while round-robin spreads it and gives up locality. Same pool, same cardinality, different answer.
 
 ---
 
@@ -2047,10 +2312,17 @@ The solver must preserve these distinctions:
 | **Requirement vs guarantee** | A declared requirement still needs proof. |
 | **Validation vs verification** | A coherent model can still describe an unsafe architecture. |
 | **Unspecified vs negative guarantee** | Unknown is not the same as explicitly unordered/unbounded/non-deduplicated. |
-| **Topic ordering vs execution ordering** | Ordered delivery can still lead to concurrent/overtaking execution. |
+| **Semantic layer vs semantic category** | L0 versus L1 says which layer a fact belongs to; structural/guarantee/requirement says what kind of claim it makes. Correctness relevance decides neither. |
+| **Transport ordering vs execution ordering** | Ordered delivery can still lead to concurrent/overtaking execution. |
 | **Ordering vs serialization** | Serialization prevents overlap; ordering preserves the correct precedence. |
 | **Transport order vs semantic order** | A broker can serialize concurrent producers without establishing a business-level happens-before relation. |
-| **Operation concurrency vs lane concurrency** | One is global to the deployed operation; the other is per dispatch lane. |
+| **Routing domain vs pool member** | A routing key names a semantic domain; `MemberAssignment` maps it onto a member. The domain keeps its identity across rebalances. |
+| **Routing domain vs storage partition** | Equal key expressions do not make execution affinity and physical partitioning the same concept. |
+| **Shared pool vs shared routing domain** | One execution population is not one ownership domain; two boundaries in one pool borrow no affinity from each other. |
+| **Routing absence vs unconstrained routing** | No routing block is no fact — not a declaration that routing is arbitrary. |
+| **Grouping vs ordering** | A transport may group without ordering, order without grouping, or both. Serialization needs only the first. |
+| **Grouping vs dispatch** | Grouping is a transport equivalence domain; dispatch maps it onto execution topology. Dispatch preserves precedence and never creates it. |
+| **Topic scope vs subscription scope** | Exclusive declaration modes, not a default and an override. Neither inherits from the other. |
 | **Serializability vs linearizability** | Serializable histories need not respect real-time precedence. The DSL currently declares no object-history requirement (§5); the distinction is kept so that `serializable` is never promoted into one. |
 | **Atomic transaction vs external side effect** | Local atomic commit does not imply an external publication/request is atomic with it. |
 | **Idempotency lineage vs deduplication** | Propagating a key lets the analyzer trace identity; only a guarantee/mechanism actually deduplicates. |
@@ -2090,6 +2362,37 @@ It should **not** be read as:
 
 Conseqa proves selected application-level properties over a declared abstraction. Its strength comes from making the abstraction explicit and forcing correctness arguments to state which facts they depend on.
 
+### 25.1 Proof scope
+
+Every successful proof records the semantic layers its argument consumed:
+
+| Scope | Meaning |
+|---|---|
+| `l0_only` | No explicit L1 fact was required. |
+| `runtime_dependent` | At least one L1 fact was necessary. |
+
+The scope records a **dependency**, nothing more. A `runtime_dependent` proof is not weaker in kind; it is conditional on the runtime realization the model declares, and must be re-examined when that realization changes — which is exactly what makes the record useful. Changing a pool's member concurrency, or dropping a router's routing block, invalidates the proofs that cited them, and the scope is how a reader finds them.
+
+`l0_only` does **not** mean implementation-free. A proof resting on `isolation: serializable` is L0-only, and still assumes the concrete database implements serializable execution. Scope identifies dependency on semantic layers, not the absence of conformance assumptions.
+
+Alongside the scope, a proof carries the declarations it consumed, so a report can say precisely why a verdict holds:
+
+```
+Requirement:  SerializedBy(account_id)
+Verdict:      Proven
+Scope:        runtime_dependent
+Evidence:
+    Router update_account_router
+        semantic routing key = account_id
+        member_assignment    = consistent_hash
+    ExecutionPool account_workers
+        member_concurrency   = bounded(1)
+```
+
+### 25.2 Removing L1
+
+Deleting the runtime model from a valid model leaves it valid. Requirements discharged from runtime facts become **unproven** — never violated, and never a structural error. That asymmetry is the point of the layering: L0 stands alone, and L1 is what a particular realization adds.
+
 ---
 
 ## 26. Authoring rule of thumb
@@ -2105,6 +2408,16 @@ When declaring a requirement, ask:
 > What observable property would make the architecture wrong if it failed?
 
 Keep that requirement separate from the mechanism expected to satisfy it. The solver's job is to connect the two.
+
+When deciding which layer a declaration belongs to, ask:
+
+> Is this a property of the application machine, or of one particular way of running it?
+
+Serializable isolation, explicit locks, message identity, and `retry: may_repeat` describe the machine, however much infrastructure implements them — they are L0. Transport ordering, delivery, routing, execution pools, and storage partitioning describe one realization — they are L1. Do not move a declaration to L1 because it feels operational, or keep it in L0 because a proof depends on it. Correctness relevance decides neither.
+
+When declaring transport semantics, ask which of the two facts you actually have. Grouping and ordering are separate on purpose: a transport that groups by a key without ordering within it is an ordinary thing, and saying so earns a serialization proof without claiming an order that does not exist. Declaring `within_group` to reach a grouping key would be exactly the false statement §26 warns against.
+
+When declaring runtime topology, declare only what the architecture genuinely provides. Inventing a pool or a member assignment to make a proof pass is the same error as declaring a guarantee the implementation does not offer — and here the temptation is sharper, because `member_concurrency = bounded(1)` discharges obligations so readily. If the architecture does not constrain execution that way, leave the requirement unproven.
 
 ---
 
@@ -2144,7 +2457,7 @@ What the DSL deliberately does not yet decide. Every entry is scoped so that res
    1. *Collect* every explicit lock step of every transaction in every operation — object, selector, mode, declared order, program position — and, once question 8 settles it, the implicit locks its isolation level implies.
    2. *Abstract* each lock to a class: the object and the shape of its selector (full identity, partial identity, `all`), with selector values carried as canonical paths, so that two classes are *disjoint* only when provably so (distinct literals, or identities pinned to different canonical values) and otherwise *may overlap*. Two classes *conflict* when they may overlap and are not both `shared`.
    3. *Order* the classes: within a transaction, program order between steps and the `by` order within a step give a per-transaction acquisition order over conflicting classes; a multi-instance step with `order: unspecified` contributes no order among its own instances.
-   4. *Admit* concurrency: two transactions can overlap unless a declared fact says otherwise — `bounded(1)` on an operation, a proven serialization requirement for same-key invocations, lane concurrency. The serialization verdicts already compute most of this.
+   4. *Admit* concurrency: two transactions can overlap unless a declared fact says otherwise — a proven serialization requirement for same-key invocations, or `member_concurrency = bounded(1)` on a pool both boundaries are assigned to. The serialization verdicts already compute most of this.
    5. *Decide.* The union of the admitted transactions' acquisition orders over conflicting classes is acyclic: **proven**, citing the global order it found. A cycle whose every edge is a declared fact, whose transactions are admitted concurrently, and whose classes may overlap: **disproven**, with a counterexample trace — "T1 holds A, requests B; T2 holds B, requests A" — the checker's first disproven verdict, consistent with §1.2 because it is built from declarations, not from their absence. Anything else — an `unspecified` order on a multi-instance class, an unspecified concurrency bound, overlap that cannot be decided — is **unknown**, with the lock steps it hinges on as evidence.
 
    To settle alongside: whether deadlock freedom is declared (a data-model requirement, keeping the rule that requirements are obligations) or standing; a `data_model` subject kind for the report; the rendering of a disproven obligation with its trace; and the wait-policy assumption of question 8. Until question 8 lands, the analysis is implementable but would return unknown for nearly every real model, the transfer pattern included — which is still the honest answer.
@@ -2159,4 +2472,7 @@ What the DSL deliberately does not yet decide. Every entry is scoped so that res
 - **Object-history requirements.** No object-level history requirement (such as linearizability) exists; §5 states the scope rule and what its absence does not weaken. To be reconsidered as a coherent family when Conseqa models distributed persistence and availability.
 - **Process completion.** Recoverability's `guaranteed` obliges one operation to reach its terminal. That a multi-operation process — a saga across the trigger graph — reaches its end state is a distinct liveness property with no declaration; it needs new surface (the trigger graph is its natural consumer), not a stronger reading of `guaranteed`.
 - **Retry execution.** `ErrorDisposition::retryable` states that another attempt is semantically admitted (§8.1); nothing models the mechanism that performs one — no retry policy, loop, attempt count, backoff, or timeout. A retry-execution revision may consume the disposition.
-- **Performance overlay.** The correctness vocabulary deliberately exposes distinctions a future probabilistic layer could consume — terminal versus retryable outcomes, attempt populations, concurrency bounds — but no performance semantics exist in the model.
+- **Performance overlay.** The correctness vocabulary deliberately exposes distinctions a future probabilistic layer could consume — terminal versus retryable outcomes, attempt populations, member concurrency, member assignment, routing and partition keys — but no performance semantics exist in the model. L1 is qualitative by design: pool cardinality, traffic rates, key-frequency distributions, service-time distributions, storage-node counts, replication factors, capacity, queueing, and latency belong to an external simulation scenario evaluated *against* a Conseqa architecture, never inside it.
+- **Explicit negative routing** — *partly resolved.* There is still no `unconstrained` routing variant: absence of a routing block expresses that no member-affinity fact exists, and routing keeps exactly two components. The distinction between *unknown* and *known arbitrary* member behaviour is now carried where it belongs, on the assignment: `member_assignment: round_robin` (§10.6), admitted for the external analysis that needs it rather than for any proof. Still open is whether a routing *key* ever needs a comparable negative.
+- **Global execution gates.** Removing operation-level concurrency leaves no way to say "no two invocations of X overlap globally", independent of topology. If a genuine architectural need appears, it should be an explicit primitive — never hidden inside `Operation`, where it was detached from the execution topology that realizes it.
+- **Beyond the pool.** L1's execution abstraction stops at a population of interchangeable members. Physical database nodes, replica topology, consensus protocols, database lock-manager internals, hosts, containers, process ids, CPU, memory, availability zones, network links, queue capacities, and autoscaling policies are all outside it.

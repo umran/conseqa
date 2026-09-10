@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::analyzer::report::{Property, Subject};
-use crate::spec::{Id, Revision};
+use crate::spec::{Id, Input, Revision};
 
 use super::analysis::{AnalysisHub, AnalysisPin, AnalysisState};
 use super::auth::{TaskToken, TokenMap};
@@ -36,7 +36,8 @@ use super::snapshot::{Head, WorkspaceSnapshot};
 use super::summary::OperationSummary;
 use super::symbol::{SymbolKey, SymbolKind, SymbolOwner, SymbolVersion};
 use super::task::{
-    DependencyRequest, DependencyRequestId, PromptEvidence, TaskBudget, TaskCompletionGate,
+    DependencyRequest, DependencyRequestId, DependencyResolution, PromptEvidence, TaskBudget,
+    TaskCompletionGate,
     TaskId, TaskKind, TaskSpec, TaskState, WriteScope,
 };
 use super::workspace::{EvidenceRef, WorkspaceState};
@@ -514,7 +515,6 @@ impl ConfluenceEngine {
                 SymbolKey::OperationInterface(operation.clone()),
                 SymbolKey::OperationProgram(operation.clone()),
                 SymbolKey::OperationRequirements(operation.clone()),
-                SymbolKey::OperationExecution(operation.clone()),
             ],
         };
 
@@ -708,16 +708,28 @@ impl ConfluenceEngine {
     }
 
     /// Records conservative observations of an operation's summary
-    /// inputs: interface, program, requirements, and execution (§41).
+    /// inputs: interface, program, requirements, and the L1 topology
+    /// its verdicts rest on (§41).
+    ///
+    /// The runtime symbols are not optional extras. A summary carries
+    /// each input's delivery — which now lives in `SubscriptionRuntime`
+    /// rather than the interface — and proof verdicts that this model
+    /// marks `RuntimeDependent`, discharged from grouping, ordering and
+    /// member concurrency. A reader that observed only the three
+    /// operation symbols would survive a topology change that
+    /// invalidated the very proof it relied on.
     fn record_operation_inputs(&self, entry: &Arc<TaskEntry>, operation: &Id) {
         let mut read_set = entry.read_set.lock();
 
-        for key in [
+        let inputs = [
             SymbolKey::OperationInterface(operation.clone()),
             SymbolKey::OperationProgram(operation.clone()),
             SymbolKey::OperationRequirements(operation.clone()),
-            SymbolKey::OperationExecution(operation.clone()),
-        ] {
+        ]
+        .into_iter()
+        .chain(runtime_inputs_of(&entry.snapshot.workspace, operation));
+
+        for key in inputs {
             if let Some(node) = entry.snapshot.graph.node(&key) {
                 read_set.record_symbol(
                     key,
@@ -816,6 +828,7 @@ impl ConfluenceEngine {
             requested_change,
             reason,
             evidence,
+            resolution: None,
         };
 
         self.inner.persistence.record_dependency_request(&request)?;
@@ -827,6 +840,57 @@ impl ConfluenceEngine {
             });
 
         Ok(request.id)
+    }
+
+    /// Every dependency request still awaiting an outcome.
+    ///
+    /// These are the run's open cross-scope asks: each one is a worker
+    /// blocked on a symbol it may not write. A run with any of these
+    /// outstanding has not converged (§75).
+    pub fn open_dependency_requests(&self) -> Vec<DependencyRequest> {
+        self.inner
+            .persistence
+            .load_dependency_requests()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|request| request.resolution.is_none())
+            .collect()
+    }
+
+    /// Settles a dependency request. Idempotent: settling an already
+    /// settled request leaves the first outcome in place, so a repeated
+    /// dispatch cannot rewrite history.
+    pub fn resolve_dependency_request(
+        &self,
+        id: DependencyRequestId,
+        resolution: DependencyResolution,
+    ) -> Result<(), EngineError> {
+        let Some(mut request) = self
+            .inner
+            .persistence
+            .load_dependency_requests()?
+            .into_iter()
+            .find(|request| request.id == id)
+        else {
+            return Ok(());
+        };
+
+        if request.resolution.is_some() {
+            return Ok(());
+        }
+
+        request.resolution = Some(resolution);
+
+        self.inner.persistence.record_dependency_request(&request)?;
+
+        Ok(())
+    }
+
+    /// The current version of a symbol at head, or `None` when the
+    /// symbol does not exist. Used to observe whether a dependency
+    /// repair actually changed what it was asked to.
+    pub fn symbol_version(&self, key: &SymbolKey) -> Option<SymbolVersion> {
+        self.head_snapshot().graph.node(key).map(|node| node.version)
     }
 
     /// Cancels a task: its authority ends and its token is revoked.
@@ -1536,8 +1600,20 @@ fn render_symbol(workspace: &WorkspaceState, key: &SymbolKey) -> Option<serde_js
             serde_json::to_value(&workspace.operations.get(id)?.requirements)
         }
 
-        SymbolKey::OperationExecution(id) => {
-            serde_json::to_value(&workspace.operations.get(id)?.execution)
+        SymbolKey::TopicRuntime(id) => serde_json::to_value(workspace.runtime.topics.get(id)?),
+
+        SymbolKey::SubscriptionRuntime { operation, input } => serde_json::to_value(
+            workspace.runtime.subscriptions.get(operation)?.get(input)?,
+        ),
+
+        SymbolKey::ExecutionPool(id) => {
+            serde_json::to_value(workspace.runtime.execution_pools.get(id)?)
+        }
+
+        SymbolKey::Router(id) => serde_json::to_value(workspace.runtime.routers.get(id)?),
+
+        SymbolKey::StorageLayout(id) => {
+            serde_json::to_value(workspace.runtime.storage_layouts.get(id)?)
         }
 
         SymbolKey::Input { operation, input } => {
@@ -1688,7 +1764,111 @@ fn slice_shared_symbols(snapshot: &WorkspaceSnapshot, operation: &Id) -> Vec<Sym
         }
     }
 
+    // The L1 topology an operation executes under is shared, so it is
+    // never an outgoing edge of an operation-owned node — runtime
+    // symbols link *into* the operation's inputs. Walking edges alone
+    // would hand a synthesis worker a bundle with no delivery fact and
+    // no member concurrency, which is exactly what its idempotency and
+    // serialization reasoning needs.
+    if let SymbolOwner::Operation(operation) = &owner {
+        shared.extend(runtime_inputs_of(&snapshot.workspace, operation));
+    }
+
     shared.into_iter().collect()
+}
+
+/// The L1 symbols one operation's behaviour and proofs depend on: the
+/// runtime of each subscription it declares, the transport runtime of
+/// each topic it consumes, the router of each request boundary, and
+/// every execution pool those reach.
+///
+/// Deliberately conservative — it names a symbol whether or not the
+/// declaration exists yet, so a task is invalidated when one appears.
+/// Every symbol the L1 author reads: the whole topic and boundary
+/// surface, plus whatever runtime facts already exist.
+///
+/// A topology task owns no operation, so it gets no slice from
+/// `slice_shared_symbols`. Enumerating the surface explicitly is what
+/// puts it in the task's read set — without this the author would work
+/// from untracked tool reads and its patch would survive an L0 change
+/// that invalidated it.
+///
+/// Interfaces rather than whole operations: the author needs each
+/// boundary's inputs and topic, never a program body.
+pub(crate) fn topology_symbols(workspace: &WorkspaceState) -> Vec<SymbolKey> {
+    let mut keys = Vec::new();
+
+    for topic in workspace.topics.keys() {
+        keys.push(SymbolKey::Topic(topic.clone()));
+        keys.push(SymbolKey::TopicRuntime(topic.clone()));
+    }
+
+    for operation in workspace.operations.keys() {
+        keys.push(SymbolKey::OperationInterface(operation.clone()));
+        keys.extend(runtime_inputs_of(workspace, operation));
+    }
+
+    for pool in workspace.runtime.execution_pools.keys() {
+        keys.push(SymbolKey::ExecutionPool(pool.clone()));
+    }
+
+    for router in workspace.runtime.routers.keys() {
+        keys.push(SymbolKey::Router(router.clone()));
+    }
+
+    for layout in workspace.runtime.storage_layouts.keys() {
+        keys.push(SymbolKey::StorageLayout(layout.clone()));
+    }
+
+    keys.sort();
+    keys.dedup();
+    keys
+}
+
+pub(crate) fn runtime_inputs_of(
+    workspace: &WorkspaceState,
+    operation: &Id,
+) -> Vec<SymbolKey> {
+    let Some(draft) = workspace.operations.get(operation) else {
+        return Vec::new();
+    };
+
+    let mut keys = Vec::new();
+
+    for (input_id, input) in &draft.inputs {
+        match input {
+            Input::Subscription(subscription) => {
+                keys.push(SymbolKey::SubscriptionRuntime {
+                    operation: operation.clone(),
+                    input: input_id.clone(),
+                });
+
+                keys.push(SymbolKey::TopicRuntime(subscription.topic.clone()));
+
+                if let Some(runtime) = workspace
+                    .runtime
+                    .subscriptions
+                    .get(operation)
+                    .and_then(|inputs| inputs.get(input_id))
+                {
+                    keys.push(SymbolKey::ExecutionPool(runtime.dispatch.pool.clone()));
+                }
+            }
+
+            Input::Request(_) => {
+                for (router_id, router) in &workspace.runtime.routers {
+                    if &router.boundary.operation == operation
+                        && &router.boundary.input == input_id
+                    {
+                        keys.push(SymbolKey::Router(router_id.clone()));
+                        keys.push(SymbolKey::ExecutionPool(router.pool.clone()));
+                    }
+                }
+            }
+        }
+    }
+
+    keys
 }
 
 pub(crate) fn now_unix_ms() -> u64 {

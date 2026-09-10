@@ -2,10 +2,19 @@
 //! invalidation.
 //!
 //! An operation is deliberately not one monolithic symbol. Its
-//! interface, program, requirements, execution facts, and derived
-//! summary version separately, so a task that read only a callee's
-//! interface is not invalidated when the callee's requirements change
-//! (§9.1 of the confluence spec).
+//! interface, program, requirements, and derived summary version
+//! separately, so a task that read only a callee's interface is not
+//! invalidated when the callee's requirements change (§9.1 of the
+//! confluence spec).
+//!
+//! The L1 runtime declarations are symbols of their own, and every one
+//! of them is shared. Runtime topology is architecture: which
+//! execution population a boundary is assigned to, and how much may
+//! run there, is a decision about the whole system rather than part of
+//! any single operation's synthesis — the same reason a service
+//! carries no topology meaning. A subscription runtime therefore names
+//! an operation and an input without belonging to that operation's
+//! write authority.
 
 use std::fmt;
 
@@ -75,7 +84,6 @@ pub enum SymbolKey {
     OperationInterface(Id),
     OperationProgram(Id),
     OperationRequirements(Id),
-    OperationExecution(Id),
 
     Input {
         operation: Id,
@@ -107,6 +115,20 @@ pub enum SymbolKey {
         occurrence: u32,
     },
 
+    // ---- L1: runtime topology ----
+    /// Transport facts for one topic.
+    TopicRuntime(Id),
+
+    /// Delivery and dispatch facts for one subscription boundary.
+    SubscriptionRuntime {
+        operation: Id,
+        input: Id,
+    },
+
+    ExecutionPool(Id),
+    Router(Id),
+    StorageLayout(Id),
+
     /// The derived proof summary of an operation. Not stored in the
     /// workspace — it is analysis output — but addressable for reads,
     /// with observation tracked against the summary's inputs.
@@ -129,7 +151,11 @@ impl SymbolKey {
             Self::OperationInterface(_) => SymbolKind::OperationInterface,
             Self::OperationProgram(_) => SymbolKind::OperationProgram,
             Self::OperationRequirements(_) => SymbolKind::OperationRequirements,
-            Self::OperationExecution(_) => SymbolKind::OperationExecution,
+            Self::TopicRuntime(_) => SymbolKind::TopicRuntime,
+            Self::SubscriptionRuntime { .. } => SymbolKind::SubscriptionRuntime,
+            Self::ExecutionPool(_) => SymbolKind::ExecutionPool,
+            Self::Router(_) => SymbolKind::Router,
+            Self::StorageLayout(_) => SymbolKind::StorageLayout,
             Self::Input { .. } => SymbolKind::Input,
             Self::Transaction { .. } => SymbolKind::Transaction,
             Self::EffectSite { .. } => SymbolKind::EffectSite,
@@ -149,7 +175,6 @@ impl SymbolKey {
             | Self::OperationInterface(id)
             | Self::OperationProgram(id)
             | Self::OperationRequirements(id)
-            | Self::OperationExecution(id)
             | Self::OperationSummary(id) => SymbolOwner::Operation(id.clone()),
 
             Self::Input { operation, .. }
@@ -169,7 +194,6 @@ impl SymbolKey {
             | Self::OperationInterface(id)
             | Self::OperationProgram(id)
             | Self::OperationRequirements(id)
-            | Self::OperationExecution(id)
             | Self::OperationSummary(id) => Some(id),
 
             Self::Input { operation, .. }
@@ -202,7 +226,13 @@ impl fmt::Display for SymbolKey {
             Self::OperationInterface(id) => write!(f, "operation_interface({id})"),
             Self::OperationProgram(id) => write!(f, "operation_program({id})"),
             Self::OperationRequirements(id) => write!(f, "operation_requirements({id})"),
-            Self::OperationExecution(id) => write!(f, "operation_execution({id})"),
+            Self::TopicRuntime(id) => write!(f, "topic_runtime({id})"),
+            Self::SubscriptionRuntime { operation, input } => {
+                write!(f, "subscription_runtime({operation}/{input})")
+            }
+            Self::ExecutionPool(id) => write!(f, "execution_pool({id})"),
+            Self::Router(id) => write!(f, "router({id})"),
+            Self::StorageLayout(id) => write!(f, "storage_layout({id})"),
             Self::Input { operation, input } => write!(f, "input({operation}/{input})"),
             Self::Transaction {
                 operation,
@@ -246,7 +276,11 @@ pub enum SymbolKind {
     OperationInterface,
     OperationProgram,
     OperationRequirements,
-    OperationExecution,
+    TopicRuntime,
+    SubscriptionRuntime,
+    ExecutionPool,
+    Router,
+    StorageLayout,
     Input,
     Transaction,
     EffectSite,
@@ -261,7 +295,8 @@ pub enum SymbolKind {
 #[serde(tag = "kind", content = "value", rename_all = "snake_case")]
 pub enum SymbolOwner {
     /// Part of the shared skeleton: services, schemas, data models,
-    /// topics, state machines, prompt obligations.
+    /// topics, state machines, the whole runtime topology, and prompt
+    /// obligations.
     Shared,
 
     /// Owned by one operation's synthesis authority.

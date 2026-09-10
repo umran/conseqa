@@ -49,16 +49,72 @@ Click anything for a structured detail panel; double-click an
 operation to drill in. The top bar's filter box dims non-matching
 vertices, and a fit control in the canvas corner re-centres the graph.
 
+*Layout.* The graph is layered left to right along the flow of
+information: columns follow reachability, and everything that can happen
+in parallel stacks vertically inside a column, so a large architecture
+grows along both axes instead of into a strip. An edge to the
+neighbouring column crosses the gutter directly; a longer one, a return,
+or a hop within a column climbs a gutter into the channel reserved above
+its band and comes back down another, so no edge is ever drawn through a
+card. A drawing too wide to fit at a readable size wraps: its columns
+break into bands the way a paragraph breaks into lines, at whichever
+width leaves everything largest once fitted, and an edge that crosses
+bands travels outside them. Small graphs never wrap.
+
+*Layers.* L0 — the abstract application machine — is always drawn. L1,
+the declared runtime realization, is switched from the top bar (`L0` is
+a label, not a control: the machine is the model, not an overlay on it),
+and it is laid *onto* the machine rather than beside it, because every
+L1 fact is a fact about some L0 thing:
+
+- A **router** or a **subscription dispatch** realizes a boundary — the
+  way a caller or a topic enters an operation — so it is an intermediate
+  vertex *on that edge*: the caller/topic edge ends at the vertex and a
+  short arm carries on into the operation (caller → [router] → op, topic
+  → [dispatch] → op). The vertex is marked request (solid) or subscribe
+  (dashed) and names the execution pool, its member concurrency, and the
+  routing/affinity fact. The pool name is its own target: a pool is a
+  shared population, and selecting one lights every vertex that names it
+  — which is all "shared pool" means (§52), with no pool node to say it.
+- A **storage layout** is a fact about an object, so the objects
+  operations persist to are drawn as a downstream data tier, wired to
+  the operations that touch them by always-visible access edges. Each
+  access edge is selectable and carries the one fact that matters of it
+  — whether the access keys to the object's partition (solid) or does
+  not (dashed) — and its detail says why. Partitioned objects (a layout
+  is declared) are solid and spined; unpartitioned ones are open and
+  dashed. No prose labels the tier; the shapes carry it.
+- A **topic** carries its transport facts (grouping, ordering) on its
+  own node, since topic-scoped transport is a fact about the topic.
+
+The switch is disabled for a model that declares no L1 facts, and with
+L1 off none of the above appears — those are facts of the layer that
+declares them. Selection follows what a thing is a fact *about*, and
+nothing wider: a router or a subscription lights only its own path — the
+caller edges, the vertex, the operation — not the operation's other
+edges; a pool lights every path it runs, which is what a shared pool is;
+an access edge lights just its operation and object. Selecting the
+operation itself still lights its one-hop neighbourhood, its
+realizations, and the objects it writes. Nothing is a parallel graph
+joined by on-demand links: the realization sits on the paths and the
+entities it is about.
+
 **Operation view** (`#/op/<id>`). A page header (name, copyable id,
-description, and a fact strip: service, concurrency, transaction and
+description, and a fact strip: service, transaction and
 program-step counts, the state machines it drives, verdict tally),
 then three sections as Kumo layer cards. **Requirements** is a table —
 one row per declared requirement with its key, its semantics
 (replay-consistent result, guaranteed completion) and, when a report
 is loaded, the verdict over its obligations; **Inputs** is a table of
-what starts an invocation (kind, source schema or topic, delivery and
-dispatch semantics, request identity and result contract). The two sit
-side by side when the pane is wide enough and stack otherwise.
+what starts an invocation, split by layer: the **L0 contract** (request
+identity and result contract, or the messages a subscription consumes)
+and the **L1 realization** (for a request, the router, its routing key,
+member assignment and the target pool's member concurrency; for a
+subscription, its delivery, routing, member assignment and the same pool
+fact). A boundary with no declared realization says so, and says that
+absence is the absence of a fact rather than a realization lacking these
+properties. The two sit side by side when the pane is wide enough and
+stack otherwise.
 **Program** shows the operation's one program — there is exactly one,
 so there are no tabs and the route carries no query: `#/op/<id>` lands
 on it directly, and an old `?flow=` query is tolerated and ignored.
@@ -100,13 +156,26 @@ deep link or history navigation selects what the address bar names.
 **Detail panel.** Every model entity — service, operation, topic,
 schema, data object, state machine, state, transition, input, inline
 effect, intent binding, transaction-output binding, result binding,
-inline transaction, transaction step, program step, requirement, or
-graph edge — opens a detail panel organized into collapsible, counted
-sections (execution, inputs, inline effects, requirements,
-obligations, …) with key/value grids, typed badges, and clickable ids
-that open the referenced entity in place. The entities are resolved
-from the program, which is the source of truth for every
-operation-owned execution occurrence.
+inline transaction, transaction step, program step, requirement, graph
+edge, or L1 declaration (execution pool, router, storage layout) —
+opens a detail panel organized into collapsible, counted sections
+(execution, inputs, inline effects, requirements, obligations, …) with
+key/value grids, typed badges, and clickable ids that open the
+referenced entity in place. The entities are resolved from the program,
+which is the source of truth for every operation-owned execution
+occurrence.
+
+An L1 declaration's panel says what the fact does and, as importantly,
+what it does not: a pool carries no cardinality, sharing one relates
+execution populations and not routing domains, a partition key is
+neither an object identity nor a routing key. A data object's panel
+carries its storage layout (or says none is declared) and the operations
+that access it; a **data-access** edge's panel names the operation, the
+object, and whether that access keys to the partition, with the reason. Each L1 declaration also lists **the proofs resting on
+it** — the obligations whose reasoning names it — so the verdicts a
+change to the topology would put back in question can be read off the
+declaration itself. Topics and inputs carry the same list, being where
+L1 facts attach to L0 entities.
 
 **Top bar.** Model name and revision, breadcrumbs for the current
 page, the id filter on the system view, and — when a report is loaded
@@ -129,11 +198,16 @@ keyed from it — appear at the top of the obligations panel.
 
 **Obligations panel.** The checker's obligations, grouped by the
 operation (or data model, machine, topic) they anchor to, with a
-segmented status filter (all / unknown / proven / disproven), a text
-filter, per-group status counts, and cards that expand to the declared
-facts a proof relies on, the checker's evidence, or a counterexample
-trace — each with a "focus subject" action that navigates to the
-entity. With a report loaded, vertices gain status rings and rollup
+segmented status filter (all / unknown / proven / disproven), a
+segmented layer filter (any / L0 / L1), a text filter, per-group status
+counts, and cards that expand to the declared facts a proof relies on,
+the checker's evidence, or a counterexample trace — each with a "focus
+subject" action that navigates to the entity. Every id a verdict names
+in its prose is a link to that declaration, which is what makes a
+proof's provenance followable rather than merely stated. The layer
+filter reads `scope` for a proven obligation and `remedy` for an
+unproven one; an obligation the checker classifies neither way appears
+only under "any layer". With a report loaded, vertices gain status rings and rollup
 chips (worst status wins: disproven > unknown > proven), requirement
 chips in the operation view are colored by their obligation status, and
 transitions in the machine view inherit theirs.
@@ -141,21 +215,37 @@ transitions in the machine view inherit theirs.
 ## The obligation report
 
 The report format is `conseqa::analyzer::report` (`ProverReport`,
-`format: 2`): one obligation per declared requirement — serialization,
+`format: 4`): one obligation per declared requirement — serialization,
 ordering, idempotency, result replay (the result half of an idempotency
 requirement declaring `result: replay_consistent`), recoverability —
 with status `proven`, `disproven`, or `unknown`. Format 2 replaced the
 response-replay property with result replay, dropped object-history
 obligations and the flow subject, and made proofs cite the program
-paths and decisions they rest on. Unknown is epistemic: the
-checker could not establish the property, typically because a
-required fact is `unspecified` or no V1 verifier attempts that family.
-It is never evidence of a violation.
+paths and decisions they rest on; format 3 added proof `scope` and
+rebuilt the serialization and ordering arguments on the L1 runtime
+model; format 4 added `remedy` to unproven serialization and ordering
+obligations. Unknown is epistemic: the checker could not establish the
+property, typically because a required fact is `unspecified` or no V1
+verifier attempts that family. It is never evidence of a violation.
 
-Each obligation carries its `summary`, `subject`, `assumptions` (the
-declared facts a proof relies on — conditional, per §25 of the
-semantics contract), `evidence` (the checker's obstacles), and, for
-disproofs, a `counterexample` trace.
+Each obligation carries its `summary`, `subject`, `scope`, `remedy`,
+`assumptions` (the declared facts a proof relies on — conditional, per
+§25 of the semantics contract), `evidence` (the checker's obstacles),
+and, for disproofs, a `counterexample` trace. `scope` is `l0_only` or
+`runtime_dependent`, and the card shows it as a badge: a
+runtime-dependent proof holds of the declared runtime topology and must
+be re-examined when that topology changes. `remedy` is its dual on an
+unproven obligation — `application` or `runtime`, the layer the facts it
+is waiting on belong to — and shows as "needs L0 fact" or "needs L1
+fact". It is a routing hint, not a promise that declaring one closes the
+argument.
+
+The front end refuses a report of any other format, and says so in the
+top bar rather than in the console: a report that is counted in one
+place and silently dropped everywhere else leaves proven obligations
+reading as indeterminate, which is the one thing a proof view must never
+do. `REPORT_FORMAT` in `viz/src/types/report.ts` mirrors
+`conseqa::analyzer::report::FORMAT` and has to move with it.
 
 ```
 conseqa model.yaml --report proof.json       # produce a report
@@ -207,13 +297,28 @@ npm run build   # typecheck + single-file bundle → dist/index.html
 ```
 
 The production build is one `dist/index.html` with every script and
-stylesheet inlined (`vite-plugin-singlefile`). `conseqa-viz` embeds
-that file at compile time (`include_str!`) and injects the page data —
-title, model, derived graph, report — as `window.CONSEQA`, so `cargo`
-needs no Node toolchain. **Rebuild and commit `viz/dist/index.html`
-after changing the front end.** During development the app fetches
+stylesheet inlined (`vite-plugin-singlefile`). `conseqa::viz::render`
+embeds that file at compile time (`include_str!`) and injects the page
+data — title, model, derived graph, report — as `window.CONSEQA`, so
+`cargo` needs no Node toolchain. During development the app fetches
 `public/conseqa.json` instead; regenerate it with `npm run data`, or
 directly with `conseqa-viz <model> --verify --json --out <path>`.
+
+Compile time is the catch: every binary that renders carries the bundle
+it was built with, so a front-end change reaches a reader only after the
+whole chain runs.
+
+```
+cd viz && npm run build     # → viz/dist/index.html (committed)
+cargo build --release       # rebakes it into every binary that renders
+```
+
+`conseqa-viz` is one of those binaries; so is `conseqa-confluence`,
+whose `export_spec` writes `spec.html` through the same renderer, and
+`conseqa-harness`. **Rebuild and commit `viz/dist/index.html` after
+changing the front end, and rebuild the binaries after that.** An MCP
+server already running keeps the image it started with — a rebuilt
+binary reaches it only on its next start.
 
 ## Layout of the implementation
 

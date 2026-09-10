@@ -1,6 +1,7 @@
 pub mod error;
 pub mod id_declaration;
 pub mod reference;
+mod runtime;
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -307,6 +308,8 @@ pub fn validate(model: &Model) -> Vec<ValidationError> {
 
     errors.extend(validate_field_paths(model, &index));
 
+    runtime::validate_runtime(model, &index, &mut errors);
+
     errors
 }
 
@@ -540,8 +543,6 @@ fn validate_topics(model: &Model) -> Vec<ValidationError> {
 
     validate_publication_topic_membership(model, &mut errors);
 
-    validate_topic_ordering_shape(model, &mut errors);
-
     validate_message_identity_shape(model, &mut errors);
 
     errors
@@ -549,7 +550,7 @@ fn validate_topics(model: &Model) -> Vec<ValidationError> {
 
 fn validate_message_identity_shape(model: &Model, errors: &mut Vec<ValidationError>) {
     for (topic_id, topic) in &model.topics {
-        let MessageIdentity::Keyed { mapping } = &topic.message_identity else {
+        let MessageIdentity::Keyed(MessageIdentityKey { mapping }) = &topic.message_identity else {
             continue;
         };
 
@@ -603,7 +604,7 @@ fn validate_request_identity_shape(model: &Model) -> Vec<ValidationError> {
                 continue;
             };
 
-            let RequestIdentity::Keyed { fields } = &request.identity else {
+            let RequestIdentity::Keyed(RequestIdentityKey { fields }) = &request.identity else {
                 continue;
             };
 
@@ -795,20 +796,9 @@ fn validate_field_paths(model: &Model, index: &ReferenceIndex<'_>) -> Vec<Valida
         }
     }
 
-    // Topic ordering fields.
-    for (topic_id, topic) in &model.topics {
-        let TopicOrdering::Keyed(key) = &topic.ordering else {
-            continue;
-        };
-
-        for (schema, path) in &key.mapping {
-            validate_schema_path(model, topic_id, schema, path, &mut errors);
-        }
-    }
-
     // Topic message-identity fields.
     for (topic_id, topic) in &model.topics {
-        let MessageIdentity::Keyed { mapping } = &topic.message_identity else {
+        let MessageIdentity::Keyed(MessageIdentityKey { mapping }) = &topic.message_identity else {
             continue;
         };
 
@@ -835,7 +825,7 @@ fn validate_field_paths(model: &Model, index: &ReferenceIndex<'_>) -> Vec<Valida
                 continue;
             };
 
-            let RequestIdentity::Keyed { fields } = &request.identity else {
+            let RequestIdentity::Keyed(RequestIdentityKey { fields }) = &request.identity else {
                 continue;
             };
 
@@ -1491,32 +1481,6 @@ fn validate_publication_topic_membership(model: &Model, errors: &mut Vec<Validat
     }
 }
 
-fn validate_topic_ordering_shape(model: &Model, errors: &mut Vec<ValidationError>) {
-    for (topic_id, topic) in &model.topics {
-        let TopicOrdering::Keyed(key) = &topic.ordering else {
-            continue;
-        };
-
-        for schema in key.mapping.keys() {
-            if !topic.messages.contains(schema) {
-                errors.push(ValidationError::TopicKeySchemaNotOnTopic {
-                    topic: topic_id.clone(),
-                    schema: schema.clone(),
-                });
-            }
-        }
-
-        for schema in &topic.messages {
-            if !key.mapping.contains_key(schema) {
-                errors.push(ValidationError::TopicKeyMissingSchema {
-                    topic: topic_id.clone(),
-                    schema: schema.clone(),
-                });
-            }
-        }
-    }
-}
-
 fn validate_publication_membership(
     model: &Model,
     effect_id: &Id,
@@ -1591,13 +1555,7 @@ fn validate_topic_references(
             expect_reference(index, topic_id, schema, ReferenceKind::Schema, errors);
         }
 
-        if let TopicOrdering::Keyed(key) = &topic.ordering {
-            for schema in key.mapping.keys() {
-                expect_reference(index, topic_id, schema, ReferenceKind::Schema, errors);
-            }
-        }
-
-        if let MessageIdentity::Keyed { mapping } = &topic.message_identity {
+        if let MessageIdentity::Keyed(MessageIdentityKey { mapping }) = &topic.message_identity {
             for schema in mapping.keys() {
                 expect_reference(index, topic_id, schema, ReferenceKind::Schema, errors);
             }
@@ -2390,6 +2348,22 @@ fn visit_declarations<'a>(
 
     for id in model.topics.keys() {
         visit(id, ReferenceKind::Topic, None);
+    }
+
+    // L1 declarations share the one global namespace: a pool may not
+    // take a topic's ID, and a router may not take a pool's.
+    if let Some(runtime) = &model.runtime {
+        for id in runtime.execution_pools.keys() {
+            visit(id, ReferenceKind::ExecutionPool, None);
+        }
+
+        for id in runtime.routers.keys() {
+            visit(id, ReferenceKind::Router, None);
+        }
+
+        for id in runtime.storage_layouts.keys() {
+            visit(id, ReferenceKind::StorageLayout, None);
+        }
     }
 
     for (machine_id, machine) in &model.state_machines {

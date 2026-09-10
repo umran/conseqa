@@ -2,6 +2,9 @@
 # card, apply the payment — every hand-off an identified event on one
 # keyed topic.
 #
+# Serialization and ordering are discharged from the runtime topology
+# at the foot of this file, so those proofs are runtime-dependent.
+#
 # The model keeps four deliberate gaps, and the checker reports each:
 # tx.reserve_inventory is not deduplicated and its write depends on a
 # read, so reserve_inventory is neither idempotent nor recoverable;
@@ -160,15 +163,6 @@ topics:
     - schema.OrderPaid
     - schema.PaymentCaptured
     - schema.PaymentFailed
-    ordering:
-      kind: keyed
-      mapping:
-        schema.InventoryReserved: order_id
-        schema.OrderCancelled: order_id
-        schema.OrderCreated: order_id
-        schema.OrderPaid: order_id
-        schema.PaymentCaptured: order_id
-        schema.PaymentFailed: order_id
     message_identity:
       kind: keyed
       mapping:
@@ -317,9 +311,6 @@ operations:
           - source: input:input.create_order.request
             path: idempotency_key
         completion: resumable
-    execution:
-      concurrency:
-        kind: unbounded
   operation.reserve_inventory:
     service: service.inventory
     description: Reserve stock for an OrderCreated event.
@@ -331,12 +322,6 @@ operations:
           kind: only
           schemas:
           - schema.OrderCreated
-        delivery: at_least_once
-        dispatch:
-          routing: by_topic_key
-          lane_concurrency:
-            kind: bounded
-            value: 1
     program:
       steps:
       - kind: transaction
@@ -448,9 +433,6 @@ operations:
           - source: input:input.reserve_inventory.created
             path: event_id
         completion: guaranteed
-    execution:
-      concurrency:
-        kind: unbounded
   operation.charge_payment:
     service: service.payments
     description: Charge the card after inventory reservation, announcing the capture or the decline.
@@ -462,12 +444,6 @@ operations:
           kind: only
           schemas:
           - schema.InventoryReserved
-        delivery: at_least_once
-        dispatch:
-          routing: by_topic_key
-          lane_concurrency:
-            kind: bounded
-            value: 1
     program:
       steps:
       - kind: execute_effect
@@ -557,9 +533,6 @@ operations:
             path: event_id
         result: unspecified
       recoverability: []
-    execution:
-      concurrency:
-        kind: unbounded
   operation.cancel_order:
     service: service.checkout
     description: Cancel a pending order and publish OrderCancelled.
@@ -626,9 +599,6 @@ operations:
       ordering: []
       idempotency: []
       recoverability: []
-    execution:
-      concurrency:
-        kind: unbounded
   operation.apply_payment:
     service: service.checkout
     description: Advance a pending order to paid on PaymentCaptured.
@@ -640,12 +610,6 @@ operations:
           kind: only
           schemas:
           - schema.PaymentCaptured
-        delivery: at_least_once
-        dispatch:
-          routing: by_topic_key
-          lane_concurrency:
-            kind: bounded
-            value: 1
     program:
       steps:
       - kind: transaction
@@ -718,9 +682,6 @@ operations:
           - source: input:input.apply_payment.captured
             path: event_id
         completion: guaranteed
-    execution:
-      concurrency:
-        kind: unbounded
   operation.transfer_stock:
     service: service.inventory
     description: Move stock between warehouses.
@@ -863,6 +824,131 @@ operations:
       ordering: []
       idempotency: []
       recoverability: []
-    execution:
-      concurrency:
+
+# ---------------------------------------------------------------------
+# L1 — one runtime realization of the machine above.
+#
+# Two facts this topology is chosen to make visible:
+#
+#   * reserve_inventory (service.inventory) and apply_payment
+#     (service.checkout) share pool.order_workers. Services carry no
+#     execution-topology meaning, so operations of different services
+#     may share one execution population — and create_order, of the
+#     same service as apply_payment, sits in a different pool.
+#
+#   * A shared pool is a shared execution population, not a shared
+#     routing domain. Both subscriptions route by the same order_id
+#     topic key, and nothing infers that their domains have a common
+#     owner. Each proof stands on its own routing declaration.
+# ---------------------------------------------------------------------
+runtime:
+
+  # Topic-scoped transport semantics: one grouping domain and one
+  # ordering guarantee for every subscription of this topic, as a
+  # partitioned log provides. No subscription may declare its own.
+  topics:
+    topic.order_events:
+      grouping:
+        schema.InventoryReserved: [order_id]
+        schema.OrderCancelled: [order_id]
+        schema.OrderCreated: [order_id]
+        schema.OrderPaid: [order_id]
+        schema.PaymentCaptured: [order_id]
+        schema.PaymentFailed: [order_id]
+
+      ordering: within_group
+
+  execution_pools:
+    pool.order_workers:
+      member_concurrency:
+        kind: bounded
+        value: 1
+
+    pool.payment_workers:
+      member_concurrency:
+        kind: bounded
+        value: 1
+
+    pool.checkout_api:
+      member_concurrency:
         kind: unbounded
+
+    pool.inventory_api:
+      member_concurrency:
+        kind: unbounded
+
+  subscriptions:
+    operation.reserve_inventory:
+      input.reserve_inventory.created:
+        delivery: at_least_once
+        dispatch:
+          pool: pool.order_workers
+          routing:
+            key: grouping_key
+            member_assignment:
+              kind: consistent_hash
+
+    operation.charge_payment:
+      input.charge_payment.reserved:
+        delivery: at_least_once
+        dispatch:
+          pool: pool.payment_workers
+          routing:
+            key: grouping_key
+            member_assignment:
+              kind: consistent_hash
+
+    operation.apply_payment:
+      input.apply_payment.captured:
+        delivery: at_least_once
+        dispatch:
+          pool: pool.order_workers
+          routing:
+            key: grouping_key
+            member_assignment:
+              kind: consistent_hash
+
+  routers:
+    # order_id is a routing key here and a partition key below. The
+    # expressions coincide; the semantic identities do not, and the
+    # analyzer never collapses them.
+    router.create_order:
+      boundary:
+        operation: operation.create_order
+        input: input.create_order.request
+      pool: pool.checkout_api
+      routing:
+        key:
+          - order_id
+        member_assignment:
+          kind: consistent_hash
+
+    router.cancel_order:
+      boundary:
+        operation: operation.cancel_order
+        input: input.cancel_order.request
+      pool: pool.checkout_api
+
+    router.transfer_stock:
+      boundary:
+        operation: operation.transfer_stock
+        input: input.transfer_stock.request
+      pool: pool.inventory_api
+
+  storage_layouts:
+    layout.order:
+      object:
+        data_model: data.checkout
+        object: object.order
+      partition_key:
+        - order_id
+
+    # A composite partition key, matching the object's own identity but
+    # remaining a separate fact from it.
+    layout.stock:
+      object:
+        data_model: data.inventory
+        object: object.stock
+      partition_key:
+        - warehouse_id
+        - sku

@@ -10,6 +10,8 @@ export interface Graph {
   operations: OperationNode[];
   topics: TopicNode[];
   externals: ExternalNode[];
+  /** The declared L1 runtime topology; empty for an L0-only model. */
+  runtime: RuntimeView;
   client: ClientNode | null;
   edges: Edge[];
   effect_owners: Record<Id, EffectOwner>;
@@ -38,12 +40,48 @@ export interface OperationNode {
   steps: number;
   machines: Id[];
   requirements: RequirementBadges;
-  concurrency: string;
+}
+
+export interface RuntimeView {
+  execution_pools: ExecutionPoolNode[];
+  routers: RouterNode[];
+  storage_layouts: StorageLayoutNode[];
+}
+
+export interface ExecutionPoolNode {
+  id: Id;
+  member_concurrency: string;
+  /** Boundaries assigned to this pool — the shared execution
+   *  population made visible. */
+  assigned: { operation: Id; input: Id }[];
+}
+
+export interface RouterNode {
+  id: Id;
+  operation: Id;
+  input: Id;
+  pool: Id;
+  /** The semantic routing key; empty when the router declares none. */
+  routing_key: string[];
+  member_assignment: string | null;
+}
+
+export interface StorageLayoutNode {
+  id: Id;
+  data_model: Id;
+  object: Id;
+  partition_key: string[];
 }
 
 export interface TopicNode {
   id: Id;
+
+  /** Topic-scoped transport facts. In subscription-scoped mode both
+   *  read "none" and each subscribe edge carries its own. */
   ordering: string;
+  grouping: string;
+  topic_scoped_transport: boolean;
+
   messages: Id[];
 }
 
@@ -84,8 +122,16 @@ export type Edge = EdgeBase &
         input: Id;
         schemas: Id[];
         delivery: string;
-        routing: string;
-        lane_concurrency: string;
+        /** The transport facts in force, resolved from whichever scope
+         *  declares them. */
+        grouping: string;
+        ordering: string;
+        /** The dispatch routing key, or "none" when the dispatch
+         *  declares no member affinity; null when the subscription has
+         *  no declared runtime at all. */
+        routing: string | null;
+        pool: Id | null;
+        member_assignment: string | null;
       }
     | {
         kind: "request";

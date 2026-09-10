@@ -9,12 +9,22 @@ import { Text } from "@cloudflare/kumo/components/text";
 import { ArrowSquareOutIcon, CaretRightIcon, GraphIcon } from "@phosphor-icons/react";
 import type { CSSProperties, ComponentPropsWithRef, ReactElement, ReactNode } from "react";
 
-import { commitGuarantee, delivery, isolation, laneConcurrency, requestIdentity, routing } from "../lib/explain";
+import {
+  commitGuarantee,
+  delivery,
+  isolation,
+  memberAssignment,
+  memberConcurrency,
+  noRuntimeDeclared,
+  requestIdentity,
+  requestRouting,
+  subscriptionRouting,
+} from "../lib/explain";
 import { pathText, shortId } from "../lib/ids";
 import { effectDef, effectSummary, locationLabel, operationTransactions, walkProgram, type StepHop } from "../lib/index";
 import { propertyMatchesRequirement, worstStatus } from "../lib/obligations";
 import { hashes } from "../lib/route";
-import { concurrencyText, conditionText, predicateText } from "../lib/text";
+import { conditionText, predicateText } from "../lib/text";
 import { useApp, type DetailContext } from "../state/AppState";
 import { Fact, FactBadge, IdLink, KeyComponents, Mono, Muted, RefText, SectionCard, StatusBadge, StatusChips, selectableRow } from "../panels/parts";
 import type { Effect, Id, Operation, OperationBlock, RequirementKind, TransactionStep, TransitionSideEffect } from "../types/model";
@@ -470,7 +480,59 @@ function RequirementsTable({ id, op }: { id: Id; op: Operation }) {
   );
 }
 
-function InputsTable({ op }: { op: Operation }) {
+/** How one boundary is realized: the pool that executes it, the member
+ *  affinity it declares, and what one member does at a time.
+ *
+ *  Requests and subscriptions are separate primitives with the same
+ *  shape — a routing key and a member assignment, terminating at a pool
+ *  — so they are shown the same way and in the same column, next to but
+ *  never mixed with the L0 contract they realize. */
+function Realization({ opId, inputId, kind }: { opId: Id; inputId: Id; kind: "request" | "subscription" }) {
+  const { model } = useApp();
+
+  if (kind === "request") {
+    const routed = Object.entries(model.runtime?.routers ?? {}).find(
+      ([, r]) => r.boundary.operation === opId && r.boundary.input === inputId,
+    );
+    if (!routed) return <FactBadge fact={noRuntimeDeclared()} />;
+    const [routerId, router] = routed;
+    const pool = model.runtime?.execution_pools?.[router.pool];
+    return (
+      <>
+        <span className="inline-flex items-center gap-1 text-xs text-kumo-subtle">
+          router
+          <IdLink id={routerId}>{shortId(routerId)}</IdLink>
+        </span>
+        <FactBadge fact={requestRouting(router.routing?.key)} />
+        {router.routing && <FactBadge fact={memberAssignment(router.routing.member_assignment)} />}
+        {pool && <FactBadge fact={memberConcurrency(pool.member_concurrency)} />}
+      </>
+    );
+  }
+
+  const runtime = model.runtime?.subscriptions?.[opId]?.[inputId];
+  if (!runtime) {
+    return (
+      <>
+        <FactBadge fact={noRuntimeDeclared()} />
+        <FactBadge fact={delivery("unspecified")} />
+      </>
+    );
+  }
+  const pool = model.runtime?.execution_pools?.[runtime.dispatch.pool];
+  return (
+    <>
+      <FactBadge fact={delivery(runtime.delivery)} />
+      <FactBadge fact={subscriptionRouting(runtime.dispatch.routing?.key)} />
+      {runtime.dispatch.routing && (
+        <FactBadge fact={memberAssignment(runtime.dispatch.routing.member_assignment)} />
+      )}
+      {pool && <FactBadge fact={memberConcurrency(pool.member_concurrency)} />}
+    </>
+  );
+}
+
+function InputsTable({ opId, op }: { opId: Id; op: Operation }) {
   const { selection, select } = useApp();
   const inputs = Object.entries(op.inputs);
 
@@ -483,7 +545,8 @@ function InputsTable({ op }: { op: Operation }) {
           <Table.Head>input</Table.Head>
           <Table.Head>kind</Table.Head>
           <Table.Head>source</Table.Head>
-          <Table.Head>semantics</Table.Head>
+          <Table.Head>L0 contract</Table.Head>
+          <Table.Head>L1 realization</Table.Head>
         </Table.Row>
       </Table.Header>
       <Table.Body>
@@ -527,12 +590,17 @@ function InputsTable({ op }: { op: Operation }) {
                       </span>
                     </>
                   ) : (
-                    <>
-                      <FactBadge fact={delivery(input.delivery)} />
-                      <FactBadge fact={routing(input.dispatch.routing)} />
-                      <FactBadge fact={laneConcurrency(input.dispatch.lane_concurrency)} />
-                    </>
+                    <Badge variant="neutral">
+                      {input.messages.kind === "all"
+                        ? "all topic messages"
+                        : input.messages.schemas.map(shortId).join(", ")}
+                    </Badge>
                   )}
+                </span>
+              </Table.Cell>
+              <Table.Cell>
+                <span className="flex flex-wrap items-center gap-1.5">
+                  <Realization opId={opId} inputId={inputId} kind={input.kind} />
                 </span>
               </Table.Cell>
             </Table.Row>
@@ -580,7 +648,6 @@ export function OperationView({ id }: { id: string }) {
           {op.description && <p className="max-w-3xl text-sm leading-relaxed text-kumo-default">{op.description}</p>}
           <dl className="flex flex-wrap gap-x-8 gap-y-3">
             <Fact label="service"><IdLink id={op.service}>{shortId(op.service)}</IdLink></Fact>
-            <Fact label="concurrency"><Badge variant="neutral">{concurrencyText(op.execution.concurrency)}</Badge></Fact>
             <Fact label="transactions">{transactionCount}</Fact>
             <Fact label="program steps">{stepCount}</Fact>
             {machines.length > 0 && (
@@ -604,7 +671,7 @@ export function OperationView({ id }: { id: string }) {
 
         <SectionCard title="Inputs" count={inputCount} hint="what starts an invocation">
           <div className="overflow-x-auto">
-            <InputsTable op={op} />
+            <InputsTable opId={id} op={op} />
           </div>
         </SectionCard>
 

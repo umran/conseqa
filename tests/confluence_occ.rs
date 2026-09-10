@@ -7,7 +7,6 @@
 #![allow(clippy::result_large_err)]
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::num::NonZeroU32;
 
 use conseqa::confluence::{
     CommitReceipt, CommitRejection, CommitRequest, ConfluenceEngine, CreateTask, EngineError,
@@ -18,9 +17,8 @@ use conseqa::confluence::{
     TaskBudget, TaskHandle, TaskKind, TaskState, WorkspaceState, WriteGrant, WriteScope,
 };
 use conseqa::spec::{
-    DeliverySemantics, Derivation, DispatchRouting, DispatchSemantics, ExecutionSemantics,
-    FieldPath, Id, IdempotencyGuarantee, Input, LaneConcurrency, MessageSelector, ObjectSelector,
-    OperationBlock, OperationConcurrency, OperationStep, Revision, SelectorPredicate,
+    Derivation, FieldPath, Id, IdempotencyGuarantee, Input, MessageSelector, ObjectSelector,
+    OperationBlock, OperationStep, Revision, SelectorPredicate,
     SerializationRequirement, SubscriptionInput, Transaction, TransactionIsolation,
     Service, ServiceKind, TransactionStep, ValueRef, ValueSource, Write,
 };
@@ -75,9 +73,32 @@ fn submit(
         .expect("the sequencer is running")
 }
 
-fn execution(bound: u32) -> ExecutionSemantics {
-    ExecutionSemantics {
-        concurrency: OperationConcurrency::Bounded(NonZeroU32::new(bound).expect("non-zero")),
+/// A small, always-valid, distinguishable write to one operation's
+/// program: a marker transaction that touches nothing, then a
+/// terminal.
+///
+/// These tests are about the commit protocol — write-write conflicts,
+/// read-set invalidation, scope enforcement — not about program
+/// content. What they need of a mutation is only that it targets a
+/// known operation-scoped symbol and that two different markers
+/// produce different fingerprints.
+fn probe_program(operation: &str, marker: u32) -> Mutation {
+    let short = operation.strip_prefix("operation.").unwrap_or(operation);
+
+    Mutation::ReplaceOperationProgram {
+        operation: id(operation),
+        program: OperationBlock {
+            steps: vec![
+                OperationStep::Transaction(conseqa::spec::Transaction {
+                    id: id(&format!("tx.{short}.probe{marker}")),
+                    data_model: None,
+                    isolation: conseqa::spec::TransactionIsolation::ReadCommitted,
+                    idempotency: IdempotencyGuarantee::NotDeduplicated,
+                    steps: Vec::new(),
+                }),
+                OperationStep::Complete,
+            ],
+        },
     }
 }
 
@@ -133,9 +154,11 @@ fn ping_interface() -> OperationInterfaceDraft {
             id("input.ping.request"),
             Input::Request(conseqa::spec::RequestInput {
                 schema: id("schema.PingRequest"),
-                identity: conseqa::spec::RequestIdentity::Keyed {
-                    fields: vec![path("id")],
-                },
+                identity: conseqa::spec::RequestIdentity::Keyed(
+                    conseqa::spec::RequestIdentityKey {
+                        fields: vec![path("id")],
+                    },
+                ),
                 result: conseqa::spec::ResultType {
                     ok: id("schema.PingResponse"),
                     err: conseqa::spec::ErrorResultType {
@@ -344,10 +367,10 @@ fn an_interactive_session_builds_a_new_project_from_empty() {
 
     let _ = current;
 
-    // Commit 2: author the program and execution facts of the operation
-    // the session created in commit 1. Requires the All grant — a
-    // per-existing-operation scope, fixed at session creation, would
-    // not have covered operation.ping.
+    // Commit 2: author the program of the operation the session created
+    // in commit 1. Requires the All grant — a per-existing-operation
+    // scope, fixed at session creation, would not have covered
+    // operation.ping.
     submit_session(
         &engine,
         &token,
@@ -355,10 +378,6 @@ fn an_interactive_session_builds_a_new_project_from_empty() {
             Mutation::ReplaceOperationProgram {
                 operation: id("operation.ping"),
                 program: ping_program(),
-            },
-            Mutation::ReplaceOperationExecution {
-                operation: id("operation.ping"),
-                execution: execution(1),
             },
         ],
     );
@@ -369,7 +388,6 @@ fn an_interactive_session_builds_a_new_project_from_empty() {
     let draft = &head.workspace.operations[&id("operation.ping")];
 
     assert!(draft.program.is_some(), "the program was authored");
-    assert!(draft.execution.is_some(), "the execution facts were authored");
     assert!(draft.assemblable());
 }
 
@@ -400,20 +418,14 @@ fn non_conflicting_tasks_both_commit() {
     let first = submit(
         &engine,
         &a,
-        vec![Mutation::ReplaceOperationExecution {
-            operation: id("operation.create_order"),
-            execution: execution(2),
-        }],
+        vec![probe_program("operation.create_order", 2)],
     )
     .expect("a commits");
 
     let second = submit(
         &engine,
         &b,
-        vec![Mutation::ReplaceOperationExecution {
-            operation: id("operation.transfer_stock"),
-            execution: execution(3),
-        }],
+        vec![probe_program("operation.transfer_stock", 3)],
     )
     .expect("b commits after a without conflict");
 
@@ -443,17 +455,14 @@ fn read_write_conflict_invalidates_the_reader() {
     engine
         .read_symbol(
             a.id,
-            &SymbolKey::OperationExecution(id("operation.create_order")),
+            &SymbolKey::OperationProgram(id("operation.create_order")),
         )
         .expect("a reads");
 
     submit(
         &engine,
         &b,
-        vec![Mutation::ReplaceOperationExecution {
-            operation: id("operation.create_order"),
-            execution: execution(2),
-        }],
+        vec![probe_program("operation.create_order", 2)],
     )
     .expect("b commits");
 
@@ -469,7 +478,7 @@ fn read_write_conflict_invalidates_the_reader() {
             assert!(matches!(
                 causes.as_slice(),
                 [InvalidationCause::ChangedSymbol { symbol }]
-                    if *symbol == SymbolKey::OperationExecution(id("operation.create_order"))
+                    if *symbol == SymbolKey::OperationProgram(id("operation.create_order"))
             ));
 
             saw_invalidation = true;
@@ -488,10 +497,7 @@ fn read_write_conflict_invalidates_the_reader() {
     let rejection = submit(
         &engine,
         &a,
-        vec![Mutation::ReplaceOperationExecution {
-            operation: id("operation.transfer_stock"),
-            execution: execution(2),
-        }],
+        vec![probe_program("operation.transfer_stock", 2)],
     )
     .expect_err("a's commit is rejected");
 
@@ -511,10 +517,7 @@ fn read_write_conflict_invalidates_the_reader() {
     submit(
         &engine,
         &replacement,
-        vec![Mutation::ReplaceOperationExecution {
-            operation: id("operation.transfer_stock"),
-            execution: execution(2),
-        }],
+        vec![probe_program("operation.transfer_stock", 2)],
     )
     .expect("the replacement commits cleanly");
 }
@@ -538,10 +541,7 @@ fn write_write_conflict_is_rejected() {
     submit(
         &engine,
         &a,
-        vec![Mutation::ReplaceOperationExecution {
-            operation: id("operation.create_order"),
-            execution: execution(2),
-        }],
+        vec![probe_program("operation.create_order", 2)],
     )
     .expect("a commits first");
 
@@ -553,17 +553,14 @@ fn write_write_conflict_is_rejected() {
     let rejection = submit(
         &engine,
         &b,
-        vec![Mutation::ReplaceOperationExecution {
-            operation: id("operation.create_order"),
-            execution: execution(9),
-        }],
+        vec![probe_program("operation.create_order", 9)],
     )
     .expect_err("b's replacement is rejected");
 
     assert!(matches!(
         rejection,
         CommitRejection::WriteConflict { symbol }
-            if symbol == SymbolKey::OperationExecution(id("operation.create_order"))
+            if symbol == SymbolKey::OperationProgram(id("operation.create_order"))
     ));
 
     assert_eq!(engine.task_status(b.id).unwrap(), TaskState::Invalidated);
@@ -655,10 +652,7 @@ fn phantom_new_writer_invalidates_the_querying_task() {
     let rejection = submit(
         &engine,
         &a,
-        vec![Mutation::ReplaceOperationExecution {
-            operation: id("operation.transfer_stock"),
-            execution: execution(2),
-        }],
+        vec![probe_program("operation.transfer_stock", 2)],
     )
     .expect_err("a cannot commit on a stale answer");
 
@@ -807,10 +801,7 @@ fn duplicate_submission_commits_once() {
         patch_id: PatchId::fresh(),
         base_revision: a.snapshot_revision,
         patch: SpecPatch {
-            mutations: vec![Mutation::ReplaceOperationExecution {
-                operation: id("operation.create_order"),
-                execution: execution(2),
-            }],
+            mutations: vec![probe_program("operation.create_order", 2)],
         },
         client_nonce: Uuid::new_v4(),
     };
@@ -851,10 +842,7 @@ fn stale_read_after_head_moved_is_caught_at_commit() {
     submit(
         &engine,
         &d,
-        vec![Mutation::ReplaceOperationExecution {
-            operation: id("operation.create_order"),
-            execution: execution(2),
-        }],
+        vec![probe_program("operation.create_order", 2)],
     )
     .expect("d commits");
 
@@ -865,24 +853,21 @@ fn stale_read_after_head_moved_is_caught_at_commit() {
     engine
         .read_symbol(
             c.id,
-            &SymbolKey::OperationExecution(id("operation.create_order")),
+            &SymbolKey::OperationProgram(id("operation.create_order")),
         )
         .expect("c reads from its pinned snapshot");
 
     let rejection = submit(
         &engine,
         &c,
-        vec![Mutation::ReplaceOperationExecution {
-            operation: id("operation.transfer_stock"),
-            execution: execution(2),
-        }],
+        vec![probe_program("operation.transfer_stock", 2)],
     )
     .expect_err("the stale observation is caught at the gate");
 
     assert!(matches!(
         rejection,
         CommitRejection::ReadConflict { symbol, .. }
-            if symbol == SymbolKey::OperationExecution(id("operation.create_order"))
+            if symbol == SymbolKey::OperationProgram(id("operation.create_order"))
     ));
 
     assert_eq!(engine.task_status(c.id).unwrap(), TaskState::Invalidated);
@@ -904,10 +889,7 @@ fn wrong_base_revision_is_rejected() {
             patch_id: PatchId::fresh(),
             base_revision: Revision(999),
             patch: SpecPatch {
-                mutations: vec![Mutation::ReplaceOperationExecution {
-                    operation: id("operation.create_order"),
-                    execution: execution(2),
-                }],
+                mutations: vec![probe_program("operation.create_order", 2)],
             },
             client_nonce: Uuid::new_v4(),
         })
@@ -933,20 +915,64 @@ fn write_scope_violation_is_rejected_and_fixable() {
     let rejection = submit(
         &engine,
         &a,
-        vec![Mutation::ReplaceOperationExecution {
-            operation: id("operation.transfer_stock"),
-            execution: execution(2),
-        }],
+        vec![probe_program("operation.transfer_stock", 2)],
     )
     .expect_err("out-of-scope write is rejected");
 
     assert!(matches!(
         rejection,
         CommitRejection::WriteScopeViolation { attempted }
-            if attempted == SymbolKey::OperationExecution(id("operation.transfer_stock"))
+            if attempted == SymbolKey::OperationProgram(id("operation.transfer_stock"))
     ));
 
     assert_eq!(engine.task_status(a.id).unwrap(), TaskState::Running);
+}
+
+/// The L1 runtime topology has exactly one holder. Every other scope
+/// in the workflow — decomposition included — is refused, so a pool and
+/// the router that terminates at it can never be written by two
+/// concurrent workers with different pictures of the system.
+#[test]
+fn only_the_topology_scope_may_write_the_runtime_model() {
+    let engine = engine();
+
+    let pool = || Mutation::PutExecutionPool {
+        id: id("pool.probe"),
+        value: conseqa::spec::ExecutionPool {
+            member_concurrency: conseqa::spec::MemberConcurrency::Bounded(
+                std::num::NonZeroU32::new(1).expect("non-zero"),
+            ),
+        },
+    };
+
+    for scope in [
+        WriteScope::shared_skeleton(),
+        WriteScope::operation_synthesis(id("operation.create_order")),
+        WriteScope::requirement_repair(id("operation.create_order")),
+        WriteScope::requirement_discovery(id("operation.create_order")),
+    ] {
+        let denied = task(&engine, TaskKind::OperationSynthesis, scope.clone());
+
+        let rejection = submit(&engine, &denied, vec![pool()])
+            .expect_err("an L1 write outside the topology scope is rejected");
+
+        assert!(
+            matches!(
+                rejection,
+                CommitRejection::WriteScopeViolation { ref attempted }
+                    if *attempted == SymbolKey::ExecutionPool(id("pool.probe"))
+            ),
+            "{scope:?} accepted an L1 write: {rejection:?}"
+        );
+    }
+
+    let author = task(
+        &engine,
+        TaskKind::TopologySynthesis,
+        WriteScope::runtime_topology(),
+    );
+
+    submit(&engine, &author, vec![pool()]).expect("the topology scope may write L1");
 }
 
 #[test]
@@ -1047,13 +1073,6 @@ fn planned_operation_commits_as_draft_and_requirements_flow_through_proposals() 
                             messages: MessageSelector::Only(BTreeSet::from([id(
                                 "schema.OrderPaid",
                             )])),
-                            delivery: DeliverySemantics::AtLeastOnce,
-                            dispatch: DispatchSemantics {
-                                routing: DispatchRouting::ByTopicKey,
-                                lane_concurrency: LaneConcurrency::Bounded(
-                                    NonZeroU32::new(1).expect("non-zero"),
-                                ),
-                            },
                         }),
                     )]),
                 },
@@ -1141,10 +1160,7 @@ fn recovery_restores_the_head_and_invalidates_active_tasks() {
         committed_revision = submit(
             &engine,
             &a,
-            vec![Mutation::ReplaceOperationExecution {
-                operation: id("operation.create_order"),
-                execution: execution(2),
-            }],
+            vec![probe_program("operation.create_order", 2)],
         )
         .expect("the commit persists")
         .revision;
@@ -1181,13 +1197,11 @@ fn recovery_restores_the_head_and_invalidates_active_tasks() {
     let head = reopened.head_snapshot();
 
     assert_eq!(
-        head.workspace.operations[&id("operation.create_order")]
-            .execution
-            .as_ref()
-            .map(|execution| execution.concurrency),
-        Some(OperationConcurrency::Bounded(
-            NonZeroU32::new(2).expect("non-zero")
-        )),
+        head.workspace.operations[&id("operation.create_order")].program,
+        Some(match probe_program("operation.create_order", 2) {
+            Mutation::ReplaceOperationProgram { program, .. } => program,
+            _ => unreachable!("probe_program builds a program mutation"),
+        }),
     );
 
     // The task that was running when the process died is conservatively

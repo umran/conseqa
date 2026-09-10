@@ -42,20 +42,67 @@ schemas, data objects, topics, state machines, and one interface per \
 planned operation (id, service, inputs, request/subscription contracts). \
 Extract every explicit correctness statement in the prompt as a prompt \
 obligation. Do not implement operation programs — establish stable \
-interfaces callers can reason against. Commit one `submit_patch` that \
-creates all planned operation interfaces and prompt obligations.",
+interfaces callers can reason against.
+
+This is the L0 application model only. The runtime topology (L1) — \
+transport grouping and ordering, subscription delivery and dispatch, \
+execution pools, request routers, storage layouts — is authored in a \
+later phase, once the run knows which requirements it has to \
+discharge. Do not declare any of it here, and do not shape an \
+interface around a topology you are imagining.
+
+Commit one `submit_patch` that creates all planned operation interfaces \
+and the prompt obligations.",
+
+        TaskKind::TopologySynthesis => "\
+## Your task: runtime topology
+
+You own the runtime topology (L1), and nothing else: transport \
+grouping and ordering, subscription delivery and dispatch, execution \
+pools and their member concurrency, request routers, and storage \
+layouts. The L0 application model is settled and not yours to change.
+
+Sometimes no topology can discharge a requirement, because the \
+application model does not carry what a proof would need — a message \
+schema with no field bearing the serialization key, so no grouping key \
+can group by it; a topic carrying a schema that cannot be grouped at \
+all, when a topic-scoped grouping must cover every message. Do not \
+approximate around that with a key that is not the one the requirement \
+names. File a `dependency_request` against the L0 symbol, say what it \
+needs and why, and leave the requirement unproven for now.
+
+Your objective names the obligations the runtime has to discharge. \
+Read each one's `requirement_report`: its structured obstacle names \
+the exact missing fact. Serialization and ordering are proven from \
+this layer — a grouping domain owned by one pool member whose \
+concurrency is bounded(1) is what proves same-key invocations never \
+overlap, and a transport ordering on top of that is what proves they \
+take effect in order. Serialization needs no ordering fact at all: \
+declare `ordering: none` where the transport genuinely orders nothing \
+rather than claiming an order to reach a grouping key.
+
+Grouping and ordering are independent facts sharing one exclusive \
+scope — declare them either on the topic runtime, covering every \
+subscription of it, or on each subscription runtime, never both.
+
+L1 is optional, and an unproven requirement is an acceptable outcome. \
+Never invent topology to make a proof pass: if the architecture \
+genuinely does not constrain execution that way, leave it unproven and \
+say so. Commit one `submit_patch` for the whole layer.",
 
         TaskKind::OperationSynthesis => "\
 ## Your task: operation synthesis
 
-Synthesize this operation's program and execution facts: inline \
-transactions, bindings, effects, branches/matches, returns or \
-completion, and the operation's concurrency. Reason about causal \
+Synthesize this operation's program: inline transactions, bindings, \
+effects, branches/matches, returns or completion. Reason about causal \
 behavior, state access, and control flow — not about proof \
-obligations, which come later. If a shared symbol (a schema field, a \
-callee contract, a topic, a transition) must change, file a \
-`dependency_request` rather than editing it. Commit one scoped \
-`submit_patch`.",
+obligations, which come later, and not about runtime topology, which is \
+the coordinator's. An operation declares no concurrency of its own: \
+where its invocations execute and how many run at once are facts about \
+the execution resource, declared in L1. If a shared symbol (a schema \
+field, a callee contract, a topic, a transition, an execution pool) \
+must change, file a `dependency_request` rather than editing it. Commit \
+one scoped `submit_patch`.",
 
         TaskKind::RequirementDiscovery => "\
 ## Your task: requirement discovery
@@ -82,10 +129,15 @@ Commit one scoped `submit_patch`, or report unresolved.",
         TaskKind::SharedDependencyRepair => "\
 ## Your task: shared dependency repair
 
-Apply the specific shared-symbol change your objective names — a \
-schema, data object, topic, state machine, or interface. Keep the \
-change minimal and coherent with the operations that depend on it. \
-Commit one scoped `submit_patch`.",
+Another worker needed a change to a symbol it was not authorized to \
+write, and named it. Apply that change — a schema, data object, topic, \
+state machine, or interface — keeping it minimal and coherent with the \
+operations that depend on it. Commit one scoped `submit_patch`.
+
+Judge the request; do not just execute it. If the change is wrong, \
+unnecessary, or would break a dependent operation, commit nothing and \
+say why. Committing nothing is a real outcome, recorded as a declined \
+request, and it is the right one when the requester was mistaken.",
 
         TaskKind::DependencyReview => "\
 ## Your task: dependency review
