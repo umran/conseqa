@@ -82,3 +82,79 @@ fn video_streaming_example_proves_everything() {
 
     assert_eq!(unproven, [""; 0], "every obligation should prove");
 }
+
+#[test]
+fn hedged_read_example_is_valid() {
+    let model = load("hedged_read.yaml");
+
+    let errors = validation::validate(&model);
+
+    assert!(
+        errors.is_empty(),
+        "hedged read example should validate:\n{errors:#?}"
+    );
+}
+
+#[test]
+fn hedged_read_example_exposes_async_executions_to_the_graph() {
+    use conseqa::viz::graph::{EdgeDetail, extract};
+
+    let model = load("hedged_read.yaml");
+
+    let graph = extract(&model);
+
+    // Every effect of the hedged read is launched asynchronously —
+    // both raced stores and the fire-and-forget audit — while the
+    // ledger write of record_read is an ordinary synchronous
+    // execution. The graph says which is which, so a visualization
+    // can distinguish the edges (§84 of the async revision).
+    let mut asynchronous = Vec::new();
+    let mut synchronous = Vec::new();
+
+    for edge in &graph.edges {
+        let (effect, executed, launched) = match &edge.detail {
+            EdgeDetail::Publish {
+                effect,
+                executed_at,
+                async_executed_at,
+                ..
+            }
+            | EdgeDetail::Request {
+                effect,
+                executed_at,
+                async_executed_at,
+                ..
+            }
+            | EdgeDetail::External {
+                effect,
+                executed_at,
+                async_executed_at,
+                ..
+            } => (effect, executed_at, async_executed_at),
+
+            _ => continue,
+        };
+
+        assert!(!executed.is_empty(), "every declared effect is executed");
+
+        if launched == executed {
+            asynchronous.push(effect.0.as_str());
+        } else {
+            assert!(launched.is_empty(), "no effect mixes launch modes here");
+            synchronous.push(effect.0.as_str());
+        }
+    }
+
+    asynchronous.sort_unstable();
+
+    assert_eq!(
+        asynchronous,
+        [
+            "effect.hedged_read.audit",
+            "effect.hedged_read.primary",
+            "effect.hedged_read.replica",
+        ]
+    );
+
+    assert_eq!(synchronous, ["effect.record_read.ledger"]);
+}

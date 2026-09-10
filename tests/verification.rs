@@ -21,11 +21,13 @@ use conseqa::{
     },
     parser::yaml,
     spec::{
-        Arm, Branch, CompletionRequirement, Condition, Derivation, Effect, ErrorDisposition,
-        ErrorResultType, EstablishTransactionOutput, ExecuteEffect, ExternalEffect, FieldPath, Id,
-        IdempotencyGuarantee, IdempotencyKey, IdempotencyRequirement, Input, MemberAssignment,
+        Arm, AsyncJoin, Branch, CompletionRequirement, Condition, Derivation, Effect,
+        ErrorDisposition, ErrorResultType, EstablishTransactionOutput, ExecuteEffect,
+        ExecuteEffectAsync, ExternalEffect, FieldPath, Id,
+        IdempotencyGuarantee, IdempotencyKey, IdempotencyRequirement, Input, JoinAll,
+        MemberAssignment,
         MemberConcurrency, Literal, MatchResult, MessageIdentity, MessageSelector, Model,
-        ObjectSelector, OperationBlock, OperationInputRef, OperationStep,
+        ObjectSelector, OperationBlock, OperationInputRef, OperationStep, Race,
         RecoverabilityRequirement, RequestIdentity, RequestInput, RequestRouting, ResultOutcome,
         ResultReplayRequirement, ResultType, ResultVariant, Return, Router, RuntimeModel, Schema,
         SchemaFragment, SelectorPredicate, SelectorValue, SerializationRequirement,
@@ -4932,4 +4934,264 @@ fn a_transition_established_output_without_recovery_defeats_result_replay() {
 
     assert_eq!(recovery, &vec![ReplayGap::NoKeyedCommit]);
     assert!(reconstruction.contains(&ReplayGap::ContainsTransition));
+}
+
+// Asynchronous effect execution: launches are ordinary effect attempts,
+// join_all surfaces launch-time result judgments, race is conservative.
+
+/// Restructures charge_payment's opening card charge into an async
+/// launch joined back under the original result binding: the
+/// asynchronous form of the same program.
+fn asyncify_charge_payment(model: &mut Model) {
+    let program = program_mut(model, "operation.charge_payment");
+
+    let OperationStep::ExecuteEffect(card) = program.steps.remove(0) else {
+        panic!("expected the card-charge execute_effect step");
+    };
+
+    program.steps.insert(
+        0,
+        OperationStep::ExecuteEffectAsync(ExecuteEffectAsync {
+            handle: id("async.charge_payment.card"),
+            effect_id: card.effect_id,
+            effect: card.effect,
+            values: card.values,
+        }),
+    );
+
+    program.steps.insert(
+        1,
+        OperationStep::JoinAll(JoinAll {
+            handles: vec![AsyncJoin {
+                handle: id("async.charge_payment.card"),
+                bind: card.bind,
+            }],
+        }),
+    );
+}
+
+/// Rebuilds charge_payment's opening into a hedged pair of async card
+/// charges — both deduplicated by the delivery's event id, declines
+/// terminal, so each candidate's result is individually replay-stable
+/// — synchronized by the step the caller chooses at position 2.
+fn hedge_charge_payment(model: &mut Model, synchronize: OperationStep) {
+    {
+        let card = charge_card_mut(model);
+
+        card.idempotency = IdempotencyGuarantee::DeduplicatedBy {
+            key: IdempotencyKey {
+                components: vec![input_key("input.charge_payment.reserved", &["event_id"])],
+            },
+        };
+
+        card.result
+            .as_mut()
+            .expect("card charge declares a result")
+            .err
+            .disposition = ErrorDisposition::Terminal;
+    }
+
+    let program = program_mut(model, "operation.charge_payment");
+
+    let OperationStep::ExecuteEffect(card) = program.steps.remove(0) else {
+        panic!("expected the card-charge execute_effect step");
+    };
+
+    program.steps.insert(
+        0,
+        OperationStep::ExecuteEffectAsync(ExecuteEffectAsync {
+            handle: id("async.charge_payment.primary"),
+            effect_id: card.effect_id,
+            effect: card.effect.clone(),
+            values: card.values.clone(),
+        }),
+    );
+
+    program.steps.insert(
+        1,
+        OperationStep::ExecuteEffectAsync(ExecuteEffectAsync {
+            handle: id("async.charge_payment.hedge"),
+            effect_id: id("effect.charge_payment.card_hedge"),
+            effect: card.effect,
+            values: card.values,
+        }),
+    );
+
+    program.steps.insert(2, synchronize);
+}
+
+#[test]
+fn async_launch_and_join_judge_like_the_synchronous_execution() {
+    // Not waiting removes nothing: the launch is the same effect
+    // attempt, and the joined binding carries the judgment the effect
+    // would have had synchronously — so the async restructure raises
+    // exactly the synchronous program's obstacles.
+    let mut model = load_flash_checkout();
+
+    asyncify_charge_payment(&mut model);
+
+    let errors = validation::validate(&model);
+
+    assert!(errors.is_empty(), "{errors:#?}");
+
+    let verdict = idempotency_verdict(&model, "operation.charge_payment", 0);
+
+    let IdempotencyVerdict::Unproven { obstacles } = &verdict else {
+        panic!("expected charge_payment unproven, found {verdict:?}");
+    };
+
+    assert!(
+        matches!(
+            &obstacles[..],
+            [
+                IdempotencyObstacle::ExternalEffectNotDeduplicated { effect, .. },
+                IdempotencyObstacle::PathDecisionUnstable {
+                    decision: verification::DecisionTaken::Match { result, arm: ResultVariant::Ok, .. },
+                    gap: DecisionGap::ResultUnstable {
+                        gap: ResultGap::ExternalNotDeduplicated,
+                        ..
+                    },
+                    ..
+                },
+                IdempotencyObstacle::EffectInstanceRootUnstable { effect: failed, roots, .. },
+            ] if effect == &id("effect.charge_payment.card")
+                && result == &id("result.charge_payment.card")
+                && failed == &id("effect.charge_payment.publish_failed")
+                && matches!(roots[0].gap, StabilityGap::ResultUnstable { .. })
+        ),
+        "{obstacles:#?}"
+    );
+}
+
+#[test]
+fn joining_hedged_deduplicated_charges_proves_idempotency() {
+    // Both candidates address one logical external interaction whose
+    // terminal result is fixed, and the join surfaces the primary's
+    // launch-time judgment unchanged: the requirement proves.
+    let mut model = load_flash_checkout();
+
+    hedge_charge_payment(
+        &mut model,
+        OperationStep::JoinAll(JoinAll {
+            handles: vec![
+                AsyncJoin {
+                    handle: id("async.charge_payment.primary"),
+                    bind: Some(id("result.charge_payment.card")),
+                },
+                AsyncJoin {
+                    handle: id("async.charge_payment.hedge"),
+                    bind: None,
+                },
+            ],
+        }),
+    );
+
+    let errors = validation::validate(&model);
+
+    assert!(errors.is_empty(), "{errors:#?}");
+
+    let verdict = idempotency_verdict(&model, "operation.charge_payment", 0);
+
+    assert!(
+        matches!(verdict, IdempotencyVerdict::Proven { .. }),
+        "expected charge_payment proven, found {verdict:?}"
+    );
+}
+
+#[test]
+fn a_race_bound_result_is_conservatively_replay_unstable() {
+    // The same launches, raced instead of joined: even though each
+    // candidate's result is individually replay-stable, which one
+    // completes first is scheduling nondeterminism, so the bound
+    // result — and everything resting on it — is not established to
+    // replay.
+    let mut model = load_flash_checkout();
+
+    hedge_charge_payment(
+        &mut model,
+        OperationStep::Race(Race {
+            handles: vec![
+                id("async.charge_payment.primary"),
+                id("async.charge_payment.hedge"),
+            ],
+            bind: Some(id("result.charge_payment.card")),
+        }),
+    );
+
+    let errors = validation::validate(&model);
+
+    assert!(errors.is_empty(), "{errors:#?}");
+
+    let verdict = idempotency_verdict(&model, "operation.charge_payment", 0);
+
+    let IdempotencyVerdict::Unproven { obstacles } = &verdict else {
+        panic!("expected charge_payment unproven, found {verdict:?}");
+    };
+
+    assert!(
+        matches!(
+            &obstacles[..],
+            [
+                IdempotencyObstacle::PathDecisionUnstable {
+                    decision: verification::DecisionTaken::Match { result, .. },
+                    gap: DecisionGap::ResultUnstable {
+                        gap: ResultGap::RaceWinnerNondeterministic { candidates },
+                        ..
+                    },
+                    ..
+                },
+                IdempotencyObstacle::EffectInstanceRootUnstable { effect: failed, roots, .. },
+            ] if result == &id("result.charge_payment.card")
+                && candidates
+                    == &vec![
+                        id("effect.charge_payment.card"),
+                        id("effect.charge_payment.card_hedge"),
+                    ]
+                && failed == &id("effect.charge_payment.publish_failed")
+                && matches!(roots[0].gap, StabilityGap::ResultUnstable { .. })
+        ),
+        "{obstacles:#?}"
+    );
+}
+
+#[test]
+fn fire_and_forget_launches_stay_in_the_effect_cascade() {
+    // Launching the capture publication without ever joining it leaves
+    // the operation's judgment exactly where the synchronous execution
+    // left it: the launch is in the blast radius, and the terminal
+    // neither joins nor absolves it.
+    let mut sync_model = load_flash_checkout();
+
+    linearize_charge_payment(&mut sync_model);
+
+    let mut async_model = load_flash_checkout();
+
+    linearize_charge_payment(&mut async_model);
+
+    {
+        let program = program_mut(&mut async_model, "operation.charge_payment");
+
+        let OperationStep::ExecuteEffect(publish) = program.steps.remove(1) else {
+            panic!("expected the capture publication");
+        };
+
+        program.steps.insert(
+            1,
+            OperationStep::ExecuteEffectAsync(ExecuteEffectAsync {
+                handle: id("async.charge_payment.captured"),
+                effect_id: publish.effect_id,
+                effect: publish.effect,
+                values: publish.values,
+            }),
+        );
+    }
+
+    let errors = validation::validate(&async_model);
+
+    assert!(errors.is_empty(), "{errors:#?}");
+
+    assert_eq!(
+        idempotency_verdict(&sync_model, "operation.charge_payment", 0),
+        idempotency_verdict(&async_model, "operation.charge_payment", 0),
+    );
 }

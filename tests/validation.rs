@@ -9,9 +9,11 @@ use conseqa::{
     analyzer::validation::{self, ProgramUse, ReferenceKind, ValidationError},
     parser::yaml,
     spec::{
-        Arm, Branch, Condition, Derivation, Effect, EstablishTransactionOutput, ExecuteEffect,
-        FieldPath, Id, IdempotencyGuarantee, Input, Literal, MessageIdentity, MessageSelector,
-        Model, OperationBlock, OperationStep, RequestEffect, RequestIdentity, RequestTarget,
+        Arm, AsyncJoin, Branch, Condition, Derivation, Effect, EstablishTransactionOutput,
+        ExecuteEffect, ExecuteEffectAsync, ExecuteEffectIntentAsync, FieldPath, Id,
+        IdempotencyGuarantee, IdempotencyKey, Input, JoinAll, Literal, MessageIdentity,
+        MessageSelector,
+        Model, OperationBlock, OperationStep, Race, RequestEffect, RequestIdentity, RequestTarget,
         DataObjectRef, ExecutionPool, MemberAssignment, MemberConcurrency,
         OperationInputRef,
         RequestRouting, ResultOutcome, ResultVariant, RetrySemantics, Return, Router, RuntimeModel,
@@ -3163,4 +3165,583 @@ fn a_bounded_member_concurrency_of_zero_is_unrepresentable() {
         serde_json::from_str(r#"{"member_concurrency":{"kind":"bounded","value":0}}"#);
 
     assert!(zero.is_err(), "a bound of zero must not deserialize");
+}
+
+// Asynchronous effect execution: launches, handles, and the
+// synchronization barriers that consume them.
+
+/// Restructures charge_payment's opening card charge into an async
+/// launch joined back under the original result binding: the
+/// asynchronous form of the same program.
+fn asyncify_charge_payment(model: &mut Model) {
+    let program = program_mut(model, "operation.charge_payment");
+
+    let OperationStep::ExecuteEffect(card) = program.steps.remove(0) else {
+        panic!("expected the card-charge execute_effect step");
+    };
+
+    program.steps.insert(
+        0,
+        OperationStep::ExecuteEffectAsync(ExecuteEffectAsync {
+            handle: id("async.charge_payment.card"),
+            effect_id: card.effect_id,
+            effect: card.effect,
+            values: card.values,
+        }),
+    );
+
+    program.steps.insert(
+        1,
+        OperationStep::JoinAll(JoinAll {
+            handles: vec![AsyncJoin {
+                handle: id("async.charge_payment.card"),
+                bind: card.bind,
+            }],
+        }),
+    );
+}
+
+#[test]
+fn accepts_async_launch_joined_before_the_match() {
+    let mut model = load_flash_checkout();
+
+    asyncify_charge_payment(&mut model);
+
+    let errors = validation::validate(&model);
+
+    assert!(errors.is_empty(), "{errors:#?}");
+}
+
+#[test]
+fn rejects_result_matched_before_synchronization() {
+    // An async launch binds no result: with the join gone, the binding
+    // the match consumes is declared by nothing at all, however
+    // certainly the launch occurred.
+    let mut model = load_flash_checkout();
+
+    asyncify_charge_payment(&mut model);
+
+    program_mut(&mut model, "operation.charge_payment")
+        .steps
+        .remove(1);
+
+    let errors = validation::validate(&model);
+
+    assert!(
+        errors.iter().any(|error| matches!(
+            error,
+            ValidationError::UnknownReference {
+                reference,
+                expected: ReferenceKind::EffectResult,
+                ..
+            } if reference == &id("result.charge_payment.card")
+        )),
+        "{errors:#?}"
+    );
+}
+
+#[test]
+fn rejects_a_result_joined_on_only_one_path() {
+    // The binding exists — a join on one arm declares it — but is not
+    // produced on every path reaching the match.
+    let mut model = load_flash_checkout();
+
+    asyncify_charge_payment(&mut model);
+
+    let program = program_mut(&mut model, "operation.charge_payment");
+
+    let join = program.steps.remove(1);
+
+    program.steps.insert(
+        1,
+        OperationStep::Branch(Branch {
+            condition: Condition::Unspecified,
+            then: OperationBlock { steps: vec![join] },
+            otherwise: None,
+        }),
+    );
+
+    let errors = validation::validate(&model);
+
+    assert!(
+        errors.iter().any(|error| matches!(
+            error,
+            ValidationError::EffectResultNotBound { result, .. }
+                if result == &id("result.charge_payment.card")
+        )),
+        "{errors:#?}"
+    );
+}
+
+#[test]
+fn rejects_an_empty_join_all() {
+    let mut model = load_flash_checkout();
+
+    asyncify_charge_payment(&mut model);
+
+    // An extra, empty barrier after the real one: the barrier itself
+    // is the defect; the original join keeps the result binding
+    // declared.
+    program_mut(&mut model, "operation.charge_payment")
+        .steps
+        .insert(2, OperationStep::JoinAll(JoinAll { handles: vec![] }));
+
+    let errors = validation::validate(&model);
+
+    assert!(
+        errors
+            .iter()
+            .any(|error| matches!(error, ValidationError::EmptyJoinAll { .. })),
+        "{errors:#?}"
+    );
+}
+
+#[test]
+fn rejects_a_single_candidate_race() {
+    let mut model = load_flash_checkout();
+
+    asyncify_charge_payment(&mut model);
+
+    program_mut(&mut model, "operation.charge_payment").steps[1] = OperationStep::Race(Race {
+        handles: vec![id("async.charge_payment.card")],
+        bind: Some(id("result.charge_payment.card")),
+    });
+
+    let errors = validation::validate(&model);
+
+    assert!(
+        errors.iter().any(|error| matches!(
+            error,
+            ValidationError::RaceRequiresTwoHandles { count: 1, .. }
+        )),
+        "{errors:#?}"
+    );
+}
+
+#[test]
+fn rejects_a_repeated_handle_in_one_barrier() {
+    let mut model = load_flash_checkout();
+
+    asyncify_charge_payment(&mut model);
+
+    let OperationStep::JoinAll(join) =
+        &mut program_mut(&mut model, "operation.charge_payment").steps[1]
+    else {
+        panic!("expected the join");
+    };
+
+    join.handles.push(AsyncJoin {
+        handle: id("async.charge_payment.card"),
+        bind: None,
+    });
+
+    let errors = validation::validate(&model);
+
+    assert!(
+        errors.iter().any(|error| matches!(
+            error,
+            ValidationError::DuplicateSynchronizationHandle { handle, .. }
+                if handle == &id("async.charge_payment.card")
+        )),
+        "{errors:#?}"
+    );
+}
+
+#[test]
+fn rejects_synchronizing_a_handle_not_launched_on_every_path() {
+    let mut model = load_flash_checkout();
+
+    asyncify_charge_payment(&mut model);
+
+    // Move the launch under one arm of a decision; the join outside no
+    // longer finds the handle definitely available.
+    let program = program_mut(&mut model, "operation.charge_payment");
+
+    let launch = program.steps.remove(0);
+
+    program.steps.insert(
+        0,
+        OperationStep::Branch(Branch {
+            condition: Condition::Unspecified,
+            then: OperationBlock {
+                steps: vec![launch],
+            },
+            otherwise: None,
+        }),
+    );
+
+    let errors = validation::validate(&model);
+
+    assert!(
+        errors.iter().any(|error| matches!(
+            error,
+            ValidationError::AsyncHandleNotAvailable { handle, .. }
+                if handle == &id("async.charge_payment.card")
+        )),
+        "{errors:#?}"
+    );
+}
+
+#[test]
+fn rejects_a_reference_to_an_unknown_handle() {
+    let mut model = load_flash_checkout();
+
+    asyncify_charge_payment(&mut model);
+
+    let OperationStep::JoinAll(join) =
+        &mut program_mut(&mut model, "operation.charge_payment").steps[1]
+    else {
+        panic!("expected the join");
+    };
+
+    join.handles[0].handle = id("async.charge_payment.missing");
+
+    let errors = validation::validate(&model);
+
+    assert!(
+        errors.iter().any(|error| matches!(
+            error,
+            ValidationError::UnknownReference {
+                reference,
+                expected: ReferenceKind::AsyncHandle,
+                ..
+            } if reference == &id("async.charge_payment.missing")
+        )),
+        "{errors:#?}"
+    );
+}
+
+#[test]
+fn rejects_two_launches_declaring_one_handle() {
+    let mut model = load_flash_checkout();
+
+    asyncify_charge_payment(&mut model);
+
+    let program = program_mut(&mut model, "operation.charge_payment");
+
+    let OperationStep::ExecuteEffectAsync(launch) = program.steps[0].clone() else {
+        panic!("expected the async launch");
+    };
+
+    program.steps.insert(
+        1,
+        OperationStep::ExecuteEffectAsync(ExecuteEffectAsync {
+            handle: launch.handle,
+            effect_id: id("effect.charge_payment.card_hedge"),
+            effect: launch.effect,
+            values: launch.values,
+        }),
+    );
+
+    let errors = validation::validate(&model);
+
+    assert!(
+        errors.iter().any(|error| matches!(
+            error,
+            ValidationError::DuplicateId { id: duplicate, .. }
+                if duplicate == &id("async.charge_payment.card")
+        )),
+        "{errors:#?}"
+    );
+}
+
+#[test]
+fn rejects_binding_a_joined_resultless_effect() {
+    // Executing create_order's publication intent asynchronously and
+    // joining it is meaningful; binding a result of a publication is
+    // not.
+    let mut model = load_flash_checkout();
+
+    let program = program_mut(&mut model, "operation.create_order");
+
+    let OperationStep::ExecuteEffectIntent(step) = program.steps.remove(1) else {
+        panic!("expected the intent execution");
+    };
+
+    program.steps.insert(
+        1,
+        OperationStep::ExecuteEffectIntentAsync(ExecuteEffectIntentAsync {
+            intent: step.intent,
+            handle: id("async.create_order.publish"),
+        }),
+    );
+
+    program.steps.insert(
+        2,
+        OperationStep::JoinAll(JoinAll {
+            handles: vec![AsyncJoin {
+                handle: id("async.create_order.publish"),
+                bind: Some(id("result.create_order.publish")),
+            }],
+        }),
+    );
+
+    let errors = validation::validate(&model);
+
+    assert!(
+        errors.iter().any(|error| matches!(
+            error,
+            ValidationError::EffectHasNoResult { effect, result, .. }
+                if effect == &id("effect.create_order.publish_created")
+                    && result == &id("result.create_order.publish")
+        )),
+        "{errors:#?}"
+    );
+}
+
+#[test]
+fn accepts_an_async_intent_execution_with_a_completion_barrier() {
+    let mut model = load_flash_checkout();
+
+    let program = program_mut(&mut model, "operation.create_order");
+
+    let OperationStep::ExecuteEffectIntent(step) = program.steps.remove(1) else {
+        panic!("expected the intent execution");
+    };
+
+    program.steps.insert(
+        1,
+        OperationStep::ExecuteEffectIntentAsync(ExecuteEffectIntentAsync {
+            intent: step.intent,
+            handle: id("async.create_order.publish"),
+        }),
+    );
+
+    program.steps.insert(
+        2,
+        OperationStep::JoinAll(JoinAll {
+            handles: vec![AsyncJoin {
+                handle: id("async.create_order.publish"),
+                bind: None,
+            }],
+        }),
+    );
+
+    let errors = validation::validate(&model);
+
+    assert!(errors.is_empty(), "{errors:#?}");
+}
+
+#[test]
+fn rejects_racing_incompatible_result_contracts() {
+    let mut model = load_flash_checkout();
+
+    asyncify_charge_payment(&mut model);
+
+    let program = program_mut(&mut model, "operation.charge_payment");
+
+    let OperationStep::ExecuteEffectAsync(primary) = program.steps[0].clone() else {
+        panic!("expected the async launch");
+    };
+
+    // A hedge whose error contract differs: same ok, different err.
+    let mut hedge_effect = primary.effect.clone();
+
+    let Effect::External(external) = &mut hedge_effect else {
+        panic!("card charge should be external");
+    };
+
+    external
+        .result
+        .as_mut()
+        .expect("card charge declares a result")
+        .err
+        .schema = id("schema.RequestRejected");
+
+    program.steps.insert(
+        1,
+        OperationStep::ExecuteEffectAsync(ExecuteEffectAsync {
+            handle: id("async.charge_payment.hedge"),
+            effect_id: id("effect.charge_payment.card_hedge"),
+            effect: hedge_effect,
+            values: primary.values,
+        }),
+    );
+
+    program.steps[2] = OperationStep::Race(Race {
+        handles: vec![
+            id("async.charge_payment.card"),
+            id("async.charge_payment.hedge"),
+        ],
+        bind: Some(id("result.charge_payment.card")),
+    });
+
+    let errors = validation::validate(&model);
+
+    assert!(
+        errors.iter().any(|error| matches!(
+            error,
+            ValidationError::RaceResultContractMismatch { first, second, .. }
+                if first == &id("effect.charge_payment.card")
+                    && second == &id("effect.charge_payment.card_hedge")
+        )),
+        "{errors:#?}"
+    );
+}
+
+#[test]
+fn accepts_a_hedged_race_and_a_later_cleanup_join() {
+    // race does not consume its handles: a later join_all over the
+    // same pair distinguishes the first-completion dependency from the
+    // all-completion dependency.
+    let mut model = load_flash_checkout();
+
+    asyncify_charge_payment(&mut model);
+
+    let program = program_mut(&mut model, "operation.charge_payment");
+
+    let OperationStep::ExecuteEffectAsync(primary) = program.steps[0].clone() else {
+        panic!("expected the async launch");
+    };
+
+    program.steps.insert(
+        1,
+        OperationStep::ExecuteEffectAsync(ExecuteEffectAsync {
+            handle: id("async.charge_payment.hedge"),
+            effect_id: id("effect.charge_payment.card_hedge"),
+            effect: primary.effect,
+            values: primary.values,
+        }),
+    );
+
+    program.steps[2] = OperationStep::Race(Race {
+        handles: vec![
+            id("async.charge_payment.card"),
+            id("async.charge_payment.hedge"),
+        ],
+        bind: Some(id("result.charge_payment.card")),
+    });
+
+    program.steps.insert(
+        3,
+        OperationStep::JoinAll(JoinAll {
+            handles: vec![
+                AsyncJoin {
+                    handle: id("async.charge_payment.card"),
+                    bind: None,
+                },
+                AsyncJoin {
+                    handle: id("async.charge_payment.hedge"),
+                    bind: None,
+                },
+            ],
+        }),
+    );
+
+    let errors = validation::validate(&model);
+
+    assert!(errors.is_empty(), "{errors:#?}");
+}
+
+#[test]
+fn accepts_fire_and_forget_launches_before_the_terminal() {
+    // A terminal does not implicitly join: launching and completing is
+    // structurally meaningful fire-and-forget.
+    let mut model = load_flash_checkout();
+
+    let program = program_mut(&mut model, "operation.charge_payment");
+
+    let OperationStep::ExecuteEffect(card) = program.steps.remove(0) else {
+        panic!("expected the card-charge execute_effect step");
+    };
+
+    let OperationStep::MatchResult(matched) = program.steps.remove(0) else {
+        panic!("expected the card match");
+    };
+
+    let OperationStep::ExecuteEffect(publish) = matched.ok.steps[0].clone() else {
+        panic!("expected the capture publication");
+    };
+
+    program.steps = vec![
+        OperationStep::ExecuteEffectAsync(ExecuteEffectAsync {
+            handle: id("async.charge_payment.card"),
+            effect_id: card.effect_id,
+            effect: card.effect,
+            values: card.values,
+        }),
+        OperationStep::ExecuteEffectAsync(ExecuteEffectAsync {
+            handle: id("async.charge_payment.captured"),
+            effect_id: publish.effect_id,
+            effect: publish.effect,
+            values: publish.values,
+        }),
+        OperationStep::Complete,
+    ];
+
+    let errors = validation::validate(&model);
+
+    assert!(errors.is_empty(), "{errors:#?}");
+}
+
+// A program-level effect contract's own field paths — propagation
+// components, an external deduplication key — are validated at the
+// execution site, exactly as an intent establishment's are.
+
+#[test]
+fn rejects_an_invalid_propagation_path_in_a_program_level_effect() {
+    let mut model = load_flash_checkout();
+
+    let program = program_mut(&mut model, "operation.charge_payment");
+
+    let OperationStep::MatchResult(matched) = &mut program.steps[1] else {
+        panic!("expected the card match");
+    };
+
+    let OperationStep::ExecuteEffect(publish) = &mut matched.ok.steps[0] else {
+        panic!("expected the capture publication");
+    };
+
+    let Effect::Publication(effect) = &mut publish.effect else {
+        panic!("expected a publication");
+    };
+
+    effect.idempotency_key_propagation[0].source.components[0].path = path(&["no_such_field"]);
+
+    let errors = validation::validate(&model);
+
+    assert!(
+        errors.iter().any(|error| matches!(
+            error,
+            ValidationError::InvalidFieldPath { subject, path: wrong, .. }
+                if subject == &id("effect.charge_payment.publish_captured")
+                    && wrong == &path(&["no_such_field"])
+        )),
+        "{errors:#?}"
+    );
+}
+
+#[test]
+fn rejects_an_invalid_dedup_key_path_in_an_async_launch() {
+    let mut model = load_flash_checkout();
+
+    asyncify_charge_payment(&mut model);
+
+    let OperationStep::ExecuteEffectAsync(card) =
+        &mut program_mut(&mut model, "operation.charge_payment").steps[0]
+    else {
+        panic!("expected the async launch");
+    };
+
+    let Effect::External(external) = &mut card.effect else {
+        panic!("card charge should be external");
+    };
+
+    external.idempotency = IdempotencyGuarantee::DeduplicatedBy {
+        key: IdempotencyKey {
+            components: vec![input_ref("input.charge_payment.reserved", &["no_such_field"])],
+        },
+    };
+
+    let errors = validation::validate(&model);
+
+    assert!(
+        errors.iter().any(|error| matches!(
+            error,
+            ValidationError::InvalidFieldPath { subject, path: wrong, .. }
+                if subject == &id("effect.charge_payment.card")
+                    && wrong == &path(&["no_such_field"])
+        )),
+        "{errors:#?}"
+    );
 }

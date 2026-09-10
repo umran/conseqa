@@ -242,6 +242,20 @@ pub(crate) fn result_gap_sentence(gap: &ResultGap) -> String {
         ResultGap::NoResultContract => {
             "the effect contract yields no synchronous result".to_string()
         }
+
+        ResultGap::RaceWinnerNondeterministic { candidates } => {
+            let candidates = candidates
+                .iter()
+                .map(|candidate| format!("`{candidate}`"))
+                .collect::<Vec<_>>()
+                .join(", ");
+
+            format!(
+                "the result is bound by a `race` over [{candidates}]: which candidate \
+                 completes first is scheduling nondeterminism, so retries are not \
+                 established to observe the same winner"
+            )
+        }
     }
 }
 

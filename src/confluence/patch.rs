@@ -496,6 +496,10 @@ fn collect_program_refs(operation: &Id, program: &OperationBlock, into: &mut Vec
                 effect_refs(&execute.effect, out);
             }
 
+            OperationStep::ExecuteEffectAsync(execute) => {
+                effect_refs(&execute.effect, out);
+            }
+
             _ => {}
         }
     }

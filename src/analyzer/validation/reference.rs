@@ -25,6 +25,10 @@ pub enum ReferenceKind {
     /// A result binding declared by an effect-executing program step.
     EffectResult,
 
+    /// An asynchronous-execution handle bound by an async launch step,
+    /// consumable only by synchronization steps.
+    AsyncHandle,
+
     // L1 — runtime topology.
     ExecutionPool,
     Router,
@@ -54,6 +58,7 @@ impl fmt::Display for ReferenceKind {
             Self::Transaction => "transaction",
             Self::TransactionRead => "transaction read",
             Self::EffectResult => "effect result binding",
+            Self::AsyncHandle => "async handle",
 
             Self::ExecutionPool => "execution pool",
             Self::Router => "router",

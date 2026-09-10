@@ -69,6 +69,20 @@ pub struct ExternalEffect {
 }
 
 impl Effect {
+    /// Whether this effect kind may be launched through
+    /// `execute_effect_async`.
+    ///
+    /// Exactly the kinds legal for ordinary direct execution are
+    /// async-capable today. The match is deliberately exhaustive: a
+    /// new effect kind must decide here whether direct asynchronous
+    /// execution is legal, rather than becoming async-capable merely
+    /// by joining the enum.
+    pub fn permits_direct_async(&self) -> bool {
+        match self {
+            Self::Publication(_) | Self::Request(_) | Self::External(_) => true,
+        }
+    }
+
     /// Every value reference the effect's declaration evaluates when
     /// the effect executes: an external deduplication key, and the
     /// source and target of each propagation.

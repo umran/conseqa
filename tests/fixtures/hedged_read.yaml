@@ -1,0 +1,181 @@
+revision: 1
+
+services:
+  service.read:
+    kind: backend
+  service.audit:
+    kind: worker
+
+schemas:
+  schema.Query:
+    kind: canonical
+    description: A read request.
+    completeness: complete
+    fields:
+      id: uuid
+  schema.Row:
+    kind: canonical
+    description: A read result.
+    completeness: complete
+    fields:
+      id: uuid
+  schema.Miss:
+    kind: canonical
+    description: A read failure.
+    completeness: complete
+    fields:
+      reason: string
+  schema.ReadLogged:
+    kind: canonical
+    description: An audit record of one read.
+    completeness: complete
+    fields:
+      id: uuid
+
+data_models: {}
+
+topics:
+  topic.reads:
+    messages:
+      - schema.ReadLogged
+    message_identity:
+      kind: unspecified
+
+state_machines: {}
+
+operations:
+  operation.hedged_read:
+    service: service.read
+    description: >-
+      Race a primary against a replica read; the response follows
+      whichever store answers first, the loser stays in flight past the
+      return, and a read audit is published fire-and-forget so it never
+      delays the response.
+    inputs:
+      input.hedged_read.request:
+        kind: request
+        schema: schema.Query
+        identity:
+          kind: unspecified
+        result:
+          ok: schema.Row
+          err: schema.Miss
+    program:
+      steps:
+      - kind: execute_effect_async
+        handle: async.primary
+        effect_id: effect.hedged_read.primary
+        effect:
+          kind: external
+          name: store-a
+          idempotency:
+            kind: unspecified
+          result:
+            ok: schema.Row
+            err: schema.Miss
+        values:
+          kind: deterministic
+          from:
+          - source: input:input.hedged_read.request
+            path: id
+      - kind: execute_effect_async
+        handle: async.replica
+        effect_id: effect.hedged_read.replica
+        effect:
+          kind: external
+          name: store-b
+          idempotency:
+            kind: unspecified
+          result:
+            ok: schema.Row
+            err: schema.Miss
+        values:
+          kind: deterministic
+          from:
+          - source: input:input.hedged_read.request
+            path: id
+      # The response depends only on the race winner. There is
+      # deliberately no join before the return: joining both attempts
+      # would make the response wait for the slower store, which is
+      # exactly what hedging exists to avoid. The loser simply remains
+      # in flight beyond the request terminal.
+      - kind: race
+        handles:
+        - async.primary
+        - async.replica
+        bind: result.read
+      # Fire-and-forget: the audit publication is initiated and never
+      # awaited, so it cannot delay the response. It outlives the
+      # request and stays in the operation's side-effect blast radius.
+      - kind: execute_effect_async
+        handle: async.audit
+        effect_id: effect.hedged_read.audit
+        effect:
+          kind: publication
+          topic: topic.reads
+          schema: schema.ReadLogged
+          idempotency_key_propagation: []
+        values:
+          kind: deterministic
+          from:
+          - source: input:input.hedged_read.request
+            path: id
+      - kind: match_result
+        result: result.read
+        ok:
+          steps:
+          - kind: return
+            request: input.hedged_read.request
+            outcome:
+              kind: ok
+              values:
+                kind: deterministic
+                from:
+                - source: effect_result_ok:result.read
+                  path: id
+        err:
+          steps:
+          - kind: return
+            request: input.hedged_read.request
+            outcome:
+              kind: err
+              values:
+                kind: deterministic
+                from:
+                - source: effect_result_err:result.read
+                  path: reason
+    requirements:
+      serialization: []
+      ordering: []
+      idempotency: []
+      recoverability: []
+  operation.record_read:
+    service: service.audit
+    description: Write each audited read to the ledger, synchronously.
+    inputs:
+      input.record_read.reads:
+        kind: subscription
+        topic: topic.reads
+        messages:
+          kind: all
+    program:
+      steps:
+      - kind: execute_effect
+        effect_id: effect.record_read.ledger
+        effect:
+          kind: external
+          name: read-ledger
+          idempotency:
+            kind: unspecified
+          result: null
+        values:
+          kind: deterministic
+          from:
+          - source: input:input.record_read.reads
+            path: id
+      - kind: complete
+    requirements:
+      serialization: []
+      ordering: []
+      idempotency: []
+      recoverability: []

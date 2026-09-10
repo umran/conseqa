@@ -185,6 +185,11 @@ pub enum EdgeDetail {
         /// step locations. Empty means the capability is declared but
         /// no step of the program uses it.
         executed_at: Vec<String>,
+
+        /// The subset of `executed_at` that launches the effect
+        /// asynchronously: initiation without a completion dependency
+        /// on the following step.
+        async_executed_at: Vec<String>,
     },
 
     Subscribe {
@@ -224,6 +229,10 @@ pub enum EdgeDetail {
         retry: String,
         via_transition: Option<TransitionKey>,
         executed_at: Vec<String>,
+
+        /// The subset of `executed_at` that launches the effect
+        /// asynchronously.
+        async_executed_at: Vec<String>,
     },
 
     /// An external effect execution; the modeled system ends here.
@@ -232,6 +241,10 @@ pub enum EdgeDetail {
         effect: Id,
         idempotency: String,
         executed_at: Vec<String>,
+
+        /// The subset of `executed_at` that launches the effect
+        /// asynchronously.
+        async_executed_at: Vec<String>,
     },
 
     /// A request input no modeled operation invokes.
@@ -421,7 +434,10 @@ pub fn extract(model: &Model) -> Graph {
         }
 
         for (effect_id, effect, via_transition) in available {
-            let executed_at = executions.get(&effect_id).cloned().unwrap_or_default();
+            let EffectExecutions {
+                all: executed_at,
+                asynchronous: async_executed_at,
+            } = executions.get(&effect_id).cloned().unwrap_or_default();
 
             match effect {
                 ResolvedEffect::Publication(publication) => {
@@ -435,6 +451,7 @@ pub fn extract(model: &Model) -> Graph {
                             schema: publication.schema.clone(),
                             via_transition,
                             executed_at,
+                            async_executed_at,
                         },
                     });
                 }
@@ -452,6 +469,7 @@ pub fn extract(model: &Model) -> Graph {
                             retry: to_tag(&request.retry),
                             via_transition,
                             executed_at,
+                            async_executed_at,
                         },
                     });
                 }
@@ -469,6 +487,7 @@ pub fn extract(model: &Model) -> Graph {
                             effect: effect_id,
                             idempotency: idempotency_label(&external.idempotency),
                             executed_at,
+                            async_executed_at,
                         },
                     });
                 }
@@ -613,9 +632,19 @@ fn collect_transition_refs(model: &Model) -> BTreeMap<String, Vec<TransitionRef>
     refs
 }
 
-/// For one operation: effect id → program steps that execute it,
-/// either directly or by executing an intent binding that captured it.
-fn collect_effect_executions(op: &crate::spec::Operation) -> BTreeMap<Id, Vec<String>> {
+/// The execution sites of one effect within one operation program:
+/// every step that executes it, and the subset that launches it
+/// asynchronously.
+#[derive(Debug, Clone, Default)]
+struct EffectExecutions {
+    all: Vec<String>,
+    asynchronous: Vec<String>,
+}
+
+/// For one operation: effect id → program steps that execute it —
+/// directly, by executing an intent binding that captured it, or by
+/// launching either asynchronously.
+fn collect_effect_executions(op: &crate::spec::Operation) -> BTreeMap<Id, EffectExecutions> {
     // Intent binding → the effect it captured: an inline establishment
     // site's effect_id, or a transition application's side-effect ID.
     let mut intent_effects: BTreeMap<&Id, &Id> = BTreeMap::new();
@@ -638,24 +667,35 @@ fn collect_effect_executions(op: &crate::spec::Operation) -> BTreeMap<Id, Vec<St
         }
     }
 
-    let mut executions: BTreeMap<Id, Vec<String>> = BTreeMap::new();
+    let mut executions: BTreeMap<Id, EffectExecutions> = BTreeMap::new();
 
     for (location, step) in op.program.steps_with_locations() {
-        let effect_id = match step {
-            OperationStep::ExecuteEffect(step) => Some(step.effect_id.clone()),
+        let (effect_id, asynchronous) = match step {
+            OperationStep::ExecuteEffect(step) => (Some(step.effect_id.clone()), false),
 
-            OperationStep::ExecuteEffectIntent(step) => {
-                intent_effects.get(&step.intent).map(|id| (*id).clone())
-            }
+            OperationStep::ExecuteEffectAsync(step) => (Some(step.effect_id.clone()), true),
 
-            _ => None,
+            OperationStep::ExecuteEffectIntent(step) => (
+                intent_effects.get(&step.intent).map(|id| (*id).clone()),
+                false,
+            ),
+
+            OperationStep::ExecuteEffectIntentAsync(step) => (
+                intent_effects.get(&step.intent).map(|id| (*id).clone()),
+                true,
+            ),
+
+            _ => (None, false),
         };
 
         if let Some(effect_id) = effect_id {
-            executions
-                .entry(effect_id)
-                .or_default()
-                .push(location.to_string());
+            let entry = executions.entry(effect_id).or_default();
+
+            entry.all.push(location.to_string());
+
+            if asynchronous {
+                entry.asynchronous.push(location.to_string());
+            }
         }
     }
 

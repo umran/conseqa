@@ -74,6 +74,23 @@ struct EffectSiteFacts<'a> {
     effect: &'a Effect,
 }
 
+/// The launch an async handle refers back to, for attributing the
+/// binding a `join_all` or `race` produces.
+#[derive(Clone, Copy)]
+enum HandleLaunch<'a> {
+    Direct { effect_id: &'a Id },
+    Intent { intent: &'a Id },
+}
+
+impl<'a> HandleLaunch<'a> {
+    fn producer(self) -> BindingProducer<'a> {
+        match self {
+            Self::Direct { effect_id } => BindingProducer::EffectExecution { effect_id },
+            Self::Intent { intent } => BindingProducer::IntentExecution { intent },
+        }
+    }
+}
+
 struct BindingFacts<'a> {
     binding: &'a Id,
     fingerprint: SemanticHash,
@@ -114,6 +131,35 @@ fn collect_operation<'w>(
     };
 
     if let Some(program) = &draft.program {
+        // Async handle → its launch, so a join or race binding is
+        // attributed to the launched effect it observes.
+        let mut handle_launches: std::collections::BTreeMap<&Id, HandleLaunch<'_>> =
+            std::collections::BTreeMap::new();
+
+        for (_, step) in program.steps_with_locations() {
+            match step {
+                OperationStep::ExecuteEffectAsync(execute) => {
+                    handle_launches.insert(
+                        &execute.handle,
+                        HandleLaunch::Direct {
+                            effect_id: &execute.effect_id,
+                        },
+                    );
+                }
+
+                OperationStep::ExecuteEffectIntentAsync(execute) => {
+                    handle_launches.insert(
+                        &execute.handle,
+                        HandleLaunch::Intent {
+                            intent: &execute.intent,
+                        },
+                    );
+                }
+
+                _ => {}
+            }
+        }
+
         for (_, step) in program.steps_with_locations() {
             match step {
                 OperationStep::Transaction(transaction) => {
@@ -201,6 +247,54 @@ fn collect_operation<'w>(
                             },
                         });
                     }
+                }
+
+                OperationStep::ExecuteEffectAsync(execute) => {
+                    facts.effect_sites.push(EffectSiteFacts {
+                        effect_id: &execute.effect_id,
+                        effect: &execute.effect,
+                    });
+                }
+
+                OperationStep::ExecuteEffectIntentAsync(execute) => {
+                    facts.intent_uses.push(&execute.intent);
+                }
+
+                OperationStep::JoinAll(join) => {
+                    for entry in &join.handles {
+                        let (Some(bind), Some(launch)) =
+                            (&entry.bind, handle_launches.get(&entry.handle))
+                        else {
+                            continue;
+                        };
+
+                        facts.bindings.push(BindingFacts {
+                            binding: bind,
+                            fingerprint: SemanticHash::of(&("join_result", entry)),
+                            producer: launch.producer(),
+                        });
+                    }
+                }
+
+                OperationStep::Race(race) => {
+                    // A race binding's possible producers are its whole
+                    // candidate set; the graph attributes it to the
+                    // first resolvable candidate, matching how the
+                    // validator resolves its contract.
+                    let (Some(bind), Some(launch)) = (
+                        &race.bind,
+                        race.handles
+                            .iter()
+                            .find_map(|handle| handle_launches.get(handle)),
+                    ) else {
+                        continue;
+                    };
+
+                    facts.bindings.push(BindingFacts {
+                        binding: bind,
+                        fingerprint: SemanticHash::of(&("race_result", race)),
+                        producer: launch.producer(),
+                    });
                 }
 
                 _ => {}

@@ -85,9 +85,10 @@ pub use recoverability::{
     TransactionResolution,
 };
 pub use replay::{
-    ArtifactReplay, BoundResult, DecisionGap, DecisionReplay, DecisionRule, GoverningKeyDefect,
-    InstanceGap, InstanceStability, PayloadIdentityGap, ReplayAnalysis, ReplayGap, ResultGap,
-    ResultReplay, ResultStabilityRule, StabilityGap, StabilityRule, StableRoot, UnstableRoot,
+    ArtifactReplay, AsyncLaunch, BoundResult, DecisionGap, DecisionReplay, DecisionRule,
+    GoverningKeyDefect, InstanceGap, InstanceStability, PayloadIdentityGap, ReplayAnalysis,
+    ReplayGap, ResultGap, ResultReplay, ResultStabilityRule, StabilityGap, StabilityRule,
+    StableRoot, UnstableRoot,
 };
 pub use result_replay::{
     ResultReplayCheck, ResultReplayObstacle, ResultReplayProof, ResultReplayVerdict, ReturnedResult,

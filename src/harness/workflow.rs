@@ -1091,8 +1091,31 @@ fn operation_owned_ids(
                 }
             }
 
+            OperationStep::ExecuteEffectAsync(execute) => {
+                owned.insert(execute.effect_id.0.clone());
+                owned.insert(execute.handle.0.clone());
+            }
+
             OperationStep::ExecuteEffectIntent(execute) => {
                 if let Some(bind) = &execute.bind {
+                    owned.insert(bind.0.clone());
+                }
+            }
+
+            OperationStep::ExecuteEffectIntentAsync(execute) => {
+                owned.insert(execute.handle.0.clone());
+            }
+
+            OperationStep::JoinAll(join) => {
+                for entry in &join.handles {
+                    if let Some(bind) = &entry.bind {
+                        owned.insert(bind.0.clone());
+                    }
+                }
+            }
+
+            OperationStep::Race(race) => {
+                if let Some(bind) = &race.bind {
                     owned.insert(bind.0.clone());
                 }
             }
