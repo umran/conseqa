@@ -68,8 +68,11 @@ or a hop within a column climbs a gutter into the channel reserved above
 its band and comes back down another, so no edge is ever drawn through a
 card. A drawing too wide to fit at a readable size wraps: its columns
 break into bands the way a paragraph breaks into lines, at whichever
-width leaves everything largest once fitted, and an edge that crosses
-bands travels outside them. Small graphs never wrap.
+width leaves everything largest once fitted. An edge into the
+neighbouring band continues the way a line of text wraps — through its
+own gutter into the one channel separating the two bands, straight
+across, and on into its target; only an edge that must clear whole
+bands travels around the outside. Small graphs never wrap.
 
 *Layers.* L0 — the abstract application machine — is always drawn. L1,
 the declared runtime realization, is switched from the top bar (`L0` is
