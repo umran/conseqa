@@ -102,7 +102,7 @@ export function ObligationsPanel() {
           value={layer}
           onValueChange={(v) => setLayer(v as LayerFilter)}
         />
-        <Input size="sm" placeholder="filter obligations…" value={query} onChange={(e) => setQuery(e.target.value)} />
+        <Input size="sm" placeholder="filter obligations…" aria-label="Filter obligations" value={query} onChange={(e) => setQuery(e.target.value)} />
       </div>
       <div className="flex-1 space-y-3 overflow-y-auto px-4 py-3">
         {filter === "all" && layer === "any" && !query && (report.notes?.length ?? 0) > 0 && (
