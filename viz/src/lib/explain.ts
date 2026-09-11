@@ -5,6 +5,7 @@
 
 import type {
   DeliverySemantics,
+  ExecutionHandoff,
   ExternalIdempotency,
   ExternalIdentity,
   ExternalResultReplay,
@@ -311,7 +312,8 @@ export function memberConcurrency(value: MemberConcurrency): Explanation {
             tone: "success",
             summary:
               "A pool member runs at most one invocation at once, across every workload assigned " +
-              "to it. With a routing key that matches, same-key invocations cannot overlap.",
+              "to it. It binds each member separately: only with a matching routing key AND " +
+              "exclusive execution handoff do same-key invocations never overlap.",
           }
         : {
             label: `up to ${value.value} at a time per member`,
@@ -333,6 +335,40 @@ export function memberConcurrency(value: MemberConcurrency): Explanation {
         summary: "No usable fact about simultaneous execution on one pool member.",
       };
   }
+}
+
+export function executionHandoff(value: ExecutionHandoff | null | undefined): Explanation {
+  if (value === "exclusive_ownership") {
+    return {
+      label: "exclusive ownership handoff",
+      tone: "success",
+      summary:
+        "When execution authority for a routing domain transfers between members or member " +
+        "incarnations, exclusive execution ownership is preserved: a stale owner cannot still " +
+        "be executing while its successor begins.",
+    };
+  }
+
+  return {
+    label: "no execution-handoff fact",
+    tone: "warning",
+    summary:
+      "Nothing establishes that exclusive execution ownership survives member replacement or " +
+      "reassignment. Affinity holds per stable epoch and bounded(1) binds each member " +
+      "separately, so a stale owner may overlap its successor — no topology serialization or " +
+      "ordering proof holds without the declared handoff.",
+  };
+}
+
+export function invocationLock(): Explanation {
+  return {
+    label: "invocation lock",
+    tone: "success",
+    summary:
+      "An exclusive lock on the evaluated key, acquired at operation entry before any program " +
+      "step and held to the invocation's terminal: equal keys never execute concurrently, " +
+      "whatever the topology. No FIFO guarantee — it proves serialization, never ordering.",
+  };
 }
 
 export function messageIdentity(identity: Topic["message_identity"]): Explanation {

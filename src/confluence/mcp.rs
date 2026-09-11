@@ -1779,7 +1779,18 @@ PATCH — {"mutations": [<mutation>, ...]}; each mutation {"kind": K, ...}:
   {"kind":"put_topic","id":"topic.x","value":{"messages":[...],"message_identity":...}}
   {"kind":"put_state_machine","id":"machine.x","value":{...}}
   {"kind":"put_operation_interface","operation":"operation.x",
-   "value":{"service":"service.x","description":"...","inputs":{...}}}
+   "value":{"service":"service.x","description":"...","inputs":{...},
+            "invocation_lock":{"key":{"source":"input:input.x.request",
+                                      "path":["tenant_id"]}}}}
+    (invocation_lock optional: an exclusive lock on the evaluated key,
+     acquired at operation entry before any program step and held to the
+     invocation's terminal — equal keys never execute concurrently. L0:
+     it proves SerializedBy(key) with no topology at all, and survives
+     any topology change. The key must source an input of the operation,
+     and its ONLY input — every invocation acquires the lock, and an
+     invocation via another input has no value for the key. No FIFO
+     guarantee: it never proves ordering. Async effects that outlive the
+     terminal are not kept under it.)
   {"kind":"replace_operation_program","operation":"operation.x","program":{"steps":[...]}}
   {"kind":"replace_operation_requirements","operation":"operation.x","requirements":{...}}
   {"kind":"propose_requirements","operation":"operation.x","proposals":[
@@ -1802,8 +1813,19 @@ L1 RUNTIME TOPOLOGY (all shared-skeleton writes; L1 is optional):
      Never both scopes — there is no inheritance and no override.
      `within_group` requires a keyed grouping at the same scope.)
   {"kind":"put_execution_pool","id":"pool.x",
-   "value":{"member_concurrency":{"kind":"bounded","value":1}}}
-    (member_concurrency kinds: unspecified | unbounded | bounded{value})
+   "value":{"member_concurrency":{"kind":"bounded","value":1},
+            "execution_handoff":"exclusive_ownership"}}
+    (member_concurrency kinds: unspecified | unbounded | bounded{value}.
+     execution_handoff optional, sole value "exclusive_ownership": when
+     execution authority for a routing domain transfers between members
+     or member incarnations, exclusive execution ownership is preserved
+     — a stale owner cannot overlap its successor. Omitted means no
+     fact about overlap across such transitions. Topology serialization
+     and ordering proofs REQUIRE it alongside consistent_hash and
+     bounded(1): affinity is per stable epoch only, and bounded(1)
+     binds each member separately, so neither bridges a replacement or
+     rebalance. Declare it only where the runtime genuinely fences or
+     drains the old owner; a polling lease alone does not.)
   {"kind":"put_router","id":"router.x",
    "value":{"boundary":{"operation":"operation.x","input":"input.x.request"},
             "pool":"pool.x",
@@ -2096,6 +2118,7 @@ mod tests {
             service: Id("service.example".to_string()),
             description: None,
             inputs: BTreeMap::new(),
+            invocation_lock: None,
             program,
             requirements: Default::default(),
         };

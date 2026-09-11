@@ -1188,7 +1188,7 @@ async fn the_server_and_its_artifacts_declare_the_dsl_contract_version() {
         .expect("the server declares instructions");
 
     assert!(
-        instructions.contains("DSL contract version 2"),
+        instructions.contains("DSL contract version 3"),
         "{instructions}"
     );
 
@@ -1205,7 +1205,7 @@ async fn the_server_and_its_artifacts_declare_the_dsl_contract_version() {
     assert!(!is_error);
     assert!(
         toc.as_str()
-            .is_some_and(|text| text.contains("DSL contract version 2")),
+            .is_some_and(|text| text.contains("DSL contract version 3")),
         "{toc}"
     );
 
@@ -1215,7 +1215,7 @@ async fn the_server_and_its_artifacts_declare_the_dsl_contract_version() {
     assert!(
         reference
             .as_str()
-            .is_some_and(|text| text.starts_with("DSL contract version 2.")),
+            .is_some_and(|text| text.starts_with("DSL contract version 3.")),
         "{reference}"
     );
 
@@ -1223,14 +1223,14 @@ async fn the_server_and_its_artifacts_declare_the_dsl_contract_version() {
     let (status, is_error) = client.call("spec_status", serde_json::json!({})).await;
 
     assert!(!is_error, "{status}");
-    assert_eq!(status["dsl"], 2, "{status}");
+    assert_eq!(status["dsl"], 3, "{status}");
 
     let (report, is_error) = client
         .call("requirement_report", serde_json::json!({}))
         .await;
 
     assert!(!is_error, "{report}");
-    assert_eq!(report["dsl"], 2, "{report}");
+    assert_eq!(report["dsl"], 3, "{report}");
 
     // The export leads with the stamp, and the stamped document
     // round-trips through the standalone two-phase parser.
@@ -1247,7 +1247,7 @@ async fn the_server_and_its_artifacts_declare_the_dsl_contract_version() {
 
     let yaml = std::fs::read_to_string(dir.join("conseqa.yaml")).expect("yaml written");
 
-    assert!(yaml.starts_with("dsl: 2\n"), "{}", &yaml[..40.min(yaml.len())]);
+    assert!(yaml.starts_with("dsl: 3\n"), "{}", &yaml[..40.min(yaml.len())]);
     assert!(conseqa::parser::yaml::parse(&yaml).is_ok());
 
     // The patch boundary refuses a stale authored claim by name,
@@ -1256,7 +1256,7 @@ async fn the_server_and_its_artifacts_declare_the_dsl_contract_version() {
         .call(
             "submit_patch",
             serde_json::json!({
-                "dsl": 3,
+                "dsl": 2,
                 "patch": program_patch("operation.create_order", 7),
             }),
         )
@@ -1267,7 +1267,7 @@ async fn the_server_and_its_artifacts_declare_the_dsl_contract_version() {
     assert!(
         refused["guidance"]
             .as_str()
-            .is_some_and(|text| text.contains("declares dsl 3")),
+            .is_some_and(|text| text.contains("declares dsl 2")),
         "{refused}"
     );
 
@@ -1276,7 +1276,7 @@ async fn the_server_and_its_artifacts_declare_the_dsl_contract_version() {
         .call(
             "submit_patch",
             serde_json::json!({
-                "dsl": 2,
+                "dsl": 3,
                 "patch": program_patch("operation.create_order", 7),
             }),
         )

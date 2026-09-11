@@ -12,7 +12,7 @@ use conseqa::{
         Arm, AsyncJoin, Branch, Condition, Derivation, Effect, EstablishTransactionOutput,
         ExecuteEffect, ExecuteEffectAsync, ExecuteEffectIntentAsync, ExternalIdempotency,
         ExternalIdentity, ExternalIdentityKey, ExternalResultReplay, FieldPath, Id,
-        IdempotencyGuarantee, Input, JoinAll, Literal, MessageIdentity,
+        IdempotencyGuarantee, Input, InvocationLock, JoinAll, Literal, MessageIdentity,
         MessageSelector,
         Model, OperationBlock, OperationStep, Race, RequestEffect, RequestIdentity, RequestTarget,
         DataObjectRef, ExecutionPool, MemberAssignment, MemberConcurrency,
@@ -1471,6 +1471,124 @@ fn rejects_empty_request_identity() {
         errors,
         vec![ValidationError::EmptyRequestIdentity {
             input: id("input.create_order.request"),
+        }]
+    );
+}
+
+/// The invocation lock's key is evaluated at operation entry, before
+/// any program step; only an input payload exists there.
+#[test]
+fn rejects_an_invocation_lock_keyed_from_a_non_input_source() {
+    let mut model = load_flash_checkout();
+
+    model
+        .operations
+        .get_mut(&id("operation.apply_payment"))
+        .unwrap()
+        .invocation_lock = Some(InvocationLock {
+        key: ValueRef {
+            source: ValueSource::StateMachineSubject(id("machine.order_lifecycle")),
+            path: path(&["order_id"]),
+        },
+    });
+
+    let errors = validation::validate(&model);
+
+    assert_eq!(
+        errors,
+        vec![ValidationError::InvocationLockKeyNotFromInput {
+            operation: id("operation.apply_payment"),
+            source: id("machine.order_lifecycle"),
+        }]
+    );
+}
+
+/// Every invocation acquires the lock, and an invocation triggered by
+/// another input carries no value for the key, so the key's source
+/// must be the operation's only input.
+#[test]
+fn rejects_an_invocation_lock_uncovered_by_a_second_input() {
+    let mut model = load_flash_checkout();
+
+    let operation = model
+        .operations
+        .get_mut(&id("operation.apply_payment"))
+        .unwrap();
+
+    operation.inputs.insert(
+        id("input.apply_payment.created"),
+        Input::Subscription(conseqa::spec::SubscriptionInput {
+            topic: id("topic.order_events"),
+            messages: MessageSelector::Only(
+                [id("schema.OrderCreated")].into_iter().collect(),
+            ),
+            acknowledge_on_success: None,
+        }),
+    );
+
+    operation.invocation_lock = Some(InvocationLock {
+        key: input_ref("input.apply_payment.captured", &["order_id"]),
+    });
+
+    let errors = validation::validate(&model);
+
+    assert_eq!(
+        errors,
+        vec![ValidationError::InvocationLockKeyNotEvaluable {
+            operation: id("operation.apply_payment"),
+            input: id("input.apply_payment.created"),
+        }]
+    );
+}
+
+/// The lock key's path is judged against every schema the input
+/// admits, like a requirement key's.
+#[test]
+fn rejects_an_invocation_lock_path_the_admitted_schema_lacks() {
+    let mut model = load_flash_checkout();
+
+    model
+        .operations
+        .get_mut(&id("operation.apply_payment"))
+        .unwrap()
+        .invocation_lock = Some(InvocationLock {
+        key: input_ref("input.apply_payment.captured", &["no_such_field"]),
+    });
+
+    let errors = validation::validate(&model);
+
+    assert_eq!(
+        errors,
+        vec![ValidationError::InvalidFieldPath {
+            subject: id("operation.apply_payment"),
+            schema: id("schema.PaymentCaptured"),
+            path: path(&["no_such_field"]),
+        }]
+    );
+}
+
+/// A lock keyed from an input of a different operation is out of
+/// scope, like any other value reference.
+#[test]
+fn rejects_an_invocation_lock_keyed_from_another_operations_input() {
+    let mut model = load_flash_checkout();
+
+    model
+        .operations
+        .get_mut(&id("operation.apply_payment"))
+        .unwrap()
+        .invocation_lock = Some(InvocationLock {
+        key: input_ref("input.create_order.request", &["order_id"]),
+    });
+
+    let errors = validation::validate(&model);
+
+    assert_eq!(
+        errors,
+        vec![ValidationError::ValueSourceOutOfScope {
+            subject: id("operation.apply_payment"),
+            source: id("input.create_order.request"),
+            owner: id("operation.create_order"),
         }]
     );
 }
@@ -3157,6 +3275,7 @@ fn a_bounded_member_concurrency_of_zero_is_unrepresentable() {
         member_concurrency: MemberConcurrency::Bounded(
             std::num::NonZeroU32::new(1).expect("non-zero"),
         ),
+        execution_handoff: None,
     })
     .expect("serializes");
 

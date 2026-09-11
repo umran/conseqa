@@ -8,6 +8,7 @@ import {
   artifactRetention, commitGuarantee, delivery, externalIdempotency, externalIdentity,
   externalResult, inheritedResult, intrinsicRedrive,
   isolation, messageIdentity, requestIdentity, requestResult, resultBinding,
+  executionHandoff, invocationLock,
   memberAssignment, memberConcurrency, requestRouting, subscriptionRouting,
   transactionOutput, transportGrouping, transportOrdering,
 } from "../lib/explain";
@@ -413,6 +414,11 @@ function OperationDetail({ id }: { id: Id }) {
           <List items={node.machines.map((m) => <NavLink key={m} hash={hashes.machine(m)}>{m}</NavLink>)} />
         </Section>
       )}
+      {op.invocation_lock && (
+        <FactNote fact={invocationLock()}>
+          <RefText value={op.invocation_lock.key} />
+        </FactNote>
+      )}
       {reqRows.length > 0 && (
         <Section title="requirements" count={reqRows.length}>
           <List items={reqRows} />
@@ -691,6 +697,7 @@ function InputDetail({ opId, id }: { opId: Id; id: Id }) {
               <FactNote fact={memberAssignment(routed[1].routing.member_assignment)} />
             )}
             {routerPool && <FactNote fact={memberConcurrency(routerPool.member_concurrency)} />}
+            {routerPool && <FactNote fact={executionHandoff(routerPool.execution_handoff)} />}
           </Section>
         )}
         <Citations id={id} />
@@ -725,6 +732,7 @@ function InputDetail({ opId, id }: { opId: Id; id: Id }) {
               <FactNote fact={memberAssignment(runtime.dispatch.routing.member_assignment)} />
             )}
             {pool && <FactNote fact={memberConcurrency(pool.member_concurrency)} />}
+            {pool && <FactNote fact={executionHandoff(pool.execution_handoff)} />}
           </Section>
         )}
         <Citations id={id} />
@@ -751,6 +759,7 @@ function InputDetail({ opId, id }: { opId: Id; id: Id }) {
             <FactNote fact={memberAssignment(runtime.dispatch.routing.member_assignment)} />
           )}
           {pool && <FactNote fact={memberConcurrency(pool.member_concurrency)} />}
+          {pool && <FactNote fact={executionHandoff(pool.execution_handoff)} />}
         </Section>
       ) : (
         <FactNote fact={delivery("unspecified")} />
@@ -1274,6 +1283,7 @@ function PoolDetail({ id }: { id: Id }) {
       description="How many members there are is not a conseqa fact: pool cardinality is an external scenario input, and every proof here is about one member's behaviour, not the population's size."
     >
       <FactNote fact={memberConcurrency(pool.member_concurrency)} />
+      <FactNote fact={executionHandoff(pool.execution_handoff)} />
       {assigned.length > 0 && (
         <Section title="boundaries assigned" count={assigned.length}>
           <p className="text-xs leading-relaxed text-kumo-subtle">
@@ -1316,6 +1326,7 @@ function RouterDetail({ id }: { id: Id }) {
       <FactNote fact={requestRouting(router.routing?.key)} />
       {router.routing && <FactNote fact={memberAssignment(router.routing.member_assignment)} />}
       {pool && <FactNote fact={memberConcurrency(pool.member_concurrency)} />}
+      {pool && <FactNote fact={executionHandoff(pool.execution_handoff)} />}
       <Citations id={id} />
     </Frame>
   );

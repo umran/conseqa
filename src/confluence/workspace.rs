@@ -15,9 +15,9 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 
 use crate::spec::{
-    DataModel, Id, IdempotencyRequirement, Input, Model, Operation, OperationBlock,
-    OperationRequirements, OrderingRequirement, RecoverabilityRequirement, Revision,
-    RuntimeModel, Schema, SerializationRequirement, Service, StateMachine, Topic,
+    DataModel, Id, IdempotencyRequirement, Input, InvocationLock, Model, Operation,
+    OperationBlock, OperationRequirements, OrderingRequirement, RecoverabilityRequirement,
+    Revision, RuntimeModel, Schema, SerializationRequirement, Service, StateMachine, Topic,
 };
 
 use super::symbol::RequirementFamily;
@@ -120,6 +120,7 @@ impl WorkspaceState {
                             service: draft.service.clone(),
                             description: draft.description.clone(),
                             inputs: draft.inputs.clone(),
+                            invocation_lock: draft.invocation_lock.clone(),
                             program: program.clone(),
                             requirements: draft.requirements.clone(),
                         },
@@ -189,6 +190,11 @@ pub struct DraftOperation {
     pub description: Option<String>,
     pub inputs: BTreeMap<Id, Input>,
 
+    /// The declared entry synchronization, carried on the interface
+    /// slice (see [`OperationInterfaceDraft::invocation_lock`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub invocation_lock: Option<InvocationLock>,
+
     /// None until the operation synthesis task commits.
     pub program: Option<OperationBlock>,
 
@@ -206,6 +212,7 @@ impl DraftOperation {
             service: operation.service.clone(),
             description: operation.description.clone(),
             inputs: operation.inputs.clone(),
+            invocation_lock: operation.invocation_lock.clone(),
             program: Some(operation.program.clone()),
             requirements: operation.requirements.clone(),
             stage: OperationDraftStage::ReadyForAssembly,
@@ -219,6 +226,7 @@ impl DraftOperation {
             service: interface.service,
             description: interface.description,
             inputs: interface.inputs,
+            invocation_lock: interface.invocation_lock,
             program: None,
             requirements: OperationRequirements::default(),
             stage: OperationDraftStage::Planned,
@@ -231,6 +239,7 @@ impl DraftOperation {
             service: self.service.clone(),
             description: self.description.clone(),
             inputs: self.inputs.clone(),
+            invocation_lock: self.invocation_lock.clone(),
         }
     }
 
@@ -285,6 +294,15 @@ pub struct OperationInterfaceDraft {
     pub service: Id,
     pub description: Option<String>,
     pub inputs: BTreeMap<Id, Input>,
+
+    /// The operation's declared entry synchronization. Part of the
+    /// interface slice because it is a boundary declaration — how
+    /// invocations are admitted into the program — authored with the
+    /// inputs it keys on, not with the program it brackets; and a
+    /// caller-relevant guarantee besides, since a locked operation
+    /// self-serializes whatever topology it lands on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub invocation_lock: Option<InvocationLock>,
 }
 
 /// Identity of one explicit correctness statement extracted from the

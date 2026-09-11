@@ -145,6 +145,9 @@ pub enum ValidationCode {
     ExternalReplayStabilityRequiresIdentity,
     ExternalResultReplayWithoutResult,
 
+    InvocationLockKeyNotFromInput,
+    InvocationLockKeyNotEvaluable,
+
     // L1 — runtime topology.
     EmptyRoutingKey,
     RoutingWithoutGrouping,

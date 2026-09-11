@@ -14,6 +14,7 @@ import {
   delivery,
   intrinsicRedrive,
   isolation,
+  executionHandoff,
   memberAssignment,
   memberConcurrency,
   noRuntimeDeclared,
@@ -698,6 +699,7 @@ function Realization({ opId, inputId, kind }: { opId: Id; inputId: Id; kind: "re
           <Badge variant="neutral">{`batching: ${runtime.dispatch.batching.ordering}`}</Badge>
         )}
         {pool && <FactBadge fact={memberConcurrency(pool.member_concurrency)} />}
+        {pool && <FactBadge fact={executionHandoff(pool.execution_handoff)} />}
       </>
     );
   }
@@ -718,6 +720,7 @@ function Realization({ opId, inputId, kind }: { opId: Id; inputId: Id; kind: "re
         <FactBadge fact={requestRouting(router.routing?.key)} />
         {router.routing && <FactBadge fact={memberAssignment(router.routing.member_assignment)} />}
         {pool && <FactBadge fact={memberConcurrency(pool.member_concurrency)} />}
+        {pool && <FactBadge fact={executionHandoff(pool.execution_handoff)} />}
       </>
     );
   }
@@ -740,6 +743,7 @@ function Realization({ opId, inputId, kind }: { opId: Id; inputId: Id; kind: "re
         <FactBadge fact={memberAssignment(runtime.dispatch.routing.member_assignment)} />
       )}
       {pool && <FactBadge fact={memberConcurrency(pool.member_concurrency)} />}
+        {pool && <FactBadge fact={executionHandoff(pool.execution_handoff)} />}
     </>
   );
 }

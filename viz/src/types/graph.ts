@@ -52,6 +52,9 @@ export interface RuntimeView {
 export interface ExecutionPoolNode {
   id: Id;
   member_concurrency: string;
+  /** The declared execution-handoff guarantee, absent when the pool
+   *  declares none. */
+  execution_handoff?: string;
   /** Boundaries assigned to this pool — the shared execution
    *  population made visible. */
   assigned: { operation: Id; input: Id }[];

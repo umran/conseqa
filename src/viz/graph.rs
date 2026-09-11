@@ -89,6 +89,11 @@ pub struct ExecutionPoolNode {
     pub id: Id,
     pub member_concurrency: String,
 
+    /// The declared execution-handoff guarantee, `None` when the pool
+    /// declares none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub execution_handoff: Option<String>,
+
     /// Operation inputs assigned to this pool, request and
     /// subscription alike — the shared execution population made
     /// visible.
@@ -1001,6 +1006,13 @@ fn runtime_view(model: &Model) -> RuntimeView {
             .map(|(id, pool)| ExecutionPoolNode {
                 id: id.clone(),
                 member_concurrency: member_concurrency_label(pool.member_concurrency),
+                execution_handoff: pool.execution_handoff.map(|handoff| {
+                    match handoff {
+                        crate::spec::ExecutionHandoff::ExclusiveOwnership => {
+                            "exclusive_ownership".to_string()
+                        }
+                    }
+                }),
                 assigned: assignments.get(id).cloned().unwrap_or_default(),
             })
             .collect(),

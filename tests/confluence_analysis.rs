@@ -80,6 +80,7 @@ fn put_pool(name: &str, bound: u32) -> Mutation {
             member_concurrency: MemberConcurrency::Bounded(
                 NonZeroU32::new(bound).expect("non-zero"),
             ),
+            execution_handoff: Some(conseqa::spec::ExecutionHandoff::ExclusiveOwnership),
         },
     }
 }
@@ -179,6 +180,7 @@ async fn draft_heads_report_precise_assembly_gaps_until_programs_arrive() {
             service: id("service.checkout"),
             description: None,
             inputs: BTreeMap::new(),
+            invocation_lock: None,
         }),
     );
 
@@ -532,6 +534,7 @@ async fn bundles_fall_back_to_interfaces_before_analysis_and_use_summaries_after
                     acknowledge_on_success: None,
                 }),
             )]),
+            invocation_lock: None,
         }),
     );
 

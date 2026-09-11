@@ -76,13 +76,25 @@ needs and why, and leave the requirement unproven for now.
 
 Your objective names the obligations the runtime has to discharge. \
 Read each one's `requirement_report`: its structured obstacle names \
-the exact missing fact. Serialization and ordering are proven from \
-this layer — a grouping domain owned by one pool member whose \
-concurrency is bounded(1) is what proves same-key invocations never \
-overlap, and a transport ordering on top of that is what proves they \
-take effect in order. Serialization needs no ordering fact at all: \
-declare `ordering: none` where the transport genuinely orders nothing \
-rather than claiming an order to reach a grouping key.
+the exact missing fact. Topology serialization and ordering proofs \
+need four facts together: a grouping/partition/routing domain keyed \
+by the requirement key, `consistent_hash` member assignment, \
+`execution_handoff: exclusive_ownership` on the pool, and \
+`member_concurrency` bounded(1). The handoff fact is the one that \
+carries exclusivity across worker replacement and rebalance — \
+affinity holds per stable epoch only and bounded(1) binds each member \
+separately, so without it same-key invocations may overlap between a \
+stale owner and its successor and nothing is proven. Declare it only \
+where the runtime genuinely fences or drains the old owner; a polling \
+lease alone is not that. A transport ordering on top of the four is \
+what proves same-key invocations take effect in order. Serialization \
+needs no ordering fact at all: declare `ordering: none` where the \
+transport genuinely orders nothing rather than claiming an order to \
+reach a grouping key. Serialization (never ordering) can also be \
+proven with no topology at all by an L0 `invocation_lock` on the \
+operation's interface; that is an L0 declaration, so where it is the \
+honest architecture, file a `dependency_request` for it rather than \
+inventing topology.
 
 Grouping and ordering are independent facts sharing one exclusive \
 scope — declare them either on the topic runtime, covering every \

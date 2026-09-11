@@ -165,6 +165,7 @@ fn ping_interface() -> OperationInterfaceDraft {
                 },
             }),
         )]),
+        invocation_lock: None,
     }
 }
 
@@ -254,6 +255,9 @@ fn success_script() -> ScriptFn {
                                 value: conseqa::spec::ExecutionPool {
                                     member_concurrency: conseqa::spec::MemberConcurrency::Bounded(
                                         std::num::NonZeroU32::new(1).expect("non-zero"),
+                                    ),
+                                    execution_handoff: Some(
+                                        conseqa::spec::ExecutionHandoff::ExclusiveOwnership,
                                     ),
                                 },
                             },
@@ -393,6 +397,9 @@ fn incomplete_script() -> ScriptFn {
                                 value: conseqa::spec::ExecutionPool {
                                     member_concurrency: conseqa::spec::MemberConcurrency::Bounded(
                                         std::num::NonZeroU32::new(1).expect("non-zero"),
+                                    ),
+                                    execution_handoff: Some(
+                                        conseqa::spec::ExecutionHandoff::ExclusiveOwnership,
                                     ),
                                 },
                             },
@@ -979,6 +986,7 @@ fn planned_workspace(count: usize) -> WorkspaceState {
                         acknowledge_on_success: None,
                     }),
                 )]),
+                invocation_lock: None,
             }),
         );
     }

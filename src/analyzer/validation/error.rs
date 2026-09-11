@@ -102,6 +102,23 @@ pub enum ValidationError {
         input: Id,
     },
 
+    /// An invocation lock's key is not sourced from an input. The key
+    /// is evaluated at operation entry, before any program step
+    /// executes, and only an input payload exists there.
+    InvocationLockKeyNotFromInput {
+        operation: Id,
+        source: Id,
+    },
+
+    /// The operation admits invocations through an input other than
+    /// its invocation lock key's source. Those invocations carry no
+    /// value for the key, so the entry lock cannot be evaluated for
+    /// them.
+    InvocationLockKeyNotEvaluable {
+        operation: Id,
+        input: Id,
+    },
+
     /// A router declares a routing block whose key tuple is empty, so
     /// it names no routing domain.
     EmptyRoutingKey {
@@ -1150,6 +1167,40 @@ impl From<ValidationError> for Diagnostic {
                     }],
                 }
             }
+
+            ValidationError::InvocationLockKeyNotFromInput { operation, source } => Diagnostic {
+                code: DiagnosticCode::Validation(ValidationCode::InvocationLockKeyNotFromInput),
+                severity: Severity::Error,
+                subject: Some(operation.clone()),
+                message: format!(
+                    "The invocation lock of `{operation}` keys on `{source}`, \
+                     which is not an input of the operation."
+                ),
+                evidence: vec![Evidence {
+                    subject: Some(source),
+                    message: "The lock key is evaluated at operation entry, before \
+                              any program step executes, and only an input payload \
+                              exists there."
+                        .to_string(),
+                }],
+            },
+
+            ValidationError::InvocationLockKeyNotEvaluable { operation, input } => Diagnostic {
+                code: DiagnosticCode::Validation(ValidationCode::InvocationLockKeyNotEvaluable),
+                severity: Severity::Error,
+                subject: Some(operation.clone()),
+                message: format!(
+                    "`{operation}` admits invocations through `{input}`, which \
+                     carry no value for its invocation lock's key."
+                ),
+                evidence: vec![Evidence {
+                    subject: Some(input),
+                    message: "Every invocation acquires the lock at entry, so its \
+                              key must be evaluable from every input. Key the lock \
+                              on the operation's only input, or remove the lock."
+                        .to_string(),
+                }],
+            },
 
             ValidationError::TransactionObjectOutsideDataModel {
                 transaction,

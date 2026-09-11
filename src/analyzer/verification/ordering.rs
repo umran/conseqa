@@ -31,10 +31,19 @@
 //! ## Mechanism
 //!
 //! Same-key deliveries route to one semantic domain (`topic_key`),
-//! that domain has one active owning member (`MemberAssignment`), and
-//! the member executes one invocation at a time
+//! that domain is assigned to one member per stable ownership epoch
+//! (`MemberAssignment`), exclusive execution ownership survives
+//! ownership and member transitions
+//! (`ExecutionPool.execution_handoff = exclusive_ownership`), and the
+//! member executes one invocation at a time
 //! (`member_concurrency = bounded(1)`), so a later invocation cannot
-//! overtake an earlier one.
+//! overtake an earlier one. The handoff leg is as load-bearing here
+//! as in the serialization argument it extends: without it a stale
+//! owner may still be executing an earlier same-key invocation while
+//! its successor runs a later one, and precedence of effect is lost
+//! in the overlap. Ordering is strictly stronger than serialization,
+//! so no leg of the serialization argument may be missing from an
+//! ordering proof.
 //!
 //! The load-bearing step is that the precedence and the routing domain
 //! are established to be *the same domain*. A precedence over one
@@ -50,11 +59,19 @@
 //! in a way that lets it overtake A — including through
 //! failure-driven redelivery and ownership reassignment. That
 //! obligation is what replaces the logical-lane semantics of the
-//! previous model. A duplicate of an already completed delivery is a
-//! repeated attempt at an invocation that took effect in order, whose
-//! work is the idempotency requirement's obligation rather than
-//! ordering's; the proof records which requirement covers it, or that
-//! none does.
+//! previous model; it is about the *admission order* on the successor,
+//! and it composes with the handoff fact rather than substituting for
+//! it — exclusive handoff stops the stale owner overlapping the
+//! successor, order-preserving admission stops the successor running
+//! B before the redelivered A. A duplicate of an already completed
+//! delivery is a repeated attempt at an invocation that took effect in
+//! order, whose work is the idempotency requirement's obligation
+//! rather than ordering's; the proof records which requirement covers
+//! it, or that none does.
+//!
+//! An `InvocationLock` contributes nothing here: it serializes, but
+//! its acquisition order carries no FIFO guarantee, so it preserves
+//! no precedence.
 //!
 //! Every proof here consumes topic-runtime, dispatch, and pool facts,
 //! so an ordering proof is always `RuntimeDependent` — except the
@@ -63,9 +80,9 @@
 use serde::{Deserialize, Serialize};
 
 use crate::spec::{
-    BatchOrderingPreservation, DeliverySemantics, FieldPath, Id, Input, MemberAssignment,
-    MemberConcurrency, Model, Operation, OrderingRequirement, OrderingSemantics, OutboxInput,
-    OutboxOrdering, SubscriptionRoutingKey, ValueRef, ValueSource,
+    BatchOrderingPreservation, DeliverySemantics, ExecutionHandoff, FieldPath, Id, Input,
+    MemberAssignment, MemberConcurrency, Model, Operation, OrderingRequirement, OrderingSemantics,
+    OutboxInput, OutboxOrdering, SubscriptionRoutingKey, ValueRef, ValueSource,
 };
 
 use crate::analyzer::{Diagnostic, DiagnosticCode, Evidence, Severity, VerificationCode};
@@ -76,7 +93,7 @@ use super::idempotency::{IdempotencyCheck, IdempotencyVerdict};
 use super::serialization::{
     GroupingScope, MessageKeyFact, OutboxPartitionKeyFact, SerializationObstacle,
     admits_no_messages, admits_no_outbox_messages, assignment_owns_one_member, grouping_facts,
-    outbox_partition_facts, pool_is_serial,
+    outbox_partition_facts, pool_handoff_exclusive, pool_is_serial,
 };
 
 /// The verdict for one declared ordering requirement.
@@ -123,7 +140,9 @@ pub enum OrderingProof {
     NoAdmittedInvocations { input: Id },
 
     /// The transport's declared precedence, preserved by one owning
-    /// member at concurrency one; redelivery cannot reorder it.
+    /// member at concurrency one, with exclusive execution ownership
+    /// surviving member and ownership transitions; redelivery cannot
+    /// reorder it.
     RoutedOrder {
         input: Id,
         topic: Id,
@@ -140,12 +159,19 @@ pub enum OrderingProof {
 
         routing_key: SubscriptionRoutingKey,
         member_assignment: MemberAssignment,
+
+        /// The pool's declared execution-handoff guarantee — the leg
+        /// that keeps a stale owner's earlier invocation from
+        /// overlapping its successor's later one.
+        execution_handoff: ExecutionHandoff,
+
         duplicates: DuplicateHandling,
     },
 
     /// The outbox runtime's declared precedence, preserved by one
-    /// owning member at concurrency one, with any declared batching
-    /// stage explicitly order-preserving.
+    /// owning member at concurrency one with exclusive execution
+    /// handoff, and any declared batching stage explicitly
+    /// order-preserving.
     OutboxRoutedOrder {
         input: Id,
         outbox: Id,
@@ -158,6 +184,8 @@ pub enum OrderingProof {
         partition_keys: Vec<OutboxPartitionKeyFact>,
 
         member_assignment: MemberAssignment,
+
+        execution_handoff: ExecutionHandoff,
 
         /// The declared batch ordering-preservation fact, when a
         /// batching stage exists. `None` records that no batching
@@ -284,6 +312,16 @@ pub enum OrderingObstacle {
     MemberAssignmentNotExclusive {
         input: Id,
         declared: MemberAssignment,
+    },
+
+    /// The pool declares no exclusive execution-handoff guarantee, so
+    /// a stale owner's earlier same-key invocation may overlap its
+    /// successor's later one across a member or ownership transition,
+    /// and precedence of effect is lost in the overlap.
+    ExecutionHandoffNotExclusive {
+        input: Id,
+        pool: Id,
+        declared: Option<ExecutionHandoff>,
     },
 
     /// The grouping declares no key mapping for an admitted schema.
@@ -570,28 +608,10 @@ fn check_requirement(
 
     let mut serialization_obstacles = Vec::new();
     let serial = pool_is_serial(model, input_id, &pool_id, &mut serialization_obstacles);
+    let handoff = pool_handoff_exclusive(model, input_id, &pool_id, &mut serialization_obstacles);
 
     for obstacle in serialization_obstacles {
-        obstacles.push(match obstacle {
-            SerializationObstacle::PoolUndeclared { input, pool } => {
-                OrderingObstacle::PoolUndeclared { input, pool }
-            }
-
-            SerializationObstacle::MemberConcurrencyNotSerial {
-                input,
-                pool,
-                declared,
-            } => OrderingObstacle::MemberConcurrencyNotSerial {
-                input,
-                pool,
-                declared,
-            },
-
-            _ => OrderingObstacle::PoolUndeclared {
-                input: input_id.clone(),
-                pool: pool_id.clone(),
-            },
-        });
+        obstacles.push(map_pool_obstacle(obstacle, input_id, &pool_id));
     }
 
     // Redelivery: dispatch must preserve the established precedence,
@@ -599,10 +619,13 @@ fn check_requirement(
     // concern. The proof records which requirement answers for it.
     let duplicates = duplicate_handling(operation_id, input_id, runtime.delivery, idempotency);
 
-    match (precedence, grouping, assignment) {
-        (Some(precedence), Some(grouping), Some((routing_key, member_assignment)))
-            if serial && obstacles.is_empty() =>
-        {
+    match (precedence, grouping, assignment, handoff) {
+        (
+            Some(precedence),
+            Some(grouping),
+            Some((routing_key, member_assignment)),
+            Some(execution_handoff),
+        ) if serial && obstacles.is_empty() => {
             OrderingVerdict::proven(OrderingProof::RoutedOrder {
                 input: input_id.clone(),
                 topic: grouping.topic,
@@ -612,11 +635,53 @@ fn check_requirement(
                 message_keys: grouping.message_keys,
                 routing_key,
                 member_assignment,
+                execution_handoff,
                 duplicates,
             })
         }
 
         _ => OrderingVerdict::Unproven { obstacles },
+    }
+}
+
+/// The ordering reading of an obstacle the shared pool legs raised.
+/// The fallback arm keeps a future shared-leg obstacle from being
+/// silently mistranslated: anything unrecognized reads as the pool
+/// being unusable for the proof.
+fn map_pool_obstacle(
+    obstacle: SerializationObstacle,
+    input_id: &Id,
+    pool_id: &Id,
+) -> OrderingObstacle {
+    match obstacle {
+        SerializationObstacle::PoolUndeclared { input, pool } => {
+            OrderingObstacle::PoolUndeclared { input, pool }
+        }
+
+        SerializationObstacle::MemberConcurrencyNotSerial {
+            input,
+            pool,
+            declared,
+        } => OrderingObstacle::MemberConcurrencyNotSerial {
+            input,
+            pool,
+            declared,
+        },
+
+        SerializationObstacle::ExecutionHandoffNotExclusive {
+            input,
+            pool,
+            declared,
+        } => OrderingObstacle::ExecutionHandoffNotExclusive {
+            input,
+            pool,
+            declared,
+        },
+
+        _ => OrderingObstacle::PoolUndeclared {
+            input: input_id.clone(),
+            pool: pool_id.clone(),
+        },
     }
 }
 
@@ -800,28 +865,10 @@ fn outbox_order_route(
 
     let mut serialization_obstacles = Vec::new();
     let serial = pool_is_serial(model, input_id, &pool_id, &mut serialization_obstacles);
+    let handoff = pool_handoff_exclusive(model, input_id, &pool_id, &mut serialization_obstacles);
 
     for obstacle in serialization_obstacles {
-        obstacles.push(match obstacle {
-            SerializationObstacle::PoolUndeclared { input, pool } => {
-                OrderingObstacle::PoolUndeclared { input, pool }
-            }
-
-            SerializationObstacle::MemberConcurrencyNotSerial {
-                input,
-                pool,
-                declared,
-            } => OrderingObstacle::MemberConcurrencyNotSerial {
-                input,
-                pool,
-                declared,
-            },
-
-            _ => OrderingObstacle::PoolUndeclared {
-                input: input_id.clone(),
-                pool: pool_id.clone(),
-            },
-        });
+        obstacles.push(map_pool_obstacle(obstacle, input_id, &pool_id));
     }
 
     // The batching stage, judged explicitly: absent means no obstacle
@@ -853,10 +900,13 @@ fn outbox_order_route(
         idempotency,
     );
 
-    match (precedence, partitioned, assignment) {
-        (Some(precedence), Some(partition_keys), Some(member_assignment))
-            if serial && batch_ok && obstacles.is_empty() =>
-        {
+    match (precedence, partitioned, assignment, handoff) {
+        (
+            Some(precedence),
+            Some(partition_keys),
+            Some(member_assignment),
+            Some(execution_handoff),
+        ) if serial && batch_ok && obstacles.is_empty() => {
             OrderingVerdict::proven(OrderingProof::OutboxRoutedOrder {
                 input: input_id.clone(),
                 outbox: input.outbox.clone(),
@@ -864,6 +914,7 @@ fn outbox_order_route(
                 precedence,
                 partition_keys,
                 member_assignment,
+                execution_handoff,
                 batching,
                 duplicates,
             })
@@ -930,6 +981,7 @@ impl OrderingObstacle {
             | Self::TransportSemanticsAtBothScopes { .. }
             | Self::EmptyGroupingKey { .. }
             | Self::MemberAssignmentNotExclusive { .. }
+            | Self::ExecutionHandoffNotExclusive { .. }
             | Self::GroupingKeyMappingMissing { .. }
             | Self::KeyIdentityUnestablished { .. }
             | Self::NoSubscriptionRuntime { .. }
@@ -1010,6 +1062,27 @@ impl OrderingObstacle {
                          a routing domain one active owning member, so a later \
                          invocation may execute on a different member and overtake \
                          an earlier one."
+                    ),
+                },
+            },
+
+            Self::ExecutionHandoffNotExclusive { pool, declared, .. } => Evidence {
+                subject: Some(pool.clone()),
+                message: match declared {
+                    None => format!(
+                        "Execution pool `{pool}` declares no execution-handoff \
+                         fact, so a stale owner's earlier same-key invocation \
+                         may still be executing while its successor runs a \
+                         later one: the established precedence is lost in the \
+                         overlap."
+                    ),
+
+                    Some(_) => format!(
+                        "The execution handoff declared for `{pool}` does not \
+                         preserve exclusive execution ownership across member \
+                         and ownership transitions, so an earlier invocation on \
+                         a stale owner may overlap a later one on its \
+                         successor."
                     ),
                 },
             },

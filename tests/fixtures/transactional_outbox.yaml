@@ -12,7 +12,7 @@
 # order-preserving batching; its guaranteed completion is driven by the
 # outbox's intrinsic durable re-drive — an L0 fact, so that leg of the
 # proof is not runtime-dependent.
-dsl: 2
+dsl: 3
 revision: 1
 services:
   service.orders:
@@ -303,3 +303,4 @@ runtime:
       member_concurrency:
         kind: bounded
         value: 1
+      execution_handoff: exclusive_ownership

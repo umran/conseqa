@@ -27,7 +27,7 @@
 # the retried match would not be established to replay, and the
 # transcoder's idempotency, with the upload's cascade, would be
 # unknown.
-dsl: 2
+dsl: 3
 revision: 1
 services:
   service.ingest:
@@ -744,16 +744,19 @@ runtime:
       member_concurrency:
         kind: bounded
         value: 1
+      execution_handoff: exclusive_ownership
 
     pool.catalog_workers:
       member_concurrency:
         kind: bounded
         value: 1
+      execution_handoff: exclusive_ownership
 
     pool.notifier_workers:
       member_concurrency:
         kind: bounded
         value: 1
+      execution_handoff: exclusive_ownership
 
     # The upload boundary needs no member affinity: its idempotency
     # and recoverability rest on the keyed commit, not on topology.

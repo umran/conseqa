@@ -13,7 +13,8 @@ use conseqa::{
             EffectSafety, GoverningKeyDefect, IdempotencyObstacle, IdempotencyProof,
             IdempotencyVerdict, KeyIdentity, PathRef, PayloadIdentityGap, RecoverabilityNote,
             RecoverabilityObstacle, RecoverabilityProof, RecoverabilityVerdict, ReplayGap,
-            Resolution, ResultGap, ResultReplayObstacle, ResultReplayProof, ResultReplayVerdict,
+            InvocationLockKeyFact, Resolution, ResultGap, ResultReplayObstacle,
+            ResultReplayProof, ResultReplayVerdict,
             ProofScope, RemedyLayer, RetryDriver, SerializationObstacle, SerializationProof,
             SerializationVerdict, StabilityGap, StabilityRule, StableRoot, TransactionResolution,
             canonical_value_path,
@@ -24,8 +25,9 @@ use conseqa::{
         Arm, AsyncJoin, Branch, CompletionRequirement, Condition, Derivation, Effect,
         ErrorDisposition, ErrorResultType, EstablishTransactionOutput, ExecuteEffect,
         ExecuteEffectAsync, ExternalEffect, ExternalIdempotency, ExternalIdentity,
-        ExternalIdentityKey, ExternalResultReplay, FieldPath, Id,
-        IdempotencyGuarantee, IdempotencyKey, IdempotencyRequirement, Input, JoinAll,
+        ExecutionHandoff, ExternalIdentityKey, ExternalResultReplay, FieldPath, Id,
+        IdempotencyGuarantee, IdempotencyKey, IdempotencyRequirement, Input, InvocationLock,
+        JoinAll,
         MemberAssignment,
         MemberConcurrency, Literal, MatchResult, MessageIdentity, MessageSelector, Model,
         ObjectSelector, OperationBlock, OperationInputRef, OperationStep, Race,
@@ -238,6 +240,26 @@ fn bounded(value: u32) -> MemberConcurrency {
     MemberConcurrency::Bounded(NonZeroU32::new(value).expect("non-zero"))
 }
 
+/// Declares the two pool facts every topology proof needs: serial
+/// members and exclusive execution handoff.
+fn make_pool_proof_capable(model: &mut Model, pool: &str) {
+    let pool = pool_mut(model, pool);
+    pool.member_concurrency = bounded(1);
+    pool.execution_handoff = Some(ExecutionHandoff::ExclusiveOwnership);
+}
+
+/// Declares an operation-entry invocation lock keyed from one of the
+/// operation's inputs.
+fn set_invocation_lock(model: &mut Model, operation: &str, input: &str, components: &[&str]) {
+    model
+        .operations
+        .get_mut(&id(operation))
+        .unwrap()
+        .invocation_lock = Some(InvocationLock {
+        key: input_key(input, components),
+    });
+}
+
 /// Declares a router for one request boundary, replacing any existing
 /// one.
 fn put_router(
@@ -378,7 +400,7 @@ fn a_router_with_a_matching_key_and_a_serial_pool_proves_request_serialization()
             key: input_key("input.transfer_stock.request", &["sku"]),
         });
 
-    pool_mut(&mut model, "pool.inventory_api").member_concurrency = bounded(1);
+    make_pool_proof_capable(&mut model, "pool.inventory_api");
 
     put_router(
         &mut model,
@@ -401,6 +423,7 @@ fn a_router_with_a_matching_key_and_a_serial_pool_proves_request_serialization()
                 pool,
                 routing_key,
                 member_assignment,
+                execution_handoff,
             },
         scope,
     } = verdict
@@ -412,6 +435,7 @@ fn a_router_with_a_matching_key_and_a_serial_pool_proves_request_serialization()
     assert_eq!(router, id("router.transfer_stock"));
     assert_eq!(pool, id("pool.inventory_api"));
     assert_eq!(member_assignment, MemberAssignment::ConsistentHash);
+    assert_eq!(execution_handoff, ExecutionHandoff::ExclusiveOwnership);
     assert_eq!(scope, ProofScope::RuntimeDependent);
 
     assert_eq!(routing_key.len(), 1);
@@ -436,7 +460,7 @@ fn a_routing_key_wider_than_the_requirement_key_proves_nothing() {
             key: input_key("input.transfer_stock.request", &["sku"]),
         });
 
-    pool_mut(&mut model, "pool.inventory_api").member_concurrency = bounded(1);
+    make_pool_proof_capable(&mut model, "pool.inventory_api");
 
     put_router(
         &mut model,
@@ -486,7 +510,7 @@ fn an_empty_routing_key_never_proves_vacuously() {
             key: input_key("input.transfer_stock.request", &["sku"]),
         });
 
-    pool_mut(&mut model, "pool.inventory_api").member_concurrency = bounded(1);
+    make_pool_proof_capable(&mut model, "pool.inventory_api");
 
     put_router(
         &mut model,
@@ -677,7 +701,7 @@ fn pool_assignment_without_routing_yields_no_member_affinity() {
             key: input_key("input.transfer_stock.request", &["sku"]),
         });
 
-    pool_mut(&mut model, "pool.inventory_api").member_concurrency = bounded(1);
+    make_pool_proof_capable(&mut model, "pool.inventory_api");
 
     assert!(validation::validate(&model).is_empty());
 
@@ -869,7 +893,7 @@ fn a_storage_partition_key_proves_no_execution_affinity() {
             key: input_key("input.transfer_stock.request", &["sku"]),
         });
 
-    pool_mut(&mut model, "pool.inventory_api").member_concurrency = bounded(1);
+    make_pool_proof_capable(&mut model, "pool.inventory_api");
 
     // A layout keyed exactly like the requirement.
     runtime_mut(&mut model).storage_layouts.insert(
@@ -903,11 +927,13 @@ fn a_storage_partition_key_proves_no_execution_affinity() {
 }
 
 #[test]
-fn a_proof_states_the_safe_ownership_transfer_it_relies_on() {
-    // A member assignment used for a correctness proof carries a
-    // normative obligation: ownership of a routing domain transfers
-    // safely. The proof says so, because an implementation that
-    // rebalances without it is non-conforming.
+fn a_proof_states_affinity_and_handoff_as_separate_facts() {
+    // The ownership leg is two declared facts, and the proof cites
+    // them separately: consistent_hash asserts stable-epoch affinity
+    // only, and the pool's exclusive_ownership execution handoff is
+    // what carries exclusivity across member and ownership
+    // transitions. An implementation that rebalances without
+    // preserving it is non-conforming.
     let model = load_flash_checkout();
 
     let verification = verification::verify(&model);
@@ -926,7 +952,18 @@ fn a_proof_states_the_safe_ownership_transfer_it_relies_on() {
 
     assert!(
         obligation.assumptions.iter().any(|assumption| {
-            assumption.contains("consistent_hash") && assumption.contains("transfers that ownership")
+            assumption.contains("consistent_hash")
+                && assumption.contains("stable ownership epoch")
+                && !assumption.contains("transfers that ownership")
+        }),
+        "{:#?}",
+        obligation.assumptions
+    );
+
+    assert!(
+        obligation.assumptions.iter().any(|assumption| {
+            assumption.contains("exclusive_ownership execution handoff")
+                && assumption.contains("stale owner cannot overlap its successor")
         }),
         "{:#?}",
         obligation.assumptions
@@ -1106,7 +1143,7 @@ fn two_routers_on_one_boundary_prove_nothing() {
             key: input_key("input.transfer_stock.request", &["sku"]),
         });
 
-    pool_mut(&mut model, "pool.inventory_api").member_concurrency = bounded(1);
+    make_pool_proof_capable(&mut model, "pool.inventory_api");
 
     put_router(
         &mut model,
@@ -1465,6 +1502,433 @@ fn dangling_key_input_is_unproven_not_a_panic() {
         obstacles(&verdict),
         &[SerializationObstacle::KeyNotFromInput {
             source: ValueSource::Input(id("input.missing")),
+        }]
+    );
+}
+
+#[test]
+fn absent_execution_handoff_defeats_the_subscription_topology_proof() {
+    // consistent_hash asserts stable-epoch affinity only, and
+    // bounded(1) binds each member separately: neither says a stale
+    // invocation of a former owner cannot coexist with work on its
+    // replacement. Without the declared handoff fact the four-legged
+    // argument loses its bridge, and nothing is proven.
+    let mut model = load_flash_checkout();
+
+    pool_mut(&mut model, "pool.order_workers").execution_handoff = None;
+
+    let verdict = serialization_verdict(&model, "operation.reserve_inventory", 0);
+
+    assert_eq!(
+        obstacles(&verdict),
+        &[SerializationObstacle::ExecutionHandoffNotExclusive {
+            input: id("input.reserve_inventory.created"),
+            pool: id("pool.order_workers"),
+            declared: None,
+        }]
+    );
+}
+
+#[test]
+fn absent_execution_handoff_defeats_the_request_topology_proof() {
+    let mut model = load_flash_checkout();
+
+    model
+        .operations
+        .get_mut(&id("operation.transfer_stock"))
+        .unwrap()
+        .requirements
+        .serialization
+        .push(SerializationRequirement {
+            key: input_key("input.transfer_stock.request", &["sku"]),
+        });
+
+    // Serial members, matching routing key — and no handoff fact.
+    pool_mut(&mut model, "pool.inventory_api").member_concurrency = bounded(1);
+
+    put_router(
+        &mut model,
+        "router.transfer_stock",
+        "operation.transfer_stock",
+        "input.transfer_stock.request",
+        "pool.inventory_api",
+        Some(consistent_hash(&[&["sku"]])),
+    );
+
+    assert!(validation::validate(&model).is_empty());
+
+    let verdict = serialization_verdict(&model, "operation.transfer_stock", 0);
+
+    assert_eq!(
+        obstacles(&verdict),
+        &[SerializationObstacle::ExecutionHandoffNotExclusive {
+            input: id("input.transfer_stock.request"),
+            pool: id("pool.inventory_api"),
+            declared: None,
+        }]
+    );
+}
+
+#[test]
+fn absent_execution_handoff_defeats_the_ordering_proof() {
+    // Ordering is strictly stronger than serialization, so no leg of
+    // the serialization argument may be missing from an ordering
+    // proof: an earlier invocation still running on a stale owner
+    // loses the precedence in the overlap.
+    let mut model = load_flash_checkout();
+
+    pool_mut(&mut model, "pool.order_workers").execution_handoff = None;
+
+    let verdict = ordering_verdict(&model, "operation.apply_payment", 0);
+
+    assert!(
+        matches!(
+            &verdict,
+            verification::OrderingVerdict::Unproven { obstacles }
+                if matches!(
+                    &obstacles[..],
+                    [verification::OrderingObstacle::ExecutionHandoffNotExclusive {
+                        pool,
+                        declared: None,
+                        ..
+                    }] if pool == &id("pool.order_workers")
+                )
+        ),
+        "{verdict:?}"
+    );
+}
+
+#[test]
+fn an_invocation_lock_keyed_like_the_requirement_proves_serialization_without_topology() {
+    // Route A: the fixture's transfer router names a pool and nothing
+    // else, and the pool is unbounded — no topology route exists. The
+    // lock proves anyway, from the L0 declaration alone.
+    let mut model = load_flash_checkout();
+
+    model
+        .operations
+        .get_mut(&id("operation.transfer_stock"))
+        .unwrap()
+        .requirements
+        .serialization
+        .push(SerializationRequirement {
+            key: input_key("input.transfer_stock.request", &["sku"]),
+        });
+
+    set_invocation_lock(
+        &mut model,
+        "operation.transfer_stock",
+        "input.transfer_stock.request",
+        &["sku"],
+    );
+
+    assert!(validation::validate(&model).is_empty());
+
+    let verdict = serialization_verdict(&model, "operation.transfer_stock", 0);
+
+    let SerializationVerdict::Proven {
+        proof:
+            SerializationProof::InvocationLocked {
+                input,
+                key,
+                key_identities,
+            },
+        scope,
+    } = verdict
+    else {
+        panic!("expected an invocation-locked proof, found {verdict:?}");
+    };
+
+    assert_eq!(input, id("input.transfer_stock.request"));
+    assert_eq!(key, input_key("input.transfer_stock.request", &["sku"]));
+    assert_eq!(scope, ProofScope::L0Only);
+
+    assert_eq!(
+        key_identities,
+        vec![InvocationLockKeyFact {
+            schema: id("schema.TransferStockRequest"),
+            identity: KeyIdentity::SamePath,
+        }]
+    );
+}
+
+#[test]
+fn an_invocation_lock_outranks_a_capable_topology_with_the_l0_scope() {
+    // Both routes hold for reserve_inventory once the lock is
+    // declared. Route A is judged first because its proof survives
+    // any change of runtime realization, so the verdict is L0-only
+    // where the fixture's own proof was runtime-dependent.
+    let mut model = load_flash_checkout();
+
+    set_invocation_lock(
+        &mut model,
+        "operation.reserve_inventory",
+        "input.reserve_inventory.created",
+        &["order_id"],
+    );
+
+    assert!(validation::validate(&model).is_empty());
+
+    let verdict = serialization_verdict(&model, "operation.reserve_inventory", 0);
+
+    assert!(
+        matches!(
+            &verdict,
+            SerializationVerdict::Proven {
+                proof: SerializationProof::InvocationLocked { .. },
+                scope: ProofScope::L0Only,
+            }
+        ),
+        "{verdict:?}"
+    );
+}
+
+#[test]
+fn a_lock_keyed_from_another_source_is_declined_and_topology_still_proves() {
+    // The lock keys on another operation's input. Validation rejects
+    // the shape; verification independently declines route A — and
+    // the fixture's topology route still proves, because the two
+    // routes are independent.
+    let mut model = load_flash_checkout();
+
+    set_invocation_lock(
+        &mut model,
+        "operation.reserve_inventory",
+        "input.create_order.request",
+        &["order_id"],
+    );
+
+    assert!(!validation::validate(&model).is_empty());
+
+    let verdict = serialization_verdict(&model, "operation.reserve_inventory", 0);
+
+    assert!(
+        matches!(
+            &verdict,
+            SerializationVerdict::Proven {
+                proof: SerializationProof::SubscriptionRouted { .. },
+                scope: ProofScope::RuntimeDependent,
+            }
+        ),
+        "{verdict:?}"
+    );
+}
+
+#[test]
+fn a_lock_key_not_carrying_the_requirement_key_contributes_its_obstacle() {
+    // A lock keyed by a different field of the same input serializes
+    // the wrong population classes. Its obstacle leads the unproven
+    // verdict, and the topology route's own gaps follow.
+    let mut model = load_flash_checkout();
+
+    model
+        .operations
+        .get_mut(&id("operation.transfer_stock"))
+        .unwrap()
+        .requirements
+        .serialization
+        .push(SerializationRequirement {
+            key: input_key("input.transfer_stock.request", &["sku"]),
+        });
+
+    set_invocation_lock(
+        &mut model,
+        "operation.transfer_stock",
+        "input.transfer_stock.request",
+        &["quantity"],
+    );
+
+    assert!(validation::validate(&model).is_empty());
+
+    let verdict = serialization_verdict(&model, "operation.transfer_stock", 0);
+
+    assert_eq!(
+        obstacles(&verdict),
+        &[
+            SerializationObstacle::InvocationLockKeyNotEquivalent {
+                input: id("input.transfer_stock.request"),
+                schema: id("schema.TransferStockRequest"),
+                lock_key: path(&["quantity"]),
+            },
+            SerializationObstacle::RoutingAbsent {
+                input: id("input.transfer_stock.request"),
+                pool: id("pool.inventory_api"),
+            },
+            SerializationObstacle::MemberConcurrencyNotSerial {
+                input: id("input.transfer_stock.request"),
+                pool: id("pool.inventory_api"),
+                declared: MemberConcurrency::Unbounded,
+            },
+            SerializationObstacle::ExecutionHandoffNotExclusive {
+                input: id("input.transfer_stock.request"),
+                pool: id("pool.inventory_api"),
+                declared: None,
+            },
+        ]
+    );
+}
+
+#[test]
+fn an_invocation_lock_contributes_nothing_to_ordering() {
+    // The same lock that proves apply_payment's serialization L0-only
+    // leaves its ordering requirement exactly where the broken
+    // topology leaves it: lock acquisition makes no FIFO guarantee,
+    // so there is no precedence for it to preserve.
+    let mut model = load_flash_checkout();
+
+    pool_mut(&mut model, "pool.order_workers").execution_handoff = None;
+
+    set_invocation_lock(
+        &mut model,
+        "operation.apply_payment",
+        "input.apply_payment.captured",
+        &["order_id"],
+    );
+
+    assert!(validation::validate(&model).is_empty());
+
+    let serialization = serialization_verdict(&model, "operation.apply_payment", 0);
+
+    assert!(
+        matches!(
+            &serialization,
+            SerializationVerdict::Proven {
+                proof: SerializationProof::InvocationLocked { .. },
+                scope: ProofScope::L0Only,
+            }
+        ),
+        "{serialization:?}"
+    );
+
+    let ordering = ordering_verdict(&model, "operation.apply_payment", 0);
+
+    assert!(
+        matches!(
+            &ordering,
+            verification::OrderingVerdict::Unproven { obstacles }
+                if matches!(
+                    &obstacles[..],
+                    [verification::OrderingObstacle::ExecutionHandoffNotExclusive { .. }]
+                )
+        ),
+        "{ordering:?}"
+    );
+}
+
+#[test]
+fn an_empty_population_outranks_a_declared_lock() {
+    // Vacuous serialization needs no fact at all — not even the lock —
+    // and the proof says so.
+    let mut model = load_flash_checkout();
+
+    subscription_mut(
+        &mut model,
+        "operation.reserve_inventory",
+        "input.reserve_inventory.created",
+    )
+    .messages = MessageSelector::Only(BTreeSet::new());
+
+    set_invocation_lock(
+        &mut model,
+        "operation.reserve_inventory",
+        "input.reserve_inventory.created",
+        &["order_id"],
+    );
+
+    let verdict = serialization_verdict(&model, "operation.reserve_inventory", 0);
+
+    assert!(
+        matches!(
+            &verdict,
+            SerializationVerdict::Proven {
+                proof: SerializationProof::NoAdmittedInvocations { .. },
+                ..
+            }
+        ),
+        "{verdict:?}"
+    );
+}
+
+#[test]
+fn fragment_aliasing_establishes_lock_key_identity() {
+    // The lock key and the requirement key differ as paths but expand
+    // to the same canonical value through a declared fragment mapping
+    // — the same §4 identity the routed proofs consume.
+    let mut model = load_flash_checkout();
+
+    let mut mapping = BTreeMap::new();
+
+    for field in [
+        "order_id",
+        "event_id",
+        "warehouse_id",
+        "sku",
+        "quantity",
+        "amount",
+    ] {
+        mapping.insert(field.to_owned(), path(&[field]));
+    }
+
+    mapping.insert("ref".to_owned(), path(&["order_id"]));
+
+    model.schemas.insert(
+        id("schema.OrderCreatedView"),
+        Schema::Fragment(SchemaFragment {
+            source: id("schema.OrderCreated"),
+            mapping,
+        }),
+    );
+
+    model
+        .topics
+        .get_mut(&id("topic.order_events"))
+        .unwrap()
+        .messages
+        .insert(id("schema.OrderCreatedView"));
+
+    grouping_key_mut(&mut model, "topic.order_events")
+        .mapping
+        .insert(id("schema.OrderCreatedView"), vec![path(&["ref"])]);
+
+    let subscription = subscription_mut(
+        &mut model,
+        "operation.reserve_inventory",
+        "input.reserve_inventory.created",
+    );
+
+    subscription.messages = MessageSelector::Only(BTreeSet::from([id("schema.OrderCreatedView")]));
+
+    set_invocation_lock(
+        &mut model,
+        "operation.reserve_inventory",
+        "input.reserve_inventory.created",
+        &["ref"],
+    );
+
+    assert!(validation::validate(&model).is_empty());
+
+    // The requirement key stays `order_id`; the lock keys on `ref`.
+    // Both expand to OrderCreated.order_id.
+    let verdict = serialization_verdict(&model, "operation.reserve_inventory", 0);
+
+    let SerializationVerdict::Proven {
+        proof: SerializationProof::InvocationLocked { key_identities, .. },
+        scope,
+    } = verdict
+    else {
+        panic!("expected an invocation-locked proof, found {verdict:?}");
+    };
+
+    assert_eq!(scope, ProofScope::L0Only);
+
+    assert_eq!(
+        key_identities,
+        vec![InvocationLockKeyFact {
+            schema: id("schema.OrderCreatedView"),
+            identity: KeyIdentity::SameCanonicalValue {
+                schema: id("schema.OrderCreated"),
+                path: path(&["order_id"]),
+            },
         }]
     );
 }
@@ -4460,7 +4924,7 @@ fn request_routing_does_not_invent_request_ordering() {
             key: input_key("input.create_order.request", &["order_id"]),
         });
 
-    pool_mut(&mut model, "pool.checkout_api").member_concurrency = bounded(1);
+    make_pool_proof_capable(&mut model, "pool.checkout_api");
 
     assert!(validation::validate(&model).is_empty());
 

@@ -41,11 +41,56 @@ pub struct Operation {
 
     pub inputs: BTreeMap<Id, Input>,
 
+    /// The operation's declared entry synchronization, if any. Not a
+    /// program step: the lock brackets the whole program, and its
+    /// absence is epistemic — no synchronization fact, not evidence
+    /// that invocations overlap.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub invocation_lock: Option<InvocationLock>,
+
     /// The operation's one explicit control structure — the source of
     /// truth for every operation-owned execution occurrence.
     pub program: OperationBlock,
 
     pub requirements: OperationRequirements,
+}
+
+/// An exclusive lock acquired at operation entry and held to the
+/// invocation's terminal.
+///
+/// Semantics: the key is evaluated from the invocation context before
+/// any program step executes, the exclusive lock on that evaluated key
+/// is acquired before the first step, and it is released when the
+/// invocation reaches `return` or `complete`. Two invocations whose
+/// evaluated keys are equal therefore never execute their operation
+/// programs concurrently.
+///
+/// The declaration asserts the abstract exclusion guarantee, not a
+/// mechanism: advisory database locks, distributed mutexes, and fenced
+/// lock services are all conforming realizations. It is L0 — no
+/// routing, pool, or handoff fact participates — which is what makes
+/// it the one serialization proof route that survives any change of
+/// runtime topology.
+///
+/// Three non-implications are load-bearing. The lock establishes no
+/// ordering: acquisition makes no FIFO guarantee, so same-key
+/// invocations exclude one another in no particular order. It is not a
+/// transaction [`Lock`](super::Lock) step, which protects selected
+/// object instances for a transaction's span; this one guards the
+/// whole invocation under a semantic key. And async effects permitted
+/// to outlive the operation terminal (§16) are not implicitly kept
+/// under it after terminal — the lock spans the program, not the
+/// effect lifetimes that escape it.
+///
+/// The key must be evaluable at entry, before any step: only an input
+/// payload exists there, so the key's source must be an input of the
+/// operation — and its only input, because every invocation acquires
+/// the lock and an invocation triggered by another input carries no
+/// value for the key. Validation enforces both.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InvocationLock {
+    pub key: ValueRef,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]

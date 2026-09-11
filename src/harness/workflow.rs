@@ -1485,6 +1485,7 @@ mod tests {
             service: id("service.x"),
             description: None,
             inputs: BTreeMap::new(),
+            invocation_lock: None,
         });
 
         draft.program = Some(OperationBlock {

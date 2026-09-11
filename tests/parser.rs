@@ -4,6 +4,7 @@ use std::{
 };
 
 use conseqa::{
+    analyzer::validation,
     parser::yaml,
     spec::{
         CompletionRequirement, Condition, DeliverySemantics, Derivation, Effect, ErrorDisposition,
@@ -1018,7 +1019,7 @@ transaction: tx.x",
 /// level.
 fn operation_source(extra: &str) -> String {
     let mut source = String::from(
-        "dsl: 2
+        "dsl: 3
 revision: 1
 services:
   service.a:
@@ -1177,7 +1178,7 @@ fn flash_checkout_parses_transition_effect_intents() {
 /// surface syntax can be exercised without a fixture.
 fn field_source(fields: &str) -> String {
     let mut source = String::from(
-        "dsl: 2
+        "dsl: 3
 revision: 1
 services: {}
 schemas:
@@ -1752,7 +1753,7 @@ fn shorthand_selector_values_serialize_into_the_canonical_form() {
 #[test]
 fn an_l0_only_model_parses_with_no_runtime_block() {
     let source = "
-dsl: 2
+dsl: 3
 revision: 1
 
 topics:
@@ -1784,7 +1785,7 @@ topics:
 #[test]
 fn the_canonical_runtime_block_parses_and_round_trips() {
     let source = "
-dsl: 2
+dsl: 3
 revision: 1
 
 runtime:
@@ -1889,7 +1890,7 @@ runtime:
 #[test]
 fn subscription_scoped_transport_semantics_parse() {
     let source = "
-dsl: 2
+dsl: 3
 revision: 1
 
 schemas:
@@ -1982,7 +1983,7 @@ fn member_assignments_round_trip() {
     ] {
         let source = format!(
             "
-dsl: 2
+dsl: 3
 revision: 1
 
 runtime:
@@ -2019,7 +2020,7 @@ runtime:
 #[test]
 fn parses_asynchronous_effect_steps() {
     let source = r#"
-dsl: 2
+dsl: 3
 revision: 1
 services:
   service.read:
@@ -2316,21 +2317,21 @@ fn absent_acknowledgement_and_outboxes_stay_absent() {
 
 #[test]
 fn a_declared_dsl_version_mismatch_is_refused_by_name() {
-    let error = yaml::parse("dsl: 3\nrevision: 1\n")
+    let error = yaml::parse("dsl: 4\nrevision: 1\n")
         .expect_err("a future contract version should be refused");
 
     assert!(
         matches!(
             &error,
-            yaml::ParseError::DslVersionMismatch { found } if found.0 == 3
+            yaml::ParseError::DslVersionMismatch { found } if found.0 == 4
         ),
         "{error:?}"
     );
 
     let message = error.to_string();
 
-    assert!(message.contains("declares dsl 3"), "{message}");
-    assert!(message.contains("this build reads dsl 2"), "{message}");
+    assert!(message.contains("declares dsl 4"), "{message}");
+    assert!(message.contains("this build reads dsl 3"), "{message}");
 }
 
 #[test]
@@ -2354,7 +2355,7 @@ fn the_superseded_external_surface_fails_schema_validation() {
     // The clean break: the retired mechanism vocabulary is not
     // detected, canonicalized, or aliased — it fails ordinary shape
     // validation like any other unknown form.
-    let source = "dsl: 2
+    let source = "dsl: 3
 revision: 1
 operations:
   operation.x:
@@ -2389,7 +2390,7 @@ operations:
 
 #[test]
 fn a_present_condition_parses_and_round_trips() {
-    let source = "dsl: 2
+    let source = "dsl: 3
 revision: 1
 schemas:
   schema.Event:
@@ -2462,4 +2463,109 @@ services:
     let reparsed = yaml::parse(&serialized).expect("serialized model parses");
 
     assert_eq!(model, reparsed);
+}
+
+#[test]
+fn an_invocation_lock_and_execution_handoff_parse_and_round_trip() {
+    let source = "dsl: 3
+revision: 1
+schemas:
+  schema.Transfer:
+    kind: canonical
+    completeness: complete
+    fields:
+      account_id: uuid
+      amount: int
+  schema.TransferAccepted:
+    kind: canonical
+    completeness: complete
+    fields:
+      account_id: uuid
+operations:
+  operation.transfer:
+    service: service.x
+    invocation_lock:
+      key:
+        source: input:input.transfer.request
+        path:
+        - account_id
+    inputs:
+      input.transfer.request:
+        kind: request
+        schema: schema.Transfer
+        identity:
+          kind: unspecified
+        result:
+          ok: schema.TransferAccepted
+          err: schema.TransferAccepted
+    program:
+      steps:
+      - kind: return
+        request: input.transfer.request
+        outcome:
+          kind: ok
+          values:
+            kind: unspecified
+    requirements:
+      serialization:
+      - key:
+          source: input:input.transfer.request
+          path:
+          - account_id
+      ordering: []
+      idempotency: []
+      recoverability: []
+services:
+  service.x:
+    kind: backend
+runtime:
+  execution_pools:
+    pool.workers:
+      member_concurrency:
+        kind: bounded
+        value: 1
+      execution_handoff: exclusive_ownership
+";
+
+    let model = yaml::parse(source).expect("the lock and handoff should parse");
+
+    let operation = model
+        .operations
+        .get(&Id("operation.transfer".into()))
+        .expect("operation exists");
+
+    let lock = operation
+        .invocation_lock
+        .as_ref()
+        .expect("the lock is declared");
+
+    assert_eq!(
+        lock.key.source,
+        ValueSource::Input(Id("input.transfer.request".into()))
+    );
+    assert_eq!(lock.key.path.0, vec!["account_id".to_string()]);
+
+    let pool = model
+        .runtime
+        .as_ref()
+        .expect("runtime declared")
+        .execution_pools
+        .get(&Id("pool.workers".into()))
+        .expect("pool declared");
+
+    assert_eq!(
+        pool.execution_handoff,
+        Some(conseqa::spec::ExecutionHandoff::ExclusiveOwnership)
+    );
+
+    // Absence stays absent: a pool without the declaration serializes
+    // without the field, and an operation without the lock without its
+    // key.
+    let serialized = yaml::serialize(&model).expect("model serializes");
+
+    let reparsed = yaml::parse(&serialized).expect("serialized model parses");
+
+    assert_eq!(model, reparsed);
+
+    assert!(validation::validate(&model).is_empty());
 }

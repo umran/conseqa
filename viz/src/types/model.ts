@@ -380,8 +380,15 @@ export interface Operation {
   service: Id;
   description: string | null;
   inputs: Record<Id, Input>;
+  /** Entry synchronization: an exclusive lock on the evaluated key,
+   *  held from operation entry to the invocation's terminal. */
+  invocation_lock?: InvocationLock | null;
   program: OperationBlock;
   requirements: OperationRequirements;
+}
+
+export interface InvocationLock {
+  key: ValueRef;
 }
 
 // ---------------------------------------------------------------------
@@ -495,7 +502,12 @@ export type MemberAssignment = { kind: "consistent_hash" } | { kind: "round_robi
  *  cardinality: member counts are external scenario inputs. */
 export interface ExecutionPool {
   member_concurrency: MemberConcurrency;
+  /** Continuity of exclusive execution authority across ownership and
+   *  member transitions. Absent means no fact about such overlap. */
+  execution_handoff?: ExecutionHandoff | null;
 }
+
+export type ExecutionHandoff = "exclusive_ownership";
 
 export type MemberConcurrency =
   | { kind: "unspecified" }

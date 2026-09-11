@@ -161,6 +161,7 @@ fn derive_one(
         service: operation.service.clone(),
         description: operation.description.clone(),
         inputs: operation.inputs.clone(),
+        invocation_lock: operation.invocation_lock.clone(),
     });
 
     // JSON serializes `Some(program)` exactly as `program`, so this

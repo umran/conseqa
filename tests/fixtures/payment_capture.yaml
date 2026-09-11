@@ -26,7 +26,7 @@
 # to completion by at-least-once delivery), and receipts emails the
 # customer through a provider that deduplicates sends by event_id.
 # Every declared obligation proves.
-dsl: 2
+dsl: 3
 revision: 1
 services:
   service.payments:
@@ -412,6 +412,7 @@ runtime:
       member_concurrency:
         kind: bounded
         value: 1
+      execution_handoff: exclusive_ownership
     pool.ledger_workers:
       member_concurrency:
         kind: bounded

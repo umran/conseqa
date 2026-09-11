@@ -380,6 +380,8 @@ pub fn validate(model: &Model) -> Vec<ValidationError> {
 
     errors.extend(validate_request_identity_shape(model));
 
+    errors.extend(validate_invocation_locks(model));
+
     errors.extend(validate_state_machines(model));
 
     errors.extend(validate_transactions(model, &index));
@@ -820,6 +822,37 @@ fn validate_request_identity_shape(model: &Model) -> Vec<ValidationError> {
     errors
 }
 
+/// Every invocation acquires the operation's entry lock, and an
+/// invocation is triggered by exactly one input, so the lock key —
+/// which sources one input — is evaluable for all of them only when
+/// that input is the operation's only one. The reference pass has
+/// already established that the source is an in-scope input; this
+/// judges coverage.
+fn validate_invocation_locks(model: &Model) -> Vec<ValidationError> {
+    let mut errors = Vec::new();
+
+    for (operation_id, operation) in &model.operations {
+        let Some(lock) = &operation.invocation_lock else {
+            continue;
+        };
+
+        let ValueSource::Input(source) = &lock.key.source else {
+            continue;
+        };
+
+        for input_id in operation.inputs.keys() {
+            if input_id != source {
+                errors.push(ValidationError::InvocationLockKeyNotEvaluable {
+                    operation: operation_id.clone(),
+                    input: input_id.clone(),
+                });
+            }
+        }
+    }
+
+    errors
+}
+
 fn validate_state_machines(model: &Model) -> Vec<ValidationError> {
     let mut errors = Vec::new();
 
@@ -1108,6 +1141,17 @@ fn validate_field_paths(model: &Model, index: &ReferenceIndex<'_>) -> Vec<Valida
             for path in fields {
                 validate_schema_path(model, input_id, &request.schema, path, &mut errors);
             }
+        }
+
+        if let Some(lock) = &operation.invocation_lock {
+            validate_value_ref_path(
+                model,
+                index,
+                operation_id,
+                ValueContext::operation(operation_id),
+                &lock.key,
+                &mut errors,
+            );
         }
 
         for requirement in &operation.requirements.serialization {
@@ -2177,6 +2221,26 @@ fn validate_operation_references(
 
         for (input_id, input) in &operation.inputs {
             validate_input_references(index, input_id, input, errors);
+        }
+
+        // An invocation lock's key is confined to a stricter source
+        // vocabulary than a general value reference: it is evaluated
+        // at operation entry, where only an input payload exists.
+        if let Some(lock) = &operation.invocation_lock {
+            match &lock.key.source {
+                ValueSource::Input(_) => validate_value_ref_reference(
+                    index,
+                    operation_id,
+                    ValueContext::operation(operation_id),
+                    &lock.key,
+                    errors,
+                ),
+
+                other => errors.push(ValidationError::InvocationLockKeyNotFromInput {
+                    operation: operation_id.clone(),
+                    source: other.id().clone(),
+                }),
+            }
         }
 
         validate_program_references(model, index, operation_id, &operation.program, errors);
