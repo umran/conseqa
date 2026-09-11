@@ -15,6 +15,14 @@ pub struct IdempotencyKeyPropagation {
     pub target: IdempotencyKey,
 }
 
+/// A transaction's commit-deduplication guarantee — transaction-only.
+///
+/// `DeduplicatedBy` is the model's own keyed-commit construct,
+/// `Commit(operation, transaction, K)`, load-bearing for route-B
+/// artifact recovery (§17). External boundaries declare their facts
+/// through `ExternalIdentity` / `ExternalIdempotency` /
+/// `ExternalResultReplay` instead; this enum never appears on an
+/// external effect.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum IdempotencyGuarantee {

@@ -1,6 +1,12 @@
 # Conseqa DSL Semantics
 
 **Status:** Normative semantic contract for the DSL and the V1 verifiers — the single authoritative semantics document. The design drafts and revision documents that preceded it are retired; their normative content is consolidated here, and what they left open is §27.  
+**DSL contract version:** This document specifies **DSL contract version 1** (`DSL_VERSION`, `src/spec/model.rs`). The version names the normative semantic contract as a whole, not the parse schema: any normative change bumps it — vocabulary, validation, or proof semantics alike — while purely internal changes do not. Every specification document declares the version it is authored in (`dsl: 1`, the model root's first field, stamped at assembly and never authored); a consumer probes it before strict parsing and refuses a mismatch or absence by name.
+
+| dsl | defined by |
+|---|---|
+| 1 | the External Boundary Guarantees and Decision Vocabulary revision — external `identity` / `idempotency` / `result_replay`, versioning itself; everything earlier is unversioned prehistory, refused as predating versioning |
+
 **Implementation namespace:** `src/spec/` (surface), `src/analyzer/` (validation and verification).
 
 This document defines what an Conseqa declaration means, what it does **not** mean, and what a verifier may soundly infer from it. It is intentionally stricter than a field reference: the purpose is to prevent the analyzer, an LLM author, and a human reader from silently assigning different meanings to the same declaration.
@@ -67,11 +73,12 @@ An unknown fact cannot be used as evidence for a proof.
 
 ### 1.2 Absence of a guarantee is not evidence of a violation
 
-`unordered`, `unbounded`, and `not_deduplicated` are stronger negative declarations than `unspecified`:
+`unordered`, `unbounded`, `not_deduplicated` (transactions), and the external boundary's `distinguishable` and `unstable` are stronger negative declarations than `unspecified`:
 
 - **Unordered** explicitly says no ordering guarantee is provided.
 - **Unbounded** explicitly says no finite bound is declared.
-- **NotDeduplicated** explicitly says duplicate executions are not deduplicated at that boundary.
+- **NotDeduplicated** explicitly says no keyed commit deduplication exists for the transaction.
+- **Distinguishable** explicitly says duplicate external applications may produce distinguishable modeled work; **Unstable** explicitly says nothing fixes the boundary's terminal result. Mechanism absence is not a negative property: a boundary that merely lacks deduplication is *not* thereby `distinguishable` — a side-effect-free boundary lacks it too.
 
 Even these declarations describe guarantees, not necessarily observed runtime behavior. An unordered topic may happen to emit messages in order in one execution; the verifier simply may not rely on that.
 
@@ -109,7 +116,8 @@ Where two readings of a shorthand could collide — a schema named for a scalar,
 - topics,
 - state machines,
 - operations,
-- and a revision.
+- a revision,
+- and the `dsl` contract version, stamped at assembly and on export, never authored (see the header). Within one server every model carries the build's version by construction; the stamp matters at the document boundary, where a two-phase read refuses a mismatch by name instead of surfacing it as a shape error.
 
 **L1 — one runtime realization of that machine**, under `runtime` (§10). Optional: `runtime` may be absent entirely, and each of its collections may be omitted independently.
 
@@ -120,6 +128,8 @@ The collections describe one architecture snapshot.
 `revision` is an opaque numeric revision marker for the model.
 
 The current DSL assigns no ordering, compatibility, migration, or version-negotiation semantics beyond its numeric identity. A verifier must not infer that revision `2` is semantically compatible with, derived from, or newer in any meaningful architectural sense than revision `1` unless surrounding tooling establishes that convention.
+
+`revision` is not the `dsl` contract version, and neither is the stored-workspace `FORMAT` (a storage-encoding counter, `src/confluence/persistence.rs`) or the crate build version: four counters on four axes. The one invariant relating them: a `dsl` bump forces a `FORMAT` bump — stored workspaces embed the spec types — never conversely. A server states its `dsl` version at the MCP handshake and on the served guide, and never refuses a *connection* over any version axis: a connecting agent adapts to what the server states, and refusal lives at the artifact boundaries — a patch envelope declaring a mismatched `dsl`, a whole document probed before parsing — where a stale authored claim actually meets the server.
 
 ### `Id`
 
@@ -548,7 +558,7 @@ The disposition declares whether observing the contract's `Err` terminally resol
 
 The disposition belongs to the **result contract**, not to the schema: the same error schema may be terminal in one contract and retryable in another. One disposition covers the whole declared `Err` variant; heterogeneous per-error-class dispositions inside one contract are out of scope in V1.
 
-For a request contract, the disposition describes whether an error returned by the target semantically admits another logical request attempt. It is orthogonal to `RequestEffect.retry` (§13.2): `retry` describes whether the requesting boundary may issue repeated attempts, the disposition whether another attempt is admitted after this error — `Err retryable` with `retry: never`, and `Err terminal` with `retry: may_repeat`, are both coherent, and no automatic coupling exists. For an external contract, the disposition feeds the strengthened `deduplicated_by` terminal-result rule (§13.3).
+For a request contract, the disposition describes whether an error returned by the target semantically admits another logical request attempt. It is orthogonal to `RequestEffect.retry` (§13.2): `retry` describes whether the requesting boundary may issue repeated attempts, the disposition whether another attempt is admitted after this error — `Err retryable` with `retry: never`, and `Err terminal` with `retry: may_repeat`, are both coherent, and no automatic coupling exists. For an external contract, the disposition feeds the `result_replay: replay_stable` terminal-result rule (§13.3).
 
 ## 8.2 Subscription input
 
@@ -709,7 +719,7 @@ V1 discharges the requirement over each **admitted path** of the program — a p
 
 - **State leg.** Every transaction step must be retry-safe: a keyed commit over a stable key, or naturally replayable. There is no final-step exemption, because a duplicate delivery re-drives the whole program even after terminal completion.
 - **Effect leg.** Every effect-executing step must be duplicate-safe per the §13 rules, since even a recovered intent may be executed again (§14) — and those rules follow the work an attempt causes into other operations: a request is safe only when its target collapses duplicate invocations, a publication only when every modeled consumer of the topic collapses duplicate deliveries, an outbox write only when its containing transaction suppresses a second commit or every modeled consumer of the outbox collapses duplicate deliveries (§13.4), each through its own proven requirement. An outbox boundary does not terminate the causal effect graph: the writes staged by a path's transactions are effect occurrences of that path, and the cascade continues through every outbox input admitting the written schema.
-- **Control leg.** Every decision on the path must replay (§16): the matched result replay-stable, or the branch condition deterministic over replay-stable roots, so that every attempt in the class traverses the same path. When a controlling observation may differ between attempts, a retry may do different work, and V1 has no compatibility argument for the two histories; the decision is an obstacle.
+- **Control leg.** Every decision on the path must replay (§16): the matched result replay-stable, or the branch condition deterministic over replay-stable roots, so that every attempt in the class traverses the same path. When a controlling observation may differ between attempts, a retry may do different work, and V1 has no general compatibility argument for the two histories; the decision is an obstacle — with one narrow, structural exception. A decision not established to replay is **admissible for this leg** iff its continuation is **idempotency-inert**: on every admitted path through the decision, every step after it is itself a decision — no transaction, no effect execution or launch, no intent execution, no `join_all` or `race` — through arm bodies, branch fall-through, and enclosing-block suffixes alike, out to the terminal. The class's complete modeled work is then the shared prefix's, already judged by the other legs; divergence can alter only which terminal is constructed, which is the result-replay obligation's separate concern and is deliberately **not** granted this admission — same work is not same result. Transactions are never inert, however individually retry-safe: `arm A → T1 / arm B → T2` is divergent logical work, and the theorem is structural, not a recursive equivalence argument. `join_all` and `race` are never inert although they launch nothing: they alter which prior completions later control depends on. A launch *before* the decision does not invalidate inertness; one *inside* a continuation does — the effect enters the blast radius even unawaited. The admission is recorded on the proof as a **derived structural fact** (`IdempotencyInertContinuation`), never as an implementation assumption — no implementation claim supplies it, and it lapses by itself the moment an effectful step joins any continuation.
 
 A verdict therefore covers the cascade the operation starts, and V1 computes the mutually dependent verdicts as a greatest fixpoint (below), so a cycle whose members each collapse the others' duplicates is proven and marked coinductive — a cycle through outboxes no less than one through topics or requests; there is no separate outbox solver. Result consistency is the separate result-replay obligation below; its verdicts feed in only where a decision rests on a request effect's result. Vacuously discharged: an empty population; no admitted path, so an attempt performs no modeled work; and a triggering subscription or outbox input with `at_most_once` delivery whose payload is identity-pinned by the key (§18) — same-class messages are then one logical message delivered at most once, so a class holds at most one attempt.
 
@@ -721,7 +731,7 @@ The `result` member of an idempotency requirement asks a further question of the
 
 No privileged result artifact is involved. A request result is constructed directly at a `return` terminal from values available there (§15), so the proof is control-path replay plus ordinary provenance. V1 discharges the requirement, for each admitted path ending at a `return` for the triggering input:
 
-1. every decision on the path must replay (§16): a class then follows one path to one terminal, which fixes the variant; and
+1. every decision on the path must replay (§16): a class then follows one path to one terminal, which fixes the variant — the idempotency-inert continuation admission does **not** apply to this family, since divergent terminal-only continuations may construct divergent results; and
 2. the terminal's derivation must be replay-deterministic in the context at the terminal — `deterministic` over roots the §18 rules make stable, including transaction outputs by route A or route B of §17 and effect results whose targets prove their own consistency.
 
 Premise 2 may name other operations' verdicts, since a bound request result is stable only when the target proves its result replay-consistent for the targeted input (§13.2). The checks are therefore computed as a greatest fixpoint over the replay-consistent requirements, exactly as idempotency's are: a cycle of requests whose members each pass their local checks is proven, and the proof is marked coinductive.
@@ -1476,32 +1486,55 @@ An external effect marks a boundary beyond which Conseqa does not inspect implem
 
 `name` is descriptive.
 
-Because the checker cannot analyze the external implementation, its idempotency behavior is supplied as an explicit assumption.
+Because the checker cannot analyze the external implementation, its facts are supplied as explicit declarations — each an implementation guarantee in the §1 sense, conditional per §1.3 — along **three independent dimensions**: interaction identity, duplicate-side-effect behaviour, and terminal-result replay behaviour. The DSL declares properties, never mechanisms: provider-side deduplication, content-addressed processing, conditional mutation, and intrinsically idempotent protocol semantics all lie below the semantic floor (§1), and none is asserted by any declaration here. The dimensions must not be conflated — same logical interaction ≠ safe duplicate application, and safe duplicate application ≠ same terminal result on replay — and the verifier SHALL NOT derive either behavioural axis from the other.
 
-### `IdempotencyGuarantee::unspecified`
+```yaml
+effect:
+  kind: external
+  name: email_send
+  identity:
+    kind: keyed
+    key:
+      components:
+      - source: transaction_output:output.notification
+        path: notification_id
+  idempotency: identical_per_identity
+  result_replay: replay_stable
+  result:
+    ok: schema.Ack
+    err: { schema: schema.OperationRejected, disposition: terminal }
+```
 
-No deduplication fact is available.
+### `ExternalIdentity`
 
-### `not_deduplicated`
+What identifies one logical external interaction. `keyed { key }`: **equal evaluated key tuples identify applications of one logical interaction.** The declaration mirrors the *shape* of request identity (§8.1) and message identity (§6) while remaining its own vocabulary — an interaction identity is not an idempotency declaration, and `ExternalIdentityKey` is deliberately distinct from the requirement-facing `IdempotencyKey` type.
 
-Repeated execution is not deduplicated at this external boundary.
+Identity alone establishes nothing about what repeated applications do: not deduplication, not idempotency, not result replay, not at-most-once application. `unspecified` means the model has no usable sameness relation across applications. A keyed identity with both behavioural fields `unspecified` is valid: it declares identity while withholding behaviour, and enables nothing.
 
-A retry/duplicate path reaching such an effect is therefore potentially observably unsafe for an upstream idempotency requirement.
+### `ExternalIdempotency`
 
-### `deduplicated_by`
+What duplicate applications do to **modeled externally observable** state, quantified relative to the declared identity:
 
-The external boundary guarantees deduplication for executions sharing the declared idempotency key.
+- **`unspecified`** — no usable fact (§1.1). Epistemic: not "safe", not "unsafe".
+- **`distinguishable`** — an explicit negative, stronger than `unspecified`: repeated applications may produce distinguishable modeled external work (an unkeyed payment charge). Requires no identity. The verifier treats it as a direct duplicate-work obstacle wherever duplicate execution is admitted.
+- **`identical_per_identity`** — requires `identity: keyed`. Across applications of one interaction, any number of applications produces modeled externally observable side-effect work indistinguishable from exactly one application, **under every admitted interleaving**. The interleaving qualification is normative: `set X = 5; another interaction sets X = 8; a duplicate sets X = 5` may be distinguishable from one application, so naive re-imposition does not qualify merely because the payload repeats. An author who declares it for such a boundary owns that as their §1.3 conformance claim, exactly as §17 says of one-shot guards.
+- **`side_effect_free`** — application causes no modeled externally observable state change beyond producing its synchronous result. Universal and keyless: the degenerate case where zero side effects are trivially identical. Deliberately scoped to Conseqa-observable semantics — unmodeled internal logging, metrics, allocation, caching, and tracing are not prohibited. May coexist with a keyed identity declared for `result_replay`'s benefit.
 
-The guarantee is scoped to equality of that logical key. It does not imply ordering, transactionality, or deduplication across different keys.
+For an upstream idempotency requirement (§9), a duplicate application of the effect is safe when the effect declares `side_effect_free`, or declares `identical_per_identity` and every component of the identity key is replay-stable relative to the governing key (§18): all attempts then address one logical interaction, whose duplicates the guarantee makes indistinguishable. `result_replay` plays no role in this judgment.
 
-For an upstream idempotency requirement, a duplicate execution is safe when every component of the declared key is replay-stable relative to the governing key (§18): all attempts then execute under one key, and the boundary collapses them. No instance condition is needed, since the guarantee is scoped to key equality alone.
+### `ExternalResultReplay`
 
-For a **result-bearing** external effect, the guarantee additionally fixes the interaction's terminal result. Equal evaluated keys identify one logical external execution; individual attempts are concrete executions made while that logical execution has not yet terminally resolved. Beyond suppressing duplicate logical work, `deduplicated_by`:
+What duplicate applications observe as the boundary's terminal synchronous result, relative to the declared identity:
 
-- does not let a retryable error outcome establish the terminal logical result;
-- fixes the logical execution's terminal result once it reaches one — after the first terminal `Ok` or terminal `Err`, every subsequent same-key execution observes the same variant and a replay-equivalent payload.
+- **`unspecified`** — no usable replay fact.
+- **`unstable`** — an explicit negative: repeated applications are not guaranteed one replay-fixed terminal result; per-attempt results may differ (fresh presigned URLs, fresh nonces, fresh challenges). Requires a declared result contract; requires no identity, since its very use is to state per-attempt freshness. It does not say results *do* differ — only that nothing fixes them.
+- **`replay_stable`** — requires `identity: keyed` and a declared result contract. **After one interaction's first terminal outcome, every later application of that identity observes the same terminal variant and a replay-equivalent payload.** `ErrorDisposition` remains authoritative for terminality: `Ok` is terminal by definition; `Err` contributes the fixed terminal result only under a declared `terminal` disposition; a retryable or disposition-unspecified `Err` is an attempt-level, nonterminal outcome and establishes nothing.
 
-Duplicate-work collapse and terminal-result stability are two consequences of the same declaration; no separate external result-replay guarantee exists. A boundary that performs the work once but answers a duplicate with a distinct response — `Ok(original)` then `Err(AlreadyProcessed)` — does **not** conform unless the modeled boundary abstracts the duplicate response back into the original logical result; expose the distinct duplicate response as the modeled result and the boundary must not be declared `deduplicated_by`. For a resultless effect (`result: null`), the meaning is unchanged: same-key logical work is deduplicated, and there is no result-replay component. As every implementation guarantee, conformance is an obligation on the boundary (§1.3); the checker consumes the declaration and cannot inspect the boundary.
+A boundary that performs the work once but answers a duplicate with a distinct response — `Ok(original)` then `Err(AlreadyProcessed)` — may honestly declare `identical_per_identity` with `result_replay: unspecified` or `unstable`; under the retired single-guarantee vocabulary it could declare nothing at all. The independence is the point: a dedup provider replaying its recorded response is `identical_per_identity + replay_stable`; a presigner is `side_effect_free + unstable`; a read-only snapshot lookup is `side_effect_free + replay_stable` over a keyed identity; a pure computation with per-call metering is result-stable while its work is separately distinguishable. `ExternalIdempotency` plays no role in the result judgment (§18 rule 6), and `ExternalResultReplay` plays none in the effect leg.
+
+### Placement validation
+
+`identical_per_identity` without a keyed identity is `ExternalIdempotencyRequiresIdentity`; `replay_stable` without one is `ExternalReplayStabilityRequiresIdentity`; `unstable` or `replay_stable` on a result-less effect is `ExternalResultReplayWithoutResult` — there is no modeled synchronous result whose replay behaviour could be described. `side_effect_free` and `distinguishable` impose nothing.
 
 ### `ExternalEffect.result`
 
@@ -1517,9 +1550,7 @@ result:
 
 Absent (`result: null`), no synchronous result is modeled and an execution site may not bind one.
 
-The declaration carries the result's shape and the error's disposition, and combines with the effect's idempotency guarantee. For a result-bearing `ExternalEffect`, `deduplicated_by { key }` identifies one logical external interaction for equal evaluated keys and, in addition to suppressing duplicate logical work, fixes the interaction's terminal logical `Result`: after the first terminal `Ok` or terminal `Err`, every subsequent same-key execution observes the same variant and a replay-equivalent payload. Retryable `Err` outcomes are attempt-level, nonterminal outcomes and do not establish the logical interaction's terminal result; an `Err` with unspecified disposition provides no usable terminality fact.
-
-Relative to a governing key, a bound external result is therefore replay-stable — per observed variant — when the effect declares `deduplicated_by`, every component of its key is replay-stable, and the observed variant is terminal: `Ok` by definition, `Err` under a declared `terminal` disposition (§16, §18). A retryable or unspecified `Err`, a boundary declared `not_deduplicated` or with an unspecified guarantee, or an unstable key leaves the observation unusable as a replay-stable root, and a decision resting on it is not established to replay — an honest gap the checker reports rather than a fact it assumes. `not_deduplicated` does not say repeated executions return *different* results; only that the guarantee is unavailable.
+Relative to a governing key, a bound external result is replay-stable — per observed variant — when the effect declares `result_replay: replay_stable`, every component of its identity key is replay-stable, and the observed variant is terminal: `Ok` by definition, `Err` under a declared `terminal` disposition (§16, §18). A retryable or unspecified `Err`, a boundary declaring `unstable` or nothing, or an unstable identity key leaves the observation unusable as a replay-stable root, and a decision resting on it is not established to replay — an honest gap the checker reports rather than a fact it assumes.
 
 ## 13.4 Outbox write effect
 
@@ -1931,11 +1962,20 @@ The `then` block executes when the condition holds. `otherwise` is optional; abs
 `Condition` is deliberately small and structurally exposes every value the decision depends on, so replay analysis can judge a decision without an expression language:
 
 - `eq { value, equals }` — equality of a value reference against `equals`, which accepts the selector-value surface of §19: a map is another value reference, a plain scalar is a literal;
+- `present { value }` — the referenced path resolves to a value;
 - `and { conditions }` — every nested condition holds;
 - `not { condition }` — the nested condition does not hold;
 - `unspecified` — the model provides no fact about how the decision is made.
 
-`eq`, `and`, and `not` are **deterministic functions of their references**: given equal values for every root, the decision takes the same arm. `unspecified` declares no fact and is never deterministic; a condition containing it anywhere is not. §1.1 governs it as it governs every other `unspecified`.
+`eq`, `present`, `and`, and `not` are **deterministic functions of their references**: given equal values for every root, the decision takes the same arm. `unspecified` declares no fact and is never deterministic; a condition containing it anywhere is not. §1.1 governs it as it governs every other `unspecified`.
+
+### `present`
+
+`present { value }` holds iff the referenced path resolves to a value in the attempt's evaluation context. A path is **absent** iff any optional segment required to resolve it is absent: `present a.b` with `a` absent does not hold. Presence and absence are aspects of the referenced **logical value** — two attempts observing replay-equivalent roots agree on the presence or absence of any path within them — so `present` needs no replay rule of its own: the ordinary judgment, a deterministic condition over replay-stable roots, carries it (§18 rule 3 already makes a triggering payload replay-stable as a whole logical value, optionality included). There is no `absent` kind; `not { present … }` composes.
+
+**Absence is not a value.** `eq` does **not** hold when either operand evaluates absent — including both absent. Presence is queried only through `present`; consequently `not { eq A B }` holds when either operand is absent, and an author for whom that matters guards with `present` first. The same rule holds for a `SelectorPredicate::Eq` over a stored optional field (§19): the conjunct does not match that instance.
+
+**A vacuous `present` is redundant, not invalid.** `present` over a statically required path is well-defined — vacuously true — and is never rejected; the checker raises the warning-severity note `RedundantPresenceCheck` when the complete resolved path traverses no optional field in any schema the root admits. The note matters because **conditions never prune admitted paths**: V1 performs no constant folding, so the never-taken arm of a vacuous `present` remains an admitted path and is analyzed like any other — delete the dead arm rather than carrying phantom obligations through it.
 
 ### `return` and `complete`
 
@@ -2023,7 +2063,7 @@ A retry traverses declared control. Whether it takes the same arm at a decision 
 - for a `branch`: the condition is deterministic (not `unspecified` anywhere) **and** every root it observes is replay-stable under §18. The same roots then yield the same predicate value; or
 - for a `match_result`: the matched result is replay-stable under §18, so the variant is fixed across the class.
 
-Otherwise the checker reports the decision as **not established to replay**, naming the gap: the condition is `unspecified`; a condition root is unstable; the result is not bound before the decision on this path; or the result is unstable in the taken arm's variant — its instance not class-fixed, its request's schema not the target's, its target declaring no replay-consistent requirement for the input or one that is unproven, an external boundary that is `not_deduplicated`, carries no deduplication fact, deduplicates by an unstable key, or whose observed `Err` is retryable or of unspecified disposition (§13.3), or a result bound by `race`, whose winner is scheduling nondeterminism (§16). Instability is not proven; a different arm on retry may be legitimate. What that means for each obligation is stated in §9: an obstacle for idempotency and result replay, never for recoverability.
+Otherwise the checker reports the decision as **not established to replay**, naming the gap: the condition is `unspecified`; a condition root is unstable; the result is not bound before the decision on this path; or the result is unstable in the taken arm's variant — its instance not class-fixed, its request's schema not the target's, its target declaring no replay-consistent requirement for the input or one that is unproven, an external boundary declaring `result_replay: unstable` or no replay fact at all, one whose identity key is unstable, or one whose observed `Err` is retryable or of unspecified disposition (§13.3), or a result bound by `race`, whose winner is scheduling nondeterminism (§16). Instability is not proven; a different arm on retry may be legitimate. What that means for each obligation is stated in §9: an obstacle for idempotency and result replay, never for recoverability.
 
 ### Step locations
 
@@ -2268,14 +2308,17 @@ assumed:
    (§9, §13.2): the class then sends one logical request into one
    class of the target, and receives one variant and a
    replay-equivalent payload back. For an **external** effect, a
-   variant is stable iff the effect declares `deduplicated_by` over a
-   key whose components are all replay-stable — equal keys identify
-   one logical external interaction whose terminal result the
-   guarantee fixes (§13.3) — and the referenced variant is terminal:
-   `Ok` by definition, `Err` under a declared `terminal` disposition.
-   A retryable or unspecified `Err` gains nothing from the guarantee;
-   no instance condition applies, since result identity follows the
-   key exactly as the work collapse does. A publication has no
+   variant is stable iff the effect declares `result_replay:
+   replay_stable` over an identity whose key components are all
+   replay-stable — equal identities are one logical external
+   interaction whose terminal result the guarantee fixes (§13.3) —
+   and the referenced variant is terminal: `Ok` by definition, `Err`
+   under a declared `terminal` disposition. A retryable or
+   unspecified `Err` gains nothing from the guarantee; no instance
+   condition applies, since result identity follows the identity key
+   exactly. `ExternalIdempotency` plays no role here — a boundary may
+   fix results while its side effects are separately unsafe, and vice
+   versa. A publication has no
    result. The judgments are made at the step that binds the result;
    a `match_result` rests on the judgment of the variant of the arm
    it takes (§16).
@@ -2285,8 +2328,9 @@ assumed:
 8. **Everything else is `Unknown`**: unidentified non-key input fields,
    fields of a non-triggering input, `state_machine_subject` state
    (always, in V1), `effect` payload roots, external effect results
-   outside rule 6 — an undeduplicated or unstably keyed boundary, a
-   retryable or unspecified `Err` — an artifact available by neither
+   outside rule 6 — a boundary declaring no terminal-result replay
+   guarantee, an unstably keyed identity, a retryable or unspecified
+   `Err` — an artifact available by neither
    route, an artifact or result not in the path context at the point
    of reference, and `transaction_read` results, which additionally
    poison any natural-replay provenance closure that reaches them.
@@ -2688,7 +2732,14 @@ The solver must preserve these distinctions:
 | **`Err` vs interrupted execution** | `Err` is a conclusive logical outcome a synchronous interaction returned; a crash, timeout, or lost connection is an idempotency/recoverability question and is not an `Err` payload. |
 | **`TransactionOutput` vs `EffectIntent`** | An output exports data; an intent captures pending work. Both are artifacts of the same commit, and neither may stand in for the other. |
 | **`match_result` vs `branch`** | A control-flow decision on a `Result` destructures a mutually exclusive typed outcome; a `branch` evaluates an ordinary predicate. Success/failure is never encoded as a status-field comparison. |
-| **Effect payload replay vs effect result replay** | A class-fixed outgoing instance proves every attempt asks the same question; whether the same answer comes back is a separate fact — a target's proven result consistency, or a deduplicated external boundary's fixed terminal result (never its retryable or unspecified errors). |
+| **Idempotency-inert divergence vs result-replay-safe divergence** | A non-replaying decision whose continuations add no modeled work is admissible for idempotency and only there; its divergent terminals may still construct divergent results, so result replay keeps requiring the decision itself to replay. |
+| **Derived structural proof fact vs declared assumption** | The inert-continuation admission is proven by the analyzer from program structure and lapses on edit; an assumption is a conformance claim an implementation could violate (§1.3). The report files them apart. |
+| **`present` vs `eq`** | `present` asks whether a path resolves to a value; `eq` compares values and never holds over an absent operand. Absence is not a comparable value, and presence is asked only through `present`. |
+| **Effect payload replay vs effect result replay** | A class-fixed outgoing instance proves every attempt asks the same question; whether the same answer comes back is a separate fact — a target's proven result consistency, or an external boundary's declared `replay_stable` terminal result (never its retryable or unspecified errors). |
+| **External identity vs external idempotency vs result replay** | Identity says which applications are one logical interaction; idempotency says what duplicates of it do to external state; result replay says what they observe back. Three independent declarations — neither behavioural axis is inferred from the other, and identity alone enables nothing. |
+| **`ExternalIdentityKey` vs `IdempotencyKey`** | An interaction identity names the boundary's sameness relation; an idempotency key names a requirement's governing class. The shapes coincide; the public concepts do not, per the outbox/topic precedent. |
+| **Absence of a mechanism vs a negative property** | The retired external `not_deduplicated` stated mechanism absence; `distinguishable` states that duplicates may produce distinguishable work. §1.2 forbids reading the first as the second. |
+| **`dsl` contract version vs model `revision` vs stored `FORMAT`** | The `dsl` version names the normative semantic contract; `revision` counts content commits of one model; `FORMAT` guards the stored-workspace encoding. A `dsl` bump forces a `FORMAT` bump, never conversely; no other implication holds. |
 | **Transaction output vs request result** | An output is a schema-shaped artifact a transaction exports; a request result is a `Result<Ok, Err>` constructed at a `return` terminal. A result may be derived from an output, but no privileged artifact stands between them. |
 | **Duplicate-delivery fact vs liveness** | `at_least_once` and `may_repeat` say a retry may happen, not that retries continue until success. |
 | **Ordering key vs message identity** | The ordering key sequences messages; the message identity identifies one logical message. They may coincide; neither implies the other. |
@@ -2827,7 +2878,7 @@ What the DSL deliberately does not yet decide. Every entry is scoped so that res
 
 10. **Input-specific path admission** — *Open; V1 stance adopted.* An operation may declare several inputs, and its one program does not say which input an invocation entered through. V1 relates a path to an input only through its terminal (§16): a path is admitted for triggering input `i` iff it ends at `complete` or at `return` for `i`. This is sufficient but weaker than the model knows: a `complete`-terminated path is admitted for every input, including a request input whose invocations then return nothing; a program with two request inputs cannot state that a step is reachable only through one of them, so both populations are analyzed over it; and a `return` for another input excludes a path without saying what an `i`-invocation does instead. An explicit entry concept — a per-input entry block, an `entry` step naming the inputs that may reach the steps it dominates, or a validation rule that every request input has at least one `return` — would let validation reject a program that returns nothing for a request input, let each population analyze only the steps it can reach, and give path admission a declared rather than inferred basis. Any resolution refines admission and so can only remove paths from an analysis, never add work to a proven one.
 
-11. **External effect result replay** — *Resolved.* For a result-bearing external effect, `deduplicated_by` fixes the interaction's terminal result (§13.3), and `ResultType.err` declares an `ErrorDisposition` (§8.1); a terminal external result over a class-fixed key is a replay-stable root (§18 rule 6). Still open from that resolution: heterogeneous per-error-class dispositions inside one result contract, and any retry-execution vocabulary that would consume `retryable`.
+11. **External effect result replay** — *Resolved.* For a result-bearing external effect, `result_replay: replay_stable` over a keyed identity fixes the interaction's terminal result (§13.3), and `ResultType.err` declares an `ErrorDisposition` (§8.1); a terminal external result over a class-fixed identity is a replay-stable root (§18 rule 6). Still open from that resolution: heterogeneous per-error-class dispositions inside one result contract, and any retry-execution vocabulary that would consume `retryable`.
 
 ### Deferred surfaces
 

@@ -1,3 +1,4 @@
+dsl: 1
 revision: 1
 
 services:
@@ -68,8 +69,10 @@ operations:
         effect:
           kind: external
           name: store-a
-          idempotency:
+          identity:
             kind: unspecified
+          idempotency: unspecified
+          result_replay: unspecified
           result:
             ok: schema.Row
             err: schema.Miss
@@ -84,8 +87,10 @@ operations:
         effect:
           kind: external
           name: store-b
-          idempotency:
+          identity:
             kind: unspecified
+          idempotency: unspecified
+          result_replay: unspecified
           result:
             ok: schema.Row
             err: schema.Miss
@@ -165,8 +170,10 @@ operations:
         effect:
           kind: external
           name: read-ledger
-          idempotency:
+          identity:
             kind: unspecified
+          idempotency: unspecified
+          result_replay: unspecified
           result: null
         values:
           kind: deterministic

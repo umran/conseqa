@@ -249,9 +249,9 @@ pub struct Branch {
 /// The vocabulary is deliberately small and structurally exposes every
 /// value the decision depends on, so replay analysis can judge whether
 /// a retry takes the same arm without an expression language: `eq`,
-/// `and`, and `not` are deterministic functions of their references,
-/// and `unspecified` states that the model provides no fact about how
-/// the decision is made.
+/// `present`, `and`, and `not` are deterministic functions of their
+/// references, and `unspecified` states that the model provides no
+/// fact about how the decision is made.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Condition {
@@ -261,7 +261,9 @@ pub enum Condition {
 
     /// Equality of a modeled value against a literal or another modeled
     /// value. `equals` accepts the selector-value surface: a map is a
-    /// value reference, a scalar is a literal.
+    /// value reference, a scalar is a literal. Does not hold when
+    /// either operand evaluates absent — absence is not a comparable
+    /// value; presence is queried only through `present`.
     Eq {
         value: ValueRef,
         equals: SelectorValue,
@@ -273,6 +275,15 @@ pub enum Condition {
 
     Not {
         condition: Box<Condition>,
+    },
+
+    /// Holds iff the referenced path resolves to a value: absent iff
+    /// any optional segment required to resolve it is absent.
+    /// Presence is part of the logical value Conseqa observes, so
+    /// attempts observing replay-equivalent roots agree on it. There
+    /// is no `absent` kind; `not { present … }` composes.
+    Present {
+        value: ValueRef,
     },
 }
 
@@ -295,6 +306,8 @@ impl Condition {
             Self::And { conditions } => conditions.iter().flat_map(Condition::roots).collect(),
 
             Self::Not { condition } => condition.roots(),
+
+            Self::Present { value } => vec![value],
         }
     }
 
@@ -303,7 +316,7 @@ impl Condition {
     pub fn is_deterministic(&self) -> bool {
         match self {
             Self::Unspecified => false,
-            Self::Eq { .. } => true,
+            Self::Eq { .. } | Self::Present { .. } => true,
             Self::And { conditions } => conditions.iter().all(Condition::is_deterministic),
             Self::Not { condition } => condition.is_deterministic(),
         }

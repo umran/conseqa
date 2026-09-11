@@ -38,6 +38,12 @@ pub struct ProverReport {
     /// Version of this report format, not of the model.
     pub format: u32,
 
+    /// The DSL contract version the verdicts are relative to: the
+    /// same model text can prove differently across a contract bump,
+    /// so an archived report without it is ambiguous.
+    #[serde(default)]
+    pub dsl: Option<crate::spec::DslVersion>,
+
     /// Revision of the model the report was produced against.
     ///
     /// The visualization warns when this disagrees with the rendered
@@ -59,8 +65,11 @@ pub struct ProverReport {
 /// on the L1 runtime model — routing domains, member assignment, and
 /// execution-pool member concurrency in place of dispatch lanes and
 /// operation-global concurrency. Format 4 added `remedy` to unproven
-/// serialization and ordering obligations.
-pub const FORMAT: u32 = 4;
+/// serialization and ordering obligations. Format 5 added the `dsl`
+/// contract version the verdicts are relative to, and rebuilt the
+/// external-boundary evidence on the identity / idempotency /
+/// result-replay decomposition.
+pub const FORMAT: u32 = 5;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -308,6 +317,7 @@ pub fn scaffold(model: &Model) -> ProverReport {
 
     ProverReport {
         format: FORMAT,
+        dsl: Some(crate::spec::DSL_VERSION),
         model_revision: Some(model.revision.0),
         obligations,
         notes: Vec::new(),
@@ -360,6 +370,34 @@ pub fn obligations(model: &Model, verification: &VerificationReport) -> ProverRe
             .iter_mut()
             .find(|obligation| obligation.id == id)
         {
+            // The inert-continuation admission is derived proof
+            // evidence: the analyzer proved it from program structure,
+            // no implementation claim supplied it, and it lapses by
+            // itself if an effectful step ever joins a continuation.
+            if let IdempotencyVerdict::Proven {
+                proof: IdempotencyProof::RetrySafePaths { paths },
+                ..
+            } = &check.verdict
+            {
+                for path in paths {
+                    for decision in &path.decisions {
+                        if matches!(decision.rule, DecisionRule::IdempotencyInertContinuation) {
+                            obligation.evidence.push(EvidenceItem {
+                                subject: None,
+                                message: format!(
+                                    "{} is not established to replay; every continuation \
+                                     to a terminal is idempotency-inert, so divergence \
+                                     cannot add modeled work and may affect only terminal \
+                                     construction — which is the result-replay obligation's \
+                                     concern, not this one's.",
+                                    decision_label(&decision.decision),
+                                ),
+                            });
+                        }
+                    }
+                }
+            }
+
             if check.coinductive {
                 obligation
                     .assumptions
@@ -1003,11 +1041,21 @@ fn idempotency_assumptions(proof: &IdempotencyProof) -> Vec<String> {
 
                 for effect in &path.effects {
                     match &effect.safety {
-                        EffectSafety::ExternallyDeduplicated { key } => assumptions.push(format!(
-                            "{prefix}the external boundary of {} deduplicates \
-                             executions sharing {}",
-                            effect.effect,
-                            root_labels(key)
+                        EffectSafety::ExternallyIdempotent { identity_key } => {
+                            assumptions.push(format!(
+                                "{prefix}duplicate applications of {} within one \
+                                 interaction identity ({}) are declared externally \
+                                 indistinguishable from a single application",
+                                effect.effect,
+                                root_labels(identity_key)
+                            ))
+                        }
+
+                        EffectSafety::ExternallySideEffectFree => assumptions.push(format!(
+                            "{prefix}the external boundary of {} is declared \
+                             side-effect-free: any application causes no modeled \
+                             externally observable state change",
+                            effect.effect
                         )),
 
                         EffectSafety::SameLogicalMessage {
@@ -1264,10 +1312,31 @@ fn resumption_assumptions(paths: &[verification::PathResumption]) -> Vec<String>
     assumptions
 }
 
+/// One decision, named for evidence: the site, not the arm.
+fn decision_label(decision: &verification::DecisionTaken) -> String {
+    match decision {
+        verification::DecisionTaken::Match { result, .. } => {
+            format!("the match on {result}")
+        }
+
+        verification::DecisionTaken::Branch { location, .. } => {
+            format!("the branch at step {location}")
+        }
+    }
+}
+
 /// The facts fixing each decision of a path: one line per decision.
 fn decision_assumptions(prefix: &str, decisions: &[DecisionReplay]) -> Vec<String> {
     decisions
         .iter()
+        .filter(|decision| {
+            // The inert-continuation admission is a derived structural
+            // fact, rendered as obligation evidence — an assumption
+            // line would misfile it as something an implementation
+            // must provide, and its arm may legitimately differ per
+            // attempt.
+            !matches!(decision.rule, DecisionRule::IdempotencyInertContinuation)
+        })
         .map(|decision| {
             let taken = match &decision.decision {
                 verification::DecisionTaken::Match { result, arm, .. } => {
@@ -1289,8 +1358,8 @@ fn decision_assumptions(prefix: &str, decisions: &[DecisionReplay]) -> Vec<Strin
                     ),
 
                     ResultStabilityRule::ExternalTerminalResult { variant, .. } => format!(
-                        "{effect} deduplicates by a class-fixed external key, which fixes \
-                         the interaction's terminal result, and the observed {variant} is \
+                        "{effect} declares its terminal result replay-stable over a \
+                         class-fixed interaction identity, and the observed {variant} is \
                          terminal"
                     ),
                 },
@@ -1298,6 +1367,8 @@ fn decision_assumptions(prefix: &str, decisions: &[DecisionReplay]) -> Vec<Strin
                 DecisionRule::StableCondition { roots } => {
                     format!("the condition is deterministic over {}", root_labels(roots))
                 }
+
+                DecisionRule::IdempotencyInertContinuation => unreachable!("filtered above"),
             };
 
             format!("{prefix}{taken}: {because}")
@@ -1345,14 +1416,14 @@ fn root_rule_label(root: &StableRoot) -> Option<String> {
              target proves its result replay-consistent"
         )),
 
-        verification::StabilityRule::DeduplicatedExternalResult {
+        verification::StabilityRule::ReplayStableExternalResult {
             result,
             effect,
             variant,
         } => Some(format!(
             "the {variant} of result {result} is observed equally by every attempt: \
-             {effect} deduplicates by a class-fixed external key, which fixes the \
-             interaction's terminal result"
+             {effect} declares its terminal result replay-stable over a class-fixed \
+             interaction identity"
         )),
 
         _ => None,

@@ -486,6 +486,9 @@ fn is_program_local_error(error: &ValidationError) -> bool {
         | ValueSourceOutOfScope { .. }
         | OutboxWriteOutsideTransaction { .. }
         | OutboxWriteCannotBeIntent { .. }
+        | ExternalIdempotencyRequiresIdentity { .. }
+        | ExternalReplayStabilityRequiresIdentity { .. }
+        | ExternalResultReplayWithoutResult { .. }
         | InvalidReferenceOwner { .. } => true,
 
         UnknownReference { expected, .. } | InvalidReferenceKind { expected, .. } => {
@@ -1117,7 +1120,7 @@ fn validate_field_paths(model: &Model, index: &ReferenceIndex<'_>) -> Vec<Valida
                 index,
                 operation_id,
                 ValueContext::operation(operation_id),
-                &requirement.key,
+                &requirement.key.components,
                 &mut errors,
             );
         }
@@ -1128,7 +1131,7 @@ fn validate_field_paths(model: &Model, index: &ReferenceIndex<'_>) -> Vec<Valida
                 index,
                 operation_id,
                 ValueContext::operation(operation_id),
-                &requirement.key,
+                &requirement.key.components,
                 &mut errors,
             );
         }
@@ -1337,6 +1340,187 @@ fn validate_value_ref_path(
     }
 }
 
+
+/// A `present` condition whose complete resolved path contains no
+/// optional segment: vacuously true against every schema the root can
+/// resolve to. Redundant, not unsound — conditions never prune
+/// admitted paths, so the never-taken arm is still analyzed, which is
+/// exactly why the redundancy is worth surfacing as a note.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RedundantPresence {
+    pub operation: Id,
+    pub location: StepLocation,
+    pub root: ValueRef,
+}
+
+/// Every `present` condition in the model whose test is vacuous: the
+/// resolved path traverses no optional field in any schema its source
+/// admits. A multi-schema source (a subscription or outbox input) is
+/// redundant only when the path is non-optional in every admitted
+/// schema — optional in one, the test is meaningful.
+pub fn redundant_presence_checks(model: &Model) -> Vec<RedundantPresence> {
+    let index = ReferenceIndex::build(model);
+    let mut redundant = Vec::new();
+
+    for (operation_id, operation) in &model.operations {
+        for (location, step) in operation.program.steps_with_locations() {
+            let OperationStep::Branch(branch) = step else {
+                continue;
+            };
+
+            for root in presence_roots(&branch.condition) {
+                let Some(schemas) = presence_root_schemas(model, &index, root) else {
+                    continue;
+                };
+
+                let verdicts: Vec<Option<bool>> = schemas
+                    .iter()
+                    .map(|schema| path_has_optional_segment(model, schema, &root.path.0))
+                    .collect();
+
+                // Unresolvable paths are the reference pass's errors,
+                // not redundancy; a note about a broken model helps
+                // nobody.
+                if !verdicts.is_empty() && verdicts.iter().all(|verdict| *verdict == Some(false)) {
+                    redundant.push(RedundantPresence {
+                        operation: operation_id.clone(),
+                        location: location.clone(),
+                        root: root.clone(),
+                    });
+                }
+            }
+        }
+    }
+
+    redundant
+}
+
+/// The roots of every `present` in a condition tree, in declaration
+/// order.
+fn presence_roots(condition: &Condition) -> Vec<&ValueRef> {
+    match condition {
+        Condition::Present { value } => vec![value],
+        Condition::And { conditions } => conditions.iter().flat_map(presence_roots).collect(),
+        Condition::Not { condition } => presence_roots(condition),
+        Condition::Unspecified | Condition::Eq { .. } => Vec::new(),
+    }
+}
+
+/// The schemas a program-level value reference resolves its path
+/// against — the same dispatch `validate_value_ref_path` performs,
+/// returning the schemas instead of validating. `None` when the
+/// source has no schema to resolve (a resultless binding, a
+/// transaction read, which is never legal at a branch anyway).
+fn presence_root_schemas(
+    model: &Model,
+    index: &ReferenceIndex<'_>,
+    value: &ValueRef,
+) -> Option<Vec<Id>> {
+    match &value.source {
+        ValueSource::Input(input_id) => {
+            let input = find_input(model, index, input_id)?;
+
+            Some(match input {
+                Input::Request(request) => vec![request.schema.clone()],
+
+                Input::Subscription(subscription) => {
+                    let topic = model.topics.get(&subscription.topic)?;
+
+                    match &subscription.messages {
+                        MessageSelector::All => topic.messages.iter().cloned().collect(),
+                        MessageSelector::Only(messages) => messages.iter().cloned().collect(),
+                    }
+                }
+
+                Input::Outbox(input) => {
+                    let (_, outbox) = model.outbox(&input.outbox)?;
+
+                    match &input.messages {
+                        MessageSelector::All => outbox.messages.iter().cloned().collect(),
+                        MessageSelector::Only(messages) => messages.iter().cloned().collect(),
+                    }
+                }
+            })
+        }
+
+        ValueSource::Effect(effect_id) => {
+            Some(vec![effect_schema(model, index, effect_id)?.clone()])
+        }
+
+        ValueSource::TransactionOutput(output_id) => {
+            Some(vec![index.output_schema(output_id)?.clone()])
+        }
+
+        ValueSource::EffectResultOk(result_id) | ValueSource::EffectResultErr(result_id) => {
+            let variant = match &value.source {
+                ValueSource::EffectResultOk(_) => ResultVariant::Ok,
+                _ => ResultVariant::Err,
+            };
+
+            let schema = index
+                .binding_effect(result_id)
+                .and_then(|effect| effect_result_type(model, index, effect))
+                .map(|result| result.schema(variant).clone())?;
+
+            Some(vec![schema])
+        }
+
+        ValueSource::StateMachineSubject(machine_id) => {
+            let machine = model.state_machines.get(machine_id)?;
+
+            let StateMachineSubject::Object { object, .. } = &machine.subject;
+
+            let info = index.get(object)?;
+            let data_model = model.data_models.get(info.owner?)?;
+
+            Some(vec![data_model.objects.get(object)?.schema.clone()])
+        }
+
+        ValueSource::TransactionRead(_) => None,
+    }
+}
+
+/// Whether the resolved path traverses at least one optional field.
+/// `None` when the path does not resolve; fragments walk to their
+/// source exactly as resolution does.
+fn path_has_optional_segment(model: &Model, schema_id: &Id, components: &[String]) -> Option<bool> {
+    if components.is_empty() {
+        return None;
+    }
+
+    let schema = model.schemas.get(schema_id)?;
+
+    match schema {
+        Schema::Canonical(schema) => {
+            let field = schema.fields.get(&components[0])?;
+
+            let rest = if components.len() == 1 {
+                Some(false)
+            } else {
+                match &field.ty {
+                    TypeRef::Schema(inner) => {
+                        path_has_optional_segment(model, inner, &components[1..])
+                    }
+
+                    // V1 does not define traversal through collections.
+                    TypeRef::List(_) | TypeRef::Scalar(_) => None,
+                }
+            };
+
+            rest.map(|nested| field.optional || nested)
+        }
+
+        Schema::Fragment(fragment) => {
+            let mapped = fragment.mapping.get(&components[0])?;
+
+            let mut source_path = mapped.0.clone();
+            source_path.extend_from_slice(&components[1..]);
+
+            path_has_optional_segment(model, &fragment.source, &source_path)
+        }
+    }
+}
+
 /// A read of a field also observes the values nested beneath it.
 fn field_selection_covers(selected: &FieldPath, path: &FieldPath) -> bool {
     path.0.starts_with(&selected.0)
@@ -1364,10 +1548,10 @@ fn validate_idempotency_key_paths(
     index: &ReferenceIndex<'_>,
     subject: &Id,
     context: ValueContext<'_>,
-    key: &IdempotencyKey,
+    components: &[ValueRef],
     errors: &mut Vec<ValidationError>,
 ) {
-    for component in &key.components {
+    for component in components {
         validate_value_ref_path(model, index, subject, context, component, errors);
     }
 }
@@ -1381,9 +1565,23 @@ fn validate_propagation_paths(
     errors: &mut Vec<ValidationError>,
 ) {
     for propagation in propagations {
-        validate_idempotency_key_paths(model, index, subject, context, &propagation.source, errors);
+        validate_idempotency_key_paths(
+            model,
+            index,
+            subject,
+            context,
+            &propagation.source.components,
+            errors,
+        );
 
-        validate_idempotency_key_paths(model, index, subject, context, &propagation.target, errors);
+        validate_idempotency_key_paths(
+            model,
+            index,
+            subject,
+            context,
+            &propagation.target.components,
+            errors,
+        );
     }
 }
 
@@ -1419,8 +1617,15 @@ fn validate_effect_paths(
         }
 
         Effect::External(effect) => {
-            if let IdempotencyGuarantee::DeduplicatedBy { key } = &effect.idempotency {
-                validate_idempotency_key_paths(model, index, effect_id, context, key, errors);
+            if let ExternalIdentity::Keyed { key } = &effect.identity {
+                validate_idempotency_key_paths(
+                    model,
+                    index,
+                    effect_id,
+                    context,
+                    &key.components,
+                    errors,
+                );
             }
         }
 
@@ -1483,7 +1688,14 @@ fn validate_transaction_paths(
     // The commit key is evaluated for the invocation before the body
     // executes, so it may not observe transaction state.
     if let IdempotencyGuarantee::DeduplicatedBy { key } = &transaction.idempotency {
-        validate_idempotency_key_paths(model, index, transaction_id, operation, key, errors);
+        validate_idempotency_key_paths(
+            model,
+            index,
+            transaction_id,
+            operation,
+            &key.components,
+            errors,
+        );
     }
 
     for (step_index, step) in transaction.steps.iter().enumerate() {
@@ -1987,7 +2199,7 @@ fn validate_operation_references(
                 index,
                 operation_id,
                 ValueContext::operation(operation_id),
-                &requirement.key,
+                &requirement.key.components,
                 errors,
             );
         }
@@ -1997,7 +2209,7 @@ fn validate_operation_references(
                 index,
                 operation_id,
                 ValueContext::operation(operation_id),
-                &requirement.key,
+                &requirement.key.components,
                 errors,
             );
         }
@@ -2022,9 +2234,17 @@ fn validate_effect_references(
         }
 
         Effect::External(external) => {
-            if let IdempotencyGuarantee::DeduplicatedBy { key } = &external.idempotency {
-                validate_idempotency_key_references(index, effect_id, context, key, errors);
+            if let ExternalIdentity::Keyed { key } = &external.identity {
+                validate_idempotency_key_references(
+                    index,
+                    effect_id,
+                    context,
+                    &key.components,
+                    errors,
+                );
             }
+
+            validate_external_guarantee_placement(effect_id, external, errors);
 
             if let Some(result) = &external.result {
                 validate_result_type_references(index, effect_id, result, errors);
@@ -2034,6 +2254,42 @@ fn validate_effect_references(
         Effect::OutboxWrite(write) => {
             validate_outbox_write_references(index, effect_id, context, write, errors);
         }
+    }
+}
+
+/// The structural placement rules of the external boundary's three
+/// guarantee dimensions: `identical_per_identity` and `replay_stable`
+/// need a keyed identity to be quantified over, and either
+/// `result_replay` behaviour needs a result contract to describe.
+/// `side_effect_free` and `distinguishable` impose nothing.
+fn validate_external_guarantee_placement(
+    effect_id: &Id,
+    external: &ExternalEffect,
+    errors: &mut Vec<ValidationError>,
+) {
+    let keyed = matches!(external.identity, ExternalIdentity::Keyed { .. });
+
+    if matches!(external.idempotency, ExternalIdempotency::IdenticalPerIdentity) && !keyed {
+        errors.push(ValidationError::ExternalIdempotencyRequiresIdentity {
+            effect: effect_id.clone(),
+        });
+    }
+
+    if matches!(external.result_replay, ExternalResultReplay::ReplayStable) && !keyed {
+        errors.push(ValidationError::ExternalReplayStabilityRequiresIdentity {
+            effect: effect_id.clone(),
+        });
+    }
+
+    let describes_result = matches!(
+        external.result_replay,
+        ExternalResultReplay::Unstable | ExternalResultReplay::ReplayStable
+    );
+
+    if describes_result && external.result.is_none() {
+        errors.push(ValidationError::ExternalResultReplayWithoutResult {
+            effect: effect_id.clone(),
+        });
     }
 }
 
@@ -2061,9 +2317,21 @@ fn validate_outbox_write_references(
     );
 
     for propagation in &effect.idempotency_key_propagation {
-        validate_idempotency_key_references(index, effect_id, context, &propagation.source, errors);
+        validate_idempotency_key_references(
+            index,
+            effect_id,
+            context,
+            &propagation.source.components,
+            errors,
+        );
 
-        validate_idempotency_key_references(index, effect_id, context, &propagation.target, errors);
+        validate_idempotency_key_references(
+            index,
+            effect_id,
+            context,
+            &propagation.target.components,
+            errors,
+        );
     }
 }
 
@@ -2163,7 +2431,7 @@ fn validate_transaction_references(
             index,
             transaction_id,
             ValueContext::operation(operation_id),
-            key,
+            &key.components,
             errors,
         );
     }
@@ -2633,9 +2901,21 @@ fn validate_request_effect_references(
     }
 
     for propagation in &effect.idempotency_key_propagation {
-        validate_idempotency_key_references(index, effect_id, context, &propagation.source, errors);
+        validate_idempotency_key_references(
+            index,
+            effect_id,
+            context,
+            &propagation.source.components,
+            errors,
+        );
 
-        validate_idempotency_key_references(index, effect_id, context, &propagation.target, errors);
+        validate_idempotency_key_references(
+            index,
+            effect_id,
+            context,
+            &propagation.target.components,
+            errors,
+        );
     }
 }
 
@@ -2663,9 +2943,21 @@ fn validate_publication_references(
     );
 
     for propagation in &effect.idempotency_key_propagation {
-        validate_idempotency_key_references(index, effect_id, context, &propagation.source, errors);
+        validate_idempotency_key_references(
+            index,
+            effect_id,
+            context,
+            &propagation.source.components,
+            errors,
+        );
 
-        validate_idempotency_key_references(index, effect_id, context, &propagation.target, errors);
+        validate_idempotency_key_references(
+            index,
+            effect_id,
+            context,
+            &propagation.target.components,
+            errors,
+        );
     }
 }
 
@@ -2673,10 +2965,10 @@ fn validate_idempotency_key_references(
     index: &ReferenceIndex<'_>,
     subject: &Id,
     context: ValueContext<'_>,
-    key: &IdempotencyKey,
+    components: &[ValueRef],
     errors: &mut Vec<ValidationError>,
 ) {
-    for component in &key.components {
+    for component in components {
         validate_value_ref_reference(index, subject, context, component, errors);
     }
 }

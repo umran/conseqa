@@ -666,6 +666,7 @@ impl ConfluenceEngine {
         let value = match &state {
             AnalysisState::Pending | AnalysisState::Validating | AnalysisState::Verifying => {
                 serde_json::json!({
+                    "dsl": crate::spec::DSL_VERSION,
                     "revision": revision.0,
                     "analysis": state.label(),
                     "note": "verification has not finished for this revision yet",
@@ -673,12 +674,14 @@ impl ConfluenceEngine {
             }
 
             AnalysisState::NotAssemblable { gaps } => serde_json::json!({
+                "dsl": crate::spec::DSL_VERSION,
                 "revision": revision.0,
                 "analysis": "not_assemblable",
                 "gaps": gaps,
             }),
 
             AnalysisState::ValidationFailed { errors } => serde_json::json!({
+                "dsl": crate::spec::DSL_VERSION,
                 "revision": revision.0,
                 "analysis": "validation_failed",
                 "errors": errors,
@@ -725,6 +728,7 @@ impl ConfluenceEngine {
                     .collect();
 
                 serde_json::json!({
+                    "dsl": crate::spec::DSL_VERSION,
                     "revision": revision.0,
                     "analysis": "ready",
                     "all_proven": analysis.verification.all_proven(),

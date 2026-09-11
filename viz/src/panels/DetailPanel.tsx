@@ -5,7 +5,8 @@ import type { ReactNode } from "react";
 
 import { pathText, shortId } from "../lib/ids";
 import {
-  artifactRetention, commitGuarantee, delivery, externalIdempotency, externalResult, inheritedResult,
+  artifactRetention, commitGuarantee, delivery, externalIdempotency, externalIdentity,
+  externalResult, inheritedResult,
   isolation, messageIdentity, requestIdentity, requestResult, resultBinding,
   memberAssignment, memberConcurrency, requestRouting, subscriptionRouting,
   transactionOutput, transportGrouping, transportOrdering,
@@ -788,12 +789,13 @@ function EffectDetail({ id }: { id: Id }) {
       {e.kind === "external" && (
         <>
           <KeyValue rows={[["kind", <Tag key="k" variant="warning">external</Tag>], ["name", <Mono key="n">{e.name}</Mono>]]} />
-          <FactNote fact={externalIdempotency(e.idempotency)}>
-            {e.idempotency.kind === "deduplicated_by" && (
-              <span className="text-xs text-kumo-subtle">by <KeyComponents value={e.idempotency.key} /></span>
+          <FactNote fact={externalIdentity(e.identity)}>
+            {e.identity.kind === "keyed" && (
+              <span className="text-xs text-kumo-subtle">by <KeyComponents value={e.identity.key} /></span>
             )}
           </FactNote>
-          <FactNote fact={externalResult(e.result, e.idempotency)}>
+          <FactNote fact={externalIdempotency(e.idempotency)} />
+          <FactNote fact={externalResult(e.result, e.result_replay)}>
             {e.result && <ResultContract result={e.result} />}
           </FactNote>
         </>

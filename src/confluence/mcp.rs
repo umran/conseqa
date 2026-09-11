@@ -200,6 +200,14 @@ pub struct RequirementReportParams {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct SubmitPatchParams {
+    /// The DSL contract version this patch is authored against.
+    /// Optional: omitted means the server's current version, since an
+    /// agent learns the DSL from this server's live guide. Present
+    /// and mismatched, the patch is refused by name before shape
+    /// validation.
+    #[serde(default)]
+    pub dsl: Option<u64>,
+
     /// The typed patch: {"mutations":[...]}. See dsl_reference for
     /// mutation shapes.
     pub patch: serde_json::Value,
@@ -855,6 +863,27 @@ impl ConseqaMcp {
         let (engine, task) = (resolved.engine, resolved.task);
         let params = params.0;
 
+        // A stale authored claim meets the server here, not at the
+        // connection: refuse a declared version mismatch by name,
+        // before shape validation turns it into serde noise.
+        if let Some(declared) = params.dsl
+            && declared != crate::spec::DSL_VERSION.0
+        {
+            return json_error(serde_json::json!({
+                "committed": false,
+                "error": "dsl_version_mismatch",
+                "declared": declared,
+                "server": crate::spec::DSL_VERSION,
+                "guidance": format!(
+                    "This patch declares dsl {declared}, but this server speaks dsl {}; \
+                     the contract changed and patches are not migrated automatically. \
+                     Re-learn the DSL with dsl_guide and dsl_reference, then re-author \
+                     the patch.",
+                    crate::spec::DSL_VERSION
+                ),
+            }));
+        }
+
         let patch: SpecPatch = parse_arg!(params.patch, "patch");
 
         if patch.mutations.is_empty() {
@@ -1184,7 +1213,9 @@ impl ConseqaMcp {
     )]
     async fn dsl_reference(&self) -> Result<CallToolResult, McpError> {
         Ok(CallToolResult::success(vec![ContentBlock::text(format!(
-            "{DSL_REFERENCE}{PROGRAM_EXAMPLE_PREAMBLE}\n{PROGRAM_EXAMPLE_JSON}\n"
+            "DSL contract version {}.\n\n{DSL_REFERENCE}{PROGRAM_EXAMPLE_PREAMBLE}\n\
+             {PROGRAM_EXAMPLE_JSON}\n",
+            crate::spec::DSL_VERSION,
         ))]))
     }
 
@@ -1268,6 +1299,7 @@ impl ConseqaMcp {
         let skeleton_gaps = super::commit::skeleton_diagnostics(workspace);
 
         let mut body = serde_json::json!({
+            "dsl": crate::spec::DSL_VERSION,
             "revision": head.revision.0,
             "skeleton": {
                 "ready_to_fan_out": skeleton_gaps.is_empty(),
@@ -1545,16 +1577,30 @@ impl ServerHandler for ConseqaMcp {
     fn get_info(&self) -> ServerInfo {
         let mut info = ServerInfo::new(ServerCapabilities::builder().enable_tools().build());
 
+        // This build, honestly: the default is rmcp's own build env,
+        // which reports the library. The DSL contract version is a
+        // separate axis and deliberately not encoded here — it rides
+        // the instructions and the served guide instead.
+        let mut implementation = rmcp::model::Implementation::default();
+        implementation.name = env!("CARGO_PKG_NAME").to_string();
+        implementation.version = env!("CARGO_PKG_VERSION").to_string();
+        info.server_info = implementation;
+
         // The worker daemon serves the task contract; interactive
         // backings (the stdio and multi-project servers) serve the
-        // authoring loop.
-        info.instructions = Some(
+        // authoring loop. Both briefs lead with the DSL contract
+        // version, so an agent learns which contract it authors
+        // against before it drafts anything; `Implementation` stays
+        // the build version — the axes are distinct.
+        info.instructions = Some(format!(
+            "This server speaks Conseqa DSL contract version {}; author against it, \
+             and learn it through dsl_guide and dsl_reference.\n\n{}",
+            crate::spec::DSL_VERSION,
             match &self.backing {
                 Backing::Single(_) => WORKER_INSTRUCTIONS,
                 Backing::Multi { .. } | Backing::Local(_) => INTERACTIVE_INSTRUCTIONS,
             }
-            .to_string(),
-        );
+        ));
 
         info
     }
@@ -1823,9 +1869,35 @@ A transactional outbox write, legal ONLY as a transaction step:
      admission is atomic with the commit; the step binds no result. The
      kind is rejected under execute_effect, execute_effect_async, and
      establish_effect_intent.)
+An external effect declares three orthogonal boundary facts:
+  {"kind":"external","name":"provider.op",
+   "identity":{"kind":"keyed","key":{"components":[<value ref>...]}},
+   "idempotency":"identical_per_identity",
+   "result_replay":"replay_stable",
+   "result":{"ok":"schema.Ok",
+             "err":{"schema":"schema.Err","disposition":"terminal"}}}
+    (identity: unspecified | keyed — what makes applications one logical
+     interaction. idempotency: unspecified | distinguishable |
+     identical_per_identity | side_effect_free — duplicate-side-effect
+     behaviour; identical_per_identity requires keyed identity.
+     result_replay: unspecified | unstable | replay_stable — terminal-
+     result behaviour; unstable and replay_stable require a result
+     contract, replay_stable also a keyed identity. The axes are
+     independent: a side_effect_free boundary may be result-unstable
+     (a presigner), and neither behavioural axis is inferred from the
+     other.)
 Value references:
   {"source":"input:input.x.request","path":"order_id"}
 Derivations: {"kind":"unspecified"} or {"kind":"deterministic","from":[<value ref>...]}.
+
+BRANCH CONDITIONS — deliberately small, structurally exposed:
+  {"kind":"eq","value":<value ref>,"equals":<value ref or literal>}
+  {"kind":"present","value":<value ref>}   (holds iff the path resolves;
+     absent iff any optional segment is absent. eq never holds over an
+     absent operand; presence is asked only through present. A present
+     over a required path is vacuously true — redundant, warned, valid.)
+  {"kind":"and","conditions":[...]}  {"kind":"not","condition":...}
+  {"kind":"unspecified"}   (no fact; the decision never replays)
 
 ASYNC PROGRAM STEPS — launch effects without waiting, then synchronize:
   {"kind":"execute_effect_async","handle":"async.x","effect_id":"effect.x",
@@ -1924,9 +1996,11 @@ fn guide_sections() -> Vec<(&'static str, &'static str)> {
 /// The guide's table of contents: every section and subsection header,
 /// with the usage hint.
 fn guide_toc() -> String {
-    let mut toc = String::from(
-        "The Conseqa DSL semantics guide. Call dsl_guide again with a topic — a \
-         section name or a few words of it — to read that section in full.\n\nSections:\n",
+    let mut toc = format!(
+        "The Conseqa DSL semantics guide, DSL contract version {}. Call dsl_guide again \
+         with a topic — a section name or a few words of it — to read that section in \
+         full.\n\nSections:\n",
+        crate::spec::DSL_VERSION,
     );
 
     let mut in_fence = false;
@@ -2022,6 +2096,7 @@ mod tests {
         operations.insert(operation_id.clone(), operation);
 
         let model = Model {
+            dsl: crate::spec::DSL_VERSION,
             revision: Revision(1),
             services: BTreeMap::new(),
             schemas: BTreeMap::new(),

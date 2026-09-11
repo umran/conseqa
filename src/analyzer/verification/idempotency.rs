@@ -63,9 +63,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::analyzer::{Diagnostic, DiagnosticCode, Evidence, Severity, VerificationCode};
 use crate::spec::{
-    DeliverySemantics, FieldPath, Id, IdempotencyGuarantee, IdempotencyKey, Input,
-    MessageIdentity, MessageIdentityKey,
-    MessageSelector, Model, Operation, ValueSource,
+    DeliverySemantics, ExternalIdempotency, ExternalIdentity, FieldPath, Id, IdempotencyKey,
+    Input, MessageIdentity, MessageIdentityKey, MessageSelector, Model, Operation, ValueSource,
 };
 
 use super::ProofScope;
@@ -73,10 +72,11 @@ use super::describe::{
     decision_gap_sentence, describe_decision, describe_path, gap_sentences, governing_key_evidence,
     unstable_roots,
 };
-use super::paths::{DecisionTaken, Path, PathRef, paths};
+use super::paths::{DecisionTaken, Path, PathRef, PathStep, paths};
 use super::replay::{
-    DecisionGap, DecisionReplay, EffectSite, GoverningKeyDefect, InstanceGap, InstanceStability,
-    PathContext, ReplayAnalysis, ReplayGap, StableRoot, TracedStep, UnstableRoot,
+    DecisionGap, DecisionReplay, DecisionRule, EffectSite, GoverningKeyDefect, InstanceGap,
+    InstanceStability, PathContext, ReplayAnalysis, ReplayGap, StableRoot, TracedStep,
+    UnstableRoot,
 };
 use super::trigger::{EffectContract, ProducerSite, TriggerGraph, collapses_duplicates, key_input};
 
@@ -270,7 +270,8 @@ impl EffectSafety {
         };
 
         match self {
-            Self::ExternallyDeduplicated { .. }
+            Self::ExternallyIdempotent { .. }
+            | Self::ExternallySideEffectFree
             | Self::DeduplicatedByTarget { .. }
             // Transaction commit deduplication is an L0 fact.
             | Self::TransactionDeduplicated { .. } => ProofScope::L0Only,
@@ -282,9 +283,9 @@ impl EffectSafety {
 
     fn dependencies(&self) -> Vec<(Id, Id)> {
         match self {
-            Self::ExternallyDeduplicated { .. } | Self::TransactionDeduplicated { .. } => {
-                Vec::new()
-            }
+            Self::ExternallyIdempotent { .. }
+            | Self::ExternallySideEffectFree
+            | Self::TransactionDeduplicated { .. } => Vec::new(),
 
             Self::DeduplicatedByTarget {
                 operation, input, ..
@@ -350,9 +351,16 @@ pub struct EffectRetrySafety {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum EffectSafety {
-    /// The external boundary deduplicates executions sharing the
-    /// stable key.
-    ExternallyDeduplicated { key: Vec<StableRoot> },
+    /// The external boundary declares duplicate applications of one
+    /// keyed interaction externally indistinguishable from a single
+    /// application, and the interaction-identity key is stable across
+    /// the class.
+    ExternallyIdempotent { identity_key: Vec<StableRoot> },
+
+    /// The external boundary declares itself side-effect-free: any
+    /// application causes no modeled externally observable state
+    /// change, so duplicates are harmless with no key condition.
+    ExternallySideEffectFree,
 
     /// Every attempt publishes the same logical message — the instance
     /// is class-fixed and the topic's message identity maps the
@@ -439,16 +447,19 @@ pub enum IdempotencyObstacle {
         reconstruction: Vec<ReplayGap>,
     },
 
-    /// The external boundary explicitly does not deduplicate: a
-    /// duplicate execution is distinguishable duplicate work (§13.3).
-    ExternalEffectNotDeduplicated { path: PathRef, effect: Id },
+    /// The external boundary declares `distinguishable`: a duplicate
+    /// application may produce distinguishable modeled external work
+    /// (§13.3).
+    ExternalApplicationsDistinguishable { path: PathRef, effect: Id },
 
-    /// No deduplication fact is available for the external boundary.
-    ExternalEffectDeduplicationUnknown { path: PathRef, effect: Id },
+    /// No duplicate-side-effect fact is declared for the external
+    /// boundary.
+    ExternalIdempotencyUnknown { path: PathRef, effect: Id },
 
-    /// The declared external deduplication key is not replay-stable,
-    /// so attempts may execute under different keys.
-    ExternalDeduplicationKeyUnstable {
+    /// The declared external interaction-identity key is not
+    /// replay-stable, so attempts may address different logical
+    /// interactions.
+    ExternalIdentityKeyUnstable {
         path: PathRef,
         effect: Id,
         roots: Vec<UnstableRoot>,
@@ -996,8 +1007,10 @@ fn check_requirement(
     let mut obstacles = Vec::new();
     let mut safe = Vec::new();
 
+    let inert = idempotency_inert_decisions(&admitted);
+
     for path in admitted {
-        if let Some(safety) = analyze_path(scope, &analysis, path, &mut obstacles) {
+        if let Some(safety) = analyze_path(scope, &analysis, path, &inert, &mut obstacles) {
             safe.push(safety);
         }
     }
@@ -1048,9 +1061,9 @@ impl IdempotencyObstacle {
             }
 
             Self::TransactionNotRetrySafe { path, .. }
-            | Self::ExternalEffectNotDeduplicated { path, .. }
-            | Self::ExternalEffectDeduplicationUnknown { path, .. }
-            | Self::ExternalDeduplicationKeyUnstable { path, .. }
+            | Self::ExternalApplicationsDistinguishable { path, .. }
+            | Self::ExternalIdempotencyUnknown { path, .. }
+            | Self::ExternalIdentityKeyUnstable { path, .. }
             | Self::PublicationNotIdentified { path, .. }
             | Self::PublicationConsumerNotKeyed { path, .. }
             | Self::PublicationConsumerRequirementUnproven { path, .. }
@@ -1070,10 +1083,53 @@ impl IdempotencyObstacle {
     }
 }
 
+/// The §9 idempotency-inert continuation admission: the locations of
+/// decisions after which, on every admitted path, only further
+/// decisions occur before the terminal. Divergence at such a decision
+/// cannot add modeled work — no transaction, no effect execution or
+/// launch, no intent execution, no `join_all` or `race` follows on
+/// any continuation — so a non-replaying decision there need not
+/// block an idempotency proof: the class's complete modeled work is
+/// the shared prefix's, and terminal divergence is the result-replay
+/// obligation's separate concern.
+///
+/// The quantification is over complete continuations, never immediate
+/// arm bodies: branch fall-through and enclosing-block suffixes are
+/// already unrolled into the admitted paths, so "every step after the
+/// decision on every path is a decision" is exactly the predicate. A
+/// location effectful on any one continuation is disqualified on all.
+fn idempotency_inert_decisions(paths: &[&Path<'_>]) -> BTreeSet<crate::spec::StepLocation> {
+    let mut inert = BTreeSet::new();
+    let mut disqualified = BTreeSet::new();
+
+    for path in paths {
+        for (index, step) in path.steps.iter().enumerate() {
+            let PathStep::Decision { location, .. } = step else {
+                continue;
+            };
+
+            let effectful_suffix = path.steps[index + 1..]
+                .iter()
+                .any(|later| !matches!(later, PathStep::Decision { .. }));
+
+            if effectful_suffix {
+                disqualified.insert(location.clone());
+            } else {
+                inert.insert(location.clone());
+            }
+        }
+    }
+
+    inert.retain(|location| !disqualified.contains(location));
+
+    inert
+}
+
 fn analyze_path(
     scope: &Scope<'_>,
     analysis: &ReplayAnalysis<'_>,
     path: &Path<'_>,
+    inert: &BTreeSet<crate::spec::StepLocation>,
     obstacles: &mut Vec<IdempotencyObstacle>,
 ) -> Option<PathRetrySafety> {
     let before = obstacles.len();
@@ -1083,6 +1139,7 @@ fn analyze_path(
 
     let mut transactions = Vec::new();
     let mut effects = Vec::new();
+    let mut decisions = Vec::new();
 
     // The keyed-commit judgment of each transaction on the path, for
     // the outbox writes that commit with it: the producer-suppressed
@@ -1146,21 +1203,41 @@ fn analyze_path(
                 }
             }
 
-            TracedStep::Decision { taken, replay, .. } => {
-                if let Err(gap) = replay {
+            TracedStep::Decision {
+                location,
+                taken,
+                replay,
+            } => match replay {
+                Ok(rule) => decisions.push(DecisionReplay {
+                    decision: taken.clone(),
+                    rule: rule.clone(),
+                }),
+
+                // The idempotency-inert continuation admission (§9):
+                // when nothing but decisions and terminals can follow
+                // this decision on any admitted path, divergence adds
+                // no modeled work — recorded as a derived structural
+                // fact on the proof, never silently and never as an
+                // implementation assumption.
+                Err(_) if inert.contains(location) => decisions.push(DecisionReplay {
+                    decision: taken.clone(),
+                    rule: DecisionRule::IdempotencyInertContinuation,
+                }),
+
+                Err(gap) => {
                     obstacles.push(IdempotencyObstacle::PathDecisionUnstable {
                         path: reference.clone(),
                         decision: taken.clone(),
                         gap: gap.clone(),
                     });
                 }
-            }
+            },
         }
     }
 
     (obstacles.len() == before).then_some(PathRetrySafety {
         path: reference,
-        decisions: trace.stable_decisions(),
+        decisions,
         transactions,
         effects,
     })
@@ -1343,16 +1420,35 @@ fn contract_safety(
                 consumers,
             })
         }
+        // The external effect leg consumes only the declared
+        // duplicate-side-effect behaviour; `result_replay` plays no
+        // role here (§13.3) — result stability is the replay
+        // analysis's separate concern.
         EffectContract::External(external) => match &external.idempotency {
-            IdempotencyGuarantee::DeduplicatedBy { key } => {
+            ExternalIdempotency::SideEffectFree => Some(EffectSafety::ExternallySideEffectFree),
+
+            ExternalIdempotency::IdenticalPerIdentity => {
+                // Validation guarantees a keyed identity accompanies
+                // the declaration; stay total regardless.
+                let ExternalIdentity::Keyed { key } = &external.identity else {
+                    obstacles.push(IdempotencyObstacle::ExternalIdempotencyUnknown {
+                        path: path.clone(),
+                        effect: effect.clone(),
+                    });
+
+                    return None;
+                };
+
                 let roots: Vec<_> = key.components.iter().collect();
 
                 let (stable, unstable) = analysis.roots_stability(context, &roots);
 
                 if unstable.is_empty() {
-                    Some(EffectSafety::ExternallyDeduplicated { key: stable })
+                    Some(EffectSafety::ExternallyIdempotent {
+                        identity_key: stable,
+                    })
                 } else {
-                    obstacles.push(IdempotencyObstacle::ExternalDeduplicationKeyUnstable {
+                    obstacles.push(IdempotencyObstacle::ExternalIdentityKeyUnstable {
                         path: path.clone(),
                         effect: effect.clone(),
                         roots: unstable,
@@ -1362,8 +1458,8 @@ fn contract_safety(
                 }
             }
 
-            IdempotencyGuarantee::NotDeduplicated => {
-                obstacles.push(IdempotencyObstacle::ExternalEffectNotDeduplicated {
+            ExternalIdempotency::Distinguishable => {
+                obstacles.push(IdempotencyObstacle::ExternalApplicationsDistinguishable {
                     path: path.clone(),
                     effect: effect.clone(),
                 });
@@ -1371,8 +1467,8 @@ fn contract_safety(
                 None
             }
 
-            IdempotencyGuarantee::Unspecified => {
-                obstacles.push(IdempotencyObstacle::ExternalEffectDeduplicationUnknown {
+            ExternalIdempotency::Unspecified => {
+                obstacles.push(IdempotencyObstacle::ExternalIdempotencyUnknown {
                     path: path.clone(),
                     effect: effect.clone(),
                 });
@@ -1611,35 +1707,35 @@ impl IdempotencyObstacle {
                 ),
             },
 
-            Self::ExternalEffectNotDeduplicated { path, effect } => Evidence {
+            Self::ExternalApplicationsDistinguishable { path, effect } => Evidence {
                 subject: Some(effect.clone()),
                 message: format!(
-                    "{} executes external effect `{effect}`, which is explicitly \
-                     `not_deduplicated`: a duplicate execution is distinguishable \
-                     duplicate work at that boundary.",
+                    "{} applies external effect `{effect}`, declared \
+                     `distinguishable`: a duplicate application may produce \
+                     distinguishable modeled external work at that boundary.",
                     capitalize(&describe_path(path))
                 ),
             },
 
-            Self::ExternalEffectDeduplicationUnknown { path, effect } => Evidence {
+            Self::ExternalIdempotencyUnknown { path, effect } => Evidence {
                 subject: Some(effect.clone()),
                 message: format!(
-                    "{} executes external effect `{effect}`, and no deduplication \
-                     fact is declared for that boundary.",
+                    "{} applies external effect `{effect}`, and no \
+                     duplicate-side-effect fact is declared for that boundary.",
                     capitalize(&describe_path(path))
                 ),
             },
 
-            Self::ExternalDeduplicationKeyUnstable {
+            Self::ExternalIdentityKeyUnstable {
                 path,
                 effect,
                 roots,
             } => Evidence {
                 subject: Some(effect.clone()),
                 message: format!(
-                    "External effect `{effect}` on {} deduplicates by a key that is \
-                     not replay-stable, so attempts may execute under different \
-                     keys: {}.",
+                    "External effect `{effect}` on {} declares an interaction \
+                     identity that is not replay-stable, so attempts may address \
+                     different logical interactions: {}.",
                     describe_path(path),
                     unstable_roots(roots)
                 ),

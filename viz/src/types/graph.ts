@@ -165,7 +165,9 @@ export type Edge = EdgeBase &
         kind: "external";
         operation: Id;
         effect: Id;
+        identity: string;
         idempotency: string;
+        result_replay: string;
         executed_at: string[];
         /** The subset of `executed_at` launching asynchronously. */
         async_executed_at: string[];

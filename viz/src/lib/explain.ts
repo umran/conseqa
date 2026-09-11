@@ -5,6 +5,9 @@
 
 import type {
   DeliverySemantics,
+  ExternalIdempotency,
+  ExternalIdentity,
+  ExternalResultReplay,
   IdempotencyGuarantee,
   Input,
   MemberAssignment,
@@ -360,14 +363,25 @@ export function transportGrouping(grouping: GroupingKey | undefined): Explanatio
   };
 }
 
-export function externalIdempotency(guarantee: IdempotencyGuarantee): Explanation {
-  switch (guarantee.kind) {
-    case "deduplicated_by":
-      return { label: "deduplicated by the external system", tone: "success", summary: "The boundary performs at most one execution per key value; a duplicate execution with the same key is absorbed there." };
-    case "not_deduplicated":
-      return { label: "not deduplicated", tone: "warning", summary: "The external system performs every execution it receives: a duplicate execution is duplicate work." };
+export function externalIdentity(identity: ExternalIdentity): Explanation {
+  switch (identity.kind) {
+    case "keyed":
+      return { label: "keyed interaction identity", tone: "info", summary: "Equal evaluated key tuples are applications of one logical external interaction. Identity alone claims nothing about behaviour — the idempotency and result-replay declarations say what holds across one interaction's applications." };
     case "unspecified":
-      return { label: "deduplication unspecified", tone: "warning", summary: "No fact says whether the external system absorbs duplicate executions." };
+      return { label: "no interaction identity", tone: "neutral", summary: "No fact says which applications of this boundary are the same logical interaction; per-identity guarantees cannot be declared." };
+  }
+}
+
+export function externalIdempotency(idempotency: ExternalIdempotency): Explanation {
+  switch (idempotency) {
+    case "identical_per_identity":
+      return { label: "duplicates identical per identity", tone: "success", summary: "Across applications of one keyed interaction, any number of applications produces modeled external work indistinguishable from exactly one, under every admitted interleaving. The property is declared, not the mechanism." };
+    case "side_effect_free":
+      return { label: "side-effect-free", tone: "success", summary: "Any application causes no modeled externally observable state change beyond producing its synchronous result; duplicates are harmless with no key condition." };
+    case "distinguishable":
+      return { label: "duplicates distinguishable", tone: "warning", summary: "An explicit negative: repeated applications may produce distinguishable modeled external work — duplicate execution is duplicate work." };
+    case "unspecified":
+      return { label: "idempotency unspecified", tone: "warning", summary: "No fact says what duplicate applications do to external state." };
   }
 }
 
@@ -385,13 +399,14 @@ export function requestResult(): Explanation {
   };
 }
 
-/** What an external boundary's result says under its idempotency
- *  guarantee: `deduplicated_by` fixes one logical interaction's
- *  terminal result per key, and the error's disposition decides
- *  whether an observed err is that terminal result. */
+/** What an external boundary's result says under its declared
+ *  `result_replay` behaviour: `replay_stable` over a keyed identity
+ *  fixes one interaction's terminal result, and the error's
+ *  disposition decides whether an observed err is that terminal
+ *  result. Independent of the idempotency axis. */
 export function externalResult(
   result: ResultType | null,
-  idempotency: IdempotencyGuarantee,
+  resultReplay: ExternalResultReplay,
 ): Explanation {
   if (!result) {
     return {
@@ -400,14 +415,24 @@ export function externalResult(
       summary: "The boundary returns nothing the program can observe; executing it binds no result.",
     };
   }
-  if (idempotency.kind !== "deduplicated_by") {
+  if (resultReplay === "unstable") {
+    return {
+      label: "returns a per-attempt result",
+      tone: "warning",
+      summary:
+        "The boundary explicitly declares its result unstable: per-attempt results may differ " +
+        "(a fresh URL, a fresh nonce), so no terminal result is fixed and a decision on this " +
+        "result is not established to replay.",
+    };
+  }
+  if (resultReplay !== "replay_stable") {
     return {
       label: "returns a result",
       tone: "warning",
       summary:
         "The boundary returns Result<ok, err>, and the program may branch on it — but without " +
-        "deduplicated_by, nothing identifies same-key executions as one logical interaction, so " +
-        "no terminal result is fixed and a decision on this result is not established to replay.",
+        "result_replay: replay_stable, nothing fixes the interaction's terminal result, so a " +
+        "decision on this result is not established to replay.",
     };
   }
   switch (result.err.disposition) {
@@ -416,29 +441,29 @@ export function externalResult(
         label: "returns a fixed terminal result",
         tone: "success",
         summary:
-          "Equal deduplication keys identify one logical interaction whose terminal result the " +
-          "guarantee fixes: ok is terminal by definition and the err is declared terminal, so a " +
-          "same-key repeat observes the same outcome again and a decision on this result replays " +
-          "whenever the key is class-fixed.",
+          "Equal identity keys are one logical interaction whose terminal result the guarantee " +
+          "fixes: ok is terminal by definition and the err is declared terminal, so a same-key " +
+          "repeat observes the same outcome again and a decision on this result replays " +
+          "whenever the identity key is class-fixed.",
       };
     case "retryable":
       return {
         label: "returns a result with a retryable err",
         tone: "info",
         summary:
-          "Equal deduplication keys identify one logical interaction, and its terminal ok is " +
-          "fixed — but the retryable err conclusively ends only its own attempt: a later " +
-          "same-key execution may observe a different outcome, so only the ok arm of a decision " +
-          "on this result is established to replay.",
+          "Equal identity keys are one logical interaction, and its terminal ok is fixed — but " +
+          "the retryable err conclusively ends only its own attempt: a later same-key " +
+          "application may observe a different outcome, so only the ok arm of a decision on " +
+          "this result is established to replay.",
       };
     case "unspecified":
       return {
         label: "returns a result",
         tone: "info",
         summary:
-          "Equal deduplication keys identify one logical interaction, and its terminal ok is " +
-          "fixed — but the err's disposition is unspecified: no fact says whether an observed " +
-          "err terminally resolved the interaction, so the err arm of a decision on this result " +
+          "Equal identity keys are one logical interaction, and its terminal ok is fixed — but " +
+          "the err's disposition is unspecified: no fact says whether an observed err " +
+          "terminally resolved the interaction, so the err arm of a decision on this result " +
           "is not established to replay.",
       };
   }

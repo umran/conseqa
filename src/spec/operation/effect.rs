@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::spec::{Id, IdempotencyGuarantee, IdempotencyKeyPropagation, ResultType};
+use crate::spec::{Id, IdempotencyKeyPropagation, ResultType, ValueRef};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -78,30 +78,110 @@ pub struct RequestTarget {
     pub input: Id,
 }
 
+/// An external boundary: the modeled system ends here, so its facts
+/// are declared, never proven — each is a conformance obligation on
+/// the boundary (§1.3), and the checker consumes them independently.
+///
+/// Three orthogonal dimensions, none derivable from another:
+/// `identity` (what makes two applications the same logical
+/// interaction), `idempotency` (what duplicate applications do to
+/// external state), and `result_replay` (what duplicate applications
+/// observe as the synchronous result).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ExternalEffect {
     pub name: String,
 
-    /// This is declared because the modeled system ends here;
-    /// the checker cannot inspect the external implementation.
-    pub idempotency: IdempotencyGuarantee,
+    /// What identifies one logical external interaction: equal
+    /// evaluated key tuples are applications of the same interaction.
+    /// Identity alone claims nothing about behaviour — not
+    /// deduplication, not idempotency, not result replay.
+    pub identity: ExternalIdentity,
 
-    /// The synchronous result the boundary returns, declared for the
-    /// same reason: Conseqa cannot inspect beyond it. `None` means no
-    /// synchronous result is modeled.
-    ///
-    /// The contract declares the result's shape and the error's
-    /// disposition. For a result-bearing effect, `deduplicated_by`
-    /// additionally fixes the interaction's terminal logical result:
-    /// equal evaluated keys identify one logical external execution,
-    /// and after its first terminal `Ok` or terminal `Err`, every
-    /// subsequent same-key execution observes the same variant and a
-    /// replay-equivalent payload. A retryable `Err` is an attempt-level,
-    /// nonterminal outcome and establishes no terminal result. The
-    /// checker cannot prove the real boundary honors this; the
-    /// declaration is a conformance obligation on the boundary.
+    /// Duplicate-side-effect behaviour, relative to that identity.
+    pub idempotency: ExternalIdempotency,
+
+    /// Terminal-result replay behaviour, relative to that identity.
+    pub result_replay: ExternalResultReplay,
+
+    /// The synchronous result the boundary returns. `None` means no
+    /// synchronous result is modeled, and no `result_replay` fact
+    /// beyond `unspecified` may be declared.
     pub result: Option<ResultType>,
+}
+
+/// The boundary's notion of "one logical interaction", mirroring the
+/// *shape* of request identity and message identity while remaining
+/// its own vocabulary: an interaction identity is not an idempotency
+/// declaration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ExternalIdentity {
+    /// No usable sameness relation across applications.
+    Unspecified,
+
+    /// Equal evaluated key tuples identify applications of one
+    /// logical external interaction.
+    Keyed { key: ExternalIdentityKey },
+}
+
+/// The evaluated identity of one logical external interaction.
+///
+/// Deliberately distinct from the public `IdempotencyKey` type even
+/// though the shapes coincide: verifier internals are shared, the
+/// public semantic concepts are not.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExternalIdentityKey {
+    pub components: Vec<ValueRef>,
+}
+
+/// What duplicate applications of the boundary do to modeled
+/// externally observable state. A declared implementation guarantee
+/// (§1.3); the DSL states the property, never the mechanism.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExternalIdempotency {
+    /// No usable duplicate-side-effect fact. Epistemic: not "safe",
+    /// not "unsafe".
+    Unspecified,
+
+    /// An explicit negative: repeated applications may produce
+    /// distinguishable modeled external work (an unkeyed charge).
+    Distinguishable,
+
+    /// Across applications of one keyed interaction, any number of
+    /// applications produces modeled externally observable side-effect
+    /// work indistinguishable from exactly one application, under
+    /// every admitted interleaving. Requires a keyed identity.
+    IdenticalPerIdentity,
+
+    /// Application causes no modeled externally observable state
+    /// change beyond producing its synchronous result. Universal and
+    /// keyless; unmodeled internal activity (logging, metrics,
+    /// caching) is not prohibited.
+    SideEffectFree,
+}
+
+/// What duplicate applications observe as the boundary's terminal
+/// synchronous result. Independent of `ExternalIdempotency` in both
+/// directions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExternalResultReplay {
+    /// No usable result-replay fact.
+    Unspecified,
+
+    /// An explicit negative: per-attempt results may differ (fresh
+    /// presigned URLs, fresh nonces). Requires a result contract.
+    Unstable,
+
+    /// After one keyed interaction's first terminal outcome, every
+    /// later application of that identity observes the same terminal
+    /// variant and a replay-equivalent payload. `Ok` is terminal by
+    /// definition; `Err` only under a declared `terminal` disposition.
+    /// Requires a keyed identity and a result contract.
+    ReplayStable,
 }
 
 impl Effect {
@@ -125,8 +205,8 @@ impl Effect {
     }
 
     /// Every value reference the effect's declaration evaluates when
-    /// the effect executes: an external deduplication key, and the
-    /// source and target of each propagation.
+    /// the effect executes: an external interaction-identity key, and
+    /// the source and target of each propagation.
     pub fn roots(&self) -> Vec<&crate::spec::ValueRef> {
         let mut roots = Vec::new();
 
@@ -135,7 +215,7 @@ impl Effect {
             Self::Request(effect) => &effect.idempotency_key_propagation,
             Self::OutboxWrite(effect) => &effect.idempotency_key_propagation,
             Self::External(effect) => {
-                if let IdempotencyGuarantee::DeduplicatedBy { key } = &effect.idempotency {
+                if let ExternalIdentity::Keyed { key } = &effect.identity {
                     roots.extend(key.components.iter());
                 }
 

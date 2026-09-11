@@ -25,6 +25,7 @@
 # to completion by at-least-once delivery), and receipts emails the
 # customer through a provider that deduplicates sends by event_id.
 # Every declared obligation proves.
+dsl: 1
 revision: 1
 services:
   service.payments:
@@ -357,12 +358,14 @@ operations:
         effect:
           kind: external
           name: receipt_email_provider
-          idempotency:
-            kind: deduplicated_by
+          identity:
+            kind: keyed
             key:
               components:
               - source: input:input.send_receipt.captured
                 path: event_id
+          idempotency: identical_per_identity
+          result_replay: unspecified
           result: null
         values:
           kind: deterministic

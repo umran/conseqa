@@ -137,6 +137,7 @@ impl WorkspaceState {
         }
 
         Ok(Model {
+            dsl: crate::spec::DSL_VERSION,
             revision: self.revision,
             services: self.services.clone(),
             schemas: self.schemas.clone(),

@@ -10,8 +10,9 @@ use conseqa::{
     parser::yaml,
     spec::{
         Arm, AsyncJoin, Branch, Condition, Derivation, Effect, EstablishTransactionOutput,
-        ExecuteEffect, ExecuteEffectAsync, ExecuteEffectIntentAsync, FieldPath, Id,
-        IdempotencyGuarantee, IdempotencyKey, Input, JoinAll, Literal, MessageIdentity,
+        ExecuteEffect, ExecuteEffectAsync, ExecuteEffectIntentAsync, ExternalIdempotency,
+        ExternalIdentity, ExternalIdentityKey, ExternalResultReplay, FieldPath, Id,
+        IdempotencyGuarantee, Input, JoinAll, Literal, MessageIdentity,
         MessageSelector,
         Model, OperationBlock, OperationStep, Race, RequestEffect, RequestIdentity, RequestTarget,
         DataObjectRef, ExecutionPool, MemberAssignment, MemberConcurrency,
@@ -3727,8 +3728,8 @@ fn rejects_an_invalid_dedup_key_path_in_an_async_launch() {
         panic!("card charge should be external");
     };
 
-    external.idempotency = IdempotencyGuarantee::DeduplicatedBy {
-        key: IdempotencyKey {
+    external.identity = ExternalIdentity::Keyed {
+        key: ExternalIdentityKey {
             components: vec![input_ref("input.charge_payment.reserved", &["no_such_field"])],
         },
     };
@@ -4155,4 +4156,89 @@ fn rejects_an_unknown_outbox_reference() {
         }),
         "{errors:#?}"
     );
+}
+
+#[test]
+fn external_identical_per_identity_requires_a_keyed_identity() {
+    let mut model = load_flash_checkout();
+
+    // The fixture card declares no identity; the per-identity
+    // guarantee has nothing to be quantified over.
+    charge_card_mut(&mut model).idempotency = ExternalIdempotency::IdenticalPerIdentity;
+
+    let errors = validation::validate(&model);
+
+    assert_eq!(
+        errors,
+        vec![ValidationError::ExternalIdempotencyRequiresIdentity {
+            effect: id("effect.charge_payment.card"),
+        }]
+    );
+}
+
+#[test]
+fn external_replay_stability_requires_a_keyed_identity() {
+    let mut model = load_flash_checkout();
+
+    charge_card_mut(&mut model).result_replay = ExternalResultReplay::ReplayStable;
+
+    let errors = validation::validate(&model);
+
+    assert_eq!(
+        errors,
+        vec![ValidationError::ExternalReplayStabilityRequiresIdentity {
+            effect: id("effect.charge_payment.card"),
+        }]
+    );
+}
+
+#[test]
+fn external_result_replay_behaviours_require_a_result_contract() {
+    // Both `unstable` and `replay_stable` describe the synchronous
+    // result; a result-less boundary has none to describe.
+    for result_replay in [
+        ExternalResultReplay::Unstable,
+        ExternalResultReplay::ReplayStable,
+    ] {
+        let mut model = load_flash_checkout();
+
+        {
+            let card = charge_card_mut(&mut model);
+            card.identity = ExternalIdentity::Keyed {
+                key: ExternalIdentityKey {
+                    components: vec![input_ref("input.charge_payment.reserved", &["event_id"])],
+                },
+            };
+            card.result = None;
+            card.result_replay = result_replay;
+        }
+
+        let errors = validation::validate(&model);
+
+        assert!(
+            errors.iter().any(|error| matches!(
+                error,
+                ValidationError::ExternalResultReplayWithoutResult { effect }
+                    if effect == &id("effect.charge_payment.card")
+            )),
+            "{result_replay:?}: {errors:#?}"
+        );
+    }
+}
+
+#[test]
+fn a_keyed_identity_with_unspecified_behaviours_is_valid() {
+    // Identity alone declares sameness while withholding behaviour;
+    // it enables nothing and forbids nothing.
+    let mut model = load_flash_checkout();
+
+    charge_card_mut(&mut model).identity = ExternalIdentity::Keyed {
+        key: ExternalIdentityKey {
+            components: vec![input_ref("input.charge_payment.reserved", &["event_id"])],
+        },
+    };
+
+    let errors = validation::validate(&model);
+
+    assert!(errors.is_empty(), "{errors:#?}");
 }

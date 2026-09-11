@@ -43,6 +43,8 @@ export function conditionText(c: Condition): string {
       return c.conditions.map(conditionText).join(" ∧ ");
     case "not":
       return `¬(${conditionText(c.condition)})`;
+    case "present":
+      return `present(${refString(c.value)})`;
   }
 }
 
