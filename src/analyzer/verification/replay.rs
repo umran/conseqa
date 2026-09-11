@@ -514,6 +514,17 @@ pub enum DecisionRule {
     /// The condition is a deterministic function of replay-stable
     /// roots.
     StableCondition { roots: Vec<StableRoot> },
+
+    /// The decision is not established to replay, and every
+    /// continuation from it to a terminal is idempotency-inert: only
+    /// further decisions and terminals follow, so divergence cannot
+    /// add modeled work and may affect only terminal construction.
+    /// A derived structural fact, never an implementation assumption
+    /// — it lapses by itself the moment an effectful step joins any
+    /// continuation. Produced only by the idempotency family; result
+    /// replay continues to require the decision itself to replay,
+    /// because divergent terminals may construct divergent results.
+    IdempotencyInertContinuation,
 }
 
 /// Why a retry is not established to take the same arm (§16).

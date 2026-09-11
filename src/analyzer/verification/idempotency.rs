@@ -72,10 +72,11 @@ use super::describe::{
     decision_gap_sentence, describe_decision, describe_path, gap_sentences, governing_key_evidence,
     unstable_roots,
 };
-use super::paths::{DecisionTaken, Path, PathRef, paths};
+use super::paths::{DecisionTaken, Path, PathRef, PathStep, paths};
 use super::replay::{
-    DecisionGap, DecisionReplay, EffectSite, GoverningKeyDefect, InstanceGap, InstanceStability,
-    PathContext, ReplayAnalysis, ReplayGap, StableRoot, TracedStep, UnstableRoot,
+    DecisionGap, DecisionReplay, DecisionRule, EffectSite, GoverningKeyDefect, InstanceGap,
+    InstanceStability, PathContext, ReplayAnalysis, ReplayGap, StableRoot, TracedStep,
+    UnstableRoot,
 };
 use super::trigger::{EffectContract, ProducerSite, TriggerGraph, collapses_duplicates, key_input};
 
@@ -1006,8 +1007,10 @@ fn check_requirement(
     let mut obstacles = Vec::new();
     let mut safe = Vec::new();
 
+    let inert = idempotency_inert_decisions(&admitted);
+
     for path in admitted {
-        if let Some(safety) = analyze_path(scope, &analysis, path, &mut obstacles) {
+        if let Some(safety) = analyze_path(scope, &analysis, path, &inert, &mut obstacles) {
             safe.push(safety);
         }
     }
@@ -1080,10 +1083,53 @@ impl IdempotencyObstacle {
     }
 }
 
+/// The §9 idempotency-inert continuation admission: the locations of
+/// decisions after which, on every admitted path, only further
+/// decisions occur before the terminal. Divergence at such a decision
+/// cannot add modeled work — no transaction, no effect execution or
+/// launch, no intent execution, no `join_all` or `race` follows on
+/// any continuation — so a non-replaying decision there need not
+/// block an idempotency proof: the class's complete modeled work is
+/// the shared prefix's, and terminal divergence is the result-replay
+/// obligation's separate concern.
+///
+/// The quantification is over complete continuations, never immediate
+/// arm bodies: branch fall-through and enclosing-block suffixes are
+/// already unrolled into the admitted paths, so "every step after the
+/// decision on every path is a decision" is exactly the predicate. A
+/// location effectful on any one continuation is disqualified on all.
+fn idempotency_inert_decisions(paths: &[&Path<'_>]) -> BTreeSet<crate::spec::StepLocation> {
+    let mut inert = BTreeSet::new();
+    let mut disqualified = BTreeSet::new();
+
+    for path in paths {
+        for (index, step) in path.steps.iter().enumerate() {
+            let PathStep::Decision { location, .. } = step else {
+                continue;
+            };
+
+            let effectful_suffix = path.steps[index + 1..]
+                .iter()
+                .any(|later| !matches!(later, PathStep::Decision { .. }));
+
+            if effectful_suffix {
+                disqualified.insert(location.clone());
+            } else {
+                inert.insert(location.clone());
+            }
+        }
+    }
+
+    inert.retain(|location| !disqualified.contains(location));
+
+    inert
+}
+
 fn analyze_path(
     scope: &Scope<'_>,
     analysis: &ReplayAnalysis<'_>,
     path: &Path<'_>,
+    inert: &BTreeSet<crate::spec::StepLocation>,
     obstacles: &mut Vec<IdempotencyObstacle>,
 ) -> Option<PathRetrySafety> {
     let before = obstacles.len();
@@ -1093,6 +1139,7 @@ fn analyze_path(
 
     let mut transactions = Vec::new();
     let mut effects = Vec::new();
+    let mut decisions = Vec::new();
 
     // The keyed-commit judgment of each transaction on the path, for
     // the outbox writes that commit with it: the producer-suppressed
@@ -1156,21 +1203,41 @@ fn analyze_path(
                 }
             }
 
-            TracedStep::Decision { taken, replay, .. } => {
-                if let Err(gap) = replay {
+            TracedStep::Decision {
+                location,
+                taken,
+                replay,
+            } => match replay {
+                Ok(rule) => decisions.push(DecisionReplay {
+                    decision: taken.clone(),
+                    rule: rule.clone(),
+                }),
+
+                // The idempotency-inert continuation admission (§9):
+                // when nothing but decisions and terminals can follow
+                // this decision on any admitted path, divergence adds
+                // no modeled work — recorded as a derived structural
+                // fact on the proof, never silently and never as an
+                // implementation assumption.
+                Err(_) if inert.contains(location) => decisions.push(DecisionReplay {
+                    decision: taken.clone(),
+                    rule: DecisionRule::IdempotencyInertContinuation,
+                }),
+
+                Err(gap) => {
                     obstacles.push(IdempotencyObstacle::PathDecisionUnstable {
                         path: reference.clone(),
                         decision: taken.clone(),
                         gap: gap.clone(),
                     });
                 }
-            }
+            },
         }
     }
 
     (obstacles.len() == before).then_some(PathRetrySafety {
         path: reference,
-        decisions: trace.stable_decisions(),
+        decisions,
         transactions,
         effects,
     })

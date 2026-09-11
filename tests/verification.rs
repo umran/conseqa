@@ -5859,8 +5859,58 @@ fn a_present_gate_over_the_triggering_payload_replays() {
 }
 
 #[test]
-fn an_unspecified_gate_is_the_unproven_regression_pair() {
+fn a_terminal_only_unspecified_gate_is_admitted_as_idempotency_inert() {
+    // The §9 idempotency-inert continuation admission: both
+    // continuations of the non-replaying decision — the then-arm and
+    // the fall-through — reach a terminal through decisions alone, so
+    // divergence cannot add modeled work. The proof carries the
+    // derived rule rather than an obstacle or an assumption.
     let model = gate_apply_payment_on(Condition::Unspecified);
+
+    assert!(validation::validate(&model).is_empty());
+
+    let verdict = idempotency_verdict(&model, "operation.apply_payment", 0);
+
+    let IdempotencyVerdict::Proven {
+        proof: IdempotencyProof::RetrySafePaths { paths },
+        ..
+    } = &verdict
+    else {
+        panic!("expected apply_payment proven, found {verdict:?}");
+    };
+
+    assert!(
+        paths.iter().flat_map(|path| path.decisions.iter()).any(|decision| matches!(
+            decision.rule,
+            DecisionRule::IdempotencyInertContinuation
+        )),
+        "the admission is recorded on the proof:\n{paths:#?}"
+    );
+}
+
+/// Every excluded step kind poisons the continuation, whether it sits
+/// in an arm or only in the fall-through suffix after both arms.
+#[test]
+fn an_effectful_continuation_refuses_the_inert_admission() {
+    // A keyed no-op transaction after the branch: individually
+    // retry-safe, and still non-inert — the theorem is structural,
+    // never a recursive equivalence argument between arms.
+    let mut model = gate_apply_payment_on(Condition::Unspecified);
+
+    let program = program_mut(&mut model, "operation.apply_payment");
+
+    program.steps.insert(
+        1,
+        OperationStep::Transaction(Transaction {
+            id: id("tx.apply_payment.mark"),
+            data_model: None,
+            isolation: TransactionIsolation::ReadCommitted,
+            idempotency: IdempotencyGuarantee::DeduplicatedBy {
+                key: ikey("input.apply_payment.captured", &[&["event_id"]]),
+            },
+            steps: vec![],
+        }),
+    );
 
     assert!(validation::validate(&model).is_empty());
 
@@ -5877,6 +5927,117 @@ fn an_unspecified_gate_is_the_unproven_regression_pair() {
                 gap: DecisionGap::ConditionUnspecified,
                 ..
             }
+        )),
+        "the fall-through transaction keeps the decision an obstacle:\n{obstacles:#?}"
+    );
+}
+
+#[test]
+fn nested_terminal_only_decisions_stay_inert() {
+    // Divergence through further decisions is still divergence among
+    // terminals only.
+    let model = gate_apply_payment_on(Condition::Unspecified);
+
+    let mut model = model;
+    let program = program_mut(&mut model, "operation.apply_payment");
+
+    program.steps[0] = OperationStep::Branch(Branch {
+        condition: Condition::Unspecified,
+        then: block(vec![
+            OperationStep::Branch(Branch {
+                condition: Condition::Unspecified,
+                then: block(vec![OperationStep::Complete]),
+                otherwise: None,
+            }),
+            OperationStep::Complete,
+        ]),
+        otherwise: None,
+    });
+
+    assert!(validation::validate(&model).is_empty());
+
+    let verdict = idempotency_verdict(&model, "operation.apply_payment", 0);
+
+    assert!(
+        matches!(&verdict, IdempotencyVerdict::Proven { .. }),
+        "{verdict:?}"
+    );
+}
+
+#[test]
+fn the_inert_admission_never_reaches_result_replay() {
+    // The same shape as the presign pattern: a keyed transaction, a
+    // side-effect-free external with an explicitly unstable result,
+    // and a match whose arms only construct terminals. Idempotency
+    // proves through the admission; a declared replay-consistent
+    // result stays unproven, because divergent terminals may
+    // construct divergent results — same work is not same result.
+    let mut model = load_flash_checkout();
+
+    let operation = model
+        .operations
+        .get_mut(&id("operation.transfer_stock"))
+        .unwrap();
+
+    operation.program.steps = vec![
+        execute(
+            "effect.transfer_stock.presign",
+            conseqa::spec::Effect::External(ExternalEffect {
+                name: "object-storage.presign".into(),
+                identity: ExternalIdentity::Unspecified,
+                idempotency: ExternalIdempotency::SideEffectFree,
+                result_replay: ExternalResultReplay::Unstable,
+                result: Some(ResultType {
+                    ok: id("schema.ChargeAccepted"),
+                    err: ErrorResultType {
+                        schema: id("schema.ChargeDeclined"),
+                        disposition: ErrorDisposition::Terminal,
+                    },
+                }),
+            }),
+            deterministic(vec![input_key("input.transfer_stock.request", &["sku"])]),
+            Some("result.transfer_stock.presign"),
+        ),
+        OperationStep::MatchResult(MatchResult {
+            result: id("result.transfer_stock.presign"),
+            ok: block(vec![return_ok(
+                "input.transfer_stock.request",
+                deterministic(vec![]),
+            )]),
+            err: block(vec![return_err(
+                "input.transfer_stock.request",
+                deterministic(vec![]),
+            )]),
+        }),
+    ];
+
+    operation
+        .requirements
+        .idempotency
+        .push(IdempotencyRequirement {
+            key: ikey("input.transfer_stock.request", &[&["sku"]]),
+            result: ResultReplayRequirement::ReplayConsistent,
+        });
+
+    assert!(validation::validate(&model).is_empty());
+
+    let verdict = idempotency_verdict(&model, "operation.transfer_stock", 0);
+
+    assert!(
+        matches!(&verdict, IdempotencyVerdict::Proven { .. }),
+        "idempotency proves through the admission: {verdict:?}"
+    );
+
+    let verdict = result_replay_verdict(&model, "operation.transfer_stock", 0);
+
+    let ResultReplayVerdict::Unproven { obstacles } = &verdict else {
+        panic!("result replay must still require the decision to replay, found {verdict:?}");
+    };
+
+    assert!(
+        obstacles.iter().any(|obstacle| matches!(
+            obstacle,
+            ResultReplayObstacle::PathDecisionUnstable { .. }
         )),
         "{obstacles:#?}"
     );
