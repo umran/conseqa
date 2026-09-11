@@ -2378,3 +2378,80 @@ operations:
 
     assert!(matches!(&error, yaml::ParseError::Yaml(_)), "{error:?}");
 }
+
+#[test]
+fn a_present_condition_parses_and_round_trips() {
+    let source = "dsl: 1
+revision: 1
+schemas:
+  schema.Event:
+    kind: canonical
+    completeness: complete
+    fields:
+      id: uuid
+      note: string?
+topics:
+  topic.events:
+    messages:
+    - schema.Event
+    message_identity:
+      kind: keyed
+      mapping:
+        schema.Event:
+        - - id
+operations:
+  operation.observe:
+    service: service.x
+    inputs:
+      input.observe.events:
+        kind: subscription
+        topic: topic.events
+        messages:
+          kind: all
+    program:
+      steps:
+      - kind: branch
+        condition:
+          kind: not
+          condition:
+            kind: present
+            value:
+              source: input:input.observe.events
+              path: note
+        then:
+          steps:
+          - kind: complete
+      - kind: complete
+    requirements:
+      serialization: []
+      ordering: []
+      idempotency: []
+      recoverability: []
+services:
+  service.x:
+    kind: backend
+";
+
+    let model = yaml::parse(source).expect("the present condition should parse");
+
+    let operation = model
+        .operations
+        .get(&Id("operation.observe".into()))
+        .expect("operation exists");
+
+    let OperationStep::Branch(branch) = &operation.program.steps[0] else {
+        panic!("expected the branch");
+    };
+
+    let Condition::Not { condition } = &branch.condition else {
+        panic!("expected the negation");
+    };
+
+    assert!(matches!(&**condition, Condition::Present { value }
+        if value.path.0 == vec!["note".to_string()]));
+
+    let serialized = yaml::serialize(&model).expect("model serializes");
+    let reparsed = yaml::parse(&serialized).expect("serialized model parses");
+
+    assert_eq!(model, reparsed);
+}

@@ -1962,11 +1962,20 @@ The `then` block executes when the condition holds. `otherwise` is optional; abs
 `Condition` is deliberately small and structurally exposes every value the decision depends on, so replay analysis can judge a decision without an expression language:
 
 - `eq { value, equals }` — equality of a value reference against `equals`, which accepts the selector-value surface of §19: a map is another value reference, a plain scalar is a literal;
+- `present { value }` — the referenced path resolves to a value;
 - `and { conditions }` — every nested condition holds;
 - `not { condition }` — the nested condition does not hold;
 - `unspecified` — the model provides no fact about how the decision is made.
 
-`eq`, `and`, and `not` are **deterministic functions of their references**: given equal values for every root, the decision takes the same arm. `unspecified` declares no fact and is never deterministic; a condition containing it anywhere is not. §1.1 governs it as it governs every other `unspecified`.
+`eq`, `present`, `and`, and `not` are **deterministic functions of their references**: given equal values for every root, the decision takes the same arm. `unspecified` declares no fact and is never deterministic; a condition containing it anywhere is not. §1.1 governs it as it governs every other `unspecified`.
+
+### `present`
+
+`present { value }` holds iff the referenced path resolves to a value in the attempt's evaluation context. A path is **absent** iff any optional segment required to resolve it is absent: `present a.b` with `a` absent does not hold. Presence and absence are aspects of the referenced **logical value** — two attempts observing replay-equivalent roots agree on the presence or absence of any path within them — so `present` needs no replay rule of its own: the ordinary judgment, a deterministic condition over replay-stable roots, carries it (§18 rule 3 already makes a triggering payload replay-stable as a whole logical value, optionality included). There is no `absent` kind; `not { present … }` composes.
+
+**Absence is not a value.** `eq` does **not** hold when either operand evaluates absent — including both absent. Presence is queried only through `present`; consequently `not { eq A B }` holds when either operand is absent, and an author for whom that matters guards with `present` first. The same rule holds for a `SelectorPredicate::Eq` over a stored optional field (§19): the conjunct does not match that instance.
+
+**A vacuous `present` is redundant, not invalid.** `present` over a statically required path is well-defined — vacuously true — and is never rejected; the checker raises the warning-severity note `RedundantPresenceCheck` when the complete resolved path traverses no optional field in any schema the root admits. The note matters because **conditions never prune admitted paths**: V1 performs no constant folding, so the never-taken arm of a vacuous `present` remains an admitted path and is analyzed like any other — delete the dead arm rather than carrying phantom obligations through it.
 
 ### `return` and `complete`
 
@@ -2723,6 +2732,7 @@ The solver must preserve these distinctions:
 | **`Err` vs interrupted execution** | `Err` is a conclusive logical outcome a synchronous interaction returned; a crash, timeout, or lost connection is an idempotency/recoverability question and is not an `Err` payload. |
 | **`TransactionOutput` vs `EffectIntent`** | An output exports data; an intent captures pending work. Both are artifacts of the same commit, and neither may stand in for the other. |
 | **`match_result` vs `branch`** | A control-flow decision on a `Result` destructures a mutually exclusive typed outcome; a `branch` evaluates an ordinary predicate. Success/failure is never encoded as a status-field comparison. |
+| **`present` vs `eq`** | `present` asks whether a path resolves to a value; `eq` compares values and never holds over an absent operand. Absence is not a comparable value, and presence is asked only through `present`. |
 | **Effect payload replay vs effect result replay** | A class-fixed outgoing instance proves every attempt asks the same question; whether the same answer comes back is a separate fact — a target's proven result consistency, or an external boundary's declared `replay_stable` terminal result (never its retryable or unspecified errors). |
 | **External identity vs external idempotency vs result replay** | Identity says which applications are one logical interaction; idempotency says what duplicates of it do to external state; result replay says what they observe back. Three independent declarations — neither behavioural axis is inferred from the other, and identity alone enables nothing. |
 | **`ExternalIdentityKey` vs `IdempotencyKey`** | An interaction identity names the boundary's sameness relation; an idempotency key names a requirement's governing class. The shapes coincide; the public concepts do not, per the outbox/topic precedent. |

@@ -6,6 +6,8 @@ export type Id = string;
 export type FieldPath = string[];
 
 export interface Model {
+  /** The DSL contract version the model is expressed in. */
+  dsl: number;
   revision: number;
 
   // L0 — the abstract application machine.
@@ -314,7 +316,8 @@ export type Condition =
   | { kind: "unspecified" }
   | { kind: "eq"; value: ValueRef; equals: SelectorValue }
   | { kind: "and"; conditions: Condition[] }
-  | { kind: "not"; condition: Condition };
+  | { kind: "not"; condition: Condition }
+  | { kind: "present"; value: ValueRef };
 
 export type ResultOutcome =
   | { kind: "ok"; values: Derivation }

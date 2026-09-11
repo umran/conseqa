@@ -1890,6 +1890,15 @@ Value references:
   {"source":"input:input.x.request","path":"order_id"}
 Derivations: {"kind":"unspecified"} or {"kind":"deterministic","from":[<value ref>...]}.
 
+BRANCH CONDITIONS — deliberately small, structurally exposed:
+  {"kind":"eq","value":<value ref>,"equals":<value ref or literal>}
+  {"kind":"present","value":<value ref>}   (holds iff the path resolves;
+     absent iff any optional segment is absent. eq never holds over an
+     absent operand; presence is asked only through present. A present
+     over a required path is vacuously true — redundant, warned, valid.)
+  {"kind":"and","conditions":[...]}  {"kind":"not","condition":...}
+  {"kind":"unspecified"}   (no fact; the decision never replays)
+
 ASYNC PROGRAM STEPS — launch effects without waiting, then synchronize:
   {"kind":"execute_effect_async","handle":"async.x","effect_id":"effect.x",
    "effect":<effect>, "values":<derivation>}

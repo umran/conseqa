@@ -1340,6 +1340,187 @@ fn validate_value_ref_path(
     }
 }
 
+
+/// A `present` condition whose complete resolved path contains no
+/// optional segment: vacuously true against every schema the root can
+/// resolve to. Redundant, not unsound — conditions never prune
+/// admitted paths, so the never-taken arm is still analyzed, which is
+/// exactly why the redundancy is worth surfacing as a note.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RedundantPresence {
+    pub operation: Id,
+    pub location: StepLocation,
+    pub root: ValueRef,
+}
+
+/// Every `present` condition in the model whose test is vacuous: the
+/// resolved path traverses no optional field in any schema its source
+/// admits. A multi-schema source (a subscription or outbox input) is
+/// redundant only when the path is non-optional in every admitted
+/// schema — optional in one, the test is meaningful.
+pub fn redundant_presence_checks(model: &Model) -> Vec<RedundantPresence> {
+    let index = ReferenceIndex::build(model);
+    let mut redundant = Vec::new();
+
+    for (operation_id, operation) in &model.operations {
+        for (location, step) in operation.program.steps_with_locations() {
+            let OperationStep::Branch(branch) = step else {
+                continue;
+            };
+
+            for root in presence_roots(&branch.condition) {
+                let Some(schemas) = presence_root_schemas(model, &index, root) else {
+                    continue;
+                };
+
+                let verdicts: Vec<Option<bool>> = schemas
+                    .iter()
+                    .map(|schema| path_has_optional_segment(model, schema, &root.path.0))
+                    .collect();
+
+                // Unresolvable paths are the reference pass's errors,
+                // not redundancy; a note about a broken model helps
+                // nobody.
+                if !verdicts.is_empty() && verdicts.iter().all(|verdict| *verdict == Some(false)) {
+                    redundant.push(RedundantPresence {
+                        operation: operation_id.clone(),
+                        location: location.clone(),
+                        root: root.clone(),
+                    });
+                }
+            }
+        }
+    }
+
+    redundant
+}
+
+/// The roots of every `present` in a condition tree, in declaration
+/// order.
+fn presence_roots(condition: &Condition) -> Vec<&ValueRef> {
+    match condition {
+        Condition::Present { value } => vec![value],
+        Condition::And { conditions } => conditions.iter().flat_map(presence_roots).collect(),
+        Condition::Not { condition } => presence_roots(condition),
+        Condition::Unspecified | Condition::Eq { .. } => Vec::new(),
+    }
+}
+
+/// The schemas a program-level value reference resolves its path
+/// against — the same dispatch `validate_value_ref_path` performs,
+/// returning the schemas instead of validating. `None` when the
+/// source has no schema to resolve (a resultless binding, a
+/// transaction read, which is never legal at a branch anyway).
+fn presence_root_schemas(
+    model: &Model,
+    index: &ReferenceIndex<'_>,
+    value: &ValueRef,
+) -> Option<Vec<Id>> {
+    match &value.source {
+        ValueSource::Input(input_id) => {
+            let input = find_input(model, index, input_id)?;
+
+            Some(match input {
+                Input::Request(request) => vec![request.schema.clone()],
+
+                Input::Subscription(subscription) => {
+                    let topic = model.topics.get(&subscription.topic)?;
+
+                    match &subscription.messages {
+                        MessageSelector::All => topic.messages.iter().cloned().collect(),
+                        MessageSelector::Only(messages) => messages.iter().cloned().collect(),
+                    }
+                }
+
+                Input::Outbox(input) => {
+                    let (_, outbox) = model.outbox(&input.outbox)?;
+
+                    match &input.messages {
+                        MessageSelector::All => outbox.messages.iter().cloned().collect(),
+                        MessageSelector::Only(messages) => messages.iter().cloned().collect(),
+                    }
+                }
+            })
+        }
+
+        ValueSource::Effect(effect_id) => {
+            Some(vec![effect_schema(model, index, effect_id)?.clone()])
+        }
+
+        ValueSource::TransactionOutput(output_id) => {
+            Some(vec![index.output_schema(output_id)?.clone()])
+        }
+
+        ValueSource::EffectResultOk(result_id) | ValueSource::EffectResultErr(result_id) => {
+            let variant = match &value.source {
+                ValueSource::EffectResultOk(_) => ResultVariant::Ok,
+                _ => ResultVariant::Err,
+            };
+
+            let schema = index
+                .binding_effect(result_id)
+                .and_then(|effect| effect_result_type(model, index, effect))
+                .map(|result| result.schema(variant).clone())?;
+
+            Some(vec![schema])
+        }
+
+        ValueSource::StateMachineSubject(machine_id) => {
+            let machine = model.state_machines.get(machine_id)?;
+
+            let StateMachineSubject::Object { object, .. } = &machine.subject;
+
+            let info = index.get(object)?;
+            let data_model = model.data_models.get(info.owner?)?;
+
+            Some(vec![data_model.objects.get(object)?.schema.clone()])
+        }
+
+        ValueSource::TransactionRead(_) => None,
+    }
+}
+
+/// Whether the resolved path traverses at least one optional field.
+/// `None` when the path does not resolve; fragments walk to their
+/// source exactly as resolution does.
+fn path_has_optional_segment(model: &Model, schema_id: &Id, components: &[String]) -> Option<bool> {
+    if components.is_empty() {
+        return None;
+    }
+
+    let schema = model.schemas.get(schema_id)?;
+
+    match schema {
+        Schema::Canonical(schema) => {
+            let field = schema.fields.get(&components[0])?;
+
+            let rest = if components.len() == 1 {
+                Some(false)
+            } else {
+                match &field.ty {
+                    TypeRef::Schema(inner) => {
+                        path_has_optional_segment(model, inner, &components[1..])
+                    }
+
+                    // V1 does not define traversal through collections.
+                    TypeRef::List(_) | TypeRef::Scalar(_) => None,
+                }
+            };
+
+            rest.map(|nested| field.optional || nested)
+        }
+
+        Schema::Fragment(fragment) => {
+            let mapped = fragment.mapping.get(&components[0])?;
+
+            let mut source_path = mapped.0.clone();
+            source_path.extend_from_slice(&components[1..]);
+
+            path_has_optional_segment(model, &fragment.source, &source_path)
+        }
+    }
+}
+
 /// A read of a field also observes the values nested beneath it.
 fn field_selection_covers(selected: &FieldPath, path: &FieldPath) -> bool {
     path.0.starts_with(&selected.0)

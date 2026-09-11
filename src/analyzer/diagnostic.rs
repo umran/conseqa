@@ -72,6 +72,11 @@ pub enum VerificationCode {
     /// a duplicate repeats is checked by nothing. A warning, not a
     /// verdict.
     DuplicateDeliveryUnchecked,
+
+    /// A `present` condition over a path with no optional segment is
+    /// vacuously true. Redundant, not unsound — a warning, never an
+    /// error.
+    RedundantPresenceCheck,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

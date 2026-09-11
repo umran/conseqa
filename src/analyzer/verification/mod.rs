@@ -241,6 +241,17 @@ pub enum ModelNote {
         outbox: Id,
         delivery: DeliverySemantics,
     },
+
+    /// A `present` condition over a path with no optional segment:
+    /// vacuously true, so redundant — and its never-taken arm is
+    /// still an admitted path, since conditions never prune paths.
+    /// A warning, never an error: the predicate has a well-defined
+    /// meaning (§16).
+    RedundantPresenceCheck {
+        operation: Id,
+        location: crate::spec::StepLocation,
+        root: crate::spec::ValueRef,
+    },
 }
 
 impl ModelNote {
@@ -248,6 +259,8 @@ impl ModelNote {
         match self {
             Self::DuplicateDeliveryUnchecked { input, .. }
             | Self::DuplicateOutboxDeliveryUnchecked { input, .. } => Some(input.clone()),
+
+            Self::RedundantPresenceCheck { operation, .. } => Some(operation.clone()),
         }
     }
 
@@ -287,12 +300,36 @@ impl ModelNote {
                     admits(delivery)
                 )
             }
+
+            Self::RedundantPresenceCheck {
+                operation,
+                location,
+                root,
+            } => {
+                format!(
+                    "Program step `{location}` of `{operation}` tests `present` on a path \
+                     with no optional segment: the condition is vacuously true. The \
+                     never-taken arm remains an admitted path — conditions never prune \
+                     paths — so delete the dead arm rather than carrying phantom \
+                     obligations through it. Root: {}.",
+                    root.source.id()
+                )
+            }
         }
     }
 
     pub fn diagnostic(&self) -> Diagnostic {
+        let code = match self {
+            Self::DuplicateDeliveryUnchecked { .. }
+            | Self::DuplicateOutboxDeliveryUnchecked { .. } => {
+                VerificationCode::DuplicateDeliveryUnchecked
+            }
+
+            Self::RedundantPresenceCheck { .. } => VerificationCode::RedundantPresenceCheck,
+        };
+
         Diagnostic {
-            code: DiagnosticCode::Verification(VerificationCode::DuplicateDeliveryUnchecked),
+            code: DiagnosticCode::Verification(code),
             severity: Severity::Warning,
             subject: self.subject(),
             message: self.message(),
@@ -305,6 +342,14 @@ impl ModelNote {
 /// deliveries without an idempotency requirement keyed from it.
 pub fn notes(model: &Model) -> Vec<ModelNote> {
     let mut notes = Vec::new();
+
+    for redundant in crate::analyzer::validation::redundant_presence_checks(model) {
+        notes.push(ModelNote::RedundantPresenceCheck {
+            operation: redundant.operation,
+            location: redundant.location,
+            root: redundant.root,
+        });
+    }
 
     for (operation_id, operation) in &model.operations {
         for (input_id, input) in &operation.inputs {

@@ -5787,3 +5787,129 @@ fn result_replay_alone_does_not_discharge_duplicate_work() {
         "every decision replays under the fixed terminal result:\n{obstacles:#?}"
     );
 }
+
+/// Rebuilds apply_payment into a payload-gated no-op: one branch on
+/// the given condition whose then-arm completes, then a fall-through
+/// complete. The triggering payload is replay-stable (keyed message
+/// identity pinned by the requirement key), so whether the decision
+/// replays is exactly the condition's own quality.
+fn gate_apply_payment_on(condition: Condition) -> Model {
+    let mut model = load_flash_checkout();
+
+    // Give the payload an optional field for `present` to ask about.
+    let Some(conseqa::spec::Schema::Canonical(captured)) =
+        model.schemas.get_mut(&id("schema.PaymentCaptured"))
+    else {
+        panic!("PaymentCaptured should be canonical");
+    };
+
+    captured
+        .fields
+        .get_mut("amount")
+        .expect("amount exists")
+        .optional = true;
+
+    let program = program_mut(&mut model, "operation.apply_payment");
+
+    program.steps = vec![
+        OperationStep::Branch(Branch {
+            condition,
+            then: block(vec![OperationStep::Complete]),
+            otherwise: None,
+        }),
+        OperationStep::Complete,
+    ];
+
+    model
+}
+
+fn present_amount() -> Condition {
+    Condition::Present {
+        value: input_key("input.apply_payment.captured", &["amount"]),
+    }
+}
+
+#[test]
+fn a_present_gate_over_the_triggering_payload_replays() {
+    let model = gate_apply_payment_on(Condition::Not {
+        condition: Box::new(present_amount()),
+    });
+
+    assert!(validation::validate(&model).is_empty());
+
+    // Presence is part of the logical value: same class, same
+    // payload, same presence — the decision replays and the gated
+    // no-op proves outright.
+    let verdict = idempotency_verdict(&model, "operation.apply_payment", 0);
+
+    assert!(
+        matches!(&verdict, IdempotencyVerdict::Proven { .. }),
+        "{verdict:?}"
+    );
+
+    // Nothing here is redundant: the tested path is optional.
+    assert!(
+        conseqa::analyzer::verification::notes(&model)
+            .iter()
+            .all(|note| !matches!(
+                note,
+                conseqa::analyzer::verification::ModelNote::RedundantPresenceCheck { .. }
+            )),
+    );
+}
+
+#[test]
+fn an_unspecified_gate_is_the_unproven_regression_pair() {
+    let model = gate_apply_payment_on(Condition::Unspecified);
+
+    assert!(validation::validate(&model).is_empty());
+
+    let verdict = idempotency_verdict(&model, "operation.apply_payment", 0);
+
+    let IdempotencyVerdict::Unproven { obstacles } = &verdict else {
+        panic!("expected apply_payment unproven, found {verdict:?}");
+    };
+
+    assert!(
+        obstacles.iter().any(|obstacle| matches!(
+            obstacle,
+            IdempotencyObstacle::PathDecisionUnstable {
+                gap: DecisionGap::ConditionUnspecified,
+                ..
+            }
+        )),
+        "{obstacles:#?}"
+    );
+}
+
+#[test]
+fn a_present_over_a_required_path_is_valid_and_noted() {
+    // Vacuously true, never rejected: the decision still replays and
+    // the proof still lands — but the checker notes the redundancy,
+    // because the never-taken arm remains an admitted path.
+    let model = gate_apply_payment_on(Condition::Present {
+        value: input_key("input.apply_payment.captured", &["event_id"]),
+    });
+
+    assert!(validation::validate(&model).is_empty());
+
+    let verdict = idempotency_verdict(&model, "operation.apply_payment", 0);
+
+    assert!(
+        matches!(&verdict, IdempotencyVerdict::Proven { .. }),
+        "{verdict:?}"
+    );
+
+    let notes = conseqa::analyzer::verification::notes(&model);
+
+    assert!(
+        notes.iter().any(|note| matches!(
+            note,
+            conseqa::analyzer::verification::ModelNote::RedundantPresenceCheck {
+                operation,
+                ..
+            } if operation == &id("operation.apply_payment")
+        )),
+        "{notes:#?}"
+    );
+}
