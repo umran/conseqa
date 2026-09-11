@@ -12,6 +12,7 @@
 # consistent-hash assignment, serial pool, and order-preserving
 # batching; its guaranteed completion is driven by at-least-once outbox
 # delivery.
+dsl: 1
 revision: 1
 services:
   service.orders:

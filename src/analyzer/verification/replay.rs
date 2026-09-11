@@ -71,9 +71,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 
 use crate::spec::{
-    Derivation, ErrorDisposition, ExternalEffect, FieldPath, Id, IdempotencyGuarantee,
-    IdempotencyKey, Input, MessageIdentity, MessageSelector, Model, Operation, RequestIdentity,
-    ResultVariant, StepLocation, Transaction, TransactionStep, ValueRef, ValueSource, MessageIdentityKey, RequestIdentityKey,
+    Derivation, ErrorDisposition, ExternalEffect, ExternalIdentity, ExternalResultReplay,
+    FieldPath, Id, IdempotencyGuarantee, IdempotencyKey, Input, MessageIdentity,
+    MessageIdentityKey, MessageSelector, Model, Operation, RequestIdentity, RequestIdentityKey,
+    ResultVariant, StepLocation, Transaction, TransactionStep, ValueRef, ValueSource,
 };
 
 use super::paths::{Decision, DecisionTaken, Path, PathStep, Terminal};
@@ -128,12 +129,12 @@ pub enum StabilityRule {
     ReplayConsistentResult { result: Id, effect: Id },
 
     /// A reference into a terminal external result that every attempt
-    /// in the class observes equally: the boundary deduplicates by a
-    /// class-fixed key, so equal keys identify one logical external
-    /// interaction whose terminal result is fixed, and the referenced
-    /// variant is terminal — `Ok` by definition, `Err` by declared
-    /// disposition.
-    DeduplicatedExternalResult {
+    /// in the class observes equally: the boundary declares its
+    /// terminal result replay-stable over a class-fixed interaction
+    /// identity, so equal identities are one logical interaction with
+    /// one fixed terminal result, and the referenced variant is
+    /// terminal — `Ok` by definition, `Err` by declared disposition.
+    ReplayStableExternalResult {
         result: Id,
         effect: Id,
         variant: ResultVariant,
@@ -376,15 +377,16 @@ pub enum ResultStabilityRule {
         instance: InstanceStability,
     },
 
-    /// The external boundary declares `deduplicated_by` over a key
-    /// that is class-fixed through the cited roots, so same-class
-    /// attempts address one logical external interaction, whose
-    /// terminal result the guarantee fixes — and the observed variant
-    /// is terminal: `Ok` by definition, `Err` by the contract's
-    /// declared `terminal` disposition (§13.3).
+    /// The external boundary declares `result_replay: replay_stable`
+    /// over an interaction identity that is class-fixed through the
+    /// cited roots, so same-class attempts address one logical
+    /// external interaction, whose terminal result the guarantee
+    /// fixes — and the observed variant is terminal: `Ok` by
+    /// definition, `Err` by the contract's declared `terminal`
+    /// disposition (§13.3).
     ExternalTerminalResult {
         variant: ResultVariant,
-        key: Vec<StableRoot>,
+        identity_key: Vec<StableRoot>,
     },
 }
 
@@ -409,21 +411,17 @@ pub enum ResultGap {
     /// this analysis.
     TargetResultUnproven { operation: Id, input: Id },
 
-    /// The external boundary explicitly does not deduplicate, so the
-    /// `deduplicated_by` terminal-result guarantee is unavailable.
-    /// This does not say repeated executions return different results;
-    /// only that no fact fixes them.
-    ExternalNotDeduplicated,
+    /// The external boundary declares no terminal-result replay
+    /// guarantee: `result_replay` is `unstable` (an explicit negative
+    /// — per-attempt results may differ) or `unspecified` (no usable
+    /// fact). Either way, nothing fixes a same-identity terminal
+    /// result.
+    ExternalResultNotReplayStable { declared: ExternalResultReplay },
 
-    /// No deduplication fact is declared for the external boundary,
-    /// so nothing identifies same-key executions as one logical
-    /// interaction with one terminal result.
-    ExternalDeduplicationUnknown,
-
-    /// The declared external deduplication key is not replay-stable,
-    /// so attempts may address different logical external
-    /// interactions.
-    ExternalDeduplicationKeyUnstable { roots: Vec<UnstableRoot> },
+    /// The declared external interaction-identity key is not
+    /// replay-stable, so attempts may address different logical
+    /// external interactions.
+    ExternalIdentityKeyUnstable { roots: Vec<UnstableRoot> },
 
     /// The observed `Err` is declared retryable: an attempt-level,
     /// nonterminal outcome. It does not establish the logical
@@ -1093,7 +1091,7 @@ impl<'a> ReplayAnalysis<'a> {
                             }
 
                             ResultStabilityRule::ExternalTerminalResult { .. } => {
-                                StabilityRule::DeduplicatedExternalResult {
+                                StabilityRule::ReplayStableExternalResult {
                                     result: result.clone(),
                                     effect: effect.clone(),
                                     variant,
@@ -1551,14 +1549,16 @@ impl<'a> ReplayAnalysis<'a> {
 
     /// The §13.3 judgment of an external result, per variant.
     ///
-    /// `deduplicated_by` over a class-fixed key makes equal-key
-    /// executions one logical external interaction whose terminal
-    /// result is fixed, so a terminal variant is replay-stable: `Ok`
-    /// by definition, `Err` under a declared `terminal` disposition.
-    /// A retryable `Err` is attempt-level and nonterminal; an
-    /// unspecified disposition provides no usable fact. The outgoing
-    /// instance is not consulted: result identity follows the key
-    /// alone, exactly as the boundary's duplicate-work collapse does.
+    /// `result_replay: replay_stable` over a class-fixed identity key
+    /// makes equal-key applications one logical external interaction
+    /// whose terminal result is fixed, so a terminal variant is
+    /// replay-stable: `Ok` by definition, `Err` under a declared
+    /// `terminal` disposition. A retryable `Err` is attempt-level and
+    /// nonterminal; an unspecified disposition provides no usable
+    /// fact. `ExternalIdempotency` plays no role here — a boundary
+    /// may fix results while its side effects are separately unsafe,
+    /// and vice versa. The outgoing instance is not consulted: result
+    /// identity follows the identity key alone.
     fn external_result_replay(
         &self,
         context: &PathContext,
@@ -1576,16 +1576,18 @@ impl<'a> ReplayAnalysis<'a> {
             return unstable(ResultGap::NoResultContract);
         };
 
-        let key = match &external.idempotency {
-            IdempotencyGuarantee::DeduplicatedBy { key } => key,
+        if !matches!(external.result_replay, ExternalResultReplay::ReplayStable) {
+            return unstable(ResultGap::ExternalResultNotReplayStable {
+                declared: external.result_replay,
+            });
+        }
 
-            IdempotencyGuarantee::NotDeduplicated => {
-                return unstable(ResultGap::ExternalNotDeduplicated);
-            }
-
-            IdempotencyGuarantee::Unspecified => {
-                return unstable(ResultGap::ExternalDeduplicationUnknown);
-            }
+        // Validation guarantees `replay_stable` comes with a keyed
+        // identity; stay total regardless.
+        let ExternalIdentity::Keyed { key } = &external.identity else {
+            return unstable(ResultGap::ExternalResultNotReplayStable {
+                declared: external.result_replay,
+            });
         };
 
         let roots: Vec<&ValueRef> = key.components.iter().collect();
@@ -1593,7 +1595,7 @@ impl<'a> ReplayAnalysis<'a> {
         let (stable, unstable_roots) = self.roots_stability(context, &roots);
 
         if !unstable_roots.is_empty() {
-            return unstable(ResultGap::ExternalDeduplicationKeyUnstable {
+            return unstable(ResultGap::ExternalIdentityKeyUnstable {
                 roots: unstable_roots,
             });
         }
@@ -1602,7 +1604,7 @@ impl<'a> ReplayAnalysis<'a> {
             effect: effect.clone(),
             rule: ResultStabilityRule::ExternalTerminalResult {
                 variant,
-                key: stable.clone(),
+                identity_key: stable.clone(),
             },
         };
 

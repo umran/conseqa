@@ -12,6 +12,7 @@
 # terminal result is fixed and charge_payment's branch on it is not
 # established to replay; and create_order's idempotency is unknown
 # through the cascade those consumers start.
+dsl: 1
 revision: 1
 services:
   service.checkout:
@@ -451,8 +452,10 @@ operations:
         effect:
           kind: external
           name: payment-provider.charge
-          idempotency:
-            kind: not_deduplicated
+          identity:
+            kind: unspecified
+          idempotency: distinguishable
+          result_replay: unspecified
           result:
             ok: schema.ChargeAccepted
             err: schema.ChargeDeclined

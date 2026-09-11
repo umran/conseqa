@@ -19,7 +19,8 @@ use crate::analyzer::verification::{
     SerializationVerdict, VerificationReport,
 };
 use crate::spec::{
-    DeliverySemantics, ErrorDisposition, Id, IdempotencyGuarantee, Input, Model, Operation,
+    DeliverySemantics, ErrorDisposition, ExternalIdempotency, ExternalResultReplay, Id, Input,
+    Model, Operation,
     RequestIdentity, ResultReplayRequirement, RetrySemantics, ValueRef,
 };
 
@@ -97,7 +98,9 @@ pub enum OutwardEffectContract {
     External {
         effect: Id,
         name: String,
-        deduplicated: bool,
+        identity: ExternalIdentitySummary,
+        idempotency: ExternalIdempotency,
+        result_replay: ExternalResultReplay,
     },
 
     /// A transactional outbox write: admitted atomically with the
@@ -108,6 +111,15 @@ pub enum OutwardEffectContract {
         outbox: Id,
         schema: Id,
     },
+}
+
+/// Whether an external boundary declares an interaction identity —
+/// the summary carries the fact, not the key's value references.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExternalIdentitySummary {
+    Unspecified,
+    Keyed,
 }
 
 /// One declared requirement and its analyzer verdict, as a summary
@@ -205,10 +217,14 @@ fn derive_one(
             crate::spec::Effect::External(external) => OutwardEffectContract::External {
                 effect: effect_id.clone(),
                 name: external.name.clone(),
-                deduplicated: matches!(
-                    external.idempotency,
-                    IdempotencyGuarantee::DeduplicatedBy { .. }
-                ),
+                identity: match &external.identity {
+                    crate::spec::ExternalIdentity::Unspecified => {
+                        ExternalIdentitySummary::Unspecified
+                    }
+                    crate::spec::ExternalIdentity::Keyed { .. } => ExternalIdentitySummary::Keyed,
+                },
+                idempotency: external.idempotency,
+                result_replay: external.result_replay,
             },
 
             // Structurally invalid at a direct site — validation

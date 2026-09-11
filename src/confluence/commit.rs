@@ -852,6 +852,7 @@ fn probe_model(candidate: &WorkspaceState, operation: &Id) -> Option<Model> {
     operations.insert(operation.clone(), assembled);
 
     Some(Model {
+        dsl: crate::spec::DSL_VERSION,
         revision: candidate.revision,
         services: candidate.services.clone(),
         schemas: candidate.schemas.clone(),

@@ -63,9 +63,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::analyzer::{Diagnostic, DiagnosticCode, Evidence, Severity, VerificationCode};
 use crate::spec::{
-    DeliverySemantics, FieldPath, Id, IdempotencyGuarantee, IdempotencyKey, Input,
-    MessageIdentity, MessageIdentityKey,
-    MessageSelector, Model, Operation, ValueSource,
+    DeliverySemantics, ExternalIdempotency, ExternalIdentity, FieldPath, Id, IdempotencyKey,
+    Input, MessageIdentity, MessageIdentityKey, MessageSelector, Model, Operation, ValueSource,
 };
 
 use super::ProofScope;
@@ -270,7 +269,8 @@ impl EffectSafety {
         };
 
         match self {
-            Self::ExternallyDeduplicated { .. }
+            Self::ExternallyIdempotent { .. }
+            | Self::ExternallySideEffectFree
             | Self::DeduplicatedByTarget { .. }
             // Transaction commit deduplication is an L0 fact.
             | Self::TransactionDeduplicated { .. } => ProofScope::L0Only,
@@ -282,9 +282,9 @@ impl EffectSafety {
 
     fn dependencies(&self) -> Vec<(Id, Id)> {
         match self {
-            Self::ExternallyDeduplicated { .. } | Self::TransactionDeduplicated { .. } => {
-                Vec::new()
-            }
+            Self::ExternallyIdempotent { .. }
+            | Self::ExternallySideEffectFree
+            | Self::TransactionDeduplicated { .. } => Vec::new(),
 
             Self::DeduplicatedByTarget {
                 operation, input, ..
@@ -350,9 +350,16 @@ pub struct EffectRetrySafety {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum EffectSafety {
-    /// The external boundary deduplicates executions sharing the
-    /// stable key.
-    ExternallyDeduplicated { key: Vec<StableRoot> },
+    /// The external boundary declares duplicate applications of one
+    /// keyed interaction externally indistinguishable from a single
+    /// application, and the interaction-identity key is stable across
+    /// the class.
+    ExternallyIdempotent { identity_key: Vec<StableRoot> },
+
+    /// The external boundary declares itself side-effect-free: any
+    /// application causes no modeled externally observable state
+    /// change, so duplicates are harmless with no key condition.
+    ExternallySideEffectFree,
 
     /// Every attempt publishes the same logical message — the instance
     /// is class-fixed and the topic's message identity maps the
@@ -439,16 +446,19 @@ pub enum IdempotencyObstacle {
         reconstruction: Vec<ReplayGap>,
     },
 
-    /// The external boundary explicitly does not deduplicate: a
-    /// duplicate execution is distinguishable duplicate work (§13.3).
-    ExternalEffectNotDeduplicated { path: PathRef, effect: Id },
+    /// The external boundary declares `distinguishable`: a duplicate
+    /// application may produce distinguishable modeled external work
+    /// (§13.3).
+    ExternalApplicationsDistinguishable { path: PathRef, effect: Id },
 
-    /// No deduplication fact is available for the external boundary.
-    ExternalEffectDeduplicationUnknown { path: PathRef, effect: Id },
+    /// No duplicate-side-effect fact is declared for the external
+    /// boundary.
+    ExternalIdempotencyUnknown { path: PathRef, effect: Id },
 
-    /// The declared external deduplication key is not replay-stable,
-    /// so attempts may execute under different keys.
-    ExternalDeduplicationKeyUnstable {
+    /// The declared external interaction-identity key is not
+    /// replay-stable, so attempts may address different logical
+    /// interactions.
+    ExternalIdentityKeyUnstable {
         path: PathRef,
         effect: Id,
         roots: Vec<UnstableRoot>,
@@ -1048,9 +1058,9 @@ impl IdempotencyObstacle {
             }
 
             Self::TransactionNotRetrySafe { path, .. }
-            | Self::ExternalEffectNotDeduplicated { path, .. }
-            | Self::ExternalEffectDeduplicationUnknown { path, .. }
-            | Self::ExternalDeduplicationKeyUnstable { path, .. }
+            | Self::ExternalApplicationsDistinguishable { path, .. }
+            | Self::ExternalIdempotencyUnknown { path, .. }
+            | Self::ExternalIdentityKeyUnstable { path, .. }
             | Self::PublicationNotIdentified { path, .. }
             | Self::PublicationConsumerNotKeyed { path, .. }
             | Self::PublicationConsumerRequirementUnproven { path, .. }
@@ -1343,16 +1353,35 @@ fn contract_safety(
                 consumers,
             })
         }
+        // The external effect leg consumes only the declared
+        // duplicate-side-effect behaviour; `result_replay` plays no
+        // role here (§13.3) — result stability is the replay
+        // analysis's separate concern.
         EffectContract::External(external) => match &external.idempotency {
-            IdempotencyGuarantee::DeduplicatedBy { key } => {
+            ExternalIdempotency::SideEffectFree => Some(EffectSafety::ExternallySideEffectFree),
+
+            ExternalIdempotency::IdenticalPerIdentity => {
+                // Validation guarantees a keyed identity accompanies
+                // the declaration; stay total regardless.
+                let ExternalIdentity::Keyed { key } = &external.identity else {
+                    obstacles.push(IdempotencyObstacle::ExternalIdempotencyUnknown {
+                        path: path.clone(),
+                        effect: effect.clone(),
+                    });
+
+                    return None;
+                };
+
                 let roots: Vec<_> = key.components.iter().collect();
 
                 let (stable, unstable) = analysis.roots_stability(context, &roots);
 
                 if unstable.is_empty() {
-                    Some(EffectSafety::ExternallyDeduplicated { key: stable })
+                    Some(EffectSafety::ExternallyIdempotent {
+                        identity_key: stable,
+                    })
                 } else {
-                    obstacles.push(IdempotencyObstacle::ExternalDeduplicationKeyUnstable {
+                    obstacles.push(IdempotencyObstacle::ExternalIdentityKeyUnstable {
                         path: path.clone(),
                         effect: effect.clone(),
                         roots: unstable,
@@ -1362,8 +1391,8 @@ fn contract_safety(
                 }
             }
 
-            IdempotencyGuarantee::NotDeduplicated => {
-                obstacles.push(IdempotencyObstacle::ExternalEffectNotDeduplicated {
+            ExternalIdempotency::Distinguishable => {
+                obstacles.push(IdempotencyObstacle::ExternalApplicationsDistinguishable {
                     path: path.clone(),
                     effect: effect.clone(),
                 });
@@ -1371,8 +1400,8 @@ fn contract_safety(
                 None
             }
 
-            IdempotencyGuarantee::Unspecified => {
-                obstacles.push(IdempotencyObstacle::ExternalEffectDeduplicationUnknown {
+            ExternalIdempotency::Unspecified => {
+                obstacles.push(IdempotencyObstacle::ExternalIdempotencyUnknown {
                     path: path.clone(),
                     effect: effect.clone(),
                 });
@@ -1611,35 +1640,35 @@ impl IdempotencyObstacle {
                 ),
             },
 
-            Self::ExternalEffectNotDeduplicated { path, effect } => Evidence {
+            Self::ExternalApplicationsDistinguishable { path, effect } => Evidence {
                 subject: Some(effect.clone()),
                 message: format!(
-                    "{} executes external effect `{effect}`, which is explicitly \
-                     `not_deduplicated`: a duplicate execution is distinguishable \
-                     duplicate work at that boundary.",
+                    "{} applies external effect `{effect}`, declared \
+                     `distinguishable`: a duplicate application may produce \
+                     distinguishable modeled external work at that boundary.",
                     capitalize(&describe_path(path))
                 ),
             },
 
-            Self::ExternalEffectDeduplicationUnknown { path, effect } => Evidence {
+            Self::ExternalIdempotencyUnknown { path, effect } => Evidence {
                 subject: Some(effect.clone()),
                 message: format!(
-                    "{} executes external effect `{effect}`, and no deduplication \
-                     fact is declared for that boundary.",
+                    "{} applies external effect `{effect}`, and no \
+                     duplicate-side-effect fact is declared for that boundary.",
                     capitalize(&describe_path(path))
                 ),
             },
 
-            Self::ExternalDeduplicationKeyUnstable {
+            Self::ExternalIdentityKeyUnstable {
                 path,
                 effect,
                 roots,
             } => Evidence {
                 subject: Some(effect.clone()),
                 message: format!(
-                    "External effect `{effect}` on {} deduplicates by a key that is \
-                     not replay-stable, so attempts may execute under different \
-                     keys: {}.",
+                    "External effect `{effect}` on {} declares an interaction \
+                     identity that is not replay-stable, so attempts may address \
+                     different logical interactions: {}.",
                     describe_path(path),
                     unstable_roots(roots)
                 ),

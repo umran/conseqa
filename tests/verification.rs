@@ -23,7 +23,8 @@ use conseqa::{
     spec::{
         Arm, AsyncJoin, Branch, CompletionRequirement, Condition, Derivation, Effect,
         ErrorDisposition, ErrorResultType, EstablishTransactionOutput, ExecuteEffect,
-        ExecuteEffectAsync, ExternalEffect, FieldPath, Id,
+        ExecuteEffectAsync, ExternalEffect, ExternalIdempotency, ExternalIdentity,
+        ExternalIdentityKey, ExternalResultReplay, FieldPath, Id,
         IdempotencyGuarantee, IdempotencyKey, IdempotencyRequirement, Input, JoinAll,
         MemberAssignment,
         MemberConcurrency, Literal, MatchResult, MessageIdentity, MessageSelector, Model,
@@ -1521,6 +1522,23 @@ fn verification_report_round_trips_through_json() {
         serde_json::from_str(&json).expect("report should deserialize");
 
     assert_eq!(report, restored);
+}
+
+
+/// Declares the full provider-side boundary contract on an external
+/// effect: keyed interaction identity over the given input components,
+/// duplicates identical per identity, terminal result replay-stable.
+fn declare_external(card: &mut ExternalEffect, input: &str, components: &[&[&str]]) {
+    card.identity = ExternalIdentity::Keyed {
+        key: ExternalIdentityKey {
+            components: components
+                .iter()
+                .map(|component| input_key(input, component))
+                .collect(),
+        },
+    };
+    card.idempotency = ExternalIdempotency::IdenticalPerIdentity;
+    card.result_replay = ExternalResultReplay::ReplayStable;
 }
 
 fn ikey(input: &str, components: &[&[&str]]) -> IdempotencyKey {
@@ -3138,8 +3156,8 @@ fn flash_checkout_idempotency_verdicts() {
     ));
 
     // charge_payment: the capture publication is safe, but the card
-    // charge is explicitly not deduplicated — the model admits charging
-    // the card twice — so no same-key terminal result is fixed either:
+    // charge is declared distinguishable — the model admits charging
+    // the card twice — and no terminal-result replay is declared either:
     // the match on the provider's result is not established to replay,
     // and the decline publication, which reads that result, is not
     // class-fixed. Each fact is reported once, however many paths run
@@ -3154,11 +3172,11 @@ fn flash_checkout_idempotency_verdicts() {
         matches!(
             &obstacles[..],
             [
-                IdempotencyObstacle::ExternalEffectNotDeduplicated { effect, .. },
+                IdempotencyObstacle::ExternalApplicationsDistinguishable { effect, .. },
                 IdempotencyObstacle::PathDecisionUnstable {
                     decision: verification::DecisionTaken::Match { result, arm: ResultVariant::Ok, .. },
                     gap: DecisionGap::ResultUnstable {
-                        gap: ResultGap::ExternalNotDeduplicated,
+                        gap: ResultGap::ExternalResultNotReplayStable { .. },
                         ..
                     },
                     ..
@@ -3205,13 +3223,12 @@ fn flash_checkout_idempotency_verdicts() {
 fn declared_external_deduplication_completes_the_charge_proof() {
     let mut model = load_flash_checkout();
 
-    // Declare the payment provider's own idempotency: the card charge
-    // deduplicates by the propagated event id.
+    // Declare the payment provider's own boundary contract: one
+    // logical charge per propagated event id, duplicates identical,
+    // terminal result replay-stable.
     let card = charge_card_mut(&mut model);
 
-    card.idempotency = IdempotencyGuarantee::DeduplicatedBy {
-        key: ikey("input.charge_payment.reserved", &[&["event_id"]]),
-    };
+    declare_external(card, "input.charge_payment.reserved", &[&["event_id"]]);
 
     assert!(validation::validate(&model).is_empty());
 
@@ -3266,9 +3283,9 @@ fn declared_external_deduplication_completes_the_charge_proof() {
     assert!(matches!(
         &paths[0].effects[0],
         EffectRetrySafety {
-            safety: EffectSafety::ExternallyDeduplicated { key },
+            safety: EffectSafety::ExternallyIdempotent { identity_key },
             ..
-        } if matches!(key[0].rule, StabilityRule::KeyComponent)
+        } if matches!(identity_key[0].rule, StabilityRule::KeyComponent)
     ));
 }
 
@@ -3278,14 +3295,16 @@ fn unstable_external_deduplication_key_is_an_obstacle() {
 
     let card = charge_card_mut(&mut model);
 
-    card.idempotency = IdempotencyGuarantee::DeduplicatedBy {
-        key: IdempotencyKey {
+    card.identity = ExternalIdentity::Keyed {
+        key: ExternalIdentityKey {
             components: vec![ValueRef {
                 source: ValueSource::StateMachineSubject(id("machine.order_lifecycle")),
                 path: path(&["order_id"]),
             }],
         },
     };
+    card.idempotency = ExternalIdempotency::IdenticalPerIdentity;
+    card.result_replay = ExternalResultReplay::ReplayStable;
 
     assert!(validation::validate(&model).is_empty());
 
@@ -3297,7 +3316,7 @@ fn unstable_external_deduplication_key_is_an_obstacle() {
 
     assert!(matches!(
         &obstacles[0],
-        IdempotencyObstacle::ExternalDeduplicationKeyUnstable { roots, .. }
+        IdempotencyObstacle::ExternalIdentityKeyUnstable { roots, .. }
             if matches!(roots[0].gap, StabilityGap::MutableSubjectState { .. })
     ));
 }
@@ -3308,9 +3327,7 @@ fn a_terminal_error_disposition_completes_the_branching_charge_proof() {
 
     let card = charge_card_mut(&mut model);
 
-    card.idempotency = IdempotencyGuarantee::DeduplicatedBy {
-        key: ikey("input.charge_payment.reserved", &[&["event_id"]]),
-    };
+    declare_external(card, "input.charge_payment.reserved", &[&["event_id"]]);
 
     card.result.as_mut().unwrap().err.disposition = ErrorDisposition::Terminal;
 
@@ -3342,13 +3359,13 @@ fn a_terminal_error_disposition_completes_the_branching_charge_proof() {
                     rule: DecisionRule::StableResult {
                         rule: verification::ResultStabilityRule::ExternalTerminalResult {
                             variant: cited,
-                            key,
+                            identity_key,
                         },
                         ..
                     },
                 }] if *arm == variant
                     && *cited == variant
-                    && matches!(key[0].rule, StabilityRule::KeyComponent)
+                    && matches!(identity_key[0].rule, StabilityRule::KeyComponent)
             ),
             "{path:#?}"
         );
@@ -3370,9 +3387,13 @@ fn charge_transfer_externally(model: &mut Model, disposition: ErrorDisposition) 
             "effect.transfer_stock.charge",
             conseqa::spec::Effect::External(ExternalEffect {
                 name: "payments.charge".into(),
-                idempotency: IdempotencyGuarantee::DeduplicatedBy {
-                    key: ikey("input.transfer_stock.request", &[&["sku"]]),
+                identity: ExternalIdentity::Keyed {
+                    key: ExternalIdentityKey {
+                        components: vec![input_key("input.transfer_stock.request", &["sku"])],
+                    },
                 },
+                idempotency: ExternalIdempotency::IdenticalPerIdentity,
+                result_replay: ExternalResultReplay::ReplayStable,
                 result: Some(ResultType {
                     ok: id("schema.ChargeAccepted"),
                     err: ErrorResultType {
@@ -3459,7 +3480,7 @@ fn an_idempotent_external_terminal_result_proves_result_replay() {
         assert!(matches!(
             &returned.derivation[..],
             [StableRoot {
-                rule: StabilityRule::DeduplicatedExternalResult { result, effect, variant: cited },
+                rule: StabilityRule::ReplayStableExternalResult { result, effect, variant: cited },
                 ..
             }] if result == &id("result.transfer_stock.charge")
                 && effect == &id("effect.transfer_stock.charge")
@@ -3561,14 +3582,15 @@ fn an_undeduplicated_external_result_gains_no_stability() {
         panic!("the charge should be an external effect");
     };
 
-    charge.idempotency = IdempotencyGuarantee::Unspecified;
+    charge.result_replay = ExternalResultReplay::Unspecified;
 
     assert!(validation::validate(&model).is_empty());
 
-    // Without `deduplicated_by`, nothing identifies same-key
-    // executions as one logical interaction, so no terminal result is
-    // fixed — a declared terminal disposition alone proves nothing,
-    // and even the ok arm does not replay.
+    // Without `result_replay: replay_stable`, nothing fixes the
+    // interaction's terminal result — a declared terminal disposition
+    // alone proves nothing, and even the ok arm does not replay. The
+    // boundary's duplicate-side-effect declaration is untouched and
+    // irrelevant here: the axes are independent.
     let verdict = result_replay_verdict(&model, "operation.transfer_stock", 0);
 
     let ResultReplayVerdict::Unproven { obstacles } = &verdict else {
@@ -3584,7 +3606,7 @@ fn an_undeduplicated_external_result_gains_no_stability() {
                     ..
                 },
                 gap: DecisionGap::ResultUnstable {
-                    gap: ResultGap::ExternalDeduplicationUnknown,
+                    gap: ResultGap::ExternalResultNotReplayStable { .. },
                     ..
                 },
                 ..
@@ -3863,9 +3885,7 @@ fn publication_cascade_needs_collapsing_consumers_through_the_fixpoint() {
     // second round discharges the publication.
     let card = charge_card_mut(&mut model);
 
-    card.idempotency = IdempotencyGuarantee::DeduplicatedBy {
-        key: ikey("input.charge_payment.reserved", &[&["event_id"]]),
-    };
+    declare_external(card, "input.charge_payment.reserved", &[&["event_id"]]);
 
     linearize_charge_payment(&mut model);
 
@@ -3885,7 +3905,7 @@ fn publication_cascade_needs_collapsing_consumers_through_the_fixpoint() {
         &paths[0].effects[..],
         [
             EffectRetrySafety {
-                safety: EffectSafety::ExternallyDeduplicated { .. },
+                safety: EffectSafety::ExternallyIdempotent { .. },
                 ..
             },
             EffectRetrySafety {
@@ -4978,11 +4998,7 @@ fn hedge_charge_payment(model: &mut Model, synchronize: OperationStep) {
     {
         let card = charge_card_mut(model);
 
-        card.idempotency = IdempotencyGuarantee::DeduplicatedBy {
-            key: IdempotencyKey {
-                components: vec![input_key("input.charge_payment.reserved", &["event_id"])],
-            },
-        };
+        declare_external(card, "input.charge_payment.reserved", &[&["event_id"]]);
 
         card.result
             .as_mut()
@@ -5044,11 +5060,11 @@ fn async_launch_and_join_judge_like_the_synchronous_execution() {
         matches!(
             &obstacles[..],
             [
-                IdempotencyObstacle::ExternalEffectNotDeduplicated { effect, .. },
+                IdempotencyObstacle::ExternalApplicationsDistinguishable { effect, .. },
                 IdempotencyObstacle::PathDecisionUnstable {
                     decision: verification::DecisionTaken::Match { result, arm: ResultVariant::Ok, .. },
                     gap: DecisionGap::ResultUnstable {
-                        gap: ResultGap::ExternalNotDeduplicated,
+                        gap: ResultGap::ExternalResultNotReplayStable { .. },
                         ..
                     },
                     ..
@@ -5654,4 +5670,120 @@ fn outbox_verification_report_round_trips_through_json() {
         serde_json::from_str(&serialized).expect("report should reparse");
 
     assert_eq!(report, reparsed);
+}
+
+#[test]
+fn side_effect_free_discharges_the_external_effect_leg() {
+    let mut model = load_flash_checkout();
+
+    // A boundary declared side-effect-free is duplicate-safe with no
+    // key condition, and declares nothing about its result — the
+    // axes are independent, so the non-replaying match remains the
+    // only obstacle on the branching program.
+    {
+        let card = charge_card_mut(&mut model);
+        card.idempotency = ExternalIdempotency::SideEffectFree;
+        card.result_replay = ExternalResultReplay::Unstable;
+    }
+
+    assert!(validation::validate(&model).is_empty());
+
+    let verdict = idempotency_verdict(&model, "operation.charge_payment", 0);
+
+    let IdempotencyVerdict::Unproven { obstacles } = &verdict else {
+        panic!("expected charge_payment unproven, found {verdict:?}");
+    };
+
+    assert!(
+        !obstacles.iter().any(|obstacle| matches!(
+            obstacle,
+            IdempotencyObstacle::ExternalApplicationsDistinguishable { .. }
+                | IdempotencyObstacle::ExternalIdempotencyUnknown { .. }
+                | IdempotencyObstacle::ExternalIdentityKeyUnstable { .. }
+        )),
+        "the effect leg is discharged by the declaration:\n{obstacles:#?}"
+    );
+
+    assert!(
+        obstacles.iter().any(|obstacle| matches!(
+            obstacle,
+            IdempotencyObstacle::PathDecisionUnstable {
+                gap: DecisionGap::ResultUnstable {
+                    gap: ResultGap::ExternalResultNotReplayStable { .. },
+                    ..
+                },
+                ..
+            }
+        )),
+        "the explicitly unstable result still blocks the decision:\n{obstacles:#?}"
+    );
+
+    // Without the branch, nothing is left to prove about the result,
+    // and the proof records the side-effect-freedom.
+    linearize_charge_payment(&mut model);
+
+    assert!(validation::validate(&model).is_empty());
+
+    let verdict = idempotency_verdict(&model, "operation.charge_payment", 0);
+
+    let IdempotencyVerdict::Proven {
+        proof: IdempotencyProof::RetrySafePaths { paths },
+        ..
+    } = &verdict
+    else {
+        panic!("expected charge_payment proven, found {verdict:?}");
+    };
+
+    assert!(matches!(
+        &paths[0].effects[0],
+        EffectRetrySafety {
+            safety: EffectSafety::ExternallySideEffectFree,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn result_replay_alone_does_not_discharge_duplicate_work() {
+    let mut model = load_flash_checkout();
+
+    // The mirror-image isolation: a replay-stable terminal result
+    // makes every decision replay, but says nothing about duplicate
+    // side effects — the unknown idempotency stays the obstacle.
+    {
+        let card = charge_card_mut(&mut model);
+        card.identity = ExternalIdentity::Keyed {
+            key: ExternalIdentityKey {
+                components: vec![input_key("input.charge_payment.reserved", &["event_id"])],
+            },
+        };
+        card.idempotency = ExternalIdempotency::Unspecified;
+        card.result_replay = ExternalResultReplay::ReplayStable;
+        card.result.as_mut().unwrap().err.disposition = ErrorDisposition::Terminal;
+    }
+
+    assert!(validation::validate(&model).is_empty());
+
+    let verdict = idempotency_verdict(&model, "operation.charge_payment", 0);
+
+    let IdempotencyVerdict::Unproven { obstacles } = &verdict else {
+        panic!("expected charge_payment unproven, found {verdict:?}");
+    };
+
+    assert!(
+        obstacles.iter().any(|obstacle| matches!(
+            obstacle,
+            IdempotencyObstacle::ExternalIdempotencyUnknown { effect, .. }
+                if effect == &id("effect.charge_payment.card")
+        )),
+        "{obstacles:#?}"
+    );
+
+    assert!(
+        !obstacles.iter().any(|obstacle| matches!(
+            obstacle,
+            IdempotencyObstacle::PathDecisionUnstable { .. }
+        )),
+        "every decision replays under the fixed terminal result:\n{obstacles:#?}"
+    );
 }

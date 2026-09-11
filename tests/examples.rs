@@ -321,10 +321,10 @@ fn payment_capture_example_proves_everything() {
         paths.iter().flat_map(|path| path.effects.iter()).any(|effect| {
             matches!(
                 &effect.safety,
-                verification::EffectSafety::ExternallyDeduplicated { .. }
+                verification::EffectSafety::ExternallyIdempotent { .. }
             )
         }),
-        "the email send should be externally deduplicated:\n{paths:#?}"
+        "the email send should be externally idempotent:\n{paths:#?}"
     );
 
     // Per-account relay order rests on the outbox runtime's keyed

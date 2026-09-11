@@ -256,7 +256,9 @@ pub enum EdgeDetail {
     External {
         operation: Id,
         effect: Id,
+        identity: String,
         idempotency: String,
+        result_replay: String,
         executed_at: Vec<String>,
 
         /// The subset of `executed_at` that launches the effect
@@ -584,7 +586,9 @@ pub fn extract(model: &Model) -> Graph {
                         detail: EdgeDetail::External {
                             operation: op_id.clone(),
                             effect: effect_id,
-                            idempotency: idempotency_label(&external.idempotency),
+                            identity: external_identity_label(&external.identity),
+                            idempotency: external_idempotency_label(external.idempotency),
+                            result_replay: external_result_replay_label(external.result_replay),
                             executed_at,
                             async_executed_at,
                         },
@@ -1029,11 +1033,29 @@ fn runtime_view(model: &Model) -> RuntimeView {
     }
 }
 
-fn idempotency_label(value: &crate::spec::IdempotencyGuarantee) -> String {
+fn external_identity_label(value: &crate::spec::ExternalIdentity) -> String {
     match value {
-        crate::spec::IdempotencyGuarantee::Unspecified => "unspecified".to_string(),
-        crate::spec::IdempotencyGuarantee::NotDeduplicated => "not_deduplicated".to_string(),
-        crate::spec::IdempotencyGuarantee::DeduplicatedBy { .. } => "deduplicated_by".to_string(),
+        crate::spec::ExternalIdentity::Unspecified => "unspecified".to_string(),
+        crate::spec::ExternalIdentity::Keyed { .. } => "keyed".to_string(),
+    }
+}
+
+fn external_idempotency_label(value: crate::spec::ExternalIdempotency) -> String {
+    match value {
+        crate::spec::ExternalIdempotency::Unspecified => "unspecified".to_string(),
+        crate::spec::ExternalIdempotency::Distinguishable => "distinguishable".to_string(),
+        crate::spec::ExternalIdempotency::IdenticalPerIdentity => {
+            "identical_per_identity".to_string()
+        }
+        crate::spec::ExternalIdempotency::SideEffectFree => "side_effect_free".to_string(),
+    }
+}
+
+fn external_result_replay_label(value: crate::spec::ExternalResultReplay) -> String {
+    match value {
+        crate::spec::ExternalResultReplay::Unspecified => "unspecified".to_string(),
+        crate::spec::ExternalResultReplay::Unstable => "unstable".to_string(),
+        crate::spec::ExternalResultReplay::ReplayStable => "replay_stable".to_string(),
     }
 }
 

@@ -44,7 +44,13 @@ const EVENT_SEQ_KEY: &str = "task_event_seq";
 /// carry `deny_unknown_fields`, so a database written by format 1
 /// cannot be deserialized at all. Refusing it by version gives that a
 /// name, rather than surfacing a schema change as a corrupt value.
-const FORMAT: u64 = 2;
+///
+/// Bumped to 3 when the external boundary's single idempotency
+/// guarantee split into identity / idempotency / result-replay and
+/// the DSL contract version (`dsl: 1`) arrived: stored workspaces
+/// embed the spec types, so a DSL bump forces a format bump — never
+/// conversely.
+const FORMAT: u64 = 3;
 
 #[derive(Debug, thiserror::Error)]
 pub enum PersistenceError {
@@ -442,4 +448,52 @@ fn append_task_event(
     events.insert(sequence, bytes.as_slice())?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A database written by an earlier stored-workspace format is
+    /// refused by version with the named error — never surfaced as a
+    /// corrupt value.
+    #[test]
+    fn an_earlier_format_database_is_refused_by_version() {
+        let path = std::env::temp_dir().join(format!(
+            "conseqa-format-test-{}.redb",
+            uuid::Uuid::new_v4()
+        ));
+
+        // A fresh database stamps the current format.
+        drop(Persistence::open_file(&path).expect("a fresh database opens"));
+
+        // Rewind the stamp to the previous format, as an old binary
+        // would have left it.
+        {
+            let db = Database::open(&path).expect("the database reopens raw");
+            let txn = db.begin_write().expect("write txn");
+            {
+                let mut meta = txn.open_table(META).expect("meta table");
+                meta.insert(FORMAT_KEY, FORMAT - 1).expect("stamp old format");
+            }
+            txn.commit().expect("commit");
+        }
+
+        let error = match Persistence::open_file(&path) {
+            Err(error) => error,
+            Ok(_) => panic!("the old format should be refused"),
+        };
+
+        assert!(
+            matches!(error, PersistenceError::FormatMismatch { found } if found == FORMAT - 1),
+            "{error:?}"
+        );
+
+        assert!(
+            error.to_string().contains("start a new run against a fresh database"),
+            "{error}"
+        );
+
+        std::fs::remove_file(&path).ok();
+    }
 }

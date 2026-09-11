@@ -205,22 +205,22 @@ pub(crate) fn result_gap_sentence(gap: &ResultGap) -> String {
              `{input}` is not proven in this analysis"
         ),
 
-        ResultGap::ExternalNotDeduplicated => {
-            "the external boundary is explicitly `not_deduplicated`, so no \
-             same-key terminal result is fixed"
-                .to_string()
-        }
+        ResultGap::ExternalResultNotReplayStable { declared } => match declared {
+            crate::spec::ExternalResultReplay::Unstable => {
+                "the external boundary declares `result_replay: unstable`: \
+                 per-attempt results may differ, and no same-identity terminal \
+                 result is fixed"
+                    .to_string()
+            }
 
-        ResultGap::ExternalDeduplicationUnknown => {
-            "no deduplication fact is declared for the external boundary, so \
-             nothing identifies same-key executions as one logical interaction \
-             with one terminal result"
-                .to_string()
-        }
+            _ => "the external boundary declares no terminal-result replay \
+                  guarantee, so no same-identity terminal result is fixed"
+                .to_string(),
+        },
 
-        ResultGap::ExternalDeduplicationKeyUnstable { roots } => format!(
-            "the external deduplication key is not replay-stable, so attempts \
-             may address different logical external interactions: {}",
+        ResultGap::ExternalIdentityKeyUnstable { roots } => format!(
+            "the external interaction-identity key is not replay-stable, so \
+             attempts may address different logical external interactions: {}",
             unstable_roots(roots)
         ),
 

@@ -10,6 +10,34 @@ use super::{
     TopicRuntime,
 };
 
+/// The DSL contract version this build speaks.
+///
+/// A single integer naming the normative semantic contract — the
+/// semantics document as a whole — not the parse schema: any
+/// normative change bumps it, vocabulary, validation, and proof
+/// semantics alike, while purely internal changes do not. Version 1
+/// was declared by the external-boundary-guarantees revision;
+/// everything before it is unversioned prehistory and is refused by
+/// name rather than surfaced as a parse accident.
+///
+/// Independent of the stored-workspace `FORMAT` (a storage-encoding
+/// counter): a DSL bump forces a `FORMAT` bump, never conversely, and
+/// the numbers are not aligned.
+pub const DSL_VERSION: DslVersion = DslVersion(1);
+
+/// A declared DSL contract version.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
+#[serde(transparent)]
+pub struct DslVersion(pub u64);
+
+impl std::fmt::Display for DslVersion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
 /// One Conseqa model, in two semantic layers.
 ///
 /// The L0 collections sit directly on the root, so a model that
@@ -20,6 +48,11 @@ use super::{
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Model {
+    /// The DSL contract version this model is expressed in. Stamped
+    /// at assembly and on export; a document consumer probes it
+    /// before strict parsing and refuses a mismatch by name.
+    pub dsl: DslVersion,
+
     pub revision: Revision,
 
     // ---- L0: the abstract application machine ----

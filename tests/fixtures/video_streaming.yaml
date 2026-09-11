@@ -27,6 +27,7 @@
 # the retried match would not be established to replay, and the
 # transcoder's idempotency, with the upload's cascade, would be
 # unknown.
+dsl: 1
 revision: 1
 services:
   service.ingest:
@@ -371,12 +372,14 @@ operations:
         effect:
           kind: external
           name: transcoding-engine.render
-          idempotency:
-            kind: deduplicated_by
+          identity:
+            kind: keyed
             key:
               components:
               - source: input:input.transcode_video.uploaded
                 path: video_id
+          idempotency: identical_per_identity
+          result_replay: replay_stable
           result:
             ok: schema.RenderCompleted
             err:
@@ -599,12 +602,14 @@ operations:
         effect:
           kind: external
           name: push-gateway.notify
-          idempotency:
-            kind: deduplicated_by
+          identity:
+            kind: keyed
             key:
               components:
               - source: input:input.notify_published.published
                 path: event_id
+          idempotency: identical_per_identity
+          result_replay: unspecified
           result: null
         values:
           kind: deterministic

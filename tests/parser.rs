@@ -7,7 +7,8 @@ use conseqa::{
     parser::yaml,
     spec::{
         CompletionRequirement, Condition, DeliverySemantics, Derivation, Effect, ErrorDisposition,
-        ErrorResultType, Field, FieldPath, Id, IdempotencyGuarantee, Input, Literal,
+        ErrorResultType, ExternalIdempotency, ExternalIdentity, ExternalResultReplay, Field,
+        FieldPath, Id, IdempotencyGuarantee, Input, Literal,
         MemberAssignment, MemberConcurrency, MessageIdentity, Model, OperationStep,
         RequestIdentity, ResultOutcome, ResultVariant, ScalarType, Schema, SchemaCompleteness,
         SelectorValue, ServiceKind, SubscriptionRoutingKey, OrderingSemantics, Transaction,
@@ -427,7 +428,7 @@ fn flash_checkout_parses_nested_semantics() {
 
     assert_eq!(concurrency.get(), 1);
 
-    // Inline effect + nested IdempotencyGuarantee.
+    // Inline effect + the external boundary's three declarations.
     let Effect::External(card) = effect(
         &model,
         "operation.charge_payment",
@@ -436,7 +437,9 @@ fn flash_checkout_parses_nested_semantics() {
         panic!("card charge should be an external effect");
     };
 
-    assert_eq!(card.idempotency, IdempotencyGuarantee::NotDeduplicated);
+    assert_eq!(card.identity, ExternalIdentity::Unspecified);
+    assert_eq!(card.idempotency, ExternalIdempotency::Distinguishable);
+    assert_eq!(card.result_replay, ExternalResultReplay::Unspecified);
 
     // TransactionStep + SelectorPredicate + SelectorValue +
     // FieldSelection + LockOrder, inside an inline transaction.
@@ -1015,7 +1018,8 @@ transaction: tx.x",
 /// level.
 fn operation_source(extra: &str) -> String {
     let mut source = String::from(
-        "revision: 1
+        "dsl: 1
+revision: 1
 services:
   service.a:
     kind: backend
@@ -1173,7 +1177,8 @@ fn flash_checkout_parses_transition_effect_intents() {
 /// surface syntax can be exercised without a fixture.
 fn field_source(fields: &str) -> String {
     let mut source = String::from(
-        "revision: 1
+        "dsl: 1
+revision: 1
 services: {}
 schemas:
   Subject:
@@ -1747,6 +1752,7 @@ fn shorthand_selector_values_serialize_into_the_canonical_form() {
 #[test]
 fn an_l0_only_model_parses_with_no_runtime_block() {
     let source = "
+dsl: 1
 revision: 1
 
 topics:
@@ -1778,6 +1784,7 @@ topics:
 #[test]
 fn the_canonical_runtime_block_parses_and_round_trips() {
     let source = "
+dsl: 1
 revision: 1
 
 runtime:
@@ -1882,6 +1889,7 @@ runtime:
 #[test]
 fn subscription_scoped_transport_semantics_parse() {
     let source = "
+dsl: 1
 revision: 1
 
 schemas:
@@ -1974,6 +1982,7 @@ fn member_assignments_round_trip() {
     ] {
         let source = format!(
             "
+dsl: 1
 revision: 1
 
 runtime:
@@ -2010,6 +2019,7 @@ runtime:
 #[test]
 fn parses_asynchronous_effect_steps() {
     let source = r#"
+dsl: 1
 revision: 1
 services:
   service.read:
@@ -2057,8 +2067,10 @@ operations:
         effect:
           kind: external
           name: store-a
-          idempotency:
+          identity:
             kind: unspecified
+          idempotency: unspecified
+          result_replay: unspecified
           result:
             ok: schema.Row
             err: schema.Miss
@@ -2070,8 +2082,10 @@ operations:
         effect:
           kind: external
           name: store-b
-          idempotency:
+          identity:
             kind: unspecified
+          idempotency: unspecified
+          result_replay: unspecified
           result:
             ok: schema.Row
             err: schema.Miss
@@ -2290,4 +2304,77 @@ fn absent_acknowledgement_and_outboxes_stay_absent() {
 
     assert!(!serialized.contains("acknowledge_on_success"));
     assert!(!serialized.contains("outboxes"));
+}
+
+#[test]
+fn a_declared_dsl_version_mismatch_is_refused_by_name() {
+    let error = yaml::parse("dsl: 2\nrevision: 1\n")
+        .expect_err("a future contract version should be refused");
+
+    assert!(
+        matches!(
+            &error,
+            yaml::ParseError::DslVersionMismatch { found } if found.0 == 2
+        ),
+        "{error:?}"
+    );
+
+    let message = error.to_string();
+
+    assert!(message.contains("declares dsl 2"), "{message}");
+    assert!(message.contains("this build reads dsl 1"), "{message}");
+}
+
+#[test]
+fn a_missing_dsl_version_is_refused_as_predating_versioning() {
+    let error = yaml::parse("revision: 1\n")
+        .expect_err("an unversioned specification should be refused");
+
+    assert!(
+        matches!(&error, yaml::ParseError::DslVersionMissing),
+        "{error:?}"
+    );
+
+    assert!(
+        error.to_string().contains("predates versioning"),
+        "{error}"
+    );
+}
+
+#[test]
+fn the_superseded_external_surface_fails_schema_validation() {
+    // The clean break: the retired mechanism vocabulary is not
+    // detected, canonicalized, or aliased — it fails ordinary shape
+    // validation like any other unknown form.
+    let source = "dsl: 1
+revision: 1
+operations:
+  operation.x:
+    service: service.x
+    inputs: {}
+    program:
+      steps:
+      - kind: execute_effect
+        effect_id: effect.x
+        effect:
+          kind: external
+          name: provider
+          idempotency:
+            kind: deduplicated_by
+            key:
+              components: []
+          result: null
+        values:
+          kind: unspecified
+      - kind: complete
+    requirements:
+      serialization: []
+      ordering: []
+      idempotency: []
+      recoverability: []
+";
+
+    let error = yaml::parse(source).expect_err("the legacy surface should not parse");
+
+    assert!(matches!(&error, yaml::ParseError::Yaml(_)), "{error:?}");
 }

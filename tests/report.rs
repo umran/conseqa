@@ -34,7 +34,8 @@ fn scaffold_enumerates_requirement_obligations() {
     let report = report::scaffold(&model);
 
     assert_eq!(report.format, report::FORMAT);
-    assert_eq!(report.format, 4);
+    assert_eq!(report.format, 5);
+    assert_eq!(report.dsl, Some(conseqa::spec::DSL_VERSION));
     assert_eq!(report.model_revision, Some(1));
 
     // 3 serialization + 3 ordering + 4 idempotency + 1 result replay
@@ -127,7 +128,7 @@ fn obligations_carry_real_verdicts() {
         charge
             .evidence
             .iter()
-            .any(|evidence| evidence.message.contains("not_deduplicated"))
+            .any(|evidence| evidence.message.contains("distinguishable"))
     );
 
     assert!(

@@ -1358,6 +1358,7 @@ mod tests {
             },
             obligations: ProverReport {
                 format: 2,
+                dsl: Some(crate::spec::DSL_VERSION),
                 model_revision: Some(7),
                 obligations,
                 notes: Vec::new(),

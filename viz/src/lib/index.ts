@@ -263,7 +263,7 @@ export function effectSummary(model: Model, index: ModelIndex, effectId: Id): st
     case "request":
       return `request ${shortId(e.target.operation)} (${shortId(e.target.input)}) · retry ${e.retry}`;
     case "external":
-      return `external ${e.name} · ${e.idempotency.kind}`;
+      return `external ${e.name} · ${e.idempotency}`;
     case "outbox_write":
       return `write ${shortId(e.schema)} → outbox ${shortId(e.outbox)}`;
   }

@@ -135,6 +135,10 @@ pub enum ValidationCode {
     RaceResultContractMismatch,
     EffectKindNotAsyncCapable,
 
+    ExternalIdempotencyRequiresIdentity,
+    ExternalReplayStabilityRequiresIdentity,
+    ExternalResultReplayWithoutResult,
+
     // L1 — runtime topology.
     EmptyRoutingKey,
     RoutingWithoutGrouping,

@@ -300,6 +300,23 @@ pub enum ValidationError {
         result: Id,
     },
 
+    /// An external effect declares `identical_per_identity` without a
+    /// keyed interaction identity: the guarantee is quantified over
+    /// applications of one interaction, and no identity defines which
+    /// applications those are.
+    ExternalIdempotencyRequiresIdentity { effect: Id },
+
+    /// An external effect declares `result_replay: replay_stable`
+    /// without a keyed interaction identity: the fixed terminal result
+    /// is a fact about one interaction, and no identity defines it.
+    ExternalReplayStabilityRequiresIdentity { effect: Id },
+
+    /// An external effect declares a `result_replay` behaviour —
+    /// `unstable` or `replay_stable` — while declaring no result
+    /// contract: there is no modeled synchronous result whose replay
+    /// behaviour could be described.
+    ExternalResultReplayWithoutResult { effect: Id },
+
     /// A `join_all` declares no handles; the barrier would wait on
     /// nothing.
     EmptyJoinAll {
@@ -1483,6 +1500,68 @@ impl From<ValidationError> for Diagnostic {
                     message: "A publication produces no synchronous result, and an external \
                               effect produces one only when it declares a `result` contract; \
                               a request inherits its target input's contract."
+                        .to_string(),
+                }],
+            },
+
+            ValidationError::ExternalIdempotencyRequiresIdentity { effect } => Diagnostic {
+                code: DiagnosticCode::Validation(
+                    ValidationCode::ExternalIdempotencyRequiresIdentity,
+                ),
+                severity: Severity::Error,
+                subject: Some(effect.clone()),
+                message: format!(
+                    "External effect `{effect}` declares `idempotency: \
+                     identical_per_identity` with `identity: unspecified`."
+                ),
+                evidence: vec![Evidence {
+                    subject: Some(effect),
+                    message: "`identical_per_identity` is quantified over applications of \
+                              one logical external interaction; a keyed `identity` is what \
+                              defines which applications those are. Declare `identity: \
+                              keyed` with the interaction key, or use `side_effect_free` \
+                              for a keyless universal guarantee."
+                        .to_string(),
+                }],
+            },
+
+            ValidationError::ExternalReplayStabilityRequiresIdentity { effect } => Diagnostic {
+                code: DiagnosticCode::Validation(
+                    ValidationCode::ExternalReplayStabilityRequiresIdentity,
+                ),
+                severity: Severity::Error,
+                subject: Some(effect.clone()),
+                message: format!(
+                    "External effect `{effect}` declares `result_replay: replay_stable` \
+                     with `identity: unspecified`."
+                ),
+                evidence: vec![Evidence {
+                    subject: Some(effect),
+                    message: "A replay-fixed terminal result is a fact about one logical \
+                              external interaction; a keyed `identity` is what defines \
+                              which applications share it. Declare `identity: keyed` with \
+                              the interaction key, or leave `result_replay` at \
+                              `unspecified` or `unstable`."
+                        .to_string(),
+                }],
+            },
+
+            ValidationError::ExternalResultReplayWithoutResult { effect } => Diagnostic {
+                code: DiagnosticCode::Validation(
+                    ValidationCode::ExternalResultReplayWithoutResult,
+                ),
+                severity: Severity::Error,
+                subject: Some(effect.clone()),
+                message: format!(
+                    "External effect `{effect}` declares a `result_replay` behaviour but \
+                     no `result` contract."
+                ),
+                evidence: vec![Evidence {
+                    subject: Some(effect),
+                    message: "`unstable` and `replay_stable` describe the replay behaviour \
+                              of the boundary's synchronous result; an effect declaring \
+                              `result: null` has none to describe. Declare the result \
+                              contract, or leave `result_replay: unspecified`."
                         .to_string(),
                 }],
             },

@@ -38,6 +38,10 @@ struct McpClient {
     token: String,
     session: Option<String>,
     next_id: u64,
+
+    /// The initialize result, kept so tests can read the server's
+    /// declared instructions.
+    init: serde_json::Value,
 }
 
 impl McpClient {
@@ -48,6 +52,7 @@ impl McpClient {
             token: token.to_string(),
             session: None,
             next_id: 1,
+            init: serde_json::Value::Null,
         };
 
         let response = client
@@ -67,6 +72,8 @@ impl McpClient {
             response.get("result").is_some(),
             "initialize succeeds: {response}"
         );
+
+        client.init = response["result"].clone();
 
         client
             .notify(serde_json::json!({
@@ -1155,5 +1162,129 @@ async fn spec_status_reports_a_running_design_and_passes_the_objective() {
         "a moving head reports the run, not a verdict: {status}"
     );
 
+    server.shutdown().await;
+}
+
+/// Part V of the external-boundary revision: the server states the DSL
+/// contract it speaks at the handshake and on every served surface —
+/// and never refuses a connection over it; refusal lives at the patch
+/// boundary, where a stale authored claim actually meets the server.
+#[tokio::test]
+async fn the_server_and_its_artifacts_declare_the_dsl_contract_version() {
+    let engine = ConfluenceEngine::in_memory(fixture_workspace()).expect("engine starts");
+
+    let server = mcp::serve(engine.clone(), "127.0.0.1:0".parse().expect("bind addr"))
+        .await
+        .expect("the mcp server binds");
+
+    let url = format!("http://{}/mcp", server.local_addr);
+    let handle = task(&engine, "operation.create_order");
+    let mut client = McpClient::connect(&url, &handle.token.0).await;
+
+    // The handshake: instructions lead with the contract version; the
+    // Implementation stays the build version — the axes are distinct.
+    let instructions = client.init["instructions"]
+        .as_str()
+        .expect("the server declares instructions");
+
+    assert!(
+        instructions.contains("DSL contract version 1"),
+        "{instructions}"
+    );
+
+    assert_eq!(
+        client.init["serverInfo"]["version"],
+        env!("CARGO_PKG_VERSION"),
+        "{}",
+        client.init
+    );
+
+    // Machine-readable before any project state: guide and reference.
+    let (toc, is_error) = client.call("dsl_guide", serde_json::json!({})).await;
+
+    assert!(!is_error);
+    assert!(
+        toc.as_str()
+            .is_some_and(|text| text.contains("DSL contract version 1")),
+        "{toc}"
+    );
+
+    let (reference, is_error) = client.call("dsl_reference", serde_json::json!({})).await;
+
+    assert!(!is_error);
+    assert!(
+        reference
+            .as_str()
+            .is_some_and(|text| text.starts_with("DSL contract version 1.")),
+        "{reference}"
+    );
+
+    // Machine-readable with a project open: status and report.
+    let (status, is_error) = client.call("spec_status", serde_json::json!({})).await;
+
+    assert!(!is_error, "{status}");
+    assert_eq!(status["dsl"], 1, "{status}");
+
+    let (report, is_error) = client
+        .call("requirement_report", serde_json::json!({}))
+        .await;
+
+    assert!(!is_error, "{report}");
+    assert_eq!(report["dsl"], 1, "{report}");
+
+    // The export leads with the stamp, and the stamped document
+    // round-trips through the standalone two-phase parser.
+    let dir = std::env::temp_dir().join(format!("conseqa-dsl-export-{}", uuid::Uuid::new_v4()));
+
+    let (exported, is_error) = client
+        .call(
+            "export_spec",
+            serde_json::json!({"dir": dir.display().to_string()}),
+        )
+        .await;
+
+    assert!(!is_error, "{exported}");
+
+    let yaml = std::fs::read_to_string(dir.join("conseqa.yaml")).expect("yaml written");
+
+    assert!(yaml.starts_with("dsl: 1\n"), "{}", &yaml[..40.min(yaml.len())]);
+    assert!(conseqa::parser::yaml::parse(&yaml).is_ok());
+
+    // The patch boundary refuses a stale authored claim by name,
+    // before shape validation.
+    let (refused, is_error) = client
+        .call(
+            "submit_patch",
+            serde_json::json!({
+                "dsl": 2,
+                "patch": program_patch("operation.create_order", 7),
+            }),
+        )
+        .await;
+
+    assert!(is_error, "{refused}");
+    assert_eq!(refused["error"], "dsl_version_mismatch", "{refused}");
+    assert!(
+        refused["guidance"]
+            .as_str()
+            .is_some_and(|text| text.contains("declares dsl 2")),
+        "{refused}"
+    );
+
+    // A matching declaration commits.
+    let (committed, is_error) = client
+        .call(
+            "submit_patch",
+            serde_json::json!({
+                "dsl": 1,
+                "patch": program_patch("operation.create_order", 7),
+            }),
+        )
+        .await;
+
+    assert!(!is_error, "{committed}");
+    assert_eq!(committed["committed"], true, "{committed}");
+
+    std::fs::remove_dir_all(&dir).ok();
     server.shutdown().await;
 }

@@ -134,10 +134,34 @@ export interface IdempotencyKeyPropagation {
   target: IdempotencyKey;
 }
 
+/** A transaction's commit-deduplication guarantee — transaction-only.
+ *  External boundaries declare identity / idempotency / result_replay
+ *  instead. */
 export type IdempotencyGuarantee =
   | { kind: "unspecified" }
   | { kind: "not_deduplicated" }
   | { kind: "deduplicated_by"; key: IdempotencyKey };
+
+/** What identifies one logical external interaction. Deliberately its
+ *  own vocabulary: an interaction identity is not an idempotency
+ *  declaration, though the key shape coincides. */
+export type ExternalIdentity =
+  | { kind: "unspecified" }
+  | { kind: "keyed"; key: ExternalIdentityKey };
+
+export interface ExternalIdentityKey {
+  components: ValueRef[];
+}
+
+/** Duplicate-side-effect behaviour, relative to the identity. */
+export type ExternalIdempotency =
+  | "unspecified"
+  | "distinguishable"
+  | "identical_per_identity"
+  | "side_effect_free";
+
+/** Terminal-result replay behaviour, relative to the identity. */
+export type ExternalResultReplay = "unspecified" | "unstable" | "replay_stable";
 
 /** Whether observing the contract's `Err` terminally resolves the
  *  logical interaction (`terminal`), conclusively ends one attempt
@@ -184,7 +208,12 @@ export interface RequestEffect {
 
 export interface ExternalEffect {
   name: string;
-  idempotency: IdempotencyGuarantee;
+  /** What makes two applications the same logical interaction. */
+  identity: ExternalIdentity;
+  /** Duplicate-side-effect behaviour, relative to that identity. */
+  idempotency: ExternalIdempotency;
+  /** Terminal-result replay behaviour, relative to that identity. */
+  result_replay: ExternalResultReplay;
   /** The synchronous result the boundary returns; null when none is modeled. */
   result: ResultType | null;
 }
