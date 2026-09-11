@@ -68,8 +68,12 @@ pub struct ProverReport {
 /// serialization and ordering obligations. Format 5 added the `dsl`
 /// contract version the verdicts are relative to, and rebuilt the
 /// external-boundary evidence on the identity / idempotency /
-/// result-replay decomposition.
-pub const FORMAT: u32 = 5;
+/// result-replay decomposition. Format 6 split the ownership leg of
+/// the topology serialization and ordering arguments — stable-epoch
+/// member affinity and exclusive execution handoff are now separate
+/// cited facts — and added the L0 invocation-lock serialization
+/// proof.
+pub const FORMAT: u32 = 6;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -621,12 +625,52 @@ fn serialization_assumptions(proof: &SerializationProof) -> Vec<String> {
              invocations"
         )],
 
+        SerializationProof::InvocationLocked {
+            input,
+            key,
+            key_identities,
+        } => {
+            let mut assumptions = vec![format!(
+                "the operation acquires an exclusive invocation lock keyed by \
+                 {} at entry, before any program step, and holds it to the \
+                 invocation's terminal",
+                value_ref_label(key)
+            )];
+
+            for fact in key_identities {
+                assumptions.push(match &fact.identity {
+                    KeyIdentity::SamePath => format!(
+                        "for {}, the lock key is the serialization key field, so \
+                         same-key invocations contend on one lock",
+                        fact.schema
+                    ),
+
+                    KeyIdentity::SameCanonicalValue { schema, path } => format!(
+                        "for {}, the lock key carries the serialization key's value \
+                         ({schema}.{path} via fragment aliasing), so same-key \
+                         invocations contend on one lock",
+                        fact.schema
+                    ),
+                });
+            }
+
+            assumptions.push(format!(
+                "equal lock keys exclude concurrent execution of the operation \
+                 program, whatever member of whatever pool runs the invocations \
+                 of {input} — no routing, concurrency, or handoff fact \
+                 participates"
+            ));
+
+            assumptions
+        }
+
         SerializationProof::RequestRouted {
             input,
             router,
             pool,
             routing_key,
             member_assignment,
+            execution_handoff,
         } => {
             let mut assumptions = vec![format!(
                 "{router} routes invocations of {input} into {pool} by a semantic \
@@ -652,6 +696,8 @@ fn serialization_assumptions(proof: &SerializationProof) -> Vec<String> {
 
             assumptions.push(member_assignment_assumption(member_assignment));
 
+            assumptions.push(execution_handoff_assumption(pool, execution_handoff));
+
             assumptions.push(format!(
                 "{pool} bounds each member to one simultaneously active invocation, so \
                  the owning member runs same-key invocations one at a time"
@@ -667,6 +713,7 @@ fn serialization_assumptions(proof: &SerializationProof) -> Vec<String> {
             grouping_scope,
             message_keys,
             member_assignment,
+            execution_handoff,
         } => {
             let mut assumptions = vec![format!(
                 "{}, and {input} dispatches into {pool} by that grouping key, so \
@@ -677,6 +724,8 @@ fn serialization_assumptions(proof: &SerializationProof) -> Vec<String> {
             assumptions.extend(grouping_key_assumptions(message_keys, "serialization"));
 
             assumptions.push(member_assignment_assumption(member_assignment));
+
+            assumptions.push(execution_handoff_assumption(pool, execution_handoff));
 
             assumptions.push(format!(
                 "{pool} bounds each member to one simultaneously active invocation, so \
@@ -692,6 +741,7 @@ fn serialization_assumptions(proof: &SerializationProof) -> Vec<String> {
             pool,
             partition_keys,
             member_assignment,
+            execution_handoff,
         } => {
             let mut assumptions = vec![format!(
                 "{outbox} consumption through {input} is partitioned by a keyed \
@@ -702,6 +752,8 @@ fn serialization_assumptions(proof: &SerializationProof) -> Vec<String> {
             assumptions.extend(partition_key_assumptions(partition_keys, "serialization"));
 
             assumptions.push(member_assignment_assumption(member_assignment));
+
+            assumptions.push(execution_handoff_assumption(pool, execution_handoff));
 
             assumptions.push(format!(
                 "{pool} bounds each member to one simultaneously active invocation, so \
@@ -718,14 +770,13 @@ fn serialization_assumptions(proof: &SerializationProof) -> Vec<String> {
     }
 }
 
-/// What a member assignment guarantees about domain ownership — the
-/// step that turns routing-domain equality into a single executing
-/// member.
+/// What a member assignment guarantees about domain ownership within a
+/// stable ownership epoch — affinity only; continuity across epochs is
+/// the execution-handoff fact's separate assumption.
 fn member_assignment_assumption(assignment: &MemberAssignment) -> String {
     match assignment {
         MemberAssignment::ConsistentHash => "consistent_hash assignment gives each routing \
-             domain one owning pool member at a time, and transfers that ownership safely \
-             when membership changes"
+             domain one owning pool member during a stable ownership epoch"
             .to_string(),
 
         // Unreachable through a well-formed proof: the verifiers gate
@@ -736,6 +787,23 @@ fn member_assignment_assumption(assignment: &MemberAssignment) -> String {
         MemberAssignment::RoundRobin => "round_robin assignment gives no routing domain an \
              owning pool member, so this proof cites a fact that does not support it"
             .to_string(),
+    }
+}
+
+/// What the pool's execution-handoff declaration guarantees across
+/// ownership and member transitions — the leg stable-epoch affinity
+/// and member concurrency cannot supply.
+fn execution_handoff_assumption(
+    pool: &Id,
+    handoff: &crate::spec::ExecutionHandoff,
+) -> String {
+    match handoff {
+        crate::spec::ExecutionHandoff::ExclusiveOwnership => format!(
+            "{pool} declares exclusive_ownership execution handoff: when execution \
+             authority for a routing domain transfers between members or member \
+             incarnations, exclusive execution ownership is preserved, so a stale \
+             owner cannot overlap its successor"
+        ),
     }
 }
 
@@ -816,6 +884,7 @@ fn ordering_assumptions(proof: &OrderingProof) -> Vec<String> {
             message_keys,
             routing_key,
             member_assignment,
+            execution_handoff,
             duplicates,
         } => {
             let mut assumptions = Vec::new();
@@ -848,6 +917,8 @@ fn ordering_assumptions(proof: &OrderingProof) -> Vec<String> {
             });
 
             assumptions.push(member_assignment_assumption(member_assignment));
+
+            assumptions.push(execution_handoff_assumption(pool, execution_handoff));
 
             assumptions.push(format!(
                 "{pool} bounds each member to one simultaneously active invocation, so a \
@@ -900,6 +971,7 @@ fn ordering_assumptions(proof: &OrderingProof) -> Vec<String> {
             precedence,
             partition_keys,
             member_assignment,
+            execution_handoff,
             batching,
             duplicates,
         } => {
@@ -920,6 +992,8 @@ fn ordering_assumptions(proof: &OrderingProof) -> Vec<String> {
             assumptions.extend(partition_key_assumptions(partition_keys, "ordering"));
 
             assumptions.push(member_assignment_assumption(member_assignment));
+
+            assumptions.push(execution_handoff_assumption(pool, execution_handoff));
 
             assumptions.push(format!(
                 "{pool} bounds each member to one simultaneously active invocation, so a \

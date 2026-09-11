@@ -1,6 +1,6 @@
 {
-  "format": 5,
-  "dsl": 2,
+  "format": 6,
+  "dsl": 3,
   "model_revision": 1,
   "obligations": [
     {
@@ -19,7 +19,8 @@
       "assumptions": [
         "topic.order_events declares a keyed grouping for every subscription of it, and input.apply_payment.captured dispatches into pool.order_workers by that grouping key, so same-key deliveries share one routing domain",
         "for schema.PaymentCaptured, the grouping key order_id is the serialization key field",
-        "consistent_hash assignment gives each routing domain one owning pool member at a time, and transfers that ownership safely when membership changes",
+        "consistent_hash assignment gives each routing domain one owning pool member during a stable ownership epoch",
+        "pool.order_workers declares exclusive_ownership execution handoff: when execution authority for a routing domain transfers between members or member incarnations, exclusive execution ownership is preserved, so a stale owner cannot overlap its successor",
         "pool.order_workers bounds each member to one simultaneously active invocation, so the owning member runs same-key invocations one at a time"
       ],
       "evidence": []
@@ -42,7 +43,8 @@
         "topic.order_events declares a keyed grouping for every subscription of it",
         "for schema.PaymentCaptured, the grouping key order_id is the ordering key field",
         "input.apply_payment.captured dispatches by the grouping key, so same-key deliveries belong to the one routing domain the grouping established",
-        "consistent_hash assignment gives each routing domain one owning pool member at a time, and transfers that ownership safely when membership changes",
+        "consistent_hash assignment gives each routing domain one owning pool member during a stable ownership epoch",
+        "pool.order_workers declares exclusive_ownership execution handoff: when execution authority for a routing domain transfers between members or member incarnations, exclusive execution ownership is preserved, so a stale owner cannot overlap its successor",
         "pool.order_workers bounds each member to one simultaneously active invocation, so a later invocation cannot overtake an earlier one",
         "dispatch preserves the transport's established same-key precedence when admitting invocations, including across failure-driven redelivery and ownership reassignment",
         "a duplicate of a completed delivery repeats an invocation that already took effect in order; its work is idempotency requirement #0's obligation (proven)"
@@ -106,7 +108,8 @@
       "assumptions": [
         "topic.order_events declares a keyed grouping for every subscription of it, and input.charge_payment.reserved dispatches into pool.payment_workers by that grouping key, so same-key deliveries share one routing domain",
         "for schema.InventoryReserved, the grouping key order_id is the serialization key field",
-        "consistent_hash assignment gives each routing domain one owning pool member at a time, and transfers that ownership safely when membership changes",
+        "consistent_hash assignment gives each routing domain one owning pool member during a stable ownership epoch",
+        "pool.payment_workers declares exclusive_ownership execution handoff: when execution authority for a routing domain transfers between members or member incarnations, exclusive execution ownership is preserved, so a stale owner cannot overlap its successor",
         "pool.payment_workers bounds each member to one simultaneously active invocation, so the owning member runs same-key invocations one at a time"
       ],
       "evidence": []
@@ -129,7 +132,8 @@
         "topic.order_events declares a keyed grouping for every subscription of it",
         "for schema.InventoryReserved, the grouping key order_id is the ordering key field",
         "input.charge_payment.reserved dispatches by the grouping key, so same-key deliveries belong to the one routing domain the grouping established",
-        "consistent_hash assignment gives each routing domain one owning pool member at a time, and transfers that ownership safely when membership changes",
+        "consistent_hash assignment gives each routing domain one owning pool member during a stable ownership epoch",
+        "pool.payment_workers declares exclusive_ownership execution handoff: when execution authority for a routing domain transfers between members or member incarnations, exclusive execution ownership is preserved, so a stale owner cannot overlap its successor",
         "pool.payment_workers bounds each member to one simultaneously active invocation, so a later invocation cannot overtake an earlier one",
         "dispatch preserves the transport's established same-key precedence when admitting invocations, including across failure-driven redelivery and ownership reassignment",
         "a duplicate of a completed delivery repeats an invocation that already took effect in order; its work is idempotency requirement #0's obligation (unproven)"
@@ -240,7 +244,8 @@
       "assumptions": [
         "topic.order_events declares a keyed grouping for every subscription of it, and input.reserve_inventory.created dispatches into pool.order_workers by that grouping key, so same-key deliveries share one routing domain",
         "for schema.OrderCreated, the grouping key order_id is the serialization key field",
-        "consistent_hash assignment gives each routing domain one owning pool member at a time, and transfers that ownership safely when membership changes",
+        "consistent_hash assignment gives each routing domain one owning pool member during a stable ownership epoch",
+        "pool.order_workers declares exclusive_ownership execution handoff: when execution authority for a routing domain transfers between members or member incarnations, exclusive execution ownership is preserved, so a stale owner cannot overlap its successor",
         "pool.order_workers bounds each member to one simultaneously active invocation, so the owning member runs same-key invocations one at a time"
       ],
       "evidence": []
@@ -263,7 +268,8 @@
         "topic.order_events declares a keyed grouping for every subscription of it",
         "for schema.OrderCreated, the grouping key order_id is the ordering key field",
         "input.reserve_inventory.created dispatches by the grouping key, so same-key deliveries belong to the one routing domain the grouping established",
-        "consistent_hash assignment gives each routing domain one owning pool member at a time, and transfers that ownership safely when membership changes",
+        "consistent_hash assignment gives each routing domain one owning pool member during a stable ownership epoch",
+        "pool.order_workers declares exclusive_ownership execution handoff: when execution authority for a routing domain transfers between members or member incarnations, exclusive execution ownership is preserved, so a stale owner cannot overlap its successor",
         "pool.order_workers bounds each member to one simultaneously active invocation, so a later invocation cannot overtake an earlier one",
         "dispatch preserves the transport's established same-key precedence when admitting invocations, including across failure-driven redelivery and ownership reassignment",
         "a duplicate of a completed delivery repeats an invocation that already took effect in order; its work is idempotency requirement #0's obligation (unproven)"

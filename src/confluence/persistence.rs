@@ -55,7 +55,14 @@ const EVENT_SEQ_KEY: &str = "task_event_seq";
 /// `OutboxInput` lost its selector and acknowledgement,
 /// `OutboxRuntime` its delivery, and outbox dispatch replaced its
 /// bare member assignment with a routing block.
-const FORMAT: u64 = 4;
+///
+/// Bumped to 5 with the serialization-semantics revision (`dsl: 3`):
+/// the operation interface gained `invocation_lock` and
+/// `ExecutionPool` gained `execution_handoff` — additive fields, but
+/// the verdicts stored beside them are relative to the revised proof
+/// semantics, so a format-4 workspace must not be silently reread as
+/// though its proofs still held.
+const FORMAT: u64 = 5;
 
 #[derive(Debug, thiserror::Error)]
 pub enum PersistenceError {

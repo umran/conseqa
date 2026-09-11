@@ -24,11 +24,18 @@ use super::{
 /// (`OutboxInput` loses its selector and acknowledgement,
 /// `OutboxRuntime` its delivery), and outbox dispatch declares an
 /// explicit routing block in place of a bare member assignment.
+/// Version 3 is the serialization-semantics revision: serialization
+/// gains the L0 `Operation.invocation_lock` proof route,
+/// `MemberAssignment` sheds its implicit safe-ownership-transfer
+/// rule — `consistent_hash` now asserts stable-epoch affinity only —
+/// and the topology serialization and ordering proofs require the new
+/// explicit `ExecutionPool.execution_handoff = exclusive_ownership`
+/// fact as their ownership-continuity leg.
 ///
 /// Independent of the stored-workspace `FORMAT` (a storage-encoding
 /// counter): a DSL bump forces a `FORMAT` bump, never conversely, and
 /// the numbers are not aligned.
-pub const DSL_VERSION: DslVersion = DslVersion(2);
+pub const DSL_VERSION: DslVersion = DslVersion(3);
 
 /// A declared DSL contract version.
 #[derive(

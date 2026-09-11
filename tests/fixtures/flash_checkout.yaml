@@ -12,7 +12,7 @@
 # terminal result is fixed and charge_payment's branch on it is not
 # established to replay; and create_order's idempotency is unknown
 # through the cascade those consumers start.
-dsl: 2
+dsl: 3
 revision: 1
 services:
   service.checkout:
@@ -843,6 +843,13 @@ operations:
 #     routing domain. Both subscriptions route by the same order_id
 #     topic key, and nothing infers that their domains have a common
 #     owner. Each proof stands on its own routing declaration.
+#
+#   * The serial worker pools declare execution_handoff:
+#     exclusive_ownership — the fourth leg of every topology
+#     serialization proof. consistent_hash gives one owner per stable
+#     ownership epoch and bounded(1) binds each member separately;
+#     only the declared handoff fact says a stale owner cannot still
+#     be executing while its replacement begins.
 # ---------------------------------------------------------------------
 runtime:
 
@@ -866,11 +873,13 @@ runtime:
       member_concurrency:
         kind: bounded
         value: 1
+      execution_handoff: exclusive_ownership
 
     pool.payment_workers:
       member_concurrency:
         kind: bounded
         value: 1
+      execution_handoff: exclusive_ownership
 
     pool.checkout_api:
       member_concurrency:

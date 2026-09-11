@@ -211,11 +211,7 @@ pub fn skeleton_diagnostics(workspace: &WorkspaceState) -> Vec<DraftDiagnostic> 
     for (operation, draft) in &workspace.operations {
         mutations.push(Mutation::PutOperationInterface {
             operation: operation.clone(),
-            value: OperationInterfaceDraft {
-                service: draft.service.clone(),
-                description: draft.description.clone(),
-                inputs: draft.inputs.clone(),
-            },
+            value: draft.interface(),
         });
     }
 
@@ -370,6 +366,7 @@ fn apply_mutation(
                     draft.service = value.service.clone();
                     draft.description = value.description.clone();
                     draft.inputs = value.inputs.clone();
+                    draft.invocation_lock = value.invocation_lock.clone();
                     draft.recompute_stage();
                 }
 
@@ -780,6 +777,8 @@ fn check_patch(candidate: &WorkspaceState, patch: &SpecPatch) -> Vec<DraftDiagno
                 for (input_id, input) in &value.inputs {
                     check_input(candidate, operation, input_id, input, &mut diagnostics);
                 }
+
+                check_invocation_lock(operation, value, &mut diagnostics);
             }
 
             Mutation::ReplaceOperationProgram { operation, program } => {
@@ -872,6 +871,7 @@ fn probe_model(candidate: &WorkspaceState, operation: &Id) -> Option<Model> {
         service: draft.service.clone(),
         description: draft.description.clone(),
         inputs: draft.inputs.clone(),
+        invocation_lock: draft.invocation_lock.clone(),
         program,
         requirements: draft.requirements.clone(),
     };
@@ -890,6 +890,62 @@ fn probe_model(candidate: &WorkspaceState, operation: &Id) -> Option<Model> {
         operations,
         runtime: (!candidate.runtime.is_empty()).then(|| candidate.runtime.clone()),
     })
+}
+
+/// The structural half of the invocation-lock rules, judged at the
+/// gate so a broken declaration is fixed in-session: the key must
+/// source an input the interface itself declares, and that input must
+/// be the interface's only one — every invocation acquires the lock,
+/// and an invocation triggered by another input carries no value for
+/// the key. Path resolution is whole-model validation's job.
+fn check_invocation_lock(
+    operation: &Id,
+    value: &OperationInterfaceDraft,
+    diagnostics: &mut Vec<DraftDiagnostic>,
+) {
+    let Some(lock) = &value.invocation_lock else {
+        return;
+    };
+
+    let key = SymbolKey::OperationInterface(operation.clone());
+
+    match &lock.key.source {
+        crate::spec::ValueSource::Input(input) => {
+            if !value.inputs.contains_key(input) {
+                diagnostics.push(DraftDiagnostic::new(
+                    Some(key),
+                    format!(
+                        "the invocation lock of {operation} keys on {input}, which \
+                         the interface does not declare"
+                    ),
+                ));
+
+                return;
+            }
+
+            for other in value.inputs.keys().filter(|id| *id != input) {
+                diagnostics.push(DraftDiagnostic::new(
+                    Some(key.clone()),
+                    format!(
+                        "{operation} admits invocations through {other}, which carry \
+                         no value for its invocation lock's key; key the lock on the \
+                         operation's only input, or remove the lock"
+                    ),
+                ));
+            }
+        }
+
+        other => diagnostics.push(DraftDiagnostic::new(
+            Some(key),
+            format!(
+                "the invocation lock of {operation} keys on {}:{}, and only an \
+                 input payload exists at operation entry where the key is \
+                 evaluated",
+                other.kind_name(),
+                other.id()
+            ),
+        )),
+    }
 }
 
 fn check_schema(

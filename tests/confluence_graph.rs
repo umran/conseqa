@@ -48,6 +48,7 @@ fn gateway_operation() -> DraftOperation {
         service: id("service.checkout"),
         description: Some("Calls create_order.".to_string()),
         inputs: BTreeMap::new(),
+        invocation_lock: None,
     });
 
     draft.program = Some(OperationBlock {

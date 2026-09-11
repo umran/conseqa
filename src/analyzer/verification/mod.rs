@@ -94,8 +94,9 @@ pub use result_replay::{
     ResultReplayCheck, ResultReplayObstacle, ResultReplayProof, ResultReplayVerdict, ReturnedResult,
 };
 pub use serialization::{
-    GroupingScope, KeyIdentity, MessageKeyFact, OutboxPartitionKeyFact, RoutingKeyFact,
-    SerializationCheck, SerializationObstacle, SerializationProof, SerializationVerdict,
+    GroupingScope, InvocationLockKeyFact, KeyIdentity, MessageKeyFact, OutboxPartitionKeyFact,
+    RoutingKeyFact, SerializationCheck, SerializationObstacle, SerializationProof,
+    SerializationVerdict,
 };
 pub use trigger::{
     Consumer, EffectContract, OutboxConsumer, OutboxProducer, Producer, ProducerSite,

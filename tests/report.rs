@@ -34,7 +34,7 @@ fn scaffold_enumerates_requirement_obligations() {
     let report = report::scaffold(&model);
 
     assert_eq!(report.format, report::FORMAT);
-    assert_eq!(report.format, 5);
+    assert_eq!(report.format, 6);
     assert_eq!(report.dsl, Some(conseqa::spec::DSL_VERSION));
     assert_eq!(report.model_revision, Some(1));
 

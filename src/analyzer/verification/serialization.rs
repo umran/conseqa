@@ -24,36 +24,45 @@
 //!
 //! ## Accepted proof routes
 //!
-//! 1. **Vacuous population**: the key's subscription input admits no
-//!    message schemas, so the population is empty by declaration.
-//!    This is the only L0-only route.
-//! 2. **Request-routed**: an L1 `Router` serves the key's request
-//!    boundary; its semantic routing key is equivalent to the
-//!    serialization key, so same-key invocations share one routing
-//!    domain; its `MemberAssignment` gives that domain one active
-//!    owning member, including through handoff; and the target
-//!    `ExecutionPool` declares `member_concurrency = bounded(1)`, so
-//!    that member runs one invocation at a time.
-//! 3. **Subscription-routed**: the same argument on the delivery side.
-//!    The dispatch routes by `grouping_key`, a keyed grouping is in
-//!    effect at one of the two declaration scopes, and the
-//!    serialization key is established to carry the same logical value
-//!    as the grouping key for every admitted message schema.
+//! Two independent positive routes exist, plus the vacuous one.
 //!
-//! Both runtime routes have the same shape, and it is the shape the
-//! whole model is built around:
+//! - **Vacuous population**: the key's message-driven input admits no
+//!   message schemas, so the population is empty by declaration.
+//!   L0-only, and needs no fact at all.
+//! - **Route A — explicit synchronization**: the operation declares an
+//!   `InvocationLock` whose key is established to carry the same
+//!   logical value as the serialization key for the key's input.
+//!   Same-key invocations then contend on one exclusive lock held
+//!   from operation entry to the invocation's terminal, so their
+//!   programs never overlap. L0-only: no routing, pool, member
+//!   lifecycle, or handoff fact participates, so the proof survives
+//!   any change of runtime topology. The lock makes no FIFO
+//!   guarantee, so this is never an ordering fact.
+//! - **Route B — runtime topology**: the request-routed,
+//!   subscription-routed, and outbox-routed arguments, one per
+//!   ingress kind, all with the same four-legged shape:
 //!
 //! ```text
 //! semantic key equivalence
 //!     -> routing-domain equivalence
-//!     -> member ownership
+//!     -> stable-epoch member affinity
+//!     -> exclusive execution handoff
 //!     -> member concurrency
 //! ```
 //!
-//! Every step is a distinct declared fact and none is substituted for
-//! another. A proof taking either runtime route is recorded as
-//! `RuntimeDependent`: it holds of the declared realization, and is
-//! invalidated when that realization changes.
+//! Concretely: the boundary's routing key is equivalent to the
+//! serialization key, so same-key invocations share one routing
+//! domain; `MemberAssignment::ConsistentHash` assigns that domain to
+//! one member per stable ownership epoch;
+//! `ExecutionPool.execution_handoff = exclusive_ownership` preserves
+//! exclusive execution ownership across member and ownership
+//! transitions, so a stale owner cannot overlap its successor; and
+//! `member_concurrency = bounded(1)` stops the owning member itself
+//! from overlapping invocations. All four facts are required. Every
+//! step is a distinct declared fact and none is substituted for
+//! another. A proof taking route B is recorded as `RuntimeDependent`:
+//! it holds of the declared realization, and is invalidated when that
+//! realization changes.
 //!
 //! ## Routes deliberately not credited
 //!
@@ -68,12 +77,23 @@
 //!   the serialization key, two same-key invocations differing in the
 //!   remaining components fall into different routing domains, so
 //!   equality of the serialization key implies nothing.
-//! - **Locks** (§21). A lock protects the object instances its
-//!   selector selects. Whether two same-key invocations conflict on a
-//!   common instance depends on such an instance existing at lock
-//!   time, which is runtime state the model cannot declare, and a
-//!   lock serializes only the span from acquisition to transaction
-//!   end, not the invocation's whole execution.
+//! - **Affinity plus a serial member, without handoff**.
+//!   `consistent_hash` asserts stable-epoch affinity only, and
+//!   `bounded(1)` bounds one member. Neither says a stale invocation
+//!   of a former owner or member incarnation cannot coexist with work
+//!   on its replacement — each of A and B individually honors
+//!   `bounded(1)` while the same-key pair overlaps. Only the declared
+//!   `exclusive_ownership` handoff bridges the transition.
+//! - **Transaction locks** (§21). A `Lock` step protects the object
+//!   instances its selector selects. Whether two same-key invocations
+//!   conflict on a common instance depends on such an instance
+//!   existing at lock time, which is runtime state the model cannot
+//!   declare, and a transaction lock serializes only the span from
+//!   acquisition to transaction end, not the invocation's whole
+//!   execution. The `InvocationLock` differs on exactly those two
+//!   points — a semantic key needing no instance, held over the whole
+//!   program — which is why it proves and a transaction lock does
+//!   not.
 //! - **Serializable isolation** (§17). An equivalent serial commit
 //!   order does not prevent concurrent execution.
 //! - **Transport ordering**. Not merely uncredited — never consulted.
@@ -81,6 +101,9 @@
 //!   whole of what a transport supplies for it. This is the reason
 //!   grouping is declared independently of ordering: an unordered
 //!   transport that still groups by key serializes.
+//! - **A message lease**. Lease expiry may permit redelivery without
+//!   the old attempt having terminated; a lease is not invocation
+//!   fencing and never satisfies the handoff leg by itself.
 //! - **`bounded(n)` with `n > 1`**: it permits overlap.
 //!
 //! A requirement no route establishes is `Unproven`, never violated:
@@ -92,9 +115,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::analyzer::{Diagnostic, DiagnosticCode, Evidence, Severity, VerificationCode};
 use crate::spec::{
-    FieldPath, Id, Input, MemberAssignment, MemberConcurrency, MessageSelector, Model, Operation,
-    OutboxInput, OutboxPartitioning, OutboxRoutingKey, SerializationRequirement, SubscriptionInput,
-    SubscriptionRoutingKey, ValueRef, ValueSource,
+    ExecutionHandoff, FieldPath, Id, Input, MemberAssignment, MemberConcurrency, MessageSelector,
+    Model, Operation, OutboxInput, OutboxPartitioning, OutboxRoutingKey, SerializationRequirement,
+    SubscriptionInput, SubscriptionRoutingKey, ValueRef, ValueSource,
 };
 
 use super::{ProofScope, RemedyLayer};
@@ -154,8 +177,34 @@ pub enum SerializationProof {
     /// empty population.
     NoAdmittedInvocations { input: Id },
 
-    /// A router assigns same-key requests to one owning member of a
-    /// pool whose members execute one invocation at a time.
+    /// Route A — explicit synchronization: the operation declares an
+    /// invocation lock whose key carries the requirement key, so
+    /// same-key invocations contend on one exclusive lock held from
+    /// operation entry to the invocation's terminal, and their
+    /// programs never overlap.
+    ///
+    /// L0-only: no routing, pool, concurrency, or handoff fact
+    /// participates, so the proof survives any change of runtime
+    /// topology. It establishes no ordering — the lock makes no FIFO
+    /// acquisition guarantee.
+    InvocationLocked {
+        input: Id,
+
+        /// The declared lock key, copied so the proof is
+        /// self-contained.
+        key: ValueRef,
+
+        /// Per admitted message schema (a request input has one), why
+        /// the lock key carries the requirement key. Empty only when
+        /// the admitted schemas cannot be resolved, which only an
+        /// identical-path identity survives.
+        key_identities: Vec<InvocationLockKeyFact>,
+    },
+
+    /// A router assigns same-key requests to one member per stable
+    /// ownership epoch, exclusive execution ownership survives
+    /// ownership and member transitions, and the owning member
+    /// executes one invocation at a time.
     RequestRouted {
         input: Id,
         router: Id,
@@ -166,10 +215,16 @@ pub enum SerializationProof {
         routing_key: Vec<RoutingKeyFact>,
 
         member_assignment: MemberAssignment,
+
+        /// The pool's declared execution-handoff guarantee — the leg
+        /// that bridges ownership and member transitions, which
+        /// affinity and member concurrency cannot.
+        execution_handoff: ExecutionHandoff,
     },
 
     /// The delivery-side counterpart: deliveries sharing a runtime
-    /// group share a routing domain, one member owns it, and that
+    /// group share a routing domain, one member owns it per stable
+    /// epoch, exclusive ownership survives transitions, and that
     /// member executes one invocation at a time.
     ///
     /// No ordering fact participates. Serialization is about
@@ -189,10 +244,13 @@ pub enum SerializationProof {
         message_keys: Vec<MessageKeyFact>,
 
         member_assignment: MemberAssignment,
+
+        execution_handoff: ExecutionHandoff,
     },
 
     /// The outbox-side counterpart: same-key messages share a keyed
-    /// outbox partition, one member owns each partition, that member
+    /// outbox partition, one member owns each partition per stable
+    /// epoch, exclusive ownership survives transitions, that member
     /// executes one invocation at a time, and no batching stage exists
     /// whose internal overlap the model leaves opaque.
     OutboxRouted {
@@ -205,13 +263,17 @@ pub enum SerializationProof {
         partition_keys: Vec<OutboxPartitionKeyFact>,
 
         member_assignment: MemberAssignment,
+
+        execution_handoff: ExecutionHandoff,
     },
 }
 
 impl SerializationProof {
     pub fn scope(&self) -> ProofScope {
         match self {
-            Self::NoAdmittedInvocations { .. } => ProofScope::L0Only,
+            Self::NoAdmittedInvocations { .. } | Self::InvocationLocked { .. } => {
+                ProofScope::L0Only
+            }
 
             Self::RequestRouted { .. }
             | Self::SubscriptionRouted { .. }
@@ -269,6 +331,18 @@ pub struct OutboxPartitionKeyFact {
 
     /// The declared partition-key path for this schema.
     pub partition_key: FieldPath,
+
+    pub identity: KeyIdentity,
+}
+
+/// For one admitted message schema, how the declared invocation-lock
+/// key was identified with the requirement key. The lock key path
+/// itself lives on the proof, once — it is one declaration, not a
+/// per-schema mapping.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InvocationLockKeyFact {
+    pub schema: Id,
 
     pub identity: KeyIdentity,
 }
@@ -419,12 +493,42 @@ pub enum SerializationObstacle {
         declared: MemberAssignment,
     },
 
+    /// The pool declares no execution-handoff guarantee (`declared:
+    /// none`), or a future weaker one, so exclusive execution
+    /// ownership of a routing domain is not established to survive
+    /// ownership and member transitions: a stale owner may still be
+    /// executing a same-key invocation while its successor begins
+    /// one. Affinity and member concurrency cannot bridge that gap —
+    /// each member individually honors `bounded(1)` while the pair
+    /// overlaps.
+    ExecutionHandoffNotExclusive {
+        input: Id,
+        pool: Id,
+        declared: Option<ExecutionHandoff>,
+    },
+
     /// The pool's declared member concurrency does not bound one
     /// member to one simultaneously active invocation.
     MemberConcurrencyNotSerial {
         input: Id,
         pool: Id,
         declared: MemberConcurrency,
+    },
+
+    /// The operation declares an invocation lock, but its key is
+    /// evaluated from a different source than the requirement key, so
+    /// the requirement's population — the key input's invocations —
+    /// is not established to contend on it.
+    InvocationLockKeyFromDifferentSource { input: Id, declared: ValueSource },
+
+    /// The operation declares an invocation lock over the right
+    /// input, but for this admitted schema its key is not established
+    /// to carry the same logical value as the requirement key, so
+    /// same-key invocations may acquire different locks.
+    InvocationLockKeyNotEquivalent {
+        input: Id,
+        schema: Id,
+        lock_key: FieldPath,
     },
 }
 
@@ -470,7 +574,35 @@ fn check_requirement(
         };
     };
 
-    match input {
+    // A population empty by declaration is serialized vacuously, and
+    // needs no fact at all — not even the lock.
+    let vacuous = match input {
+        Input::Request(_) => false,
+        Input::Subscription(subscription) => admits_no_messages(model, subscription),
+        Input::Outbox(outbox_input) => admits_no_outbox_messages(model, outbox_input),
+    };
+
+    if vacuous {
+        return SerializationVerdict::proven(SerializationProof::NoAdmittedInvocations {
+            input: input_id.clone(),
+        });
+    }
+
+    // Route A — explicit synchronization. Judged before topology
+    // because its proof is L0-only: it names fewer facts and survives
+    // any change of runtime realization. A declared lock that fails to
+    // prove contributes its obstacles to an unproven verdict alongside
+    // the topology route's, so the reader sees both nearly-taken
+    // routes.
+    let lock_obstacles =
+        match invocation_lock_route(model, operation, input_id, input, &requirement.key.path) {
+            None => Vec::new(),
+            Some(Ok(proof)) => return SerializationVerdict::proven(proof),
+            Some(Err(obstacles)) => obstacles,
+        };
+
+    // Route B — runtime topology, one argument per ingress kind.
+    let verdict = match input {
         Input::Request(request) => request_route(
             model,
             operation_id,
@@ -494,11 +626,111 @@ fn check_requirement(
             outbox_input,
             &requirement.key.path,
         ),
+    };
+
+    match verdict {
+        proven @ SerializationVerdict::Proven { .. } => proven,
+
+        SerializationVerdict::Unproven { obstacles } => SerializationVerdict::Unproven {
+            obstacles: lock_obstacles.into_iter().chain(obstacles).collect(),
+        },
     }
 }
 
+/// Route A: the operation's declared invocation lock, keyed
+/// equivalently to the requirement.
+///
+/// `None` when no lock is declared. `Err` when one is declared but
+/// cannot be credited for this requirement — sourced from a different
+/// input than the requirement key, or its path not established to
+/// carry the requirement key for some admitted schema.
+///
+/// The population argument is the same one every route rests on: the
+/// requirement constrains the key input's invocations, and when the
+/// lock key is evaluated from that same input with an equivalent
+/// path, equal requirement keys entail equal lock keys, so the
+/// population contends on one lock. Invocations of other inputs are
+/// outside the population and irrelevant here; whether the lock is
+/// coherent for them at all is validation's question, not this
+/// proof's.
+fn invocation_lock_route(
+    model: &Model,
+    operation: &Operation,
+    input_id: &Id,
+    input: &Input,
+    requirement_key: &FieldPath,
+) -> Option<Result<SerializationProof, Vec<SerializationObstacle>>> {
+    let lock = operation.invocation_lock.as_ref()?;
+
+    if lock.key.source != ValueSource::Input(input_id.clone()) {
+        return Some(Err(vec![
+            SerializationObstacle::InvocationLockKeyFromDifferentSource {
+                input: input_id.clone(),
+                declared: lock.key.source.clone(),
+            },
+        ]));
+    }
+
+    // The schemas an invocation of this input may carry — the same
+    // admission the routed proofs reason over. An unresolvable topic
+    // or outbox yields none; the vacuous case never reaches here.
+    let admitted: Vec<Id> = match input {
+        Input::Request(request) => vec![request.schema.clone()],
+
+        Input::Subscription(subscription) => match &subscription.messages {
+            MessageSelector::Only(messages) => messages.iter().cloned().collect(),
+            MessageSelector::All => model
+                .topics
+                .get(&subscription.topic)
+                .map(|topic| topic.messages.iter().cloned().collect())
+                .unwrap_or_default(),
+        },
+
+        Input::Outbox(outbox_input) => model
+            .outbox(&outbox_input.outbox)
+            .map(|(_, outbox)| outbox.messages.iter().cloned().collect())
+            .unwrap_or_default(),
+    };
+
+    let mut facts = Vec::new();
+    let mut obstacles = Vec::new();
+
+    for schema in admitted {
+        match key_identity(model, &schema, &lock.key.path, requirement_key) {
+            Some(identity) => facts.push(InvocationLockKeyFact { schema, identity }),
+
+            None => obstacles.push(SerializationObstacle::InvocationLockKeyNotEquivalent {
+                input: input_id.clone(),
+                schema,
+                lock_key: lock.key.path.clone(),
+            }),
+        }
+    }
+
+    if !obstacles.is_empty() {
+        return Some(Err(obstacles));
+    }
+
+    // A differing path proves only through per-schema canonical
+    // identities. With no resolvable admitted schema there is no such
+    // fact to stand on — an unresolvable topic or outbox, which
+    // validation already rejects — so the lock is not credited, and
+    // the topology route's obstacles carry the explanation. Identical
+    // paths need no schema at all: the same field names the same
+    // value whatever the schema turns out to be.
+    if facts.is_empty() && lock.key.path != *requirement_key {
+        return Some(Err(Vec::new()));
+    }
+
+    Some(Ok(SerializationProof::InvocationLocked {
+        input: input_id.clone(),
+        key: lock.key.clone(),
+        key_identities: facts,
+    }))
+}
+
 /// The request-side route: router, routing-key equivalence, member
-/// assignment, member concurrency.
+/// assignment, execution handoff, member concurrency.
 fn request_route(
     model: &Model,
     operation_id: &Id,
@@ -555,6 +787,7 @@ fn request_route(
     };
 
     let serial = pool_is_serial(model, input_id, &router.pool, &mut obstacles);
+    let handoff = pool_handoff_exclusive(model, input_id, &router.pool, &mut obstacles);
 
     let exclusive = routing_key
         .as_ref()
@@ -567,14 +800,17 @@ fn request_route(
         });
     }
 
-    match routing_key {
-        Some((routing_key, member_assignment)) if serial && exclusive => {
+    match (routing_key, handoff) {
+        (Some((routing_key, member_assignment)), Some(execution_handoff))
+            if serial && exclusive =>
+        {
             SerializationVerdict::proven(SerializationProof::RequestRouted {
                 input: input_id.clone(),
                 router: router_id.clone(),
                 pool: router.pool.clone(),
                 routing_key,
                 member_assignment,
+                execution_handoff,
             })
         }
 
@@ -583,7 +819,7 @@ fn request_route(
 }
 
 /// The delivery-side route: dispatch, grouping-key equivalence, member
-/// assignment, member concurrency.
+/// assignment, execution handoff, member concurrency.
 fn subscription_route(
     model: &Model,
     operation_id: &Id,
@@ -591,14 +827,6 @@ fn subscription_route(
     subscription: &SubscriptionInput,
     key: &FieldPath,
 ) -> SerializationVerdict {
-    // A population empty by declaration is serialized vacuously, and
-    // needs no runtime fact at all.
-    if admits_no_messages(model, subscription) {
-        return SerializationVerdict::proven(SerializationProof::NoAdmittedInvocations {
-            input: input_id.clone(),
-        });
-    }
-
     let Some(runtime) = model.subscription_runtime(operation_id, input_id) else {
         return SerializationVerdict::Unproven {
             obstacles: vec![SerializationObstacle::NoSubscriptionRuntime {
@@ -635,6 +863,7 @@ fn subscription_route(
     };
 
     let serial = pool_is_serial(model, input_id, &runtime.dispatch.pool, &mut obstacles);
+    let handoff = pool_handoff_exclusive(model, input_id, &runtime.dispatch.pool, &mut obstacles);
 
     let exclusive = routed
         .as_ref()
@@ -647,8 +876,8 @@ fn subscription_route(
         });
     }
 
-    match routed {
-        Some((facts, member_assignment)) if serial && exclusive => {
+    match (routed, handoff) {
+        (Some((facts, member_assignment)), Some(execution_handoff)) if serial && exclusive => {
             SerializationVerdict::proven(SerializationProof::SubscriptionRouted {
                 input: input_id.clone(),
                 topic: facts.topic,
@@ -656,6 +885,7 @@ fn subscription_route(
                 grouping_scope: facts.scope,
                 message_keys: facts.message_keys,
                 member_assignment,
+                execution_handoff,
             })
         }
 
@@ -664,8 +894,8 @@ fn subscription_route(
 }
 
 /// The outbox route: dispatch routing by the keyed partition domain,
-/// member assignment, member concurrency, and no opaque batching
-/// stage.
+/// member assignment, execution handoff, member concurrency, and no
+/// opaque batching stage.
 ///
 /// The partition domain plays the role the grouping domain plays for
 /// subscriptions, and the dispatch must declare `routing` by
@@ -684,12 +914,6 @@ fn outbox_route(
     input: &OutboxInput,
     key: &FieldPath,
 ) -> SerializationVerdict {
-    if admits_no_outbox_messages(model, input) {
-        return SerializationVerdict::proven(SerializationProof::NoAdmittedInvocations {
-            input: input_id.clone(),
-        });
-    }
-
     let Some(runtime) = model.outbox_runtime(operation_id, input_id) else {
         return SerializationVerdict::Unproven {
             obstacles: vec![SerializationObstacle::NoOutboxRuntime {
@@ -729,6 +953,7 @@ fn outbox_route(
     };
 
     let serial = pool_is_serial(model, input_id, &runtime.dispatch.pool, &mut obstacles);
+    let handoff = pool_handoff_exclusive(model, input_id, &runtime.dispatch.pool, &mut obstacles);
 
     let unbatched = runtime.dispatch.batching.is_none();
 
@@ -750,14 +975,17 @@ fn outbox_route(
         });
     }
 
-    match partitioned {
-        Some((facts, member_assignment)) if serial && exclusive && unbatched => {
+    match (partitioned, handoff) {
+        (Some((facts, member_assignment)), Some(execution_handoff))
+            if serial && exclusive && unbatched =>
+        {
             SerializationVerdict::proven(SerializationProof::OutboxRouted {
                 input: input_id.clone(),
                 outbox: input.outbox.clone(),
                 pool: runtime.dispatch.pool.clone(),
                 partition_keys: facts,
                 member_assignment,
+                execution_handoff,
             })
         }
 
@@ -899,6 +1127,39 @@ pub(super) fn pool_is_serial(
     });
 
     false
+}
+
+/// The pool's exclusive execution-handoff fact — the leg that bridges
+/// ownership and member transitions, which stable-epoch affinity and
+/// member concurrency cannot. Returns the credited fact, or records
+/// the obstacle and returns `None`.
+///
+/// Matched exhaustively on purpose, like the assignment leg: a future
+/// weaker handoff variant must not be copied into a proof as though
+/// it were `exclusive_ownership`. An undeclared pool records nothing
+/// here — the concurrency leg already raised `PoolUndeclared`, and no
+/// further fact about the missing declaration exists to interrogate.
+pub(super) fn pool_handoff_exclusive(
+    model: &Model,
+    input_id: &Id,
+    pool_id: &Id,
+    obstacles: &mut Vec<SerializationObstacle>,
+) -> Option<ExecutionHandoff> {
+    let pool = model.execution_pool(pool_id)?;
+
+    match pool.execution_handoff {
+        Some(ExecutionHandoff::ExclusiveOwnership) => Some(ExecutionHandoff::ExclusiveOwnership),
+
+        declared => {
+            obstacles.push(SerializationObstacle::ExecutionHandoffNotExclusive {
+                input: input_id.clone(),
+                pool: pool_id.clone(),
+                declared,
+            });
+
+            None
+        }
+    }
 }
 
 /// Whether the subscription's admitted message set is empty by
@@ -1174,13 +1435,17 @@ impl SerializationObstacle {
     /// The semantic layer this obstacle's fix belongs to.
     ///
     /// Almost every serialization obstacle names an L1 fact, because
-    /// every proof route but the vacuous one rests on the runtime
-    /// realization. The exception is a key that no input carries: no
-    /// routing declaration can select a population that the
-    /// application model never exposes.
+    /// every proof route but the vacuous and invocation-lock ones
+    /// rests on the runtime realization. The exceptions are a key
+    /// that no input carries — no routing declaration can select a
+    /// population the application model never exposes — and a
+    /// declared invocation lock whose key misses the requirement:
+    /// the lock is an L0 declaration, and so is its fix.
     pub fn layer(&self) -> RemedyLayer {
         match self {
-            Self::KeyNotFromInput { .. } => RemedyLayer::Application,
+            Self::KeyNotFromInput { .. }
+            | Self::InvocationLockKeyFromDifferentSource { .. }
+            | Self::InvocationLockKeyNotEquivalent { .. } => RemedyLayer::Application,
 
             Self::NoRouter { .. }
             | Self::AmbiguousRouter { .. }
@@ -1202,6 +1467,7 @@ impl SerializationObstacle {
             | Self::BatchingOverlapOpaque { .. }
             | Self::PoolUndeclared { .. }
             | Self::MemberAssignmentNotExclusive { .. }
+            | Self::ExecutionHandoffNotExclusive { .. }
             | Self::MemberConcurrencyNotSerial { .. } => RemedyLayer::Runtime,
         }
     }
@@ -1427,6 +1693,54 @@ impl SerializationObstacle {
                     "`{input}` is assigned to execution pool `{pool}`, which \
                      the runtime model does not declare, so its member \
                      concurrency is unknown."
+                ),
+            },
+
+            Self::ExecutionHandoffNotExclusive { pool, declared, .. } => Evidence {
+                subject: Some(pool.clone()),
+                message: match declared {
+                    None => format!(
+                        "Execution pool `{pool}` declares no execution-handoff \
+                         fact, so nothing establishes that exclusive execution \
+                         ownership of a routing domain survives member \
+                         replacement or reassignment: a stale owner may still \
+                         be executing a same-key invocation while its successor \
+                         begins one. `consistent_hash` asserts stable-epoch \
+                         affinity only, and `bounded(1)` binds each member \
+                         separately."
+                    ),
+
+                    Some(_) => format!(
+                        "The execution handoff declared for `{pool}` does not \
+                         preserve exclusive execution ownership across member \
+                         and ownership transitions, so a stale owner may \
+                         overlap its successor."
+                    ),
+                },
+            },
+
+            Self::InvocationLockKeyFromDifferentSource { input, declared } => Evidence {
+                subject: Some(input.clone()),
+                message: format!(
+                    "The operation declares an invocation lock, but its key is \
+                     evaluated from {}, not from `{input}` — the input whose \
+                     invocations this requirement constrains — so that \
+                     population is not established to contend on the lock.",
+                    describe_value_source(declared)
+                ),
+            },
+
+            Self::InvocationLockKeyNotEquivalent {
+                schema, lock_key, ..
+            } => Evidence {
+                subject: Some(schema.clone()),
+                message: format!(
+                    "The operation declares an invocation lock keyed by \
+                     `{lock_key}`, which is not established to carry the same \
+                     logical value as the serialization key `{}` for messages \
+                     of `{schema}`, so same-key invocations may acquire \
+                     different locks.",
+                    check.key.path
                 ),
             },
 

@@ -168,6 +168,7 @@ fn ping_interface() -> OperationInterfaceDraft {
                 },
             }),
         )]),
+        invocation_lock: None,
     }
 }
 
@@ -620,6 +621,7 @@ fn phantom_new_writer_invalidates_the_querying_task() {
                     service: id("service.checkout"),
                     description: Some("Force an order state.".to_string()),
                     inputs: BTreeMap::new(),
+                    invocation_lock: None,
                 },
             },
             Mutation::ReplaceOperationProgram {
@@ -741,6 +743,7 @@ fn unobserved_reference_is_rejected_then_fixable() {
                 service: id("service.checkout"),
                 description: Some("Calls create_order.".to_string()),
                 inputs: BTreeMap::new(),
+                invocation_lock: None,
             },
         },
         Mutation::ReplaceOperationProgram {
@@ -942,6 +945,7 @@ fn only_the_topology_scope_may_write_the_runtime_model() {
             member_concurrency: conseqa::spec::MemberConcurrency::Bounded(
                 std::num::NonZeroU32::new(1).expect("non-zero"),
             ),
+            execution_handoff: None,
         },
     };
 
@@ -1037,6 +1041,137 @@ fn draft_validation_failure_is_precise_and_fixable() {
     assert_eq!(engine.task_status(a.id).unwrap(), TaskState::Running);
 }
 
+/// The gate judges an interface's invocation lock structurally, so a
+/// broken declaration is fixed in the same session: the key must
+/// source an input the interface itself declares, and that input must
+/// be its only one.
+#[test]
+fn the_gate_refuses_a_broken_invocation_lock() {
+    let engine = engine();
+
+    let decomposer = task(&engine, TaskKind::Decompose, WriteScope::shared_skeleton());
+
+    for key in [
+        SymbolKey::Service(id("service.checkout")),
+        SymbolKey::Topic(id("topic.order_events")),
+        SymbolKey::Schema(id("schema.OrderPaid")),
+        SymbolKey::Schema(id("schema.OrderCreated")),
+    ] {
+        engine
+            .read_symbol(decomposer.id, &key)
+            .expect("the decomposer reads what it references");
+    }
+
+    let paid_input = || {
+        (
+            id("input.notify.paid"),
+            Input::Subscription(SubscriptionInput {
+                topic: id("topic.order_events"),
+                messages: MessageSelector::Only(BTreeSet::from([id("schema.OrderPaid")])),
+                acknowledge_on_success: None,
+            }),
+        )
+    };
+
+    let interface = |inputs, invocation_lock| Mutation::PutOperationInterface {
+        operation: id("operation.notify"),
+        value: OperationInterfaceDraft {
+            service: id("service.checkout"),
+            description: Some("Notify on payment.".to_string()),
+            inputs,
+            invocation_lock,
+        },
+    };
+
+    // Keyed on an input the interface does not declare.
+    let rejection = submit(
+        &engine,
+        &decomposer,
+        vec![interface(
+            BTreeMap::from([paid_input()]),
+            Some(conseqa::spec::InvocationLock {
+                key: ValueRef {
+                    source: ValueSource::Input(id("input.notify.undeclared")),
+                    path: path("order_id"),
+                },
+            }),
+        )],
+    )
+    .expect_err("an undeclared lock input is refused");
+
+    let CommitRejection::DraftValidationFailed { diagnostics } = &rejection else {
+        panic!("expected draft validation failure, got {rejection:?}");
+    };
+
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("which the interface does not declare")),
+        "{diagnostics:?}"
+    );
+
+    // Keyed on one input while the interface admits another.
+    let rejection = submit(
+        &engine,
+        &decomposer,
+        vec![interface(
+            BTreeMap::from([
+                paid_input(),
+                (
+                    id("input.notify.created"),
+                    Input::Subscription(SubscriptionInput {
+                        topic: id("topic.order_events"),
+                        messages: MessageSelector::Only(BTreeSet::from([id(
+                            "schema.OrderCreated",
+                        )])),
+                        acknowledge_on_success: None,
+                    }),
+                ),
+            ]),
+            Some(conseqa::spec::InvocationLock {
+                key: ValueRef {
+                    source: ValueSource::Input(id("input.notify.paid")),
+                    path: path("order_id"),
+                },
+            }),
+        )],
+    )
+    .expect_err("an uncovered input is refused");
+
+    let CommitRejection::DraftValidationFailed { diagnostics } = &rejection else {
+        panic!("expected draft validation failure, got {rejection:?}");
+    };
+
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("carry no value for its invocation lock")),
+        "{diagnostics:?}"
+    );
+
+    // Keyed on the interface's only input: commits.
+    submit(
+        &engine,
+        &decomposer,
+        vec![interface(
+            BTreeMap::from([paid_input()]),
+            Some(conseqa::spec::InvocationLock {
+                key: ValueRef {
+                    source: ValueSource::Input(id("input.notify.paid")),
+                    path: path("order_id"),
+                },
+            }),
+        )],
+    )
+    .expect("a coherent lock commits");
+
+    let head = engine.head_snapshot();
+    let draft = &head.workspace.operations[&id("operation.notify")];
+
+    assert!(draft.invocation_lock.is_some());
+    assert_eq!(draft.interface().invocation_lock, draft.invocation_lock);
+}
+
 #[test]
 fn planned_operation_commits_as_draft_and_requirements_flow_through_proposals() {
     let engine = engine();
@@ -1076,6 +1211,7 @@ fn planned_operation_commits_as_draft_and_requirements_flow_through_proposals() 
                             acknowledge_on_success: None,
                         }),
                     )]),
+                    invocation_lock: None,
                 },
             },
             Mutation::PutPromptObligation {

@@ -1,12 +1,13 @@
 # Conseqa DSL Semantics
 
 **Status:** Normative semantic contract for the DSL and the V1 verifiers — the single authoritative semantics document. The design drafts and revision documents that preceded it are retired; their normative content is consolidated here, and what they left open is §27.  
-**DSL contract version:** This document specifies **DSL contract version 2** (`DSL_VERSION`, `src/spec/model.rs`). The version names the normative semantic contract as a whole, not the parse schema: any normative change bumps it — vocabulary, validation, or proof semantics alike — while purely internal changes do not. Every specification document declares the version it is authored in (`dsl: 2`, the model root's first field, stamped at assembly and never authored); a consumer probes it before strict parsing and refuses a mismatch or absence by name. Version 2 is the outbox-semantics revision: an outbox has exactly one consuming input, consumption re-drive is intrinsic rather than declared, and outbox dispatch declares an explicit routing block (§5, §8.3, §10.3.2).
+**DSL contract version:** This document specifies **DSL contract version 3** (`DSL_VERSION`, `src/spec/model.rs`). The version names the normative semantic contract as a whole, not the parse schema: any normative change bumps it — vocabulary, validation, or proof semantics alike — while purely internal changes do not. Every specification document declares the version it is authored in (`dsl: 3`, the model root's first field, stamped at assembly and never authored); a consumer probes it before strict parsing and refuses a mismatch or absence by name. Version 3 is the serialization-semantics revision: serialization gains the L0 `invocation_lock` proof route, member assignment asserts stable-epoch affinity only, and every topology serialization and ordering proof requires the explicit `execution_handoff = exclusive_ownership` fact (§7, §9, §10.5, §10.6).
 
 | dsl | defined by |
 |---|---|
 | 1 | the External Boundary Guarantees and Decision Vocabulary revision — external `identity` / `idempotency` / `result_replay`, versioning itself; everything earlier is unversioned prehistory, refused as predating versioning |
 | 2 | the Outbox Semantics revision — exactly one `OutboxInput` per outbox, intrinsic durable re-drive in place of declared delivery and acknowledgement, `OutboxDispatch.routing` in place of a bare member assignment |
+| 3 | the Serialization Semantics revision — the L0 `Operation.invocation_lock` proof route; `MemberAssignment` reduced to stable-epoch affinity, its implicit safe-ownership-transfer rule removed; the explicit `ExecutionPool.execution_handoff` leg required by every topology serialization and ordering proof |
 
 **Implementation namespace:** `src/spec/` (surface), `src/analyzer/` (validation and verification).
 
@@ -467,6 +468,42 @@ An operation declares **no execution-concurrency fact**. Runtime concurrency is 
 
 `description` is documentation only and has no proof semantics.
 
+### `invocation_lock`
+
+An operation may declare one entry synchronization fact:
+
+```
+operations:
+  <operation>:
+    invocation_lock:
+      key: { source: input:<input>, path: [ <field>, ... ] }
+```
+
+Semantics — a conforming realization behaves as:
+
+```
+evaluate key from invocation context
+    -> acquire exclusive InvocationLock(key)
+    -> execute first program step
+    -> ...
+    -> operation terminal (return | complete)
+    -> release InvocationLock(key)
+```
+
+The lock is acquired before any operation program step executes and held until the invocation reaches `return` or `complete`. Two invocations whose evaluated lock keys are equal cannot execute their operation programs concurrently:
+
+```
+InvocationLock(K)  =>  SerializedBy(K)
+```
+
+provided the lock key is established to carry the same logical value as the serialization-requirement key (§9). The declaration asserts the abstract exclusion guarantee, never its mechanism: advisory database locks, distributed mutexes, and fenced lock services are Confluence realization concerns. It is not a program step, and it is not a §21 transaction `Lock`: a transaction lock protects the object instances its selector selects for a transaction's span, while this guards the whole invocation under a semantic key that needs no instance to exist.
+
+Three non-implications are normative. The lock establishes **no invocation ordering** — acquisition makes no FIFO guarantee. It is **not a concurrency bound** — it excludes equal keys only, and distinct keys proceed concurrently. And async effects permitted to outlive the operation terminal (§16) are **not implicitly kept under the lock after terminal**: the lock spans the program, not the effect lifetimes that escape it.
+
+The key is evaluated at operation entry, before any step, and only an input payload exists there. Validation therefore requires the key's source to be an input of the operation, and its **only** input — every invocation acquires the lock, and an invocation triggered by another input carries no value for the key (`InvocationLockKeyNotFromInput`, `InvocationLockKeyNotEvaluable`). The path must resolve in every schema the input admits, like a requirement key's.
+
+This is deliberately an operation-level declaration and still not an execution-concurrency fact: member concurrency describes the runtime capacity of an execution resource (§10.5), while the lock is an L0 synchronization **guarantee** the application machine asserts — the same layering that keeps serializable isolation and transaction locks L0 however much infrastructure implements them (§1). It is the one serialization proof route that survives any change of runtime topology (§9).
+
 ### Multiple inputs
 
 Each `Input` declaration is a possible source of an invocation of the operation.
@@ -671,20 +708,44 @@ Serialization establishes mutual exclusion/non-overlap. It does **not** establis
 
 Thus a keyed routing domain on a serial pool member, a lock, or another mechanism may prove serialization without proving ordering.
 
-The requirement is L0: it constrains the application machine. What discharges it is usually L1, and always in one shape:
+The requirement is L0: it constrains the application machine. Two independent positive proof routes discharge it.
+
+**Route A — explicit synchronization** is L0-only: the operation declares an `invocation_lock` (§7) whose key is established to carry the same logical value as the requirement key for the key's input — the same path, or the same canonical value through fragment aliasing (§4), for every admitted schema. Same-key invocations then contend on one exclusive lock held from operation entry to the invocation's terminal, so their programs never overlap:
+
+```
+InvocationLock(K)  =>  SerializedBy(K)
+```
+
+No routing, pool, member-lifecycle, or handoff fact participates, so the proof survives any change of runtime topology. The lock makes no FIFO guarantee, so route A is never an ordering argument.
+
+**Route B — runtime topology** is runtime-dependent, and always one four-legged shape:
 
 ```
 semantic key equivalence
     -> routing-domain equivalence
-    -> member ownership
+    -> stable-epoch member affinity
+    -> exclusive execution handoff
     -> member concurrency
 ```
 
-V1 accepts four routes. **Vacuous population**: the key's message-driven input admits no message schemas, so the constrained population is empty by declaration — the only `l0_only` route. **Request-routed**: a `Router` serves the key's request boundary, every component of its semantic routing key carries the same logical value as the requirement key (§4), its `MemberAssignment` gives that domain one active owning member including through handoff, and the target pool declares `member_concurrency = bounded(1)`. **Subscription-routed**: the same argument on the delivery side, with `key: grouping_key` naming the effective grouping domain (§10.2) and the requirement key established to carry the grouping key for every admitted schema. **Outbox-routed**: the same argument over an outbox input's keyed partitioning (§10.3.2) — the dispatch declares `routing` with `key: partition_key`, every partition-key component carries the requirement key for every admitted schema, the routing's `MemberAssignment` gives each partition one active owning member, the pool is serial, **and the dispatch declares no batching stage**. A declared batching stage stops the route whatever its ordering preservation: batch-internal overlap is intentionally unmodeled, and `member_concurrency` must not be silently read as a fact about it. `partitioning: none` also proves nothing here — it declares one undivided consumption domain, and V1 consumes keyed partition affinity only.
+All four facts are required, and each carries one narrow responsibility: the boundary's routing key is equivalent to the requirement key, so same-key invocations share one routing domain; `member_assignment: consistent_hash` assigns that domain to one member per stable ownership epoch (§10.6); `execution_handoff: exclusive_ownership` preserves exclusive execution ownership across ownership and member transitions (§10.5), so a stale owner cannot overlap its successor; and `member_concurrency = bounded(1)` stops the owning member itself from overlapping invocations.
+
+Why the handoff leg cannot be omitted: `bounded(1)` means only that one member executes at most one invocation at a time, and consistent-hash affinity holds within a stable epoch. Neither says a stale invocation belonging to a former member or member incarnation cannot coexist with work running on its replacement:
+
+```
+member A:        M ----------------------------->
+A becomes unreachable
+replacement B:              M ------------------>
+A may actually still be executing
+```
+
+Each of A and B individually satisfies `member_concurrency = bounded(1)`, and the same-key invocations overlap. Only the declared handoff fact bridges the transition.
+
+V1 accepts route B in three per-ingress forms, plus the vacuous route. **Vacuous population**: the key's message-driven input admits no message schemas, so the constrained population is empty by declaration — L0-only like route A, and needing no fact at all. **Request-routed**: a `Router` serves the key's request boundary, every component of its semantic routing key carries the same logical value as the requirement key (§4), and the four legs hold over its pool. **Subscription-routed**: the same argument on the delivery side, with `key: grouping_key` naming the effective grouping domain (§10.2) and the requirement key established to carry the grouping key for every admitted schema. **Outbox-routed**: the same argument over an outbox input's keyed partitioning (§10.3.2) — the dispatch declares `routing` with `key: partition_key`, every partition-key component carries the requirement key for every admitted schema, the four legs hold, **and the dispatch declares no batching stage**. A declared batching stage stops the route whatever its ordering preservation: batch-internal overlap is intentionally unmodeled, and `member_concurrency` must not be silently read as a fact about it. `partitioning: none` also proves nothing here — it declares one undivided consumption domain, and V1 consumes keyed partition affinity only.
 
 **No ordering fact participates in any of them.** Serialization is about non-overlap; a grouping domain is the whole of what a transport has to supply for it. That is the main reason grouping is declared independently of ordering — an unordered transport that still groups by key serializes, and the model can say so without claiming an order it does not provide.
 
-Four things are deliberately not credited. A **shared pool** is a shared execution population, not a shared routing domain: two boundaries assigned to one pool, even under equal-looking keys, borrow nothing from each other. **Routing absence** yields the target population and no member-affinity fact at all. A **routing key wider than the requirement key** partitions same-key invocations across domains, so equality of the requirement key implies nothing. And `bounded(n)` with `n > 1` permits overlap wherever it appears.
+Six things are deliberately not credited. A **shared pool** is a shared execution population, not a shared routing domain: two boundaries assigned to one pool, even under equal-looking keys, borrow nothing from each other. **Routing absence** yields the target population and no member-affinity fact at all. A **routing key wider than the requirement key** partitions same-key invocations across domains, so equality of the requirement key implies nothing. **Affinity plus a serial member, without the handoff fact** admits the overlap diagram above; neither `consistent_hash` nor `bounded(1)` bridges a member transition. An **ordinary message lease** is not invocation fencing: expiry may permit redelivery without the old attempt having terminated, so a lease alone never satisfies the handoff leg. And `bounded(n)` with `n > 1` permits overlap wherever it appears.
 
 ### `OrderingRequirement`
 
@@ -707,15 +768,15 @@ V1 recognizes two precedence sources: the effective transport ordering (§10.2�
 
 That request inputs have none is worth stating plainly: a router keyed exactly like the requirement, on a pool whose members are serial, does establish serialization — and still no ordering, because arrival order of unmodeled callers is not a logical precedence. There is nothing for the mechanism to preserve. A separate precedence source would be required.
 
-The mechanism is the §10 composition, and it is the serialization argument plus a precedence: the requirement key is established to be the effective grouping key for every admitted schema, `key: grouping_key` routes by that same domain, `MemberAssignment` gives it one active owning member, and `member_concurrency = bounded(1)` stops a later invocation overtaking an earlier one.
+The mechanism is the §10 composition, and it is the serialization argument plus a precedence: the requirement key is established to be the effective grouping key for every admitted schema, `key: grouping_key` routes by that same domain, `MemberAssignment` assigns it to one member per stable ownership epoch, `execution_handoff = exclusive_ownership` keeps a stale owner's earlier invocation from overlapping its successor's later one across a transition — precedence of effect is lost in such an overlap — and `member_concurrency = bounded(1)` stops a later invocation overtaking an earlier one on the member itself. Ordering is strictly stronger than serialization, so no leg of the serialization argument may be missing here. Route A contributes nothing: an `invocation_lock` serializes with no FIFO acquisition guarantee, so it preserves no precedence.
 
-Every leg is interrogated, not merely cited. The routing key is matched exhaustively, the member assignment is checked to give a domain one active owning member, and the pool's concurrency is checked to be `bounded(1)` — so a future routing key or assignment with weaker guarantees cannot be carried into a proof as though it were the one this rule was written for. Where a boundary is routed two ways, or a topic and its subscription both declare transport semantics, there is no single set of facts to reason from and the verifier refuses rather than reading whichever half it finds first.
+Every leg is interrogated, not merely cited. The routing key is matched exhaustively, the member assignment is checked for stable-epoch domain affinity, the pool's execution handoff for exclusive ownership across transitions, and its concurrency for `bounded(1)` — so a future routing key, assignment, or handoff variant with weaker guarantees cannot be carried into a proof as though it were the one this rule was written for. Where a boundary is routed two ways, or a topic and its subscription both declare transport semantics, there is no single set of facts to reason from and the verifier refuses rather than reading whichever half it finds first.
 
 Both precedence sources require that same grouping identity, and for the same reason: a precedence only reaches execution if same-key deliveries stay together. `within_group` needs it because its guarantee is *about* the group. `global` needs it because an order over everything is still lost the moment two same-key deliveries land on different members. So the grouping evidence is established once and cited by either — serialization proves on the grouping alone, and ordering is that argument with a precedence added.
 
-This is why an ordering proof is strictly stronger than a serialization one over the same key, and why dispatch alone can never supply it: dispatch preserves precedence, it does not create any (§10.3.1). Dispatch additionally carries the order-preservation obligation of §10.3, so redelivery cannot invert the precedence: a failure-driven redelivery cannot be overtaken by a later message of its domain, and a duplicate of an already completed message is a repeated attempt at a logical invocation that took effect in order — what that attempt does is the idempotency requirement's obligation, not ordering's, and the proof records which requirement answers for it or that none does. Vacuously discharged: a message-driven input admitting no message schemas.
+This is why an ordering proof is strictly stronger than a serialization one over the same key, and why dispatch alone can never supply it: dispatch preserves precedence, it does not create any (§10.3.1). Dispatch additionally carries the order-preservation obligation of §10.3, so redelivery cannot invert the precedence: a failure-driven redelivery cannot be overtaken by a later message of its domain, and a duplicate of an already completed message is a repeated attempt at a logical invocation that took effect in order. That obligation concerns admission order and composes with the handoff fact rather than substituting for it — exclusive handoff stops a stale owner overlapping its successor, order-preserving admission stops the successor running the later message before the redelivered earlier one — what that attempt does is the idempotency requirement's obligation, not ordering's, and the proof records which requirement answers for it or that none does. Vacuously discharged: a message-driven input admitting no message schemas.
 
-The outbox route is the same composition in the outbox's own vocabulary: the runtime declares `ordering: partition` (or `global`), every partition-key component carries the requirement key for every admitted schema — same-key deliveries then share one partition, which both precedence reaches need — the dispatch declares `routing` with `key: partition_key` whose `MemberAssignment` gives that partition one active owning member, and the pool is serial. One leg is new: a declared **batching stage** is judged explicitly. Absent, there is no batch obstacle; `ordering: preserved` lets the established precedence pass through the stage — the opaque batch processing does not let a later message overtake an earlier one against it; `ordering: unspecified` stops the proof, because the stage then provides no evidence the order survives execution. Order preservation is an ordering fact only: it is never read as a no-overlap guarantee, which is why the serialization route above refuses batching outright while this route accepts `preserved` (§10.3.2).
+The outbox route is the same composition in the outbox's own vocabulary: the runtime declares `ordering: partition` (or `global`), every partition-key component carries the requirement key for every admitted schema — same-key deliveries then share one partition, which both precedence reaches need — the dispatch declares `routing` with `key: partition_key` whose `MemberAssignment` assigns that partition to one member per stable epoch, the pool declares `execution_handoff = exclusive_ownership`, and the pool is serial. One leg is new: a declared **batching stage** is judged explicitly. Absent, there is no batch obstacle; `ordering: preserved` lets the established precedence pass through the stage — the opaque batch processing does not let a later message overtake an earlier one against it; `ordering: unspecified` stops the proof, because the stage then provides no evidence the order survives execution. Order preservation is an ordering fact only: it is never read as a no-overlap guarantee, which is why the serialization route above refuses batching outright while this route accepts `preserved` (§10.3.2).
 
 ### Serialization versus ordering
 
@@ -724,7 +785,7 @@ These terms are deliberately separate:
 - **serialization**: same-key invocations do not overlap;
 - **ordering**: the correct same-key precedence is preserved.
 
-A FIFO mutex may provide both if its acquisition order is proven to correspond to the required input order. A non-FIFO mutex may provide serialization without providing the required ordering. Likewise a routing domain on a serial pool member provides serialization; it provides ordering only when a transport precedence exists for the mechanism to preserve.
+A FIFO mutex may provide both if its acquisition order is proven to correspond to the required input order. A non-FIFO mutex may provide serialization without providing the required ordering — and the `invocation_lock` is exactly that: it declares no acquisition-order fact, so it proves serialization and never ordering. Likewise a routing domain on a serial pool member with exclusive handoff provides serialization; it provides ordering only when a transport precedence exists for the mechanism to preserve.
 
 ### `IdempotencyRequirement`
 
@@ -1119,7 +1180,7 @@ logical OutboxInput invocation
 
 #### `routing`
 
-An optional `OutboxRouting` block that intentionally mirrors `SubscriptionRouting` — `{ key, member_assignment }` — rather than burying the routing domain implicitly inside a bare member assignment. The declaration states two independent facts: `key` names **which established semantic domain is routed**, and `member_assignment` **how that domain is assigned to pool members**, with the normative §10.6 semantics unchanged, safe ownership transfer included.
+An optional `OutboxRouting` block that intentionally mirrors `SubscriptionRouting` — `{ key, member_assignment }` — rather than burying the routing domain implicitly inside a bare member assignment. The declaration states two independent facts: `key` names **which established semantic domain is routed**, and `member_assignment` **how that domain is assigned to pool members**, with the §10.6 semantics unchanged — assignment and affinity only; continuity of exclusive execution authority across transitions is `ExecutionPool.execution_handoff`'s separate fact (§10.5).
 
 With `routing` absent, Conseqa establishes only that consumption attempts execute on some member of the referenced pool — no stable partition-to-member affinity is known. With
 
@@ -1131,7 +1192,7 @@ routing:
 
 the logical partition domain established by `partitioning` is routed to pool members according to the assignment. For V1 the only routing key is `partition_key`, because `OutboxPartitioning` is the outbox's one established semantic consumption domain; validation requires keyed partitioning with it, since `partitioning: none` leaves no partition-key domain to route — routing consumes an already-declared semantic key rather than inventing one, exactly as `grouping_key` routing does on the subscription side.
 
-Routing does not imply attempt exclusivity. After redelivery or ownership uncertainty, `attempt A(M) -> member X` and `attempt B(M) -> member Y` may overlap unless stronger routing/handoff semantics establish otherwise.
+Routing does not imply attempt exclusivity. After redelivery or ownership uncertainty, `attempt A(M) -> member X` and `attempt B(M) -> member Y` may overlap unless the pool's `execution_handoff = exclusive_ownership` (§10.5) establishes otherwise. An ordinary polling message lease is not that fact: expiry may permit redelivery without the old attempt having terminated, so a lease alone is never invocation fencing.
 
 #### `batching`
 
@@ -1174,9 +1235,10 @@ means "requests through this boundary execute within `pool.web`", and provides n
 ```
 runtime.execution_pools[<pool>]:
   member_concurrency: unspecified | unbounded | bounded{ value }
+  execution_handoff: exclusive_ownership        # optional
 ```
 
-A pool identifies **a logical population of interchangeable runtime members capable of executing the operation invocations assigned to that pool**. It establishes two things: runtime population identity, and the qualitative execution concurrency of each member.
+A pool identifies **a logical population of interchangeable runtime members capable of executing the operation invocations assigned to that pool**. It establishes up to three things: runtime population identity, the qualitative execution concurrency of each member, and — when declared — the continuity of exclusive execution authority across ownership and member transitions.
 
 #### Pool identity
 
@@ -1196,6 +1258,28 @@ If they target different pools, they target distinct logical populations. That i
 
 Unlike routing, member concurrency has genuine semantic value in distinguishing an unknown resource from an explicitly unconstrained one, so it keeps both negative states.
 
+#### `execution_handoff`
+
+An optional declaration of execution-ownership continuity, with one value:
+
+> **`exclusive_ownership`** — when execution authority for a routing domain transfers from one pool member or member incarnation to another, the runtime preserves exclusive execution ownership of that domain across the transition.
+
+If `owner(K, E) = A` and `owner(K, E+1) = B`, a conforming runtime cannot allow an invocation for `K` executing under A's old authority to overlap an invocation for `K` executing under B's successor authority. This covers domain reassignment (`A -> B`) and member replacement (`A -> A'`, a new incarnation) alike.
+
+The guarantee concerns **execution authority**, not control-plane membership or agreement. None of the following alone establishes it:
+
+```
+membership lease expiry
+worker declared unhealthy
+new member started
+consistent-hash ring recomputed
+consensus agrees on new owner
+```
+
+A conforming realization must actually prevent the stale owner's execution from overlapping the successor's — draining, generation fencing, and coordinated handoff are conforming mechanisms, and Conseqa models the resulting guarantee, never the mechanism. An ordinary polling message lease is not conforming by itself: expiry permits redelivery without terminating the old attempt.
+
+Absence is epistemic — no usable fact about execution overlap across such transitions — never an assertion that overlap occurs. And the declaration is independent of `member_concurrency` in both directions: exclusive handoff does not bound how many invocations one member runs, and `bounded(1)` binds each member separately without bridging a transition between members. The §9 topology proofs need both, plus the assignment's affinity, because each fact answers one question.
+
 #### Cardinality is external
 
 A pool carries no member count, replica count, CPU, memory, autoscaling rule, host count, or container count. An external simulation scenario may instantiate `DataWorkers.members = 16` or `= 128` against the same Conseqa architecture, along with traffic rates, key-frequency distributions, service-time distributions, capacity, queueing, and latency. Those values never become Conseqa semantics.
@@ -1206,13 +1290,13 @@ A pool carries no member count, replica count, CPU, memory, autoscaling rule, ho
 member_assignment: { kind: consistent_hash }
 ```
 
-A member assignment describes how a routing domain is assigned to a member of an execution pool. The name is deliberate: the semantic relation is `semantic routing domain -> runtime execution-pool member`, and assignment accommodates ownership and handoff, which "placement" does not.
+A member assignment describes how a routing domain is assigned to a member of an execution pool — **assignment and affinity only**. It asserts nothing about execution overlap between a previous owner and its successor across worker replacement, failure recovery, scaling, membership change, partition reassignment, or ownership rebalance: that continuity is a separate declared fact, `ExecutionPool.execution_handoff` (§10.5). The split keeps `consistent_hash` from silently carrying a much stronger distributed-systems guarantee than its declaration visibly states.
 
 #### `consistent_hash`
 
-> Equal routing domains are owned by the same execution-pool member during a stable ownership epoch.
+> During a stable ownership epoch, equal routing domains are assigned to the same execution-pool member.
 
-Different routing domains may be assigned to the same member. Conseqa prescribes no hash function, virtual-node count, membership-discovery mechanism, or choice between Ketama and rendezvous hashing. The declaration specifies semantic assignment behaviour, not implementation mechanics.
+Different routing domains may be assigned to the same member. Conseqa prescribes no hash function, virtual-node count, membership-discovery mechanism, or choice between Ketama and rendezvous hashing. The declaration specifies semantic assignment behaviour, not implementation mechanics — and it says nothing about what happens **between** epochs: a stale owner overlapping its successor is consistent with this declaration alone (§10.5).
 
 #### `round_robin`
 
@@ -1228,11 +1312,20 @@ A routing key declared alongside it still names domains, and those domains keep 
 
 This is the "explicit negative routing guarantee" the initial model deferred (§27), admitted now that there is a use for the distinction. It is emphatically *not* the `unconstrained` routing variant that model declined: routing keys still have exactly two components, and absence still means absence. What changed is that the *assignment* dimension gained a second ordinary value.
 
-#### Safe ownership transfer is normative
+#### Assignment is not ownership continuity
 
-Any member assignment used to establish keyed serialization **must preserve exclusive ownership through reassignment**. If routing domain `K` moves from member A to member B, a conforming runtime must not permit A and B to execute `K` in a manner that violates the declared one-owner semantics.
+The previous contract read a normative safe-ownership-transfer rule into any assignment a serialization proof consumed. That rule is removed. Two explicit facts replace it:
 
-Draining, leases, generation fencing, coordinated handoff, and partition-ownership protocols are conforming mechanisms. Conseqa models the resulting guarantee, not the mechanism. A rebalance that silently invalidates *one routing domain → one current owning member* while the runtime still claims conformance is a non-conforming implementation, not a modeling gap.
+```
+MemberAssignment
+    -> describes assignment/affinity
+
+ExecutionPool.execution_handoff
+    -> describes continuity of exclusive execution authority
+       across assignment/member transitions
+```
+
+A topology proof cites both by name (§9), so nothing about failover ever again rides implicitly on `consistent_hash` — and a runtime that provides affinity without fencing can now say exactly that, by declaring the first fact and not the second.
 
 ### 10.7 `StorageLayout`
 
@@ -2591,7 +2684,9 @@ Program order between separate `Lock` steps is itself relevant to the lock-order
 
 A `by` order within one selector does not automatically reconcile contradictory order between two separately declared lock steps.
 
-The current DSL therefore cannot declare a deadlock-safe acquisition of several specific instances of one object: a selector admits no disjunction, so one lock step cannot name them, and no fact orders separate steps. The locking facts the DSL lacks are open question 8 (§27), and the model-wide deadlock checker that would consume them is question 9; no V1 verifier reasons about locks.
+The current DSL therefore cannot declare a deadlock-safe acquisition of several specific instances of one object: a selector admits no disjunction, so one lock step cannot name them, and no fact orders separate steps. The locking facts the DSL lacks are open question 8 (§27), and the model-wide deadlock checker that would consume them is question 9; no V1 verifier reasons about transaction locks.
+
+The operation-entry `invocation_lock` (§7) is deliberately not a `Lock`. A transaction lock protects the object instances its selector selects, for the span from acquisition to transaction end; whether two same-key invocations conflict on a common instance depends on such an instance existing at lock time, which is runtime state the model cannot declare. The invocation lock differs on exactly those two points — a semantic key needing no instance, held over the whole program — which is why the §9 serialization verifier credits it while declining every transaction-lock route.
 
 ---
 
@@ -2755,6 +2850,11 @@ The solver must preserve these distinctions:
 | **Ordering vs serialization** | Serialization prevents overlap; ordering preserves the correct precedence. |
 | **Transport order vs semantic order** | A broker can serialize concurrent producers without establishing a business-level happens-before relation. |
 | **Routing domain vs pool member** | A routing key names a semantic domain; `MemberAssignment` maps it onto a member. The domain keeps its identity across rebalances. |
+| **Stable-epoch affinity vs execution handoff** | `consistent_hash` assigns a domain to one member while an ownership epoch is stable; only `execution_handoff = exclusive_ownership` says a stale owner cannot overlap its successor across a transition. `bounded(1)` binds each member separately and bridges nothing. |
+| **Message lease vs invocation fencing** | Lease expiry may permit redelivery without the old attempt having terminated; a lease alone never establishes exclusive handoff. |
+| **Invocation lock vs transaction lock** | An `invocation_lock` guards the whole invocation under a semantic key evaluated at entry; a `Lock` step protects selected object instances for a transaction's span, and no V1 proof credits it. |
+| **Invocation lock vs ordering** | The lock excludes concurrent same-key execution with no FIFO acquisition guarantee, so it proves serialization and never ordering. |
+| **Idempotency vs serialization** | Collapsing the work of duplicate attempts does not prevent same-key invocations overlapping, and mutual exclusion does not collapse duplicate work; neither implies the other. |
 | **Routing domain vs storage partition** | Equal key expressions do not make execution affinity and physical partitioning the same concept. |
 | **Shared pool vs shared routing domain** | One execution population is not one ownership domain; two boundaries in one pool borrow no affinity from each other. |
 | **Routing absence vs unconstrained routing** | No routing block is no fact — not a declaration that routing is arbitrary. |
@@ -2846,7 +2946,19 @@ Evidence:
         semantic routing key = account_id
         member_assignment    = consistent_hash
     ExecutionPool account_workers
+        execution_handoff    = exclusive_ownership
         member_concurrency   = bounded(1)
+```
+
+An invocation-lock proof cites less and survives more:
+
+```
+Requirement:  SerializedBy(account_id)
+Verdict:      Proven
+Scope:        l0_only
+Evidence:
+    InvocationLock
+        key = account_id
 ```
 
 ### 25.2 Removing L1
@@ -2877,7 +2989,7 @@ Serializable isolation, explicit locks, message identity, and `retry: may_repeat
 
 When declaring transport semantics, ask which of the two facts you actually have. Grouping and ordering are separate on purpose: a transport that groups by a key without ordering within it is an ordinary thing, and saying so earns a serialization proof without claiming an order that does not exist. Declaring `within_group` to reach a grouping key would be exactly the false statement §26 warns against.
 
-When declaring runtime topology, declare only what the architecture genuinely provides. Inventing a pool or a member assignment to make a proof pass is the same error as declaring a guarantee the implementation does not offer — and here the temptation is sharper, because `member_concurrency = bounded(1)` discharges obligations so readily. If the architecture does not constrain execution that way, leave the requirement unproven.
+When declaring runtime topology, declare only what the architecture genuinely provides. Inventing a pool or a member assignment to make a proof pass is the same error as declaring a guarantee the implementation does not offer — and here the temptation is sharper, because `member_concurrency = bounded(1)` discharges obligations so readily. Sharper still with `execution_handoff: exclusive_ownership`, which no topology proof can do without and which most runtimes do not actually provide: declare it only where the runtime genuinely fences or drains a stale owner, and never on the strength of a message lease. If the architecture does not constrain execution that way, leave the requirement unproven — or, where entry exclusion is the honest architecture, declare the L0 `invocation_lock` (§7) instead of inventing topology.
 
 ---
 
@@ -2910,7 +3022,7 @@ What the DSL deliberately does not yet decide. Every entry is scoped so that res
    - *Predicate versus instance locks.* Whether a lock on `all` or on a partial identity covers instances inserted later (a predicate lock) or only current ones is unspecified; serialization and deadlock reasoning both depend on it.
    - *Wait policy.* No lock-wait timeout, `nowait`, or `skip locked` fact; these decide whether a circular wait deadlocks or aborts. Absent one, a checker must treat every cycle as a deadlock.
 
-   No V1 proof credits a lock — the serialization checker deliberately declines the lock route — so each of these can only add what can be stated and proven, never invalidate a verdict.
+   No V1 proof credits a transaction lock — the serialization checker deliberately declines every transaction-lock route; the operation-entry `invocation_lock` (§7) is a different primitive with its own §9 route — so each of these can only add what can be stated and proven, never invalidate a verdict.
 
 9. **Model-wide deadlock checker** — *Open; earmarked for implementation; depends on 8 to be useful.* A model-wide analysis, not a per-operation requirement: locks live in transactions, and a deadlock is a property of every transaction the model admits concurrently on one data model. The analysis, per data model:
 
@@ -2934,5 +3046,5 @@ What the DSL deliberately does not yet decide. Every entry is scoped so that res
 - **Retry execution.** `ErrorDisposition::retryable` states that another attempt is semantically admitted (§8.1); nothing models the mechanism that performs one — no retry policy, loop, attempt count, backoff, or timeout. A retry-execution revision may consume the disposition.
 - **Performance overlay.** The correctness vocabulary deliberately exposes distinctions a future probabilistic layer could consume — terminal versus retryable outcomes, attempt populations, member concurrency, member assignment, routing and partition keys — but no performance semantics exist in the model. L1 is qualitative by design: pool cardinality, traffic rates, key-frequency distributions, service-time distributions, storage-node counts, replication factors, capacity, queueing, and latency belong to an external simulation scenario evaluated *against* a Conseqa architecture, never inside it.
 - **Explicit negative routing** — *partly resolved.* There is still no `unconstrained` routing variant: absence of a routing block expresses that no member-affinity fact exists, and routing keeps exactly two components. The distinction between *unknown* and *known arbitrary* member behaviour is now carried where it belongs, on the assignment: `member_assignment: round_robin` (§10.6), admitted for the external analysis that needs it rather than for any proof. Still open is whether a routing *key* ever needs a comparable negative.
-- **Global execution gates.** Removing operation-level concurrency leaves no way to say "no two invocations of X overlap globally", independent of topology. If a genuine architectural need appears, it should be an explicit primitive — never hidden inside `Operation`, where it was detached from the execution topology that realizes it.
+- **Global execution gates** — *partly resolved.* Keyed operation-entry exclusion is now the explicit `invocation_lock` (§7): an L0 synchronization guarantee the application machine asserts, not a concurrency bound hidden in `Operation` — the same §1 layering that keeps serializable isolation L0. A keyless global gate ("no two invocations of X overlap, whatever their keys") still has no declaration: a lock key sources an input path, so a constant key cannot be written. If that need appears, it should still be its own primitive.
 - **Beyond the pool.** L1's execution abstraction stops at a population of interchangeable members. Physical database nodes, replica topology, consensus protocols, database lock-manager internals, hosts, containers, process ids, CPU, memory, availability zones, network links, queue capacities, and autoscaling policies are all outside it.

@@ -464,8 +464,11 @@ pub struct OutboxDispatch {
 ///
 /// Routing does not imply attempt exclusivity: after redelivery or
 /// ownership uncertainty, attempts for one logical message may
-/// overlap on different members unless stronger routing/handoff
-/// semantics establish otherwise.
+/// overlap on different members unless
+/// [`ExecutionPool::execution_handoff`] establishes otherwise. An
+/// ordinary polling message lease is not that fact — lease expiry may
+/// permit redelivery without the old attempt having terminated, so a
+/// lease alone is never invocation fencing.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OutboxRouting {
@@ -583,23 +586,26 @@ pub struct RequestRouting {
 /// How a semantic routing domain is assigned to a member of an
 /// execution pool.
 ///
-/// Any assignment used to establish keyed serialization must preserve
-/// exclusive ownership through reassignment: if domain `K` moves from
-/// member A to member B, a conforming runtime must not let A and B
-/// execute `K` in a manner that violates the declared one-owner
-/// semantics. Draining, leases, generation fencing, and coordinated
-/// handoff are conforming mechanisms; Conseqa models the resulting
-/// guarantee, not the mechanism.
+/// An assignment describes assignment and affinity only. It asserts
+/// nothing about execution overlap between a previous owner and its
+/// successor across worker replacement, failure recovery, scaling,
+/// membership change, partition reassignment, or ownership rebalance
+/// — that continuity is a separate fact, declared (or not) by
+/// [`ExecutionPool::execution_handoff`]. Splitting the two keeps
+/// `consistent_hash` from silently carrying a much stronger
+/// distributed-systems guarantee than its declaration visibly states.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum MemberAssignment {
-    /// Equal routing domains are owned by the same execution-pool
-    /// member during a stable ownership epoch. Different domains may
-    /// share a member.
+    /// During a stable ownership epoch, equal routing domains are
+    /// assigned to the same execution-pool member. Different domains
+    /// may share a member.
     ///
     /// The declaration fixes semantic assignment behaviour. It
     /// prescribes no hash function, virtual-node count, or membership
-    /// discovery mechanism.
+    /// discovery mechanism — and it says nothing about what happens
+    /// between epochs: a stale owner overlapping its successor is
+    /// consistent with this declaration alone.
     ConsistentHash,
 
     /// Each invocation goes to the next member in rotation,
@@ -649,6 +655,43 @@ pub enum MemberAssignment {
 #[serde(deny_unknown_fields)]
 pub struct ExecutionPool {
     pub member_concurrency: MemberConcurrency,
+
+    /// Whether exclusive execution ownership of a routing domain
+    /// survives ownership and member transitions. Absent means no
+    /// usable fact about execution overlap across such transitions —
+    /// epistemic absence, not an assertion that overlap occurs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_handoff: Option<ExecutionHandoff>,
+}
+
+/// The continuity of exclusive execution authority across
+/// assignment and member transitions — a fact about the pool's
+/// runtime, deliberately separate from [`MemberAssignment`], which
+/// describes assignment and affinity only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionHandoff {
+    /// When execution authority for a routing domain transfers from
+    /// one pool member or member incarnation to another, the runtime
+    /// preserves exclusive execution ownership of that domain across
+    /// the transition: an invocation executing under the old authority
+    /// cannot overlap one executing under the successor's.
+    ///
+    /// This covers domain reassignment (`A -> B`) and member
+    /// replacement (`A -> A'`) alike, and it concerns execution
+    /// authority, not control-plane membership or agreement. None of
+    /// the following alone establishes it: membership lease expiry, a
+    /// worker declared unhealthy, a new member started, a recomputed
+    /// consistent-hash ring, consensus on a new owner. A conforming
+    /// realization must actually prevent the stale owner's execution
+    /// from overlapping the successor's — draining, generation
+    /// fencing, and coordinated handoff are conforming mechanisms;
+    /// Conseqa models the resulting guarantee, not the mechanism.
+    ///
+    /// It does not bound member concurrency: a pool may preserve
+    /// exclusive handoff while each member runs many invocations at
+    /// once.
+    ExclusiveOwnership,
 }
 
 /// How many invocations one member of a pool may execute at once.
