@@ -12,10 +12,12 @@ import type { CSSProperties, ComponentPropsWithRef, ReactElement, ReactNode } fr
 import {
   commitGuarantee,
   delivery,
+  intrinsicRedrive,
   isolation,
   memberAssignment,
   memberConcurrency,
   noRuntimeDeclared,
+  outboxRouting,
   requestIdentity,
   requestRouting,
   subscriptionRouting,
@@ -676,19 +678,22 @@ function Realization({ opId, inputId, kind }: { opId: Id; inputId: Id; kind: "re
       return (
         <>
           <FactBadge fact={noRuntimeDeclared()} />
-          <FactBadge fact={delivery("unspecified")} />
+          <FactBadge fact={intrinsicRedrive()} />
         </>
       );
     }
     const pool = model.runtime?.execution_pools?.[runtime.dispatch.pool];
     return (
       <>
-        <FactBadge fact={delivery(runtime.delivery)} />
+        <FactBadge fact={intrinsicRedrive()} />
         <Badge variant="neutral">
           {runtime.partitioning.kind === "keyed" ? "keyed partitions" : "unpartitioned"}
         </Badge>
         <Badge variant="neutral">{`ordering: ${runtime.ordering}`}</Badge>
-        <FactBadge fact={memberAssignment(runtime.dispatch.member_assignment)} />
+        <FactBadge fact={outboxRouting(runtime.dispatch.routing?.key)} />
+        {runtime.dispatch.routing && (
+          <FactBadge fact={memberAssignment(runtime.dispatch.routing.member_assignment)} />
+        )}
         {runtime.dispatch.batching && (
           <Badge variant="neutral">{`batching: ${runtime.dispatch.batching.ordering}`}</Badge>
         )}
@@ -801,23 +806,23 @@ function InputsTable({ opId, op }: { opId: Id; op: Operation }) {
                         <Mono>&gt;</Mono>
                       </span>
                     </>
-                  ) : (
+                  ) : input.kind === "subscription" ? (
                     <>
                       <Badge variant="neutral">
                         {input.messages.kind === "all"
-                          ? input.kind === "outbox" ? "all outbox messages" : "all topic messages"
+                          ? "all topic messages"
                           : input.messages.schemas.map(shortId).join(", ")}
                       </Badge>
-                      {input.kind === "outbox" && (
+                      {input.acknowledge_on_success != null && (
                         <Badge variant="outline">
                           {input.acknowledge_on_success ? "ack on success" : "no ack on success"}
                         </Badge>
                       )}
-                      {input.kind === "subscription" && input.acknowledge_on_success != null && (
-                        <Badge variant="outline">
-                          {input.acknowledge_on_success ? "ack on success" : "no ack on success"}
-                        </Badge>
-                      )}
+                    </>
+                  ) : (
+                    <>
+                      <Badge variant="neutral">all outbox messages</Badge>
+                      <Badge variant="outline">exclusive consumer</Badge>
                     </>
                   )}
                 </span>

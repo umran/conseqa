@@ -29,7 +29,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::spec::{
     GroupingKey, Id, Input, MessageSelector, Model, OrderingSemantics, OutboxOrdering,
-    OutboxPartitioning, RuntimeModel, SubscriptionRoutingKey,
+    OutboxPartitioning, OutboxRoutingKey, RuntimeModel, SubscriptionRoutingKey,
 };
 
 use super::InputKind;
@@ -338,9 +338,12 @@ fn validate_subscription_runtimes(
 /// An outbox runtime must name an existing outbox input, dispatch to a
 /// declared pool, and satisfy the partitioning shape rules: a keyed
 /// partitioning maps only schemas the outbox admits, covers every
-/// schema admitted through the target input, keeps one tuple arity,
-/// and resolves its field paths; `ordering: partition` requires keyed
-/// partitioning. A declared batching block carries its explicit
+/// admitted schema — the exclusive consumer admits them all — keeps
+/// one tuple arity, and resolves its field paths; `ordering:
+/// partition` requires keyed partitioning, and `routing` by
+/// `partition_key` requires the keyed partition domain it names,
+/// since routing consumes an already-declared semantic key rather
+/// than inventing one. A declared batching block carries its explicit
 /// ordering-preservation value by construction — no default states
 /// preservation.
 fn validate_outbox_runtimes(
@@ -396,6 +399,23 @@ fn validate_outbox_runtimes(
                 });
             }
 
+            // `partition_key` routing names the partition domain, so
+            // one has to exist — the same rule `grouping_key` routing
+            // follows on the subscription side.
+            if let Some(routing) = &outbox_runtime.dispatch.routing {
+                match routing.key {
+                    OutboxRoutingKey::PartitionKey => {
+                        if matches!(outbox_runtime.partitioning, OutboxPartitioning::None) {
+                            errors.push(ValidationError::OutboxRoutingWithoutPartitioning {
+                                operation: operation_id.clone(),
+                                input: input_id.clone(),
+                                outbox: input.outbox.clone(),
+                            });
+                        }
+                    }
+                }
+            }
+
             let OutboxPartitioning::Keyed(key) = &outbox_runtime.partitioning else {
                 continue;
             };
@@ -418,13 +438,10 @@ fn validate_outbox_runtimes(
                 }
             }
 
-            // The mapping only has to cover what this input admits
-            // (§31 of the outbox revision); an unmapped admitted
-            // schema would belong to no partition.
-            let admitted: BTreeSet<&Id> = match &input.messages {
-                MessageSelector::Only(schemas) => schemas.iter().collect(),
-                MessageSelector::All => outbox.messages.iter().collect(),
-            };
+            // The exclusive consumer admits every schema the outbox
+            // declares, so the mapping must cover them all; an
+            // unmapped admitted schema would belong to no partition.
+            let admitted: BTreeSet<&Id> = outbox.messages.iter().collect();
 
             for schema in admitted {
                 if !key.mapping.contains_key(schema) {

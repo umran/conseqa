@@ -6,7 +6,7 @@ import type { ReactNode } from "react";
 import { pathText, shortId } from "../lib/ids";
 import {
   artifactRetention, commitGuarantee, delivery, externalIdempotency, externalIdentity,
-  externalResult, inheritedResult,
+  externalResult, inheritedResult, intrinsicRedrive,
   isolation, messageIdentity, requestIdentity, requestResult, resultBinding,
   memberAssignment, memberConcurrency, requestRouting, subscriptionRouting,
   transactionOutput, transportGrouping, transportOrdering,
@@ -498,11 +498,11 @@ function OutboxDetail({ dmId, id }: { dmId: Id; id: Id }) {
         </Section>
       )}
       {consumers.length > 0 && (
-        <Section title="consumers" count={consumers.length}>
+        <Section title="exclusive consumer" count={consumers.length}>
           <List items={consumers.map((e) => (
             <span key={e.id} className="flex flex-wrap items-center gap-1.5">
               <IdLink id={e.operation} />
-              <Tag>{e.delivery}</Tag>
+              <Tag>intrinsic re-drive</Tag>
               {e.ordering && <Tag>ordering: {e.ordering}</Tag>}
               {e.pool && <Tag>{shortId(e.pool)}</Tag>}
             </span>
@@ -698,33 +698,34 @@ function InputDetail({ opId, id }: { opId: Id; id: Id }) {
     );
   }
   if (input.kind === "outbox") {
-    const schemas = input.messages.kind === "all" ? null : input.messages.schemas;
     const runtime = model.runtime?.outboxes?.[opId]?.[id];
     const pool = runtime ? model.runtime?.execution_pools?.[runtime.dispatch.pool] : undefined;
+    const outbox = Object.values(model.data_models).flatMap((dm) => Object.entries(dm.outboxes ?? {})).find(([oid]) => oid === input.outbox)?.[1];
 
     return (
       <Frame kind="input" title={id} subtitle={<span>outbox input of <IdLink id={opId} /></span>}>
-        <KeyValue rows={[
-          ["outbox", <IdLink key="o" id={input.outbox} />],
-          ["acknowledge on success", <Mono key="a">{String(input.acknowledge_on_success)}</Mono>],
-        ]} />
+        <KeyValue rows={[["outbox", <IdLink key="o" id={input.outbox} />]]} />
+        <FactNote fact={intrinsicRedrive()} />
         <Section title="consumed messages">
-          {schemas ? <List items={schemas.map((s) => <IdLink key={s} id={s} />)} /> : <Tag>all outbox messages</Tag>}
+          <span className="flex flex-wrap items-center gap-1.5">
+            <Tag>exclusive consumer · every admitted schema</Tag>
+            {outbox?.messages.map((s) => <IdLink key={s} id={s} />)}
+          </span>
         </Section>
-        {runtime ? (
+        {runtime && (
           <Section title="L1 · realization">
             <KeyValue rows={[
               ["pool", <IdLink key="p" id={runtime.dispatch.pool} />],
               ["partitioning", <Mono key="pt">{runtime.partitioning.kind}</Mono>],
               ["ordering", <Mono key="or">{runtime.ordering}</Mono>],
+              ["routing", <Mono key="r">{runtime.dispatch.routing ? runtime.dispatch.routing.key : "none declared"}</Mono>],
               ["batching", <Mono key="b">{runtime.dispatch.batching ? runtime.dispatch.batching.ordering : "none declared"}</Mono>],
             ]} />
-            <FactNote fact={delivery(runtime.delivery)} />
-            <FactNote fact={memberAssignment(runtime.dispatch.member_assignment)} />
+            {runtime.dispatch.routing && (
+              <FactNote fact={memberAssignment(runtime.dispatch.routing.member_assignment)} />
+            )}
             {pool && <FactNote fact={memberConcurrency(pool.member_concurrency)} />}
           </Section>
-        ) : (
-          <FactNote fact={delivery("unspecified")} />
         )}
         <Citations id={id} />
       </Frame>

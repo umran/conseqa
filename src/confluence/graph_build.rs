@@ -949,16 +949,15 @@ impl<'w> Builder<'w> {
                             input: input_id.clone(),
                         });
 
-                    let selected: Vec<Id> = match &declared.messages {
-                        MessageSelector::Only(schemas) => schemas.iter().cloned().collect(),
-                        MessageSelector::All => self
-                            .workspace
-                            .data_models
-                            .values()
-                            .find_map(|data_model| data_model.outboxes.get(&declared.outbox))
-                            .map(|outbox| outbox.messages.iter().cloned().collect())
-                            .unwrap_or_default(),
-                    };
+                    // The exclusive consumer admits every schema the
+                    // outbox declares.
+                    let selected: Vec<Id> = self
+                        .workspace
+                        .data_models
+                        .values()
+                        .find_map(|data_model| data_model.outboxes.get(&declared.outbox))
+                        .map(|outbox| outbox.messages.iter().cloned().collect())
+                        .unwrap_or_default();
 
                     for schema in selected {
                         self.link(

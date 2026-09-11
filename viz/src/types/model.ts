@@ -240,15 +240,19 @@ export type Input =
       kind: "subscription";
       topic: Id;
       messages: MessageSelector;
-      /** Optional companion of the outbox declaration: absent is no
+      /** Subscription-only acknowledgement semantic: absent is no
        *  declared acknowledgement fact. */
       acknowledge_on_success?: boolean | null;
     }
   | {
+      /** The outbox's one consuming boundary: exactly one outbox
+       *  input in the model references a given outbox, and it admits
+       *  every schema the outbox declares. Consumption is intrinsic —
+       *  durable re-drive until successful completion, overlapping
+       *  attempts admitted — so there is no selector and no
+       *  acknowledgement field. */
       kind: "outbox";
       outbox: Id;
-      messages: MessageSelector;
-      acknowledge_on_success: boolean;
     };
 
 export type Literal =
@@ -429,12 +433,12 @@ export interface SubscriptionDispatch {
   routing?: SubscriptionRouting | null;
 }
 
-/** Runtime facts for one outbox input: delivery, the outbox's one
- *  grouping concept (partitioning), its own ordering vocabulary, and
- *  dispatch. All four are declared together; absence of the whole
- *  declaration is epistemic. */
+/** Runtime facts for the outbox's one consuming input: the outbox's
+ *  one grouping concept (partitioning), its own ordering vocabulary,
+ *  and dispatch. There is no delivery field — durable re-drive until
+ *  successful consumption is intrinsic to the outbox. Absence of the
+ *  whole declaration is epistemic. */
 export interface OutboxRuntime {
-  delivery: DeliverySemantics;
   partitioning: OutboxPartitioning;
   ordering: OutboxOrdering;
   dispatch: OutboxDispatch;
@@ -448,11 +452,24 @@ export type OutboxOrdering = "none" | "global" | "partition";
 
 export interface OutboxDispatch {
   pool: Id;
-  member_assignment: MemberAssignment;
+  /** Absence of `routing` is not a routing mode: it is the absence of
+   *  any member-affinity fact. */
+  routing?: OutboxRouting | null;
   /** An opaque batching stage over per-message logical invocations;
    *  absent means no batching fact is declared. */
   batching?: { ordering: "preserved" | "unspecified" } | null;
 }
+
+/** Mirrors SubscriptionRouting: which established semantic domain is
+ *  routed, and how that domain is assigned to pool members. */
+export interface OutboxRouting {
+  key: OutboxRoutingKey;
+  member_assignment: MemberAssignment;
+}
+
+/** partition_key routes by the domain OutboxRuntime.partitioning
+ *  establishes, and requires keyed partitioning. */
+export type OutboxRoutingKey = "partition_key";
 
 export interface SubscriptionRouting {
   key: SubscriptionRoutingKey;

@@ -93,7 +93,7 @@ use serde::{Deserialize, Serialize};
 use crate::analyzer::{Diagnostic, DiagnosticCode, Evidence, Severity, VerificationCode};
 use crate::spec::{
     FieldPath, Id, Input, MemberAssignment, MemberConcurrency, MessageSelector, Model, Operation,
-    OutboxInput, OutboxPartitioning, SerializationRequirement, SubscriptionInput,
+    OutboxInput, OutboxPartitioning, OutboxRoutingKey, SerializationRequirement, SubscriptionInput,
     SubscriptionRoutingKey, ValueRef, ValueSource,
 };
 
@@ -663,17 +663,20 @@ fn subscription_route(
     }
 }
 
-/// The outbox route: keyed partition affinity, member assignment,
-/// member concurrency, and no opaque batching stage.
+/// The outbox route: dispatch routing by the keyed partition domain,
+/// member assignment, member concurrency, and no opaque batching
+/// stage.
 ///
 /// The partition domain plays the role the grouping domain plays for
-/// subscriptions: every partition-key component must carry the
-/// requirement key, one member owns each partition, and that member
-/// executes one invocation at a time. Batching is the one place the
-/// routes differ: an outbox dispatch may declare an opaque batching
-/// stage, and its batch-internal overlap is deliberately unmodeled, so
-/// its presence stops any serialization argument (§79 of the outbox
-/// revision) — order preservation is not a no-overlap fact.
+/// subscriptions, and the dispatch must declare `routing` by
+/// `partition_key` for any member-affinity fact to exist at all:
+/// every partition-key component must carry the requirement key, one
+/// member owns each partition, and that member executes one
+/// invocation at a time. Batching is the one place the routes differ:
+/// an outbox dispatch may declare an opaque batching stage, and its
+/// batch-internal overlap is deliberately unmodeled, so its presence
+/// stops any serialization argument (§79 of the outbox revision) —
+/// order preservation is not a no-overlap fact.
 fn outbox_route(
     model: &Model,
     operation_id: &Id,
@@ -697,14 +700,32 @@ fn outbox_route(
 
     let mut obstacles = Vec::new();
 
-    let partitioned = match outbox_partition_facts(model, input_id, input, runtime, key) {
-        Ok(facts) => Some((facts, runtime.dispatch.member_assignment)),
-
-        Err(partition_obstacles) => {
-            obstacles.extend(partition_obstacles);
+    let partitioned = match &runtime.dispatch.routing {
+        None => {
+            obstacles.push(SerializationObstacle::RoutingAbsent {
+                input: input_id.clone(),
+                pool: runtime.dispatch.pool.clone(),
+            });
 
             None
         }
+
+        Some(routing) => match routing.key {
+            // `partition_key` names the partition domain, so the
+            // partition-key facts are what identify it with the
+            // requirement key.
+            OutboxRoutingKey::PartitionKey => {
+                match outbox_partition_facts(model, input_id, input, runtime, key) {
+                    Ok(facts) => Some((facts, routing.member_assignment)),
+
+                    Err(partition_obstacles) => {
+                        obstacles.extend(partition_obstacles);
+
+                        None
+                    }
+                }
+            }
+        },
     };
 
     let serial = pool_is_serial(model, input_id, &runtime.dispatch.pool, &mut obstacles);
@@ -745,15 +766,14 @@ fn outbox_route(
 }
 
 /// Whether the outbox input's admitted message set is empty by
-/// declaration, under the same rules as a subscription's.
+/// declaration. The exclusive consumer admits every schema the outbox
+/// declares, so the set is empty exactly when the resolvable outbox
+/// declares none; an unresolvable outbox leaves the admitted set
+/// unknown, which must not become a vacuous proof.
 pub(super) fn admits_no_outbox_messages(model: &Model, input: &OutboxInput) -> bool {
-    match &input.messages {
-        MessageSelector::Only(messages) => messages.is_empty(),
-
-        MessageSelector::All => model
-            .outbox(&input.outbox)
-            .is_some_and(|(_, outbox)| outbox.messages.is_empty()),
-    }
+    model
+        .outbox(&input.outbox)
+        .is_some_and(|(_, outbox)| outbox.messages.is_empty())
 }
 
 /// Establishes partition-domain equivalence for a keyed outbox
@@ -777,14 +797,11 @@ pub(super) fn outbox_partition_facts(
         }]);
     };
 
-    let admitted: Vec<Id> = match &input.messages {
-        MessageSelector::Only(messages) => messages.iter().cloned().collect(),
-
-        MessageSelector::All => model
-            .outbox(&input.outbox)
-            .map(|(_, outbox)| outbox.messages.iter().cloned().collect())
-            .unwrap_or_default(),
-    };
+    // The exclusive consumer admits every schema the outbox declares.
+    let admitted: Vec<Id> = model
+        .outbox(&input.outbox)
+        .map(|(_, outbox)| outbox.messages.iter().cloned().collect())
+        .unwrap_or_default();
 
     let mut facts = Vec::new();
     let mut obstacles = Vec::new();

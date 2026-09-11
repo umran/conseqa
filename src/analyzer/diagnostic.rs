@@ -102,7 +102,8 @@ pub enum ValidationCode {
     MessageIdentityArityMismatch,
     EmptyRequestIdentity,
 
-    OutboxInputMessageNotAdmitted,
+    OutboxWithoutConsumer,
+    OutboxMultipleConsumers,
     OutboxWriteMessageNotAdmitted,
     OutboxMessageIdentitySchemaNotAdmitted,
     EmptyOutboxMessageIdentity,
@@ -165,6 +166,7 @@ pub enum ValidationCode {
     EmptyOutboxPartitionKey,
     OutboxPartitionKeyArityMismatch,
     PartitionOrderingWithoutPartitioning,
+    OutboxRoutingWithoutPartitioning,
 }
 
 impl ValidationCode {
@@ -193,6 +195,7 @@ impl ValidationCode {
                 | Self::EmptyOutboxPartitionKey
                 | Self::OutboxPartitionKeyArityMismatch
                 | Self::PartitionOrderingWithoutPartitioning
+                | Self::OutboxRoutingWithoutPartitioning
         )
     }
 }

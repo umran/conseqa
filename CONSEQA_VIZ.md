@@ -35,9 +35,10 @@ invokes) sit around them. Edges are the model's information routes:
 - outbox writes: operation → outbox — drawn distinctly from
   publication, because the admission is atomic with a transaction's
   commit; the edge names the transaction whose commit admits it
-- outbox inputs: outbox → operation, carrying the acknowledgement
-  declaration and, with L1 drawn, the runtime's delivery, partitioning,
-  ordering, member assignment, and batching facts
+- outbox inputs: outbox → operation — the outbox's one exclusive
+  consumer, re-driven intrinsically until consumption succeeds — and,
+  with L1 drawn, the runtime's partitioning, ordering, routing, member
+  assignment, and batching facts
 - request effects: operation → operation
 - external effects: operation → external system
 - client requests: clients → operation, for request inputs no modeled

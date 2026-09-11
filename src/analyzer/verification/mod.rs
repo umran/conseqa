@@ -230,16 +230,16 @@ pub enum ModelNote {
         delivery: DeliverySemantics,
     },
 
-    /// The outbox counterpart: an outbox input admits duplicate
-    /// deliveries and its operation declares no idempotency
-    /// requirement keyed from it. Acknowledgement does not close this
-    /// gap — under at-least-once delivery an unacknowledged message is
-    /// redelivered, and nothing declares the repeated work safe.
+    /// The outbox counterpart: intrinsic durable re-drive admits
+    /// duplicate and overlapping consumption attempts for every
+    /// outbox input — there is no delivery fact that could exclude
+    /// them — and the operation declares no idempotency requirement
+    /// keyed from the input, so nothing declares the repeated work
+    /// safe.
     DuplicateOutboxDeliveryUnchecked {
         operation: Id,
         input: Id,
         outbox: Id,
-        delivery: DeliverySemantics,
     },
 
     /// A `present` condition over a path with no optional segment:
@@ -291,13 +291,13 @@ impl ModelNote {
                 operation,
                 input,
                 outbox,
-                delivery,
             } => {
                 format!(
-                    "`{input}` of `{operation}` consumes outbox `{outbox}` and {}; the \
-                     operation declares no idempotency requirement keyed from that input, so \
-                     the work a duplicate delivery repeats is checked by nothing.",
-                    admits(delivery)
+                    "`{input}` of `{operation}` consumes outbox `{outbox}`, whose \
+                     intrinsic durable re-drive admits duplicate and overlapping \
+                     consumption attempts; the operation declares no idempotency \
+                     requirement keyed from that input, so the work a repeated attempt \
+                     performs is checked by nothing."
                 )
             }
 
@@ -371,19 +371,14 @@ pub fn notes(model: &Model) -> Vec<ModelNote> {
                     }
                 }
 
+                // Intrinsic re-drive admits duplicates for every
+                // outbox input; no delivery fact can exclude them.
                 Input::Outbox(declared) => {
-                    let delivery = model.outbox_delivery(operation_id, input_id);
-
-                    if delivery == DeliverySemantics::AtMostOnce {
-                        continue;
-                    }
-
                     if !collapses_duplicates(operation, input_id) {
                         notes.push(ModelNote::DuplicateOutboxDeliveryUnchecked {
                             operation: operation_id.clone(),
                             input: input_id.clone(),
                             outbox: declared.outbox.clone(),
-                            delivery,
                         });
                     }
                 }

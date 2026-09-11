@@ -113,8 +113,8 @@ narrowly, yourself, or with another request_design pass.
 An unproven obligation carries a `remedy` saying which layer the \
 missing facts belong to. `runtime` means no program change can help: \
 the fix is the L1 runtime topology — transport grouping and ordering, \
-subscription delivery and dispatch, outbox delivery, partitioning, \
-ordering, and dispatch, execution pools and their member concurrency, \
+subscription delivery and dispatch, outbox partitioning, ordering, \
+and dispatch, execution pools and their member concurrency, \
 request routers, storage layouts. Author it here, after \
 the programs exist and verification has said what it has to discharge, \
 not while drafting the skeleton: L1 exists to make specific \
@@ -1774,7 +1774,8 @@ PATCH — {"mutations": [<mutation>, ...]}; each mutation {"kind": K, ...}:
      An outbox is a typed transactional message collection of the data
      model: a transaction on the model may mutate objects AND admit
      messages to its outboxes in one atomic commit. Written only by a
-     transaction's write_outbox step; consumed by an outbox input.)
+     transaction's write_outbox step; consumed by exactly one outbox
+     input, whose operation is its exclusive logical consumer.)
   {"kind":"put_topic","id":"topic.x","value":{"messages":[...],"message_identity":...}}
   {"kind":"put_state_machine","id":"machine.x","value":{...}}
   {"kind":"put_operation_interface","operation":"operation.x",
@@ -1824,24 +1825,28 @@ L1 RUNTIME TOPOLOGY (all shared-skeleton writes; L1 is optional):
      routing key: grouping_key, which routes by the effective grouping
      domain and so requires a keyed grouping in effect at one scope.)
   {"kind":"put_outbox_runtime","operation":"operation.x","input":"input.x.outbox",
-   "value":{"delivery":"at_least_once",
-            "partitioning":{"kind":"keyed",
+   "value":{"partitioning":{"kind":"keyed",
                             "mapping":{"schema.Event":[["tenant_id"]]}},
             "ordering":"partition",
             "dispatch":{"pool":"pool.x",
-                        "member_assignment":{"kind":"consistent_hash"},
+                        "routing":{"key":"partition_key",
+                                   "member_assignment":{"kind":"consistent_hash"}},
                         "batching":{"ordering":"preserved"}}}}
-    (all four facts are required; the target input must be kind outbox.
-     partitioning: {"kind":"none"} or keyed with a per-schema mapping
-     covering every schema the input admits — the outbox's ONE grouping
-     concept. ordering: "none" | "global" | "partition"; "partition"
-     requires keyed partitioning. member_assignment is mandatory — the
-     partition (or the undivided scope) is the assignment subject.
-     batching is optional; when present its "ordering" is explicit:
-     "preserved" | "unspecified". Batching is an opaque L1 realization
-     over per-message logical invocations: "preserved" lets an
-     established order pass through the stage, and its presence stops
-     any serialization proof regardless.)
+    (the target input must be kind outbox. There is NO delivery field:
+     durable re-drive until successful consumption is intrinsic to the
+     outbox, and stale attempts may overlap fresh ones — which is why
+     the consumer needs idempotency. partitioning: {"kind":"none"} or
+     keyed with a per-schema mapping covering every schema the outbox
+     admits — the outbox's ONE grouping concept. ordering: "none" |
+     "global" | "partition"; "partition" requires keyed partitioning.
+     routing is optional, mirroring subscription dispatch: omit it to
+     declare no member-affinity fact; key "partition_key" routes by the
+     declared partition domain and requires keyed partitioning. batching
+     is optional; when present its "ordering" is explicit: "preserved" |
+     "unspecified". Batching is an opaque L1 realization over
+     per-message logical invocations: "preserved" lets an established
+     order pass through the stage, and its presence stops any
+     serialization proof regardless.)
   {"kind":"put_storage_layout","id":"layout.x",
    "value":{"object":{"data_model":"data.x","object":"object.y"},
             "partition_key":["channel_id","bucket"]}}
@@ -1852,14 +1857,17 @@ L1 RUNTIME TOPOLOGY (all shared-skeleton writes; L1 is optional):
 
 Schema, topic, state-machine, input, and program declarations use the
 Conseqa model YAML structure, as JSON. An outbox input:
-  {"kind":"outbox","outbox":"outbox.x",
-   "messages":{"kind":"only","schemas":["schema.X"]},
-   "acknowledge_on_success":true}
-    (acknowledge_on_success is REQUIRED here: successful logical
-     completion acknowledges the triggering message for this consumer.
-     One committed message = one logical invocation; no batch payload
-     exists at L0. A subscription input may declare the same field,
-     optionally.)
+  {"kind":"outbox","outbox":"outbox.x"}
+    (exactly ONE outbox input in the model may reference a given
+     outbox: its operation is the outbox's exclusive logical consumer
+     of every admitted schema — there is no message selection and no
+     acknowledgement field. Consumption is intrinsic: a committed
+     message stays durably pending, re-driven until an attempt reaches
+     successful logical completion, and overlapping attempts for one
+     message are possible — so the consumer needs idempotency. Fan-out
+     to several consumers belongs to a topic, not an outbox. One
+     committed message = one logical invocation; no batch payload
+     exists at L0.)
 A transactional outbox write, legal ONLY as a transaction step:
   {"kind":"write_outbox","effect_id":"effect.x.outbox",
    "effect":{"outbox":"outbox.x","schema":"schema.X",

@@ -451,17 +451,14 @@ fn collect_input_refs(input: &Input, out: &mut Vec<SymbolKey>) {
             }
         }
 
-        Input::Outbox(input) => {
+        Input::Outbox(_) => {
             // The outbox id alone names the boundary; its owning data
             // model is implicit and resolved by the validator, so no
             // data-model key can be produced here — the same treatment
-            // a state machine's subject gets. The selected schemas are
-            // ordinary references.
-            if let crate::spec::MessageSelector::Only(schemas) = &input.messages {
-                for schema in schemas {
-                    out.push(SymbolKey::Schema(schema.clone()));
-                }
-            }
+            // a state machine's subject gets. There is no message
+            // selection: the exclusive consumer admits every schema
+            // the outbox declares, and those schemas are references
+            // of the outbox declaration, not of this input.
         }
     }
 }

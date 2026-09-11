@@ -5361,54 +5361,98 @@ fn outbox_consumer_without_a_keyed_requirement_blocks_the_cascade() {
 }
 
 #[test]
-fn at_most_once_outbox_delivery_collapses_the_consumer_and_its_own_key() {
+fn outbox_ordering_records_intrinsic_redelivery_as_duplicate_handling() {
+    let model = load_transactional_outbox();
+
+    let report = verification::verify(&model);
+
+    let ordering = report
+        .ordering
+        .iter()
+        .find(|check| check.operation == id("operation.publish_order_event"))
+        .unwrap();
+
+    // Intrinsic durable re-drive admits duplicate attempts, so the
+    // proof can never rest on single delivery — the redelivery leg
+    // must name the idempotency requirement that answers for the
+    // repeated work.
+    assert!(
+        matches!(
+            &ordering.verdict,
+            verification::OrderingVerdict::Proven {
+                proof: verification::OrderingProof::OutboxRoutedOrder {
+                    duplicates: verification::DuplicateHandling::OrderPreservingRedelivery {
+                        idempotency: Some(coverage),
+                    },
+                    ..
+                },
+                ..
+            } if coverage.proven
+        ),
+        "{:#?}",
+        ordering.verdict
+    );
+}
+
+#[test]
+fn outbox_dispatch_without_routing_has_no_member_affinity() {
     let mut model = load_transactional_outbox();
 
-    make_producer_repeat_commits(&mut model);
+    // Retire the routing block: the pool is still known, but no fact
+    // says which member owns a partition, so both the serialization
+    // and the ordering arguments lose their ownership leg.
+    outbox_runtime_mut(&mut model).dispatch.routing = None;
 
-    outbox_runtime_mut(&mut model).delivery = conseqa::spec::DeliverySemantics::AtMostOnce;
+    assert!(validation::validate(&model).is_empty());
 
-    // The producer's duplicate write collapses at the consumer through
-    // single delivery of the one logical message.
-    let IdempotencyVerdict::Proven { proof, .. } =
-        idempotency_verdict(&model, "operation.create_order", 0)
-    else {
-        panic!("single delivery should collapse the consumer");
-    };
+    model
+        .operations
+        .get_mut(&id("operation.publish_order_event"))
+        .unwrap()
+        .requirements
+        .serialization
+        .push(SerializationRequirement {
+            key: input_key("input.publish_order_event.outbox", &["tenant_id"]),
+        });
 
-    let IdempotencyProof::RetrySafePaths { paths } = proof else {
-        panic!("expected a path walk: {proof:#?}");
-    };
+    let report = verification::verify(&model);
 
-    assert!(
-        paths.iter().flat_map(|path| path.effects.iter()).any(|effect| {
-            matches!(
-                &effect.safety,
-                EffectSafety::SameLogicalOutboxMessage { consumers, .. }
-                    if consumers.iter().any(|consumer| matches!(
-                        consumer,
-                        ConsumerCollapse::SingleDelivery { .. }
-                    ))
-            )
-        }),
-        "{paths:#?}"
-    );
-
-    // And the relay's own requirement becomes vacuous: same-class
-    // messages are one logical message, delivered at most once.
-    let IdempotencyVerdict::Proven { proof, .. } =
-        idempotency_verdict(&model, "operation.publish_order_event", 0)
-    else {
-        panic!("the relay should prove vacuously");
-    };
+    let serialization = report
+        .serialization
+        .iter()
+        .find(|check| check.operation == id("operation.publish_order_event"))
+        .unwrap();
 
     assert!(
         matches!(
-            proof,
-            IdempotencyProof::SingleOutboxDelivery { outbox, .. }
-                if outbox == id("outbox.order_events")
+            &serialization.verdict,
+            verification::SerializationVerdict::Unproven { obstacles }
+                if obstacles.iter().any(|obstacle| matches!(
+                    obstacle,
+                    SerializationObstacle::RoutingAbsent { .. }
+                ))
         ),
-        "expected the single-delivery route"
+        "{:#?}",
+        serialization.verdict
+    );
+
+    let ordering = report
+        .ordering
+        .iter()
+        .find(|check| check.operation == id("operation.publish_order_event"))
+        .unwrap();
+
+    assert!(
+        matches!(
+            &ordering.verdict,
+            verification::OrderingVerdict::Unproven { obstacles }
+                if obstacles.iter().any(|obstacle| matches!(
+                    obstacle,
+                    verification::OrderingObstacle::RoutingAbsent { .. }
+                ))
+        ),
+        "{:#?}",
+        ordering.verdict
     );
 }
 
@@ -5562,7 +5606,8 @@ fn removing_the_outbox_runtime_leaves_its_obligations_unproven() {
         ordering.verdict
     );
 
-    // Guaranteed completion loses its retry driver.
+    // Guaranteed completion keeps its retry driver: durable re-drive
+    // is intrinsic to the outbox, not a runtime declaration.
     let recoverability = report
         .recoverability
         .iter()
@@ -5572,11 +5617,13 @@ fn removing_the_outbox_runtime_leaves_its_obligations_unproven() {
     assert!(
         matches!(
             &recoverability.verdict,
-            RecoverabilityVerdict::Unproven { obstacles }
-                if obstacles.iter().any(|obstacle| matches!(
-                    obstacle,
-                    RecoverabilityObstacle::NoModeledRetryDriver { .. }
-                ))
+            RecoverabilityVerdict::Proven {
+                proof: RecoverabilityProof::Guaranteed {
+                    driver: RetryDriver::IntrinsicOutboxRedrive { .. },
+                    ..
+                },
+                ..
+            }
         ),
         "{:#?}",
         recoverability.verdict
@@ -5591,7 +5638,7 @@ fn removing_the_outbox_runtime_leaves_its_obligations_unproven() {
 }
 
 #[test]
-fn outbox_recoverability_is_driven_by_at_least_once_outbox_delivery() {
+fn outbox_recoverability_is_driven_by_intrinsic_redrive_at_l0() {
     let model = load_transactional_outbox();
 
     let report = verification::verify(&model);
@@ -5602,7 +5649,7 @@ fn outbox_recoverability_is_driven_by_at_least_once_outbox_delivery() {
         .find(|check| check.operation == id("operation.publish_order_event"))
         .unwrap();
 
-    let RecoverabilityVerdict::Proven { proof, .. } = &recoverability.verdict else {
+    let RecoverabilityVerdict::Proven { proof, scope } = &recoverability.verdict else {
         panic!("guaranteed completion should prove: {recoverability:#?}");
     };
 
@@ -5610,12 +5657,16 @@ fn outbox_recoverability_is_driven_by_at_least_once_outbox_delivery() {
         matches!(
             proof,
             RecoverabilityProof::Guaranteed {
-                driver: RetryDriver::AtLeastOnceOutboxDelivery { outbox, .. },
+                driver: RetryDriver::IntrinsicOutboxRedrive { outbox, .. },
                 ..
             } if outbox == &id("outbox.order_events")
         ),
         "{proof:#?}"
     );
+
+    // The driver is an L0 fact about the abstraction itself, so the
+    // proof is not runtime-dependent.
+    assert_eq!(*scope, verification::ProofScope::L0Only, "{proof:#?}");
 }
 
 #[test]

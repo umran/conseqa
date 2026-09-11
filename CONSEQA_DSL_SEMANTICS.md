@@ -1,11 +1,12 @@
 # Conseqa DSL Semantics
 
 **Status:** Normative semantic contract for the DSL and the V1 verifiers — the single authoritative semantics document. The design drafts and revision documents that preceded it are retired; their normative content is consolidated here, and what they left open is §27.  
-**DSL contract version:** This document specifies **DSL contract version 1** (`DSL_VERSION`, `src/spec/model.rs`). The version names the normative semantic contract as a whole, not the parse schema: any normative change bumps it — vocabulary, validation, or proof semantics alike — while purely internal changes do not. Every specification document declares the version it is authored in (`dsl: 1`, the model root's first field, stamped at assembly and never authored); a consumer probes it before strict parsing and refuses a mismatch or absence by name.
+**DSL contract version:** This document specifies **DSL contract version 2** (`DSL_VERSION`, `src/spec/model.rs`). The version names the normative semantic contract as a whole, not the parse schema: any normative change bumps it — vocabulary, validation, or proof semantics alike — while purely internal changes do not. Every specification document declares the version it is authored in (`dsl: 2`, the model root's first field, stamped at assembly and never authored); a consumer probes it before strict parsing and refuses a mismatch or absence by name. Version 2 is the outbox-semantics revision: an outbox has exactly one consuming input, consumption re-drive is intrinsic rather than declared, and outbox dispatch declares an explicit routing block (§5, §8.3, §10.3.2).
 
 | dsl | defined by |
 |---|---|
 | 1 | the External Boundary Guarantees and Decision Vocabulary revision — external `identity` / `idempotency` / `result_replay`, versioning itself; everything earlier is unversioned prehistory, refused as predating versioning |
+| 2 | the Outbox Semantics revision — exactly one `OutboxInput` per outbox, intrinsic durable re-drive in place of declared delivery and acknowledgement, `OutboxDispatch.routing` in place of a bare member assignment |
 
 **Implementation namespace:** `src/spec/` (surface), `src/analyzer/` (validation and verification).
 
@@ -376,10 +377,11 @@ Because an outbox belongs to the data model, a transaction declaring that data m
 | Producer effect | publication (§13.1) | outbox write (§13.4) |
 | Producer execution | ordinary effect execution | transaction-exclusive |
 | Atomic with `DataObject` mutation | not implied | yes, through the containing transaction |
-| Consumer input | subscription (§8.2) | outbox input (§8.3) |
+| Consumer input | any number of subscriptions (§8.2) | exactly one outbox input (§8.3) |
+| Consumption semantics | declared delivery (§10.3) | intrinsic durable re-drive (§8.3) |
 | Runtime | topic/subscription runtime (§10.2–§10.3.1) | outbox runtime (§10.3.2) |
 
-The similarity is intentional; the difference in transactional placement is fundamental, and the two remain distinct semantic concepts rather than instances of a generic channel abstraction.
+The similarity is intentional; the difference in transactional placement is fundamental, and the two remain distinct semantic concepts rather than instances of a generic channel abstraction. The consumer rows carry the revision's structural rule: **exactly one `OutboxInput` in the model references a given outbox** — its owning operation is the outbox's exclusive logical consumer, and downstream fan-out belongs to topics (§8.3).
 
 The declaration implies nothing physical: not one SQL database, one server, one table namespace, or one storage technology shared between objects and outboxes. A conforming implementation must merely realize the declared atomic boundary. An outbox message is also neither an `EffectIntent` (§14) — it is durable typed application message data, not a captured effect instance awaiting execution — nor a `TransactionOutput` (§15), which exports a value back into the same operation's continuation rather than creating durable work for independent consumers. No `DataObject` named "outbox" acquires outbox semantics; they exist only through this explicit entity.
 
@@ -585,41 +587,69 @@ It does not restrict what other schemas the topic itself may carry.
 
 ### `acknowledge_on_success`
 
-A subscription may declare the same acknowledgement semantic an outbox input carries (§8.3):
+A subscription may declare an acknowledgement semantic:
 
-> When an invocation triggered through this input reaches successful logical completion, the triggering logical source item is acknowledged for this consumer.
+> When an invocation triggered through this input reaches successful logical completion — its normal terminal, with no unresolved execution failure — the triggering logical source item is acknowledged for this consumer.
 
-The field is optional here because the semantic postdates existing models: absent is **no declared acknowledgement fact** — how every model written before the field existed reads, and migration must not guess a value the model never stated — while `false` is the explicit negative. Everything §8.3 says about the semantic applies unchanged: it is consumer-relative, it is not a program statement, and it neither closes an idempotency proof nor proves duplicate collapse.
+The field is optional because the semantic postdates existing models: absent is **no declared acknowledgement fact** — how every model written before the field existed reads, and migration must not guess a value the model never stated — while `false` is the explicit negative.
+
+Acknowledgement is an input-level application semantic, deliberately explicit and deliberately not a program statement: there is no `Acknowledge(item)` primitive in `OperationBlock`, and Conseqa does not distinguish "effect succeeded", "ack call began", and "ack call returned" inside the application program — those mechanics are below the abstraction, as is whether the concrete runtime sends one batch ACK, per-message ACKs, or an offset commit. It is consumer-relative: one subscription acknowledging a message says nothing about another subscription on the same topic. If the invocation does not successfully complete, the declaration does not take effect and the item remains logically unacknowledged; whether another delivery attempt occurs is the subscription runtime's delivery semantics (§10.3). Acknowledgement itself implies neither at-most-once nor exactly-once execution, neither eventual redelivery nor eventual success — and it neither closes an idempotency proof nor proves duplicate collapse: under at-least-once delivery, failure or uncertainty *before* acknowledgement may admit another attempt, so consumer idempotency is still needed wherever duplicates are admitted.
+
+This semantic is subscription-only. An outbox input carries no acknowledgement field: successful consumption is intrinsic to the outbox abstraction (§8.3), not a declared fact.
 
 ---
 
 ## 8.3 Outbox input
 
-An outbox input declares invocation from a committed outbox message (§5). Its L0 content:
+An outbox input declares invocation from a committed outbox message (§5). Its L0 content is exactly one field:
 
-- the outbox,
-- the selected message schemas, and
-- an explicit `acknowledge_on_success` declaration.
+- the outbox.
 
 It means:
 
-> One logical message admitted to the outbox may invoke this operation, and the invocation's payload is that one message.
+> One logical message admitted to the outbox invokes this operation, and the invocation's payload is that one message.
+
+**Exactly one `OutboxInput` in the model SHALL reference a given outbox** — a structural invariant, validated, not a convention. The owning operation is the outbox's exclusive logical consumer: it consumes every message schema the outbox admits, there is no per-input message selection, and competing logical consumer operations are not permitted. An outbox admitting heterogeneous message schemas remains valid — the owning operation must be capable of handling every admitted input variant. Where several independent consumers are wanted, the outbox's consumer relays onto a **topic** and the consumers subscribe there: downstream fan-out belongs to topics, not outboxes.
 
 The operation program stays a **per-message logical machine**. No batch payload, batch iterator, or batch index exists at L0, and none is needed: a runtime may retrieve or dispatch several committed messages together, but that is an opaque realization over multiple logical per-message invocations (§10.3.2), never a new invocation shape. `M1 -> Operation(M1); M2 -> Operation(M2)` — not `Batch[M1,M2] -> BatchOperation`.
 
-`MessageSelector` has exactly its §8.2 meaning, read against the outbox: `all` admits every schema the outbox declares, `only` restricts this input without restricting the outbox. Several outbox inputs may consume one outbox; each is an independent logical consumer relationship with its own selection, acknowledgement, and runtime facts — one input acknowledging a message says nothing about another.
+An outbox input has no synchronous result; its normal terminal is `complete`. How consumption attempts are partitioned, ordered, routed, and batched are realization facts declared by an **outbox runtime** (§10.3.2) against the `(operation, input)` pair.
 
-An outbox input has no synchronous result; its normal terminal is `complete`. How often a committed message is delivered, how consumption is partitioned and ordered, and where invocations execute are realization facts declared by an **outbox runtime** (§10.3.2) against the `(operation, input)` pair.
+### Intrinsic consumption semantics
 
-### `acknowledge_on_success`
+There is no configurable acknowledgement or delivery fact on the outbox side. Consumption semantics are intrinsic to the outbox abstraction:
 
-Acknowledgement is an input-level application semantic, deliberately explicit and deliberately not a program statement:
+```text
+committed message M
+    ->
+M becomes durably pending
 
-> When an invocation triggered through this input reaches successful logical completion — its normal terminal, with no unresolved execution failure — the triggering logical message is acknowledged for this consumer.
+while M is pending
+    ->
+the runtime continues to admit consumption attempts for M
 
-There is no `Acknowledge(item)` primitive in `OperationBlock`, and Conseqa does not distinguish "effect succeeded", "ack call began", and "ack call returned" inside the application program; those mechanics are below the abstraction, as is whether the concrete runtime sends one batch ACK, per-message ACKs, an offset commit, or row deletes.
+successful logical completion of an attempt
+    ->
+M becomes consumed
 
-If the invocation does not successfully complete, the declaration does not take effect and the message remains logically unacknowledged; whether another delivery attempt occurs is the runtime's delivery semantics (§10.3.2). Acknowledgement itself implies neither at-most-once nor exactly-once execution, neither eventual redelivery nor eventual success — and it neither closes an idempotency proof nor proves duplicate collapse (§13.4): under at-least-once delivery, failure or uncertainty *before* acknowledgement may admit another attempt, so consumer idempotency is still needed wherever duplicates are admitted.
+failed or uncertain attempt
+    ->
+M remains pending
+```
+
+`Consumed(M)` means no further **ordinary** consumption attempts need be admitted. It does **not** imply that previously admitted attempts have terminated or been cancelled. The following is therefore explicitly permitted:
+
+```text
+attempt A(M) starts
+        |
+        | timeout / lease expiry / uncertainty
+        v
+attempt B(M) starts
+
+A(M) || B(M)
+```
+
+Multiple simultaneously active attempts may exist for the same logical message — which is why consumer idempotency remains necessary (§9, §13.4). What the intrinsic semantics *do* give the analyzer, as L0 facts: duplicate and overlapping attempts are always admitted (no delivery declaration can exclude them), and an interrupted invocation is re-driven until one attempt succeeds (the retry driver of `completion: guaranteed`, §9 — an L0 fact, so that leg of the proof is not runtime-dependent).
 
 ---
 
@@ -650,7 +680,7 @@ semantic key equivalence
     -> member concurrency
 ```
 
-V1 accepts four routes. **Vacuous population**: the key's message-driven input admits no message schemas, so the constrained population is empty by declaration — the only `l0_only` route. **Request-routed**: a `Router` serves the key's request boundary, every component of its semantic routing key carries the same logical value as the requirement key (§4), its `MemberAssignment` gives that domain one active owning member including through handoff, and the target pool declares `member_concurrency = bounded(1)`. **Subscription-routed**: the same argument on the delivery side, with `key: grouping_key` naming the effective grouping domain (§10.2) and the requirement key established to carry the grouping key for every admitted schema. **Outbox-routed**: the same argument over an outbox input's keyed partitioning (§10.3.2) — every partition-key component carries the requirement key for every admitted schema, the dispatch's `MemberAssignment` gives each partition one active owning member, the pool is serial, **and the dispatch declares no batching stage**. A declared batching stage stops the route whatever its ordering preservation: batch-internal overlap is intentionally unmodeled, and `member_concurrency` must not be silently read as a fact about it. `partitioning: none` also proves nothing here — it declares one undivided consumption domain, and V1 consumes keyed partition affinity only.
+V1 accepts four routes. **Vacuous population**: the key's message-driven input admits no message schemas, so the constrained population is empty by declaration — the only `l0_only` route. **Request-routed**: a `Router` serves the key's request boundary, every component of its semantic routing key carries the same logical value as the requirement key (§4), its `MemberAssignment` gives that domain one active owning member including through handoff, and the target pool declares `member_concurrency = bounded(1)`. **Subscription-routed**: the same argument on the delivery side, with `key: grouping_key` naming the effective grouping domain (§10.2) and the requirement key established to carry the grouping key for every admitted schema. **Outbox-routed**: the same argument over an outbox input's keyed partitioning (§10.3.2) — the dispatch declares `routing` with `key: partition_key`, every partition-key component carries the requirement key for every admitted schema, the routing's `MemberAssignment` gives each partition one active owning member, the pool is serial, **and the dispatch declares no batching stage**. A declared batching stage stops the route whatever its ordering preservation: batch-internal overlap is intentionally unmodeled, and `member_concurrency` must not be silently read as a fact about it. `partitioning: none` also proves nothing here — it declares one undivided consumption domain, and V1 consumes keyed partition affinity only.
 
 **No ordering fact participates in any of them.** Serialization is about non-overlap; a grouping domain is the whole of what a transport has to supply for it. That is the main reason grouping is declared independently of ordering — an unordered transport that still groups by key serializes, and the model can say so without claiming an order it does not provide.
 
@@ -685,7 +715,7 @@ Both precedence sources require that same grouping identity, and for the same re
 
 This is why an ordering proof is strictly stronger than a serialization one over the same key, and why dispatch alone can never supply it: dispatch preserves precedence, it does not create any (§10.3.1). Dispatch additionally carries the order-preservation obligation of §10.3, so redelivery cannot invert the precedence: a failure-driven redelivery cannot be overtaken by a later message of its domain, and a duplicate of an already completed message is a repeated attempt at a logical invocation that took effect in order — what that attempt does is the idempotency requirement's obligation, not ordering's, and the proof records which requirement answers for it or that none does. Vacuously discharged: a message-driven input admitting no message schemas.
 
-The outbox route is the same composition in the outbox's own vocabulary: the runtime declares `ordering: partition` (or `global`), every partition-key component carries the requirement key for every admitted schema — same-key deliveries then share one partition, which both precedence reaches need — the dispatch's `MemberAssignment` gives that partition one active owning member, and the pool is serial. One leg is new: a declared **batching stage** is judged explicitly. Absent, there is no batch obstacle; `ordering: preserved` lets the established precedence pass through the stage — the opaque batch processing does not let a later message overtake an earlier one against it; `ordering: unspecified` stops the proof, because the stage then provides no evidence the order survives execution. Order preservation is an ordering fact only: it is never read as a no-overlap guarantee, which is why the serialization route above refuses batching outright while this route accepts `preserved` (§10.3.2).
+The outbox route is the same composition in the outbox's own vocabulary: the runtime declares `ordering: partition` (or `global`), every partition-key component carries the requirement key for every admitted schema — same-key deliveries then share one partition, which both precedence reaches need — the dispatch declares `routing` with `key: partition_key` whose `MemberAssignment` gives that partition one active owning member, and the pool is serial. One leg is new: a declared **batching stage** is judged explicitly. Absent, there is no batch obstacle; `ordering: preserved` lets the established precedence pass through the stage — the opaque batch processing does not let a later message overtake an earlier one against it; `ordering: unspecified` stops the proof, because the stage then provides no evidence the order survives execution. Order preservation is an ordering fact only: it is never read as a no-overlap guarantee, which is why the serialization route above refuses batching outright while this route accepts `preserved` (§10.3.2).
 
 ### Serialization versus ordering
 
@@ -718,10 +748,10 @@ The requirement is not discharged merely because the operation has a field named
 V1 discharges the requirement over each **admitted path** of the program — a path ending at `complete`, or at a `return` for the triggering input (§16) — under the governing key's population (§12). Three legs must hold on every admitted path:
 
 - **State leg.** Every transaction step must be retry-safe: a keyed commit over a stable key, or naturally replayable. There is no final-step exemption, because a duplicate delivery re-drives the whole program even after terminal completion.
-- **Effect leg.** Every effect-executing step must be duplicate-safe per the §13 rules, since even a recovered intent may be executed again (§14) — and those rules follow the work an attempt causes into other operations: a request is safe only when its target collapses duplicate invocations, a publication only when every modeled consumer of the topic collapses duplicate deliveries, an outbox write only when its containing transaction suppresses a second commit or every modeled consumer of the outbox collapses duplicate deliveries (§13.4), each through its own proven requirement. An outbox boundary does not terminate the causal effect graph: the writes staged by a path's transactions are effect occurrences of that path, and the cascade continues through every outbox input admitting the written schema.
+- **Effect leg.** Every effect-executing step must be duplicate-safe per the §13 rules, since even a recovered intent may be executed again (§14) — and those rules follow the work an attempt causes into other operations: a request is safe only when its target collapses duplicate invocations, a publication only when every modeled consumer of the topic collapses duplicate deliveries, an outbox write only when its containing transaction suppresses a second commit or the outbox's one modeled consumer collapses duplicate deliveries (§13.4), through its own proven requirement. An outbox boundary does not terminate the causal effect graph: the writes staged by a path's transactions are effect occurrences of that path, and the cascade continues through the outbox's consuming input whenever the outbox admits the written schema.
 - **Control leg.** Every decision on the path must replay (§16): the matched result replay-stable, or the branch condition deterministic over replay-stable roots, so that every attempt in the class traverses the same path. When a controlling observation may differ between attempts, a retry may do different work, and V1 has no general compatibility argument for the two histories; the decision is an obstacle — with one narrow, structural exception. A decision not established to replay is **admissible for this leg** iff its continuation is **idempotency-inert**: on every admitted path through the decision, every step after it is itself a decision — no transaction, no effect execution or launch, no intent execution, no `join_all` or `race` — through arm bodies, branch fall-through, and enclosing-block suffixes alike, out to the terminal. The class's complete modeled work is then the shared prefix's, already judged by the other legs; divergence can alter only which terminal is constructed, which is the result-replay obligation's separate concern and is deliberately **not** granted this admission — same work is not same result. Transactions are never inert, however individually retry-safe: `arm A → T1 / arm B → T2` is divergent logical work, and the theorem is structural, not a recursive equivalence argument. `join_all` and `race` are never inert although they launch nothing: they alter which prior completions later control depends on. A launch *before* the decision does not invalidate inertness; one *inside* a continuation does — the effect enters the blast radius even unawaited. The admission is recorded on the proof as a **derived structural fact** (`IdempotencyInertContinuation`), never as an implementation assumption — no implementation claim supplies it, and it lapses by itself the moment an effectful step joins any continuation.
 
-A verdict therefore covers the cascade the operation starts, and V1 computes the mutually dependent verdicts as a greatest fixpoint (below), so a cycle whose members each collapse the others' duplicates is proven and marked coinductive — a cycle through outboxes no less than one through topics or requests; there is no separate outbox solver. Result consistency is the separate result-replay obligation below; its verdicts feed in only where a decision rests on a request effect's result. Vacuously discharged: an empty population; no admitted path, so an attempt performs no modeled work; and a triggering subscription or outbox input with `at_most_once` delivery whose payload is identity-pinned by the key (§18) — same-class messages are then one logical message delivered at most once, so a class holds at most one attempt.
+A verdict therefore covers the cascade the operation starts, and V1 computes the mutually dependent verdicts as a greatest fixpoint (below), so a cycle whose members each collapse the others' duplicates is proven and marked coinductive — a cycle through outboxes no less than one through topics or requests; there is no separate outbox solver. Result consistency is the separate result-replay obligation below; its verdicts feed in only where a decision rests on a request effect's result. Vacuously discharged: an empty population; no admitted path, so an attempt performs no modeled work; and a triggering subscription with `at_most_once` delivery whose payload is identity-pinned by the key (§18) — same-class messages are then one logical message delivered at most once, so a class holds at most one attempt. No outbox counterpart exists: intrinsic durable re-drive admits overlapping attempts for one pending message (§8.3), so an outbox-triggered class is never bounded to one attempt by a delivery fact.
 
 ### `ResultReplayRequirement::replay_consistent`
 
@@ -805,14 +835,15 @@ In addition to resumability, the architecture must guarantee that the logical in
 
 This is a liveness obligation and additionally requires a modeled retry driver, such as:
 
-- `delivery: at_least_once` on the triggering subscription's runtime (§10.3) or on the triggering outbox input's runtime (§10.3.2) — L1 facts, so a proof taking either route is `runtime_dependent`; or
+- `delivery: at_least_once` on the triggering subscription's runtime (§10.3) — an L1 fact, so a proof taking that route is `runtime_dependent`;
+- the intrinsic durable re-drive of a triggering outbox input (§8.3): a committed message stays pending, and a pending message keeps admitting consumption attempts, until an attempt succeeds — an L0 fact of the abstraction itself, needing no declaration, so that route stays `l0_only`; or
 - an inbound `RequestEffect` whose `retry` is `may_repeat` — an L0 guarantee, so that route stays `l0_only`.
 
-An inbound repeatable request may be declared among a modeled caller's effects or as a state-machine transition side effect, which is a `RequestEffect` under §22. Both driver facts re-drive the *same logical invocation*: a redelivery is another delivery of one logical message, and `may_repeat` repeats one logical request, so the re-driven attempt carries the same payload and hence the same key.
+An inbound repeatable request may be declared among a modeled caller's effects or as a state-machine transition side effect, which is a `RequestEffect` under §22. All three driver facts re-drive the *same logical invocation*: a redelivery is another delivery of one logical message, a pending outbox message re-admitted is the same message, and `may_repeat` repeats one logical request, so the re-driven attempt carries the same payload and hence the same key.
 
 Two cautions apply.
 
-First, the driver facts in the current DSL are duplicate-delivery facts, not bounded-liveness facts. §10.3 states that `at_least_once` "encodes no retry timing, retry count, backoff, or bounded eventual-delivery liveness guarantee." A `guaranteed` proof is therefore conditional on the delivery abstraction genuinely redelivering until the invocation succeeds, in the sense of §1.3.
+First, the driver facts in the current DSL are re-drive facts, not bounded-liveness facts. §10.3 states that `at_least_once` "encodes no retry timing, retry count, backoff, or bounded eventual-delivery liveness guarantee," and the outbox's intrinsic re-drive likewise fixes no attempt cadence. A `guaranteed` proof is therefore conditional on the abstraction genuinely re-driving until the invocation succeeds, in the sense of §1.3.
 
 Second, a request input alone supplies no driver. The caller is outside the model, so `guaranteed` on a request-only operation is normally not dischargeable unless the calling side is itself modeled as a `may_repeat` request effect.
 
@@ -1026,14 +1057,13 @@ This order-preservation responsibility is what replaces the logical-lane semanti
 
 ### 10.3.2 `OutboxRuntime`
 
-Runtime facts for one L0 outbox input (§8.3), addressed like a subscription runtime by the `(operation, input)` pair:
+Runtime facts for the outbox's one consuming input (§8.3), addressed like a subscription runtime by the `(operation, input)` pair:
 
 ```yaml
 runtime:
   outboxes:
     operation.publish_order_event:
       input.publish_order_event.outbox:
-        delivery: at_least_once
         partitioning:
           kind: keyed
           mapping:
@@ -1042,21 +1072,21 @@ runtime:
         ordering: partition
         dispatch:
           pool: pool.outbox_workers
-          member_assignment:
-            kind: consistent_hash
+          routing:
+            key: partition_key
+            member_assignment:
+              kind: consistent_hash
           batching:
             ordering: preserved
 ```
 
-An outbox runtime is deliberately its own concept, not a `SubscriptionRuntime` with the labels changed: an outbox consumer is a different architecture concept from a topic subscription, and equivalent proof machinery is not sufficient reason to erase semantic vocabulary. What *is* shared is shared because the mechanism genuinely is the same thing: `DeliverySemantics`, `MemberAssignment`, and `ExecutionPool` keep their exact §10.3–§10.6 meanings. There is no scope split — every fact of one consumer relationship is declared here, once — and each of several inputs on one outbox declares its own runtime. Absence of the whole declaration is epistemic: the logical consumption relationship exists with no usable runtime facts, never evidence that no concrete runtime exists.
+An outbox runtime is deliberately its own concept, not a `SubscriptionRuntime` with the labels changed: an outbox consumer is a different architecture concept from a topic subscription, and equivalent proof machinery is not sufficient reason to erase semantic vocabulary. What *is* shared is shared because the mechanism genuinely is the same thing: `MemberAssignment` and `ExecutionPool` keep their exact §10.3–§10.6 meanings. There is no scope split — every fact of the one consumer relationship is declared here, once. Absence of the whole declaration is epistemic: the logical consumption relationship exists with no usable runtime facts, never evidence that no concrete runtime exists.
 
-#### `delivery`
-
-Delivery multiplicity of one committed logical outbox message relative to this input, in the §10.3 vocabulary: `unspecified`, `at_most_once` (no redelivery; loss possible; not exactly-once execution), `at_least_once` (duplicate invocation possible; no retry count, timing, or eventual-success guarantee). Where the input declares `acknowledge_on_success = true`, a successful acknowledged invocation ends ordinary redelivery of that item for this consumer; uncertainty or failure before acknowledgement may admit another attempt under `at_least_once`.
+There is **no `delivery` field**. Durable re-drive until successful consumption is intrinsic to the outbox abstraction (§8.3), so it is not a fact a runtime declaration could add or remove; L1 describes only additional runtime organization of those consumption attempts.
 
 #### `partitioning`
 
-The outbox's one runtime grouping concept — partition identity **is** the logical grouping identity used for runtime consumption; there is no separate outbox grouping primitive, and no generic runtime-domain-key abstraction. `none` declares one undivided consumption domain for this consumer (implying no physical singularity — not one table, worker, or host — unless another declaration establishes it). `keyed` maps each consumed schema into the common logical partition-key domain, under the familiar tuple rules: per-schema field mappings, corresponding positions, one arity; only schemas admitted through the targeted input need participate. The keyed meaning is exactly the grouping-key relation:
+The outbox's one runtime grouping concept — partition identity **is** the logical grouping identity used for runtime consumption; there is no separate outbox grouping primitive, and no generic runtime-domain-key abstraction. `none` declares one undivided consumption domain for this consumer (implying no physical singularity — not one table, worker, or host — unless another declaration establishes it). `keyed` maps each consumed schema into the common logical partition-key domain, under the familiar tuple rules: per-schema field mappings, corresponding positions, one arity; the mapping covers every schema the outbox admits, since the one consumer admits them all. The keyed meaning is exactly the grouping-key relation:
 
 ```
 partition_key(A) = partition_key(B)  =>  partition(A) = partition(B)
@@ -1070,14 +1100,14 @@ The precedence this runtime establishes among consumed messages, in the outbox's
 
 #### `dispatch`
 
-Which member of the referenced pool owns the consumption partition — or, unpartitioned, the undivided consumption scope — from which a logical invocation is dispatched:
+Where consumption attempts execute, with the same conceptual shape as `SubscriptionDispatch` (§10.3.1): identify the semantic routing domain, choose how that domain maps to pool members, optionally batch logical items, and execute the resulting operation invocations in an `ExecutionPool`:
 
 ```
 outbox message
     |  partition key
     v
 outbox partition
-    |  member assignment
+    |  routing: key + member assignment
     v
 ExecutionPool member
     |
@@ -1085,11 +1115,27 @@ ExecutionPool member
 logical OutboxInput invocation
 ```
 
-`member_assignment` is mandatory and carries the normative §10.6 semantics unchanged, including safe ownership transfer; no outbox-specific hash, lease, or consumer-group protocol is prescribed. No polling primitive exists either — a conforming realization may poll a table, tail a CDC stream, or consume a broker without changing the model — and no outbox-specific concurrency field exists: general execution concurrency remains `ExecutionPool.member_concurrency`. The §10.3.1 rule that dispatch preserves precedence and never invents it applies here verbatim, redelivery and ownership reassignment included.
+`pool` is mandatory. No polling primitive exists — a conforming realization may poll a table, tail a CDC stream, or consume a broker without changing the model — and no outbox-specific concurrency field exists: general execution concurrency remains `ExecutionPool.member_concurrency`, so one outbox has one logical consumer operation and may still be executed by many pool members; logical consumer ownership and runtime worker membership are separate concepts. The §10.3.1 rule that dispatch preserves precedence and never invents it applies here verbatim, redelivery and ownership reassignment included.
+
+#### `routing`
+
+An optional `OutboxRouting` block that intentionally mirrors `SubscriptionRouting` — `{ key, member_assignment }` — rather than burying the routing domain implicitly inside a bare member assignment. The declaration states two independent facts: `key` names **which established semantic domain is routed**, and `member_assignment` **how that domain is assigned to pool members**, with the normative §10.6 semantics unchanged, safe ownership transfer included.
+
+With `routing` absent, Conseqa establishes only that consumption attempts execute on some member of the referenced pool — no stable partition-to-member affinity is known. With
+
+```yaml
+routing:
+  key: partition_key
+  member_assignment: { kind: consistent_hash }
+```
+
+the logical partition domain established by `partitioning` is routed to pool members according to the assignment. For V1 the only routing key is `partition_key`, because `OutboxPartitioning` is the outbox's one established semantic consumption domain; validation requires keyed partitioning with it, since `partitioning: none` leaves no partition-key domain to route — routing consumes an already-declared semantic key rather than inventing one, exactly as `grouping_key` routing does on the subscription side.
+
+Routing does not imply attempt exclusivity. After redelivery or ownership uncertainty, `attempt A(M) -> member X` and `attempt B(M) -> member Y` may overlap unless stronger routing/handoff semantics establish otherwise.
 
 #### `batching`
 
-The declared fact that this consumer may retrieve or dispatch several logical source items together. L0 is untouched: each item remains one logical per-message invocation (§8.3), batching changes no message, partition, or input identity, creates no new idempotency identity, and leaves acknowledgement per-message. The batch's internals — sequential iteration, parallel futures, vectorized APIs, sizes, wait durations — are deliberately opaque and partly external scenario inputs.
+The declared fact that this consumer may retrieve or dispatch several logical source items together — how several logical source-item invocations cross the source-to-execution boundary, **not** whether the underlying database or transport happened to fetch several rows or records together. L0 is untouched: each item remains one logical per-message invocation (§8.3), batching changes no message, partition, or input identity, creates no new idempotency identity, and each item's intrinsic consumption is still judged on its own invocation's completion. The batch's internals — sequential iteration, parallel futures, vectorized APIs, sizes, wait durations — are deliberately opaque and partly external scenario inputs.
 
 The one semantic the declaration carries is `ordering`, explicit with no default: `preserved` guarantees the opaque batch processing does not let a later message overtake an earlier one against an already-established ordering relation — without requiring literal serial execution, if an implementation is observationally consistent with the guarantee; `unspecified` provides no usable fact, and a verifier must not propagate a source ordering guarantee through the stage. Preservation is **not** a serialization guarantee: opaque batch processing may still overlap logical item evaluations, and `member_concurrency` must not be silently read as a fact about batch-internal parallelism — which is why a declared batching stage stops a serialization proof outright while an ordering proof accepts `preserved` (§9). Absent `batching` declares no batching fact, and no default silently states preservation.
 
@@ -1606,16 +1652,16 @@ An outbox write introduces no second transaction: its admission is the containin
 
 ### Blast radius
 
-The producing operation's effect graph treats the write as a fully visible side-effect edge: the cascade continues through the outbox to every `OutboxInput` admitting the schema, and transitively through those consumers' own effects — for idempotency verification, effect-cascade visualization, dependency analysis, and simulation-graph construction alike. An outbox boundary never terminates the causal effect graph.
+The producing operation's effect graph treats the write as a fully visible side-effect edge: the cascade continues through the outbox to its one consuming `OutboxInput` (which admits every schema the outbox declares), and transitively through that consumer's own effects — for idempotency verification, effect-cascade visualization, dependency analysis, and simulation-graph construction alike. An outbox boundary never terminates the causal effect graph.
 
 ### Duplicate outbox write
 
 For an upstream idempotency requirement, a potentially repeated outbox write is discharged by either of two routes, and they remain distinct:
 
 1. **Producer-suppressed.** The containing transaction's keyed commit deduplication, over a key stable for the governing attempt class, admits at most one logical commit per class — hence at most one committed occurrence of the write. No class-fixity of the message instance is needed: the single commit admitted whatever it admitted, once. This reuses the existing transaction-idempotency rules; no outbox-specific deduplication guarantee exists.
-2. **Message/consumer.** Where repeated executions may commit repeated writes, the publication pattern applies (§13.1): the destination outbox declares a keyed message identity covering the written schema, the instance is class-fixed — repeated writes then denote the *same logical message* rather than two — and every modeled consumer of that message collapses duplicate deliveries, through an idempotency requirement keyed from its outbox input that is itself proven, or through `at_most_once` outbox delivery of the one identified message. A write stamping a fresh random identifier or unstable timestamp into each attempt is not class-fixed merely because the outbox declares an identity field; the implementation must actually conform to the identity claim.
+2. **Message/consumer.** Where repeated executions may commit repeated writes, the publication pattern applies (§13.1): the destination outbox declares a keyed message identity covering the written schema, the instance is class-fixed — repeated writes then denote the *same logical message* rather than two — and the outbox's one modeled consumer collapses duplicate deliveries through an idempotency requirement keyed from its outbox input that is itself proven. There is no delivery-based collapse: intrinsic durable re-drive admits duplicate and overlapping consumption attempts (§8.3), so no declaration can bound the identified message to one delivery. A write stamping a fresh random identifier or unstable timestamp into each attempt is not class-fixed merely because the outbox declares an identity field; the implementation must actually conform to the identity claim.
 
-As with publication, the analysis is closed-world over modeled consumers, verdicts join the one greatest-fixpoint computation with request and publication discharge, and `idempotency_key_propagation` plays no role in the producer-side discharge — a class-fixed instance already makes duplicates payload-equal; propagation remains lineage for the consumer's analysis (§12). `acknowledge_on_success` on a consumer proves no collapse either: it defines the consumption-completion boundary, not a duplicate-delivery guarantee — under at-least-once delivery, a crash after the downstream work but before acknowledgement redelivers the message, which is precisely why the consumer's own idempotency requirement is what the discharge cites.
+As with publication, the analysis is closed-world over modeled consumers, verdicts join the one greatest-fixpoint computation with request and publication discharge, and `idempotency_key_propagation` plays no role in the producer-side discharge — a class-fixed instance already makes duplicates payload-equal; propagation remains lineage for the consumer's analysis (§12). Successful consumption proves no collapse either: it ends the admission of further ordinary attempts, not the attempts already admitted — a crash after the downstream work but before completion re-drives the message, which is precisely why the consumer's own idempotency requirement is what the discharge cites.
 
 ---
 
@@ -1914,7 +1960,7 @@ A race-bound result introduces scheduling nondeterminism — which candidate com
 
 An operation terminal does not implicitly join asynchronous executions. `async A; complete` is structurally meaningful: it establishes `start(A) < complete(operation control)` but not `complete(A) < complete(operation control)` — deliberate fire-and-forget, with no additional primitive. The terminal completes the declared synchronous control path only; with unresolved handles outstanding, Conseqa SHALL NOT infer that those effects completed, succeeded, failed, were cancelled, or will eventually complete, and no durability or eventual-completion guarantee follows from launch alone. Where durable rediscovery matters, the transaction/`EffectIntent` mechanisms must provide it — async execution is not durable rediscovery.
 
-For a request operation, `race(A,B) -> R; return R` makes the request result causally dependent on the race winner only; the loser may remain in flight beyond the terminal, so request latency and the lifetime cost of all initiated effects are distinct quantities — a major reason asynchronous execution is represented explicitly. Where a source-driven input uses `acknowledge_on_success`, successful completion — and therefore acknowledgement — may occur while launched effects remain unresolved; source acknowledgement is never silently turned into an implicit async join.
+For a request operation, `race(A,B) -> R; return R` makes the request result causally dependent on the race winner only; the loser may remain in flight beyond the terminal, so request latency and the lifetime cost of all initiated effects are distinct quantities — a major reason asynchronous execution is represented explicitly. Where a subscription uses `acknowledge_on_success` — or an outbox message's intrinsic consumption turns on successful completion (§8.3) — that completion may occur while launched effects remain unresolved; the source-side completion boundary is never silently turned into an implicit async join.
 
 Program reachability remains defined over synchronous control: no program step executes after a terminal, so `async A; complete; B` still makes B unreachable — a continuing asynchronous A does not make B reachable. Outstanding handles do not make an otherwise terminating path unterminated: they are launched side-effect executions, not additional control paths requiring terminals.
 

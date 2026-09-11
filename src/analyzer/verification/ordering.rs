@@ -655,9 +655,10 @@ fn duplicate_handling(
 }
 
 /// The outbox route: the runtime's declared precedence, the keyed
-/// partition domain identifying the ordering key, one owning member at
-/// concurrency one, and — where a batching stage exists — its declared
-/// order preservation (§60–§64 of the outbox revision).
+/// partition domain identifying the ordering key, dispatch routing by
+/// that domain with one owning member at concurrency one, and — where
+/// a batching stage exists — its declared order preservation (§60–§64
+/// of the outbox revision).
 ///
 /// A batching stage differs from the serialization side: `preserved`
 /// lets the established precedence pass through the stage, while
@@ -770,15 +771,32 @@ fn outbox_order_route(
 
     let pool_id = runtime.dispatch.pool.clone();
 
-    // The ownership leg: the partition's one active owning member.
-    let assignment = runtime.dispatch.member_assignment;
+    // The ownership leg: the dispatch must route by the partition
+    // domain, and the assignment must give each partition one active
+    // owning member.
+    let assignment = match &runtime.dispatch.routing {
+        None => {
+            obstacles.push(OrderingObstacle::RoutingAbsent {
+                input: input_id.clone(),
+                pool: pool_id.clone(),
+            });
 
-    if !assignment_owns_one_member(assignment) {
-        obstacles.push(OrderingObstacle::MemberAssignmentNotExclusive {
-            input: input_id.clone(),
-            declared: assignment,
-        });
-    }
+            None
+        }
+
+        Some(routing) => match routing.key {
+            crate::spec::OutboxRoutingKey::PartitionKey => {
+                if !assignment_owns_one_member(routing.member_assignment) {
+                    obstacles.push(OrderingObstacle::MemberAssignmentNotExclusive {
+                        input: input_id.clone(),
+                        declared: routing.member_assignment,
+                    });
+                }
+
+                Some(routing.member_assignment)
+            }
+        },
+    };
 
     let mut serialization_obstacles = Vec::new();
     let serial = pool_is_serial(model, input_id, &pool_id, &mut serialization_obstacles);
@@ -824,10 +842,19 @@ fn outbox_order_route(
         }
     };
 
-    let duplicates = duplicate_handling(operation_id, input_id, runtime.delivery, idempotency);
+    // Duplicate consumption attempts are intrinsic to the outbox
+    // abstraction — a pending message is re-driven until successfully
+    // consumed, and attempts may overlap — so redelivery is judged as
+    // at-least-once; no delivery fact exists to bound it.
+    let duplicates = duplicate_handling(
+        operation_id,
+        input_id,
+        DeliverySemantics::AtLeastOnce,
+        idempotency,
+    );
 
-    match (precedence, partitioned) {
-        (Some(precedence), Some(partition_keys))
+    match (precedence, partitioned, assignment) {
+        (Some(precedence), Some(partition_keys), Some(member_assignment))
             if serial && batch_ok && obstacles.is_empty() =>
         {
             OrderingVerdict::proven(OrderingProof::OutboxRoutedOrder {
@@ -836,7 +863,7 @@ fn outbox_order_route(
                 pool: pool_id,
                 precedence,
                 partition_keys,
-                member_assignment: assignment,
+                member_assignment,
                 batching,
                 duplicates,
             })

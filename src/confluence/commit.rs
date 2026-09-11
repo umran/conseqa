@@ -289,6 +289,34 @@ pub fn skeleton_diagnostics(workspace: &WorkspaceState) -> Vec<DraftDiagnostic> 
         }
     }
 
+    // Every outbox needs its one consuming input before programs are
+    // written against the skeleton: consumption is intrinsic, so an
+    // unconsumed outbox is a missing interface, not a stylistic gap.
+    // The gate refuses a second consumer per patch; the at-least-one
+    // half is judged here, over the whole skeleton.
+    for (data_model, declaration) in &workspace.data_models {
+        for outbox in declaration.outboxes.keys() {
+            let consumed = workspace.operations.values().any(|draft| {
+                draft.inputs.values().any(|input| {
+                    matches!(input, Input::Outbox(declared) if &declared.outbox == outbox)
+                })
+            });
+
+            if !consumed {
+                diagnostics.push(DraftDiagnostic::new(
+                    Some(SymbolKey::Outbox {
+                        data_model: data_model.clone(),
+                        outbox: outbox.clone(),
+                    }),
+                    format!(
+                        "outbox {outbox} of {data_model} has no consuming outbox input; \
+                         exactly one operation must declare the input that consumes it"
+                    ),
+                ));
+            }
+        }
+    }
+
     diagnostics
 }
 
@@ -1027,15 +1055,29 @@ fn check_input(
                 ));
             }
 
-            if let (MessageSelector::Only(schemas), Some((_, outbox))) =
-                (&declared.messages, outbox)
-            {
-                for schema in schemas {
-                    if !outbox.messages.contains(schema) {
+            // Exactly one OutboxInput may reference an outbox. The
+            // candidate already carries this patch's own interface, so
+            // the check is against every *other* boundary — refusing a
+            // second consumer at the gate, while an outbox that is
+            // merely unconsumed stays committable for the next patch
+            // to consume (whole-model validation enforces the
+            // at-least-one half).
+            for (other_operation, other) in &candidate.operations {
+                for (other_input, other_declared) in &other.inputs {
+                    if (other_operation, other_input) == (operation, input_id) {
+                        continue;
+                    }
+
+                    if let Input::Outbox(existing) = other_declared
+                        && existing.outbox == declared.outbox
+                    {
                         diagnostics.push(DraftDiagnostic::new(
-                            Some(SymbolKey::Schema(schema.clone())),
+                            Some(SymbolKey::OperationInterface(other_operation.clone())),
                             format!(
-                                "input {input_id} of {operation} selects {schema}, which outbox {} does not admit",
+                                "input {input_id} of {operation} consumes outbox {}, which \
+                                 {other_input} of {other_operation} already consumes; exactly \
+                                 one outbox input may reference an outbox — fan out \
+                                 downstream through a topic instead",
                                 declared.outbox
                             ),
                         ));

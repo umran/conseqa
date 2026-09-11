@@ -50,7 +50,12 @@ const EVENT_SEQ_KEY: &str = "task_event_seq";
 /// the DSL contract version (`dsl: 1`) arrived: stored workspaces
 /// embed the spec types, so a DSL bump forces a format bump — never
 /// conversely.
-const FORMAT: u64 = 3;
+///
+/// Bumped to 4 with the outbox-semantics revision (`dsl: 2`):
+/// `OutboxInput` lost its selector and acknowledgement,
+/// `OutboxRuntime` its delivery, and outbox dispatch replaced its
+/// bare member assignment with a routing block.
+const FORMAT: u64 = 4;
 
 #[derive(Debug, thiserror::Error)]
 pub enum PersistenceError {

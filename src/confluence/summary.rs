@@ -70,10 +70,12 @@ pub enum InputContract {
         delivery: DeliverySemantics,
     },
 
+    /// The outbox's one consuming boundary. Consumption semantics are
+    /// intrinsic — durable re-drive until successful consumption,
+    /// overlapping attempts admitted — so no delivery or
+    /// acknowledgement fact exists to summarize.
     Outbox {
         outbox: Id,
-        delivery: DeliverySemantics,
-        acknowledge_on_success: bool,
     },
 }
 
@@ -186,8 +188,6 @@ fn derive_one(
 
                 Input::Outbox(input) => InputContract::Outbox {
                     outbox: input.outbox.clone(),
-                    delivery: model.outbox_delivery(id, input_id),
-                    acknowledge_on_success: input.acknowledge_on_success,
                 },
             };
 
