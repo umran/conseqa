@@ -688,9 +688,10 @@ fn validate_message_identity_shape(model: &Model, errors: &mut Vec<ValidationErr
     }
 }
 
-/// The outbox-side counterparts of the topic checks: message-identity
-/// shape against the outbox's admitted schemas, and outbox-input
-/// message selection against the same set.
+/// The outbox-side counterparts of the topic checks — message-identity
+/// shape against the outbox's admitted schemas — plus the consumer
+/// invariant the revision makes structural: exactly one `OutboxInput`
+/// in the model references a given outbox.
 fn validate_outboxes(model: &Model) -> Vec<ValidationError> {
     let mut errors = Vec::new();
 
@@ -700,7 +701,7 @@ fn validate_outboxes(model: &Model) -> Vec<ValidationError> {
         }
     }
 
-    validate_outbox_input_membership(model, &mut errors);
+    validate_outbox_consumers(model, &mut errors);
 
     errors
 }
@@ -750,28 +751,45 @@ fn validate_outbox_message_identity_shape(
     }
 }
 
-fn validate_outbox_input_membership(model: &Model, errors: &mut Vec<ValidationError>) {
-    for operation in model.operations.values() {
+/// Exactly one `OutboxInput` per outbox: the owning operation is the
+/// outbox's exclusive logical consumer, consuming every admitted
+/// schema, so a second consumer and an unconsumed outbox are both
+/// structural errors — there is no message selection to divide an
+/// outbox between competing consumers, and a committed message with
+/// no consumer would be durably pending forever.
+fn validate_outbox_consumers(model: &Model, errors: &mut Vec<ValidationError>) {
+    let mut consumers: BTreeMap<&Id, Vec<(&Id, &Id)>> = BTreeMap::new();
+
+    for (operation_id, operation) in &model.operations {
         for (input_id, input) in &operation.inputs {
-            let Input::Outbox(input_declaration) = input else {
-                continue;
-            };
+            if let Input::Outbox(input_declaration) = input {
+                consumers
+                    .entry(&input_declaration.outbox)
+                    .or_default()
+                    .push((operation_id, input_id));
+            }
+        }
+    }
 
-            let (_, outbox) = model
-                .outbox(&input_declaration.outbox)
-                .expect("references already validated");
+    for data_model in model.data_models.values() {
+        for outbox_id in data_model.outboxes.keys() {
+            match consumers.get(outbox_id).map(Vec::as_slice) {
+                None | Some([]) => errors.push(ValidationError::OutboxWithoutConsumer {
+                    outbox: outbox_id.clone(),
+                }),
 
-            let MessageSelector::Only(messages) = &input_declaration.messages else {
-                continue;
-            };
+                Some([_]) => {}
 
-            for schema in messages {
-                if !outbox.messages.contains(schema) {
-                    errors.push(ValidationError::OutboxInputMessageNotAdmitted {
-                        input: input_id.clone(),
-                        outbox: input_declaration.outbox.clone(),
-                        schema: schema.clone(),
-                    });
+                Some([(first_operation, first_input), rest @ ..]) => {
+                    for (operation, input) in rest {
+                        errors.push(ValidationError::OutboxMultipleConsumers {
+                            outbox: outbox_id.clone(),
+                            first_operation: (*first_operation).clone(),
+                            first_input: (*first_input).clone(),
+                            operation: (*operation).clone(),
+                            input: (*input).clone(),
+                        });
+                    }
                 }
             }
         }
@@ -1230,22 +1248,14 @@ fn validate_value_ref_path(
                 }
 
                 Input::Outbox(input) => {
+                    // The exclusive consumer admits every schema the
+                    // outbox declares.
                     let (_, outbox) = model
                         .outbox(&input.outbox)
                         .expect("references already validated");
 
-                    match &input.messages {
-                        MessageSelector::All => {
-                            for schema in &outbox.messages {
-                                validate_schema_path(model, subject, schema, &value.path, errors);
-                            }
-                        }
-
-                        MessageSelector::Only(messages) => {
-                            for schema in messages {
-                                validate_schema_path(model, subject, schema, &value.path, errors);
-                            }
-                        }
+                    for schema in &outbox.messages {
+                        validate_schema_path(model, subject, schema, &value.path, errors);
                     }
                 }
             }
@@ -1435,10 +1445,7 @@ fn presence_root_schemas(
                 Input::Outbox(input) => {
                     let (_, outbox) = model.outbox(&input.outbox)?;
 
-                    match &input.messages {
-                        MessageSelector::All => outbox.messages.iter().cloned().collect(),
-                        MessageSelector::Only(messages) => messages.iter().cloned().collect(),
-                    }
+                    outbox.messages.iter().cloned().collect()
                 }
             })
         }
@@ -2395,12 +2402,6 @@ fn validate_input_references(
                 ReferenceKind::Outbox,
                 errors,
             );
-
-            if let MessageSelector::Only(messages) = &input.messages {
-                for schema in messages {
-                    expect_reference(index, input_id, schema, ReferenceKind::Schema, errors);
-                }
-            }
         }
     }
 }

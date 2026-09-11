@@ -59,8 +59,8 @@ pub struct RuntimeModel {
     #[serde(default)]
     pub subscriptions: BTreeMap<Id, BTreeMap<Id, SubscriptionRuntime>>,
 
-    /// Delivery, partitioning, ordering, and dispatch facts for L0
-    /// outbox inputs, keyed by operation ID and then by input ID.
+    /// Partitioning, ordering, and dispatch facts for L0 outbox
+    /// inputs, keyed by operation ID and then by input ID.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub outboxes: BTreeMap<Id, BTreeMap<Id, OutboxRuntime>>,
 
@@ -318,33 +318,26 @@ pub enum SubscriptionRoutingKey {
 /// `(operation, input)` pair the L0 model already establishes.
 ///
 /// The L0 [`OutboxInput`](super::OutboxInput) says that a committed
-/// logical outbox message may invoke the operation. This says how
-/// often it may be delivered, how the consumption population is
-/// partitioned, what precedence the runtime establishes, and where
-/// invocations execute. Deliberately distinct from
-/// [`SubscriptionRuntime`]: an outbox consumer is a different
-/// architecture concept from a topic subscription, however analogous
-/// the proof machinery; only genuinely shared mechanisms —
-/// [`DeliverySemantics`], [`MemberAssignment`], [`ExecutionPool`] —
-/// are reused.
+/// logical outbox message invokes the operation, and durable re-drive
+/// until successful consumption is intrinsic to the outbox
+/// abstraction — there is no delivery fact to declare. This describes
+/// only additional runtime organization of those consumption
+/// attempts: how the consumption population is partitioned, what
+/// precedence the runtime establishes, and where invocations execute.
+/// Deliberately distinct from [`SubscriptionRuntime`]: an outbox
+/// consumer is a different architecture concept from a topic
+/// subscription, however analogous the proof machinery; only
+/// genuinely shared mechanisms — [`MemberAssignment`],
+/// [`ExecutionPool`] — are reused.
 ///
-/// Unlike topic transport, there is no scope split: every fact of an
-/// outbox consumer relationship is declared here, once. Absence of the
+/// Unlike topic transport, there is no scope split: every fact of the
+/// one consumer relationship is declared here, once. Absence of the
 /// whole runtime is epistemic — the logical consumption relationship
 /// exists with no usable runtime facts — never evidence that no
 /// concrete runtime exists.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OutboxRuntime {
-    /// Delivery multiplicity of one committed logical outbox message
-    /// relative to this input — the same vocabulary subscriptions use.
-    /// Where the input declares `acknowledge_on_success`, a successful
-    /// acknowledged invocation ends ordinary redelivery of that item
-    /// for this consumer; uncertainty or failure before
-    /// acknowledgement may admit another attempt under
-    /// `at_least_once`.
-    pub delivery: DeliverySemantics,
-
     /// The outbox's one runtime grouping concept. There is no separate
     /// outbox grouping primitive: partition identity *is* the logical
     /// grouping identity used for runtime consumption.
@@ -427,15 +420,16 @@ pub enum OutboxOrdering {
     Partition,
 }
 
-/// Where outbox invocations execute: which member of the referenced
-/// pool owns the consumption partition — or, unpartitioned, the
-/// undivided consumption scope — from which a logical invocation is
-/// dispatched.
+/// Where outbox invocations execute, with the same conceptual shape
+/// as [`SubscriptionDispatch`]: identify the semantic routing domain,
+/// choose how that domain maps to pool members, optionally batch
+/// logical items, and execute in an [`ExecutionPool`].
 ///
-/// Distinct from [`SubscriptionDispatch`], and deliberately reusing
-/// [`MemberAssignment`] and [`ExecutionPool`], whose semantics are
-/// genuinely the same. No outbox-specific concurrency field exists:
-/// general execution concurrency remains
+/// Distinct from [`SubscriptionDispatch`] as a type — an outbox
+/// consumer is its own architecture concept — while deliberately
+/// reusing [`MemberAssignment`] and [`ExecutionPool`], whose
+/// semantics are genuinely the same. No outbox-specific concurrency
+/// field exists: general execution concurrency remains
 /// [`ExecutionPool::member_concurrency`]. No polling primitive exists
 /// either — a conforming realization may poll, tail a CDC stream, or
 /// consume a broker without changing the model.
@@ -445,15 +439,51 @@ pub struct OutboxDispatch {
     /// The execution pool invocations are assigned to.
     pub pool: Id,
 
-    /// How partition domains are assigned to a member of that pool,
-    /// under the existing safe ownership-transfer semantics.
-    pub member_assignment: MemberAssignment,
+    /// How consumption attempts are assigned to a member of that
+    /// pool.
+    ///
+    /// `None` is not a routing mode: it is the absence of any
+    /// member-affinity fact — consumption attempts execute on some
+    /// member of the pool, and nothing more may be inferred.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub routing: Option<OutboxRouting>,
 
     /// The declared fact that this consumer may retrieve or dispatch
     /// several logical source items together. Absent means no batching
     /// fact is declared.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub batching: Option<BatchingSemantics>,
+}
+
+/// A semantic routing key and the rule assigning its domains to pool
+/// members — the same two independent facts [`SubscriptionRouting`]
+/// declares, rather than a routing domain buried implicitly inside a
+/// bare member assignment: `key` names which established semantic
+/// domain is routed, `member_assignment` how that domain is assigned
+/// to [`ExecutionPool`] members.
+///
+/// Routing does not imply attempt exclusivity: after redelivery or
+/// ownership uncertainty, attempts for one logical message may
+/// overlap on different members unless stronger routing/handoff
+/// semantics establish otherwise.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OutboxRouting {
+    pub key: OutboxRoutingKey,
+    pub member_assignment: MemberAssignment,
+}
+
+/// The semantic routing key of an outbox consumption attempt.
+///
+/// Routing consumes an already-declared semantic key rather than
+/// inventing one, so each variant names an established domain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OutboxRoutingKey {
+    /// Route by the partition domain [`OutboxRuntime::partitioning`]
+    /// establishes. Requires keyed partitioning — with
+    /// `partitioning: none` no partition-key domain exists to route.
+    PartitionKey,
 }
 
 /// An opaque runtime batching stage over multiple logical per-message

@@ -769,13 +769,11 @@ impl<'a> ReplayAnalysis<'a> {
                     .map(|topic| topic.messages.iter().collect()),
             },
 
-            Input::Outbox(outbox_input) => match &outbox_input.messages {
-                MessageSelector::Only(messages) => Some(messages.iter().collect()),
-
-                MessageSelector::All => model
-                    .outbox(&outbox_input.outbox)
-                    .map(|(_, outbox)| outbox.messages.iter().collect()),
-            },
+            // The exclusive consumer admits every schema the outbox
+            // declares.
+            Input::Outbox(outbox_input) => model
+                .outbox(&outbox_input.outbox)
+                .map(|(_, outbox)| outbox.messages.iter().collect()),
         };
 
         // Resolve each intent binding to its producer site: an

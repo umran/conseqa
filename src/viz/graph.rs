@@ -289,25 +289,28 @@ pub enum EdgeDetail {
         executed_at: Vec<String>,
     },
 
-    /// An outbox input: one committed logical message per logical
-    /// invocation.
+    /// The outbox's one consuming input: one committed logical
+    /// message per logical invocation, re-driven intrinsically until
+    /// successfully consumed.
     OutboxConsume {
         operation: Id,
         input: Id,
 
-        /// Concrete message schemas, with `MessageSelector::All`
-        /// resolved against the outbox.
+        /// Every schema the outbox admits — the exclusive consumer
+        /// has no message selection.
         schemas: Vec<Id>,
-
-        acknowledge_on_success: bool,
-
-        delivery: String,
 
         /// The declared runtime facts, absent without an outbox
         /// runtime.
         partitioning: Option<String>,
         ordering: Option<String>,
         pool: Option<Id>,
+
+        /// The dispatch routing key, or `none` when the dispatch
+        /// declares no member affinity. Absent entirely when the
+        /// input has no declared runtime.
+        routing: Option<String>,
+
         member_assignment: Option<String>,
 
         /// The batching stage's ordering preservation; `None` inside
@@ -459,13 +462,12 @@ pub fn extract(model: &Model) -> Graph {
                 }
 
                 Input::Outbox(declared) => {
-                    let schemas = match &declared.messages {
-                        MessageSelector::All => model
-                            .outbox(&declared.outbox)
-                            .map(|(_, outbox)| outbox.messages.iter().cloned().collect())
-                            .unwrap_or_default(),
-                        MessageSelector::Only(schemas) => schemas.iter().cloned().collect(),
-                    };
+                    // The exclusive consumer admits every schema the
+                    // outbox declares.
+                    let schemas = model
+                        .outbox(&declared.outbox)
+                        .map(|(_, outbox)| outbox.messages.iter().cloned().collect())
+                        .unwrap_or_default();
 
                     let runtime = model.outbox_runtime(op_id, input_id);
 
@@ -477,14 +479,21 @@ pub fn extract(model: &Model) -> Graph {
                             operation: op_id.clone(),
                             input: input_id.clone(),
                             schemas,
-                            acknowledge_on_success: declared.acknowledge_on_success,
-                            delivery: to_tag(&model.outbox_delivery(op_id, input_id)),
                             partitioning: runtime
                                 .map(|runtime| to_tag(&runtime.partitioning)),
                             ordering: runtime.map(|runtime| to_tag(&runtime.ordering)),
                             pool: runtime.map(|runtime| runtime.dispatch.pool.clone()),
-                            member_assignment: runtime
-                                .map(|runtime| to_tag(&runtime.dispatch.member_assignment)),
+                            routing: runtime.map(|runtime| match &runtime.dispatch.routing {
+                                Some(routing) => to_tag(&routing.key),
+                                None => "none".to_string(),
+                            }),
+                            member_assignment: runtime.and_then(|runtime| {
+                                runtime
+                                    .dispatch
+                                    .routing
+                                    .as_ref()
+                                    .map(|routing| to_tag(&routing.member_assignment))
+                            }),
                             batching: runtime.map(|runtime| {
                                 runtime
                                     .dispatch

@@ -407,29 +407,25 @@ impl fmt::Display for DependencyResolution {
 mod tests {
     use super::{WriteGrant, WriteScope};
     use crate::confluence::patch::Mutation;
-    use crate::spec::{
-        DeliverySemantics, Id, MemberAssignment, OutboxDispatch, OutboxOrdering,
-        OutboxPartitioning, OutboxRuntime,
-    };
+    use crate::spec::{Id, OutboxDispatch, OutboxOrdering, OutboxPartitioning, OutboxRuntime};
 
     // The topology author's grant must cover every L1 mutation. The
     // outbox runtime is the one added after the grant table was first
     // written, so it is the one a regression would drop: without it the
-    // fanout's topology worker is told it owns "outbox delivery,
-    // partitioning, ordering, and dispatch" and then has its
-    // `put_outbox_runtime` rejected as out of scope.
+    // fanout's topology worker is told it owns "outbox partitioning,
+    // ordering, and dispatch" and then has its `put_outbox_runtime`
+    // rejected as out of scope.
     #[test]
     fn the_topology_grant_covers_outbox_runtimes() {
         let mutation = Mutation::PutOutboxRuntime {
             operation: Id("operation.dispatch".to_string()),
             input: Id("input.dispatch.outbox".to_string()),
             value: OutboxRuntime {
-                delivery: DeliverySemantics::AtLeastOnce,
                 partitioning: OutboxPartitioning::None,
                 ordering: OutboxOrdering::None,
                 dispatch: OutboxDispatch {
                     pool: Id("pool.dispatchers".to_string()),
-                    member_assignment: MemberAssignment::ConsistentHash,
+                    routing: None,
                     batching: None,
                 },
             },

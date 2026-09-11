@@ -1009,11 +1009,6 @@ fn idempotency_assumptions(proof: &IdempotencyProof) -> Vec<String> {
              identity is pinned by the key: a class holds at most one attempt"
         )],
 
-        IdempotencyProof::SingleOutboxDelivery { input, outbox } => vec![format!(
-            "{input} receives at-most-once delivery from outbox {outbox}, whose \
-             message identity is pinned by the key: a class holds at most one attempt"
-        )],
-
         IdempotencyProof::RetrySafePaths { paths } => {
             let mut assumptions = Vec::new();
 
@@ -1232,9 +1227,10 @@ fn recoverability_assumptions(proof: &RecoverabilityProof) -> Vec<String> {
                      interrupted invocations"
                 ),
 
-                RetryDriver::AtLeastOnceOutboxDelivery { input, outbox } => format!(
-                    "{input} redelivers via outbox {outbox} at least once, re-driving \
-                     interrupted invocations"
+                RetryDriver::IntrinsicOutboxRedrive { input, outbox } => format!(
+                    "outbox {outbox} intrinsically re-drives {input}: a committed \
+                     message stays pending, admitting consumption attempts, until \
+                     one succeeds"
                 ),
 
                 RetryDriver::InboundRepeatableRequest { operation, effect } => format!(

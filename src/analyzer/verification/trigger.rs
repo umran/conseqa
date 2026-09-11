@@ -3,9 +3,10 @@
 //!
 //! A request names its target directly. A publication reaches every
 //! subscription on its topic whose message selection admits the
-//! published schema; an outbox write reaches every outbox input on its
-//! outbox whose selection admits the written schema — the model's
-//! closed world of consumers. Verifiers that follow effects across
+//! published schema; an outbox write reaches the outbox's one
+//! consuming input, which admits every schema the outbox declares —
+//! the model's closed world of consumers. Verifiers that follow
+//! effects across
 //! operations — idempotency's cascade today; ordering's precedence
 //! source and process completion when they come — resolve those edges
 //! here, once per model, so they all agree on what "downstream" means.
@@ -229,23 +230,24 @@ impl<'a> TriggerGraph<'a> {
     }
 
     /// The modeled consumers of `schema` admitted to `outbox`, in
-    /// model order: every outbox input on the outbox whose message
-    /// selection admits the schema, under the same rules as topic
-    /// consumers.
+    /// model order. Structurally at most one input consumes an
+    /// outbox, and it admits every schema the outbox declares — there
+    /// is no per-input selection — so this is every outbox input on
+    /// the outbox whenever the outbox admits the schema at all.
     pub fn outbox_consumers(&self, outbox: &Id, schema: &Id) -> Vec<OutboxConsumer<'a>> {
         let declared = self
             .model
             .outbox(outbox)
             .is_some_and(|(_, outbox)| outbox.messages.contains(schema));
 
+        if !declared {
+            return Vec::new();
+        }
+
         self.outbox_inputs
             .get(outbox)
             .into_iter()
             .flatten()
-            .filter(|consumer| match &consumer.declaration.messages {
-                MessageSelector::All => declared,
-                MessageSelector::Only(schemas) => schemas.contains(schema),
-            })
             .copied()
             .collect()
     }

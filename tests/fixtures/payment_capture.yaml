@@ -16,16 +16,17 @@
 # balancing; emitting the event without the record invents money. One
 # atomic commit rules both failure shapes out.
 #
-# A relay consumes the outbox one message at a time — at-least-once,
-# partitioned by account with partition ordering, one owning serial
-# worker per partition — and republishes onto topic.payment_events,
+# The outbox's one consuming relay takes each committed message —
+# re-driven intrinsically until consumed, partitioned by account with
+# partition ordering, one owning serial worker per partition — and
+# republishes onto topic.payment_events,
 # whose keyed event_id identity makes its own redeliveries the same
 # logical message. Two independent subscribers consume that topic: the
 # ledger posts a double-entry record (keyed commit by event_id, driven
 # to completion by at-least-once delivery), and receipts emails the
 # customer through a provider that deduplicates sends by event_id.
 # Every declared obligation proves.
-dsl: 1
+dsl: 2
 revision: 1
 services:
   service.payments:
@@ -225,11 +226,6 @@ operations:
       input.publish_payment_event.outbox:
         kind: outbox
         outbox: outbox.payment_events
-        messages:
-          kind: only
-          schemas:
-          - schema.PaymentCaptured
-        acknowledge_on_success: true
     program:
       steps:
       - kind: execute_effect
@@ -393,7 +389,6 @@ runtime:
   outboxes:
     operation.publish_payment_event:
       input.publish_payment_event.outbox:
-        delivery: at_least_once
         partitioning:
           kind: keyed
           mapping:
@@ -402,8 +397,10 @@ runtime:
         ordering: partition
         dispatch:
           pool: pool.relay_workers
-          member_assignment:
-            kind: consistent_hash
+          routing:
+            key: partition_key
+            member_assignment:
+              kind: consistent_hash
   subscriptions:
     operation.post_ledger_entry:
       input.post_ledger_entry.captured:

@@ -1,18 +1,18 @@
-# The canonical transactional outbox (§70–§73 of the outbox revision):
-# create an order and admit OrderCreated to the data model's outbox in
-# one atomic commit; a relay consumes the outbox one logical message at
-# a time and publishes onto a keyed topic; a projector consumes the
-# topic.
+# The canonical transactional outbox: create an order and admit
+# OrderCreated to the data model's outbox in one atomic commit; the
+# outbox's one consuming relay publishes each committed message onto a
+# keyed topic; a projector consumes the topic.
 #
 # Everything declared proves. The producer discharges its duplicate
 # outbox write through the transaction's keyed commit (route one, §50);
 # the relay's own idempotency is keyed from the outbox message identity
 # that the producer's propagation carries; the relay's ordering rests
 # on the outbox runtime's keyed partitioning, partition ordering,
-# consistent-hash assignment, serial pool, and order-preserving
-# batching; its guaranteed completion is driven by at-least-once outbox
-# delivery.
-dsl: 1
+# partition-key routing under consistent hashing, serial pool, and
+# order-preserving batching; its guaranteed completion is driven by the
+# outbox's intrinsic durable re-drive — an L0 fact, so that leg of the
+# proof is not runtime-dependent.
+dsl: 2
 revision: 1
 services:
   service.orders:
@@ -188,11 +188,6 @@ operations:
       input.publish_order_event.outbox:
         kind: outbox
         outbox: outbox.order_events
-        messages:
-          kind: only
-          schemas:
-          - schema.OrderCreated
-        acknowledge_on_success: true
     program:
       steps:
       - kind: execute_effect
@@ -289,7 +284,6 @@ runtime:
   outboxes:
     operation.publish_order_event:
       input.publish_order_event.outbox:
-        delivery: at_least_once
         partitioning:
           kind: keyed
           mapping:
@@ -298,8 +292,10 @@ runtime:
         ordering: partition
         dispatch:
           pool: pool.outbox_workers
-          member_assignment:
-            kind: consistent_hash
+          routing:
+            key: partition_key
+            member_assignment:
+              kind: consistent_hash
           batching:
             ordering: preserved
   execution_pools:

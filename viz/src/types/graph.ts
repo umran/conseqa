@@ -188,13 +188,16 @@ export type Edge = EdgeBase &
         kind: "outbox_consume";
         operation: Id;
         input: Id;
+        /** Every schema the outbox admits — the exclusive consumer
+         *  has no message selection. */
         schemas: Id[];
-        acknowledge_on_success: boolean;
-        delivery: string;
         /** Declared runtime facts; null without an outbox runtime. */
         partitioning: string | null;
         ordering: string | null;
         pool: Id | null;
+        /** The dispatch routing key, or "none" when the dispatch
+         *  declares no member affinity; null without a runtime. */
+        routing: string | null;
         member_assignment: string | null;
         /** "none" when a runtime declares no batching stage; null
          *  without a runtime at all. */

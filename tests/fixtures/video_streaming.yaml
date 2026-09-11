@@ -27,7 +27,7 @@
 # the retried match would not be established to replay, and the
 # transcoder's idempotency, with the upload's cascade, would be
 # unknown.
-dsl: 1
+dsl: 2
 revision: 1
 services:
   service.ingest:

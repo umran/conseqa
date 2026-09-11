@@ -3942,29 +3942,61 @@ fn rejects_an_outbox_write_of_an_unadmitted_schema() {
 }
 
 #[test]
-fn rejects_an_outbox_input_selecting_an_unadmitted_schema() {
+fn rejects_an_outbox_without_a_consumer() {
     let mut model = load_transactional_outbox();
 
-    let Some(Input::Outbox(input)) = model
+    // A second outbox nobody consumes: its committed messages would
+    // stay durably pending forever.
+    model
+        .data_models
+        .get_mut(&id("data.orders"))
+        .unwrap()
+        .outboxes
+        .insert(
+            id("outbox.order_audit"),
+            conseqa::spec::Outbox {
+                messages: [id("schema.OrderCreated")].into_iter().collect(),
+                message_identity: MessageIdentity::Unspecified,
+            },
+        );
+
+    let errors = validation::validate(&model);
+
+    assert_eq!(
+        errors,
+        vec![ValidationError::OutboxWithoutConsumer {
+            outbox: id("outbox.order_audit"),
+        }]
+    );
+}
+
+#[test]
+fn rejects_a_second_outbox_consumer() {
+    let mut model = load_transactional_outbox();
+
+    // A second operation declaring an input on the same outbox: the
+    // relay is the exclusive consumer, so the newcomer is refused by
+    // name against it.
+    let competitor = conseqa::spec::Input::Outbox(conseqa::spec::OutboxInput {
+        outbox: id("outbox.order_events"),
+    });
+
+    model
         .operations
-        .get_mut(&id("operation.publish_order_event"))
+        .get_mut(&id("operation.project_order"))
         .unwrap()
         .inputs
-        .get_mut(&id("input.publish_order_event.outbox"))
-    else {
-        panic!("the relay consumes the outbox");
-    };
-
-    input.messages =
-        MessageSelector::Only([id("schema.OrderProjection")].into_iter().collect());
+        .insert(id("input.project_order.outbox"), competitor);
 
     let errors = validation::validate(&model);
 
     assert!(
-        errors.contains(&ValidationError::OutboxInputMessageNotAdmitted {
-            input: id("input.publish_order_event.outbox"),
+        errors.contains(&ValidationError::OutboxMultipleConsumers {
             outbox: id("outbox.order_events"),
-            schema: id("schema.OrderProjection"),
+            first_operation: id("operation.project_order"),
+            first_input: id("input.project_order.outbox"),
+            operation: id("operation.publish_order_event"),
+            input: id("input.publish_order_event.outbox"),
         }),
         "{errors:#?}"
     );
@@ -4029,10 +4061,44 @@ fn rejects_partition_ordering_without_keyed_partitioning() {
 
     let errors = validation::validate(&model);
 
+    // The fixture both orders by partition and routes by
+    // partition_key, so retiring the partitioning severs two
+    // consumers of the domain at once.
     assert_eq!(
         errors,
-        vec![ValidationError::PartitionOrderingWithoutPartitioning {
+        vec![
+            ValidationError::PartitionOrderingWithoutPartitioning {
+                input: id("input.publish_order_event.outbox"),
+            },
+            ValidationError::OutboxRoutingWithoutPartitioning {
+                operation: id("operation.publish_order_event"),
+                input: id("input.publish_order_event.outbox"),
+                outbox: id("outbox.order_events"),
+            },
+        ]
+    );
+}
+
+#[test]
+fn rejects_partition_key_routing_without_keyed_partitioning() {
+    let mut model = load_transactional_outbox();
+
+    // Keep the routing, retire the partitioning and the ordering that
+    // depends on it: the routing alone is left naming a domain no
+    // declaration establishes.
+    let runtime = outbox_runtime_mut(&mut model);
+
+    runtime.partitioning = conseqa::spec::OutboxPartitioning::None;
+    runtime.ordering = conseqa::spec::OutboxOrdering::None;
+
+    let errors = validation::validate(&model);
+
+    assert_eq!(
+        errors,
+        vec![ValidationError::OutboxRoutingWithoutPartitioning {
+            operation: id("operation.publish_order_event"),
             input: id("input.publish_order_event.outbox"),
+            outbox: id("outbox.order_events"),
         }]
     );
 }
@@ -4041,8 +4107,9 @@ fn rejects_partition_ordering_without_keyed_partitioning() {
 fn rejects_partition_mapping_defects() {
     let mut model = load_transactional_outbox();
 
-    // Admit a second schema through the outbox and the input, leaving
-    // it unmapped; map an unadmitted third one with an empty tuple.
+    // Admit a second schema through the outbox, leaving it unmapped —
+    // the exclusive consumer admits it implicitly — and map an
+    // unadmitted third one with an empty tuple.
     model
         .data_models
         .get_mut(&id("data.orders"))
@@ -4052,18 +4119,6 @@ fn rejects_partition_mapping_defects() {
         .unwrap()
         .messages
         .insert(id("schema.OrderProjection"));
-
-    let Some(Input::Outbox(input)) = model
-        .operations
-        .get_mut(&id("operation.publish_order_event"))
-        .unwrap()
-        .inputs
-        .get_mut(&id("input.publish_order_event.outbox"))
-    else {
-        panic!("the relay consumes the outbox");
-    };
-
-    input.messages = MessageSelector::All;
 
     let runtime = outbox_runtime_mut(&mut model);
 

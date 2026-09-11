@@ -14,6 +14,7 @@ import type {
   GroupingKey,
   MemberConcurrency,
   OrderingSemantics,
+  OutboxRoutingKey,
   ResultType,
   SubscriptionRoutingKey,
   Topic,
@@ -196,6 +197,46 @@ export function subscriptionRouting(key: SubscriptionRoutingKey | null | undefin
       "subscription, whichever holds the scope — belong to one routing domain. The member " +
       "assignment maps that domain onto a pool member; the pool's member concurrency decides " +
       "whether invocations there can overlap.",
+  };
+}
+
+/** How outbox consumption attempts are grouped into semantic routing
+ *  domains — the same two independent facts subscription routing
+ *  declares, read against the partition domain. Absence of the routing
+ *  block is not a mode; callers pass `null`. */
+export function outboxRouting(key: OutboxRoutingKey | null | undefined): Explanation {
+  if (!key) {
+    return {
+      label: "no member affinity",
+      tone: "warning",
+      summary:
+        "Consumption attempts execute within the target pool, and nothing relates " +
+        "same-partition attempts to a common member. Not a claim that assignment is arbitrary " +
+        "— that is what a round-robin member assignment states — simply no fact.",
+    };
+  }
+
+  return {
+    label: "routed by partition key",
+    tone: "info",
+    summary:
+      "Attempts sharing the declared partition key belong to one routing domain. The member " +
+      "assignment maps that domain onto a pool member; the pool's member concurrency decides " +
+      "whether invocations there can overlap.",
+  };
+}
+
+/** The outbox's intrinsic consumption contract — an L0 fact of the
+ *  abstraction, present whether or not a runtime is declared. */
+export function intrinsicRedrive(): Explanation {
+  return {
+    label: "intrinsic re-drive",
+    tone: "info",
+    summary:
+      "A committed message stays durably pending, and a pending message keeps admitting " +
+      "consumption attempts, until one reaches successful logical completion. Attempts may " +
+      "overlap after timeout or uncertainty, so duplicate invocations must be expected — an L0 " +
+      "fact of the outbox itself, not a declared delivery semantic.",
   };
 }
 

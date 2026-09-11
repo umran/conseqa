@@ -97,10 +97,10 @@ fn transactional_outbox_example_is_valid() {
 
 /// The acceptance architecture of the outbox revision (§105): a
 /// request-driven producer whose transaction atomically mutates state
-/// and admits an outbox message, an outbox-consuming relay, and a
-/// topic subscriber — with idempotency traced through the outbox,
+/// and admits an outbox message, the outbox's one consuming relay, and
+/// a topic subscriber — with idempotency traced through the outbox,
 /// ordering discharged from the outbox runtime, and completion driven
-/// by at-least-once outbox delivery.
+/// by the outbox's intrinsic durable re-drive.
 #[test]
 fn transactional_outbox_example_proves_everything() {
     let model = load("transactional_outbox.yaml");
@@ -348,7 +348,8 @@ fn payment_capture_example_proves_everything() {
     );
 
     // The ledger's guaranteed completion is driven by at-least-once
-    // topic delivery; the relay's by at-least-once outbox delivery.
+    // topic delivery; the relay's by the outbox's intrinsic durable
+    // re-drive.
     let driver_of = |operation: &str| {
         let check = verification
             .recoverability
@@ -372,7 +373,7 @@ fn payment_capture_example_proves_everything() {
 
     assert!(matches!(
         driver_of("operation.publish_payment_event"),
-        verification::RetryDriver::AtLeastOnceOutboxDelivery { .. }
+        verification::RetryDriver::IntrinsicOutboxRedrive { .. }
     ));
 }
 

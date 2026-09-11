@@ -199,12 +199,13 @@ pub enum IdempotencyProof {
     /// `at_most_once` delivery with the payload identity-pinned:
     /// same-class messages are one logical message, delivered no more
     /// than once, so repeated attempts cannot exist.
+    ///
+    /// Subscription-only. An outbox has no such route: durable
+    /// re-drive until successful consumption is intrinsic, and
+    /// attempts for one pending message may overlap, so an
+    /// outbox-triggered class can never be bounded to one attempt by
+    /// a delivery fact.
     SingleDelivery { input: Id, topic: Id },
-
-    /// The outbox counterpart of `SingleDelivery`: `at_most_once`
-    /// outbox delivery with the payload pinned by the outbox's keyed
-    /// message identity.
-    SingleOutboxDelivery { input: Id, outbox: Id },
 
     /// Every admitted path is retry-safe in all three legs.
     RetrySafePaths { paths: Vec<PathRetrySafety> },
@@ -220,9 +221,7 @@ impl IdempotencyProof {
             }
 
             // `at_most_once` is a delivery fact, and delivery is L1.
-            Self::SingleDelivery { .. } | Self::SingleOutboxDelivery { .. } => {
-                ProofScope::RuntimeDependent
-            }
+            Self::SingleDelivery { .. } => ProofScope::RuntimeDependent,
 
             Self::RetrySafePaths { paths } => ProofScope::joined(
                 paths
@@ -887,10 +886,8 @@ fn outbox_lineage(
         return Vec::new();
     };
 
-    let admitted: Vec<&Id> = match &input.messages {
-        MessageSelector::All => outbox.messages.iter().collect(),
-        MessageSelector::Only(schemas) => schemas.iter().collect(),
-    };
+    // The exclusive consumer admits every schema the outbox declares.
+    let admitted: Vec<&Id> = outbox.messages.iter().collect();
 
     let mut out = Vec::new();
 
@@ -976,19 +973,9 @@ fn check_requirement(
         );
     }
 
-    // The same route for an outbox-triggered population, from the
-    // outbox runtime's delivery fact and the outbox's keyed message
-    // identity.
-    if let Some(Input::Outbox(outbox_input)) = operation.inputs.get(analysis.input())
-        && scope.model.outbox_delivery(operation_id, analysis.input())
-            == DeliverySemantics::AtMostOnce
-        && analysis.payload_identified()
-    {
-        return IdempotencyVerdict::proven(IdempotencyProof::SingleOutboxDelivery {
-            input: analysis.input().clone(),
-            outbox: outbox_input.outbox.clone(),
-        });
-    }
+    // No outbox counterpart exists: intrinsic durable re-drive admits
+    // overlapping attempts for one pending message, so an
+    // outbox-triggered population is never single-delivery.
 
     let all = paths(&operation.program);
 
@@ -1360,18 +1347,15 @@ fn contract_safety(
             let mut consumers = Vec::new();
             let mut collapsed = true;
 
+            // The one consumer collapses duplicates only through a
+            // proven keyed requirement: intrinsic re-drive means a
+            // second delivery of the identified message can never be
+            // excluded by a delivery fact.
             for consumer in scope.graph.outbox_consumers(outbox, schema) {
                 let operation = consumer.operation.clone();
                 let input = consumer.input.clone();
 
-                if identified
-                    && scope
-                        .model
-                        .outbox_delivery(consumer.operation, consumer.input)
-                        == DeliverySemantics::AtMostOnce
-                {
-                    consumers.push(ConsumerCollapse::SingleDelivery { operation, input });
-                } else if !scope
+                if !scope
                     .model
                     .operations
                     .get(consumer.operation)

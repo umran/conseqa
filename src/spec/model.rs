@@ -18,12 +18,17 @@ use super::{
 /// semantics alike, while purely internal changes do not. Version 1
 /// was declared by the external-boundary-guarantees revision;
 /// everything before it is unversioned prehistory and is refused by
-/// name rather than surfaced as a parse accident.
+/// name rather than surfaced as a parse accident. Version 2 is the
+/// outbox-semantics revision: an outbox has exactly one consuming
+/// input, consumption re-drive is intrinsic rather than declared
+/// (`OutboxInput` loses its selector and acknowledgement,
+/// `OutboxRuntime` its delivery), and outbox dispatch declares an
+/// explicit routing block in place of a bare member assignment.
 ///
 /// Independent of the stored-workspace `FORMAT` (a storage-encoding
 /// counter): a DSL bump forces a `FORMAT` bump, never conversely, and
 /// the numbers are not aligned.
-pub const DSL_VERSION: DslVersion = DslVersion(1);
+pub const DSL_VERSION: DslVersion = DslVersion(2);
 
 /// A declared DSL contract version.
 #[derive(
@@ -160,17 +165,12 @@ impl Model {
     }
 
     /// The declared runtime facts for one outbox input, if any.
+    ///
+    /// There is no outbox delivery accessor: durable re-drive until
+    /// successful consumption is intrinsic to the outbox abstraction,
+    /// not a declared runtime fact.
     pub fn outbox_runtime(&self, operation: &Id, input: &Id) -> Option<&OutboxRuntime> {
         self.runtime.as_ref()?.outboxes.get(operation)?.get(input)
-    }
-
-    /// The outbox input's declared delivery semantics. As with
-    /// subscriptions, an undeclared outbox runtime is `Unspecified`:
-    /// duplicate and loss behaviour is simply unknown.
-    pub fn outbox_delivery(&self, operation: &Id, input: &Id) -> DeliverySemantics {
-        self.outbox_runtime(operation, input)
-            .map(|runtime| runtime.delivery)
-            .unwrap_or(DeliverySemantics::Unspecified)
     }
 
     /// Every router serving one request boundary, with its ID.

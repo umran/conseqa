@@ -46,12 +46,15 @@
 //!
 //! `completion: guaranteed` additionally requires a modeled retry
 //! driver on the triggering input: `at_least_once` delivery on the
-//! subscription, or a modeled caller declaring a `may_repeat` request
-//! effect targeting the input — whether among an operation's effects
-//! or as a state-machine transition side effect (§22). Driver facts
-//! are duplicate-delivery facts, not bounded-liveness facts; the
-//! proof is conditional on the abstraction genuinely re-driving until
-//! success (§1.3).
+//! subscription, the intrinsic durable re-drive of an outbox — a
+//! committed message stays pending, and pending messages keep
+//! admitting consumption attempts, until an attempt succeeds — or a
+//! modeled caller declaring a `may_repeat` request effect targeting
+//! the input, whether among an operation's effects or as a
+//! state-machine transition side effect (§22). Driver facts are
+//! re-drive facts, not bounded-liveness facts; the proof is
+//! conditional on the abstraction genuinely re-driving until success
+//! (§1.3).
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -148,10 +151,12 @@ impl RecoverabilityProof {
 impl RetryDriver {
     fn scope(&self) -> ProofScope {
         match self {
-            // Delivery is a realization fact.
-            Self::AtLeastOnceDelivery { .. } | Self::AtLeastOnceOutboxDelivery { .. } => {
-                ProofScope::RuntimeDependent
-            }
+            // Subscription delivery is a realization fact.
+            Self::AtLeastOnceDelivery { .. } => ProofScope::RuntimeDependent,
+
+            // Outbox re-drive is intrinsic to the L0 abstraction — no
+            // runtime declaration supplies it, and none can remove it.
+            Self::IntrinsicOutboxRedrive { .. } => ProofScope::L0Only,
 
             // A caller's `retry: may_repeat` is an L0 guarantee about
             // the request effect.
@@ -212,9 +217,11 @@ pub enum RetryDriver {
     /// The triggering subscription declares at-least-once delivery.
     AtLeastOnceDelivery { input: Id, topic: Id },
 
-    /// The triggering outbox input declares at-least-once delivery: an
-    /// unacknowledged committed message may be delivered again.
-    AtLeastOnceOutboxDelivery { input: Id, outbox: Id },
+    /// The triggering input consumes an outbox, whose durable
+    /// re-drive is intrinsic: a committed message stays pending, and
+    /// a pending message keeps admitting consumption attempts, until
+    /// an attempt reaches successful logical completion.
+    IntrinsicOutboxRedrive { input: Id, outbox: Id },
 
     /// A modeled caller declares a repeatable request effect
     /// targeting the triggering input.
@@ -681,18 +688,12 @@ fn find_driver(
             }
         }
 
-        Some(Input::Outbox(outbox_input)) => {
-            let delivery = model.outbox_delivery(operation_id, input);
-
-            if delivery == DeliverySemantics::AtLeastOnce {
-                Ok(RetryDriver::AtLeastOnceOutboxDelivery {
-                    input: input.clone(),
-                    outbox: outbox_input.outbox.clone(),
-                })
-            } else {
-                Err(Some(delivery))
-            }
-        }
+        // Intrinsic: the outbox re-drives a pending message until an
+        // attempt succeeds, with no declaration to consult.
+        Some(Input::Outbox(outbox_input)) => Ok(RetryDriver::IntrinsicOutboxRedrive {
+            input: input.clone(),
+            outbox: outbox_input.outbox.clone(),
+        }),
 
         Some(Input::Request(_)) => {
             for (caller_id, caller) in &model.operations {

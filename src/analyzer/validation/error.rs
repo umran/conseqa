@@ -373,11 +373,23 @@ pub enum ValidationError {
         effect: Id,
     },
 
-    /// An outbox input selects a schema the outbox does not admit.
-    OutboxInputMessageNotAdmitted {
-        input: Id,
+    /// An outbox has no consuming outbox input. Exactly one
+    /// `OutboxInput` must reference each outbox: consumption is
+    /// intrinsic to the abstraction, so an unconsumed outbox would
+    /// hold committed messages durably pending forever.
+    OutboxWithoutConsumer {
         outbox: Id,
-        schema: Id,
+    },
+
+    /// More than one outbox input references the same outbox. The one
+    /// consuming input's operation is the outbox's exclusive logical
+    /// consumer; downstream fan-out belongs to topics, not outboxes.
+    OutboxMultipleConsumers {
+        outbox: Id,
+        first_operation: Id,
+        first_input: Id,
+        operation: Id,
+        input: Id,
     },
 
     /// An outbox write declares a schema the destination outbox does
@@ -483,6 +495,16 @@ pub enum ValidationError {
     /// no domain exists for the guarantee to be interpreted over.
     PartitionOrderingWithoutPartitioning {
         input: Id,
+    },
+
+    /// Outbox dispatch routes by `partition_key` while the runtime
+    /// declares `partitioning: none`, so no partition-key domain
+    /// exists to route. Routing consumes an already-declared semantic
+    /// key rather than inventing one.
+    OutboxRoutingWithoutPartitioning {
+        operation: Id,
+        input: Id,
+        outbox: Id,
     },
 }
 
@@ -1701,23 +1723,48 @@ impl From<ValidationError> for Diagnostic {
                 }],
             },
 
-            ValidationError::OutboxInputMessageNotAdmitted {
-                input,
-                outbox,
-                schema,
-            } => Diagnostic {
-                code: DiagnosticCode::Validation(ValidationCode::OutboxInputMessageNotAdmitted),
+            ValidationError::OutboxWithoutConsumer { outbox } => Diagnostic {
+                code: DiagnosticCode::Validation(ValidationCode::OutboxWithoutConsumer),
                 severity: Severity::Error,
-                subject: Some(input.clone()),
+                subject: Some(outbox.clone()),
                 message: format!(
-                    "Outbox input `{input}` selects schema `{schema}`, which \
-                     outbox `{outbox}` does not admit."
+                    "Outbox `{outbox}` has no consuming outbox input; exactly one \
+                     `OutboxInput` must reference it."
                 ),
                 evidence: vec![Evidence {
                     subject: Some(outbox),
-                    message: format!(
-                        "The outbox does not declare schema `{schema}` as a message."
-                    ),
+                    message: "Consumption is intrinsic to the outbox abstraction: a \
+                              committed message stays durably pending until \
+                              successfully consumed, so an outbox without its one \
+                              consumer would accumulate pending messages forever."
+                        .to_string(),
+                }],
+            },
+
+            ValidationError::OutboxMultipleConsumers {
+                outbox,
+                first_operation,
+                first_input,
+                operation,
+                input,
+            } => Diagnostic {
+                code: DiagnosticCode::Validation(ValidationCode::OutboxMultipleConsumers),
+                severity: Severity::Error,
+                subject: Some(input.clone()),
+                message: format!(
+                    "Outbox input `{input}` of `{operation}` references outbox \
+                     `{outbox}`, which `{first_input}` of `{first_operation}` \
+                     already consumes; exactly one `OutboxInput` may reference an \
+                     outbox."
+                ),
+                evidence: vec![Evidence {
+                    subject: Some(outbox),
+                    message: "The consuming input's operation is the outbox's \
+                              exclusive logical consumer of every admitted schema. \
+                              Downstream fan-out belongs to topics, not outboxes: \
+                              relay the messages onto a topic and subscribe the \
+                              other consumers there."
+                        .to_string(),
                 }],
             },
 
@@ -1973,6 +2020,29 @@ impl From<ValidationError> for Diagnostic {
                     message: "Partition ordering is an independent order within each keyed \
                               partition; without keyed partitioning no domain exists for \
                               the guarantee to be interpreted over."
+                        .to_string(),
+                }],
+            },
+
+            ValidationError::OutboxRoutingWithoutPartitioning {
+                operation,
+                input,
+                outbox,
+            } => Diagnostic {
+                code: DiagnosticCode::Validation(
+                    ValidationCode::OutboxRoutingWithoutPartitioning,
+                ),
+                severity: Severity::Error,
+                subject: Some(input.clone()),
+                message: format!(
+                    "`{input}` of `{operation}` dispatches by `partition_key`, but the \
+                     outbox runtime declares `partitioning: none` for `{outbox}`."
+                ),
+                evidence: vec![Evidence {
+                    subject: Some(outbox),
+                    message: "Routing consumes an already-declared semantic key rather \
+                              than inventing one: declare keyed `partitioning`, or omit \
+                              the routing block."
                         .to_string(),
                 }],
             },
