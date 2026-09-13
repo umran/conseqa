@@ -33,17 +33,17 @@ import { pathText, shortId } from "../lib/ids";
 import {
   effectDef, effectSummary, errArm, locationLabel, operationTransactions, stepRejects, walkProgram,
   type Arm, type StepHop,
+  blockTerminates,
 } from "../lib/index";
 import { propertyMatchesRequirement, worstStatus } from "../lib/obligations";
 import { hashes } from "../lib/route";
-import { stepHeadline } from "../lib/text";
 import { requirementKey, useApp, type DetailContext } from "../state/AppState";
 import {
   BindingChip, BindingKindTag, BindingRoots, ConditionView, Fact, FactBadge, IdLink, KeyComponents, Mono, Muted,
   PredicateView, RefText, SectionCard, StatusBadge, StatusChips, selectableRow, useProgramNavigation,
 } from "../panels/parts";
 import type {
-  Effect, Id, Operation, OperationBlock, OperationStep, RequirementKind, ResultType, SelectorPredicate,
+  Effect, Id, Operation, OperationBlock, RequirementKind, ResultType, SelectorPredicate,
   TransactionStep, TransitionSideEffect,
 } from "../types/model";
 
@@ -344,15 +344,19 @@ function ArmBox({ label, tone = "outline", note, caption, children }: {
 /** One arm of a decision — or the rejection block of a transaction
  *  step: its label, as the checker spells it in a step location, and
  *  its block, rendered recursively. */
-function DecisionArm({ opId, op, label, block, hops, tone = "outline", caption }: {
+function DecisionArm({ opId, op, label, block, hops, tone = "outline", caption, note, startIndex = 0 }: {
   opId: Id; op: Operation; label: string; block: OperationBlock | null; hops: StepHop[];
-  tone?: ArmTone; caption?: ReactNode;
+  tone?: ArmTone; caption?: ReactNode; note?: ReactNode;
+  /** The index in `hops`' block of the arm's first step, when the arm
+   *  holds the tail of that block rather than a block of its own — a
+   *  transaction's committed continuation. */
+  startIndex?: number;
 }) {
   return (
-    <ArmBox label={label} tone={tone} caption={caption}>
+    <ArmBox label={label} tone={tone} caption={caption} note={note}>
       {block ? (
         block.steps.length ? (
-          <ProgramBlock opId={opId} op={op} block={block} hops={hops} nested />
+          <ProgramBlock opId={opId} op={op} block={block} hops={hops} startIndex={startIndex} nested />
         ) : (
           <Muted>empty arm</Muted>
         )
@@ -363,46 +367,33 @@ function DecisionArm({ opId, op, label, block, hops, tone = "outline", caption }
   );
 }
 
-/** What control does after a transaction commits: the next step of the
- *  enclosing block, named and selectable, or the end of that block — the
- *  end of the program at the top level, a fall-through to after the
- *  enclosing step inside an arm. */
-function Continuation({ opId, next, location, nested }: {
-  opId: Id; next: OperationStep | undefined; location: string; nested: boolean;
-}) {
-  const { toStep } = useProgramNavigation();
-  if (!next) {
-    return <div className="text-xs text-kumo-subtle">{nested ? "end of block · falls through" : "end of program"}</div>;
-  }
-  return (
-    <div className="text-xs text-kumo-subtle">
-      continues with{" "}
-      <button
-        type="button"
-        className="cursor-pointer font-mono text-[12px] text-kumo-link hover:underline"
-        onClick={(e) => {
-          e.stopPropagation();
-          toStep(opId, location);
-        }}
-      >
-        step {location}
-      </button>
-      {" · "}
-      <Mono>{stepHeadline(next)}</Mono>
-    </div>
-  );
-}
-
 /** One block of the program as a vertical sequence of step cards. The
  *  top-level block is a Kumo Flow with connectors; nested arm blocks are
  *  plain stacks, so arbitrary nesting stays legible. */
-function ProgramBlock({ opId, op, block, hops, nested }: { opId: Id; op: Operation; block: OperationBlock; hops: StepHop[]; nested?: boolean }) {
+function ProgramBlock({ opId, op, block, hops, nested, startIndex = 0 }: {
+  opId: Id; op: Operation; block: OperationBlock; hops: StepHop[]; nested?: boolean;
+  /** The index in the enclosing block of `block.steps[0]`, so a tail
+   *  rendered inside a transaction's committed arm keeps the locations
+   *  the checker names its steps by. */
+  startIndex?: number;
+}) {
   const { model, index, expandedTx, toggleTx } = useApp();
   const effectKind = (effectId: Id): EffectKind | null => effectDef(model, index, effectId)?.effect.kind ?? null;
 
   const stepCtx = (location: string): DetailContext => ({ step: { op: opId, location } });
 
-  const nodes: { key: string; element: ReactElement }[] = block.steps.map((step, si) => {
+  // A transaction that can reject forks the path: the steps after it
+  // are the committed path's and nothing else's (a rejected block that
+  // terminates never reaches them; one that falls through rejoins them
+  // and says so). They are drawn inside its committed arm, beside the
+  // rejected arm, so the two outcomes read as the alternatives they
+  // are — never as "commit, then reject". The block's own sequence ends
+  // at that transaction.
+  const forkAt = block.steps.findIndex((step) => step.kind === "transaction" && step.rejected !== undefined);
+  const ownSteps = forkAt === -1 ? block.steps : block.steps.slice(0, forkAt + 1);
+
+  const nodes: { key: string; element: ReactElement }[] = ownSteps.map((step, offset) => {
+    const si = startIndex + offset;
     const ownHops: StepHop[] = [...hops, { step: si }];
     const location = locationLabel(ownHops);
     const under = (arm: Arm): StepHop[] => [...hops, { step: si, arm }];
@@ -443,27 +434,33 @@ function ProgramBlock({ opId, op, block, hops, nested }: { opId: Id; op: Operati
           }
         });
 
-        // The committed outcome: what the commit made available, and
-        // where control goes next — the next step of this block, or its
-        // end.
-        const committed = (
-          <>
-            {established.length ? (
-              <div className="space-y-1">
-                {established}
-                <div className="text-[11px] text-kumo-subtle">available from here on</div>
-              </div>
-            ) : (
-              <div className="text-xs text-kumo-inactive">establishes no binding</div>
-            )}
-            <Continuation
-              opId={opId}
-              next={block.steps[si + 1]}
-              location={locationLabel([...hops, { step: si + 1 }])}
-              nested={hops.length > 0}
-            />
-          </>
+        // What a commit makes available to the steps that follow —
+        // the caption of the committed arm, or of the card when the
+        // transaction cannot reject.
+        const available = established.length ? (
+          <div className="space-y-1">
+            {established}
+            <div>available from here on</div>
+          </div>
+        ) : (
+          "establishes no binding"
         );
+
+        // The committed continuation: the rest of this block, drawn
+        // inside the arm with its own locations. Empty inside an arm
+        // means the committed path falls through to the enclosing join.
+        const continuation: OperationBlock | null = step.rejected
+          ? { steps: block.steps.slice(offset + 1) }
+          : null;
+        const continuationEmpty = continuation !== null && continuation.steps.length === 0;
+
+        // A rejected block that does not terminate rejoins the
+        // committed path after this step; say where.
+        const rejoins = step.rejected && !blockTerminates(step.rejected)
+          ? continuationEmpty
+            ? "falls through · rejoins the committed path at the end of this block"
+            : `falls through · rejoins the committed path at step ${locationLabel([...hops, { step: si + 1 }])}`
+          : null;
 
         return {
           key: location,
@@ -527,17 +524,21 @@ function ProgramBlock({ opId, op, block, hops, nested }: { opId: Id; op: Operati
                   A body with no guard cannot reject, so it gets one
                   full-width committed strip and no arm to pretend
                   otherwise. */}
-              {step.rejected ? (
+              {step.rejected && continuation ? (
                 <div className="mt-2 grid gap-2 sm:grid-cols-2">
-                  <ArmBox label="committed" tone="success">{committed}</ArmBox>
+                  <DecisionArm
+                    opId={opId} op={op} label="committed" tone="success"
+                    block={continuationEmpty ? null : continuation} hops={hops} startIndex={si + 1}
+                    caption={available}
+                  />
                   <DecisionArm
                     opId={opId} op={op} label="rejected" tone="warning" block={step.rejected} hops={under("rejected")}
-                    caption="nothing committed · no binding above is available here"
+                    caption={rejoins ? <>nothing committed · no binding above is available here<br />{rejoins}</> : "nothing committed · no binding above is available here"}
                   />
                 </div>
               ) : (
                 <div className="mt-2">
-                  <ArmBox label="committed" tone="success" note="always commits">{committed}</ArmBox>
+                  <ArmBox label="committed" tone="success" note="always commits" caption={available}>{null}</ArmBox>
                 </div>
               )}
             </StepCard>

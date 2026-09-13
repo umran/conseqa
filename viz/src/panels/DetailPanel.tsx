@@ -13,15 +13,11 @@ import {
   subscriptionRouting, transactionRejection, transportGrouping,
   transportOrdering, type Explanation,
 } from "../lib/explain";
-import {
-  effectDef, effectResultType, effectSummary, errArm, findDataObject, findTransaction,
-  findTransactionSite, intentExecutors, operationEffects, operationTransactions, stepRejects,
-  walkProgram, type IndexEntry, type LocatedStep,
-} from "../lib/index";
+import { blockTerminates, effectDef, effectResultType, effectSummary, errArm, findDataObject, findTransaction, findTransactionSite, intentExecutors, operationEffects, operationTransactions, stepRejects, walkProgram, type IndexEntry, type LocatedStep } from "../lib/index";
 import { propertyMatchesRequirement } from "../lib/obligations";
 import { accessKeysToPartition, objectAccesses, partitionKeyOf } from "../lib/runtime";
 import { hashes } from "../lib/route";
-import { predicateText, refString, stepHeadline } from "../lib/text";
+import { predicateText, refString } from "../lib/text";
 import { useApp, useCitations, useObligationsAt, type DetailTarget } from "../state/AppState";
 import { CLIENT_NODE_ID, EXTERNAL_PREFIX, type Edge } from "../types/graph";
 import type { Id, IdempotencyKeyPropagation, OperationBlock, RequirementKind, ResultType } from "../types/model";
@@ -254,7 +250,12 @@ function ServiceDetail({ id }: { id: Id }) {
  *  the names it consumes as using chips, and arms indented beneath
  *  decisions. A transaction's two outcomes are two labelled rows
  *  beneath it, so a commit and a rejection read as alternatives. */
-function ProgramSummary({ opId, block, depth = 0 }: { opId: Id; block: OperationBlock; depth?: number }) {
+function ProgramSummary({ opId, block, depth = 0, startIndex = 0 }: {
+  opId: Id; block: OperationBlock; depth?: number;
+  /** The index in the enclosing block of `block.steps[0]` — a tail
+   *  listed inside a transaction's committed row keeps its numbering. */
+  startIndex?: number;
+}) {
   const { model, index } = useApp();
   const defines = (name: Id, kind: BindingKind) => (
     <span className="ml-1.5 inline-flex items-center gap-1 align-baseline">
@@ -266,13 +267,20 @@ function ProgramSummary({ opId, block, depth = 0 }: { opId: Id; block: Operation
       <BindingChip role="uses" name={name} kind={kind} />
     </span>
   );
-  const rows: ReactNode[] = block.steps.map((s, i) => {
+  // A transaction that can reject forks the path, and the steps after
+  // it are the committed path's: they are listed under its committed
+  // row, beside the rejected row, and the block's own list ends there.
+  const forkAt = block.steps.findIndex((step) => step.kind === "transaction" && step.rejected !== undefined);
+  const ownSteps = forkAt === -1 ? block.steps : block.steps.slice(0, forkAt + 1);
+
+  const rows: ReactNode[] = ownSteps.map((s, offset) => {
+    const i = startIndex + offset;
     const number = <span className="shrink-0"><Tag>{i + 1}</Tag></span>;
     switch (s.kind) {
       case "transaction": {
         const tx = s.transaction;
         const n = tx.steps.length;
-        const next = block.steps[i + 1];
+        const continuation: OperationBlock = { steps: block.steps.slice(offset + 1) };
         const reads = tx.steps.flatMap((inner) => (inner.kind === "read" ? [inner.bind] : []));
         const established = tx.steps.flatMap((inner): { name: Id; kind: BindingKind }[] => {
           switch (inner.kind) {
@@ -296,32 +304,45 @@ function ProgramSummary({ opId, block, depth = 0 }: { opId: Id; block: Operation
                   <span className="text-kumo-inactive">· transaction-local</span>
                 </div>
               )}
-              <div className="mt-1 space-y-1 border-l border-kumo-hairline pl-2">
-                <div className="flex flex-wrap items-center gap-1.5">
-                  <Tag variant="success">committed</Tag>
-                  <span className="text-kumo-subtle">
-                    → {next
-                      ? <>continues with step {i + 2} · <Mono>{stepHeadline(next)}</Mono></>
-                      : depth > 0 ? "end of block · falls through" : "end of program"}
-                  </span>
-                  {!s.rejected && <span className="text-kumo-inactive">· always commits</span>}
+              {established.length > 0 && (
+                <div className="mt-1 flex flex-wrap items-center gap-1 text-kumo-subtle">
+                  <span>establishes</span>
+                  {established.map((b) => <BindingChip key={b.name} role="defines" name={b.name} kind={b.kind} />)}
+                  <span className="text-kumo-inactive">· available on the committed path</span>
                 </div>
-                {established.length > 0 && (
-                  <div className="flex flex-wrap items-center gap-1 pl-1 text-kumo-subtle">
-                    <span>establishes</span>
-                    {established.map((b) => <BindingChip key={b.name} role="defines" name={b.name} kind={b.kind} />)}
+              )}
+              {s.rejected ? (
+                // The two outcomes as sibling rows, each with its
+                // steps: the committed path continues with the rest of
+                // this block; the rejected block runs instead.
+                <div className="mt-1 space-y-2">
+                  <div className="space-y-1 border-l-2 border-kumo-success/50 pl-2">
+                    <div className="flex flex-wrap items-center gap-1.5">
+                      <Tag variant="success">committed</Tag>
+                      {continuation.steps.length === 0 && (
+                        <span className="text-kumo-subtle">{depth > 0 ? "falls through to the enclosing join" : "end of program"}</span>
+                      )}
+                    </div>
+                    {continuation.steps.length > 0 && (
+                      <ProgramSummary opId={opId} block={continuation} depth={depth + 1} startIndex={i + 1} />
+                    )}
                   </div>
-                )}
-                {s.rejected && (
-                  <>
+                  <div className="space-y-1 border-l-2 border-kumo-warning/50 pl-2">
                     <div className="flex flex-wrap items-center gap-1.5">
                       <Tag variant="warning">rejected</Tag>
-                      <span className="text-kumo-subtle">→ nothing committed · no binding above is available</span>
+                      <span className="text-kumo-subtle">nothing committed · no binding above is available</span>
+                      {!blockTerminates(s.rejected) && (
+                        <span className="text-kumo-inactive">
+                          · falls through, rejoining the committed path{continuation.steps.length ? ` at step ${i + 2}` : ""}
+                        </span>
+                      )}
                     </div>
                     <ProgramSummary opId={opId} block={s.rejected} depth={depth + 1} />
-                  </>
-                )}
-              </div>
+                  </div>
+                </div>
+              ) : (
+                <div className="mt-1 text-kumo-inactive">always commits</div>
+              )}
             </div>
           </li>
         );

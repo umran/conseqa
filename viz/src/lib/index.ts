@@ -151,6 +151,29 @@ export function findTransactionSite(op: Operation, id: Id): TransactionSite | nu
 /** Whether a transaction step is a logical commit guard that may reject
  *  the containing transaction: a transition (subject not in a `from`
  *  state), a version validation, a cursor advance, or a fence. */
+/** Whether every path through the block ends at a terminal, by the
+ *  validator's rule: the last step is a `return` or `complete`, or a
+ *  decision whose every arm terminates (a branch needs an `otherwise`),
+ *  or a transaction step whose rejected block terminates and that is
+ *  followed by nothing — its committed path then falls through, so the
+ *  block does not terminate. A block that does not terminate falls
+ *  through to the join after the step that holds it. */
+export function blockTerminates(block: OperationBlock): boolean {
+  const last = block.steps[block.steps.length - 1];
+  if (!last) return false;
+  switch (last.kind) {
+    case "return":
+    case "complete":
+      return true;
+    case "match_result":
+      return blockTerminates(last.ok) && Object.values(last.errors).every(blockTerminates);
+    case "branch":
+      return blockTerminates(last.then) && last.otherwise !== null && blockTerminates(last.otherwise);
+    default:
+      return false;
+  }
+}
+
 export function stepRejects(step: TransactionStep): boolean {
   switch (step.kind) {
     case "transition":

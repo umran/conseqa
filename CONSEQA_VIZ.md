@@ -169,15 +169,18 @@ of the payload they construct, and `complete` cards close a
 subscription-driven path. Transition steps link into the owning state
 machine.
 
-A transaction card ends in its two **outcomes**, drawn as sibling arms
-the way a decision's are: **committed**, listing the bindings the
-commit makes available from there on and naming the step control
-continues with, and **rejected**, holding the rejected block with the
-note that nothing committed and none of those bindings exists there.
-A transaction that cannot reject shows one committed strip that says
-so. The flow never reads as "commit, then reject": the continuation
-after the card is the committed arm's, and the rejected arm's steps
-are located beneath the transaction as `n.rejected.m`.
+A transaction card that can reject ends in its two **outcomes**, drawn
+as sibling arms exactly the way a decision's are, each a block of step
+cards: **committed** holds the rest of the enclosing block — the steps
+a commit continues with, keeping the locations the checker names them
+by — under the bindings the commit makes available; **rejected** holds
+the rejected block, located beneath the transaction as `n.rejected.m`,
+under the note that nothing committed and none of those bindings
+exists there, and, when that block falls through, where it rejoins the
+committed path. The enclosing flow ends at such a card: everything
+after it is one arm or the other, so the page never reads as "commit,
+then reject". A transaction that cannot reject forks nothing; its
+card says "always commits" and the flow simply continues below it.
 
 **Bindings** — the names a step introduces for later steps — have one
 visual identity everywhere. There are five kinds and nothing else is a
