@@ -11,12 +11,10 @@ import { useApp } from "../state/AppState";
 import type { Status } from "../types/report";
 
 /** The kinds that say what they are beside their name, because the
- *  group they sit in mixes kinds: an operation's transactions, an
- *  object's machine, a data model's outboxes, the runtime's
- *  declarations, the boundary vertices. */
+ *  group they sit in mixes kinds: an operation's transactions, a data
+ *  model's outboxes, the runtime's declarations, the boundary vertices. */
 const CAPTIONED: Partial<Record<PageKind, string>> = {
   transaction: "tx",
-  machine: "machine",
   outbox: "outbox",
   pool: "pool",
   router: "router",
@@ -28,8 +26,8 @@ const CAPTIONED: Partial<Record<PageKind, string>> = {
 /**
  * The model as a tree of pages: the topological hierarchy the canvas
  * shows one node of at a time. Services hold operations, operations
- * their transactions; data models hold objects and outboxes, objects
- * the machine that governs them; the runtime holds its declarations.
+ * their transactions; data models hold objects and outboxes; state
+ * machines and the runtime's declarations are listed flat.
  * The page in view is marked and its path kept open; a status dot on a
  * node is the worst verdict anchored to it or beneath it.
  */
@@ -63,7 +61,7 @@ export function Navigator() {
   const status = useMemo(() => {
     const map = new Map<string, Status | null>();
     const visit = (n: NavNode): Status | null => {
-      let worst = n.obKey ? worstStatus(obligations.get(n.obKey) ?? []) : null;
+      let worst = worstStatus(n.obKeys.flatMap((key) => obligations.get(key) ?? []));
       for (const c of n.children) {
         const s = visit(c);
         if (s && (!worst || STATUS_ORDER[s] < STATUS_ORDER[worst])) worst = s;

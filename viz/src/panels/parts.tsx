@@ -235,6 +235,13 @@ export function StatusBadge({ status }: { status: Status }) {
   );
 }
 
+/** The body of a page section with nothing to list: one muted line,
+ *  padded like the rows it stands in for, so an empty section reads as a
+ *  section and not as text dropped onto its card's edge. */
+export function SectionEmpty({ children }: { children: ReactNode }) {
+  return <p className="p-3 text-sm text-kumo-subtle">{children}</p>;
+}
+
 /** Compact per-status counts for the obligations anchored to an entity. */
 export function StatusChips({ obKey }: { obKey: string }) {
   const obs = useObligationsAt(obKey);
@@ -339,10 +346,17 @@ export function BindingChip({ name, kind, role, arm }: {
 
   return (
     <Tooltip
-      content={tip}
+      // The name first and whole: the chip may be showing it cut short.
+      content={
+        <span className="block max-w-xs space-y-1">
+          <span className="block break-all font-mono font-semibold">{name}</span>
+          <span className="block">{tip}</span>
+        </span>
+      }
       render={
         <button
           type="button"
+          aria-label={`${role === "defines" ? "binds" : "uses"} ${name}`}
           className={`binding-chip ${role} binding-${k}`}
           onClick={(e) => {
             e.stopPropagation();
@@ -353,15 +367,7 @@ export function BindingChip({ name, kind, role, arm }: {
           onKeyDown={(e) => e.stopPropagation()}
         >
           <span className="glyph" aria-hidden="true">{role === "defines" ? "≔" : "↑"}</span>
-          {/* A long name breaks after a dot before it breaks anywhere. */}
-          <span className="name">
-            {name.split(".").map((segment, i) => (
-              <Fragment key={i}>
-                {i > 0 && <>.<wbr /></>}
-                {segment}
-              </Fragment>
-            ))}
-          </span>
+          <span className="name">{name}</span>
           {role === "defines" && <BindingKindTag kind={k} />}
           {role === "uses" && arm && <span className="binding-arm">{arm}</span>}
         </button>

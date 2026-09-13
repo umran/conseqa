@@ -6,13 +6,11 @@ import { Empty } from "@cloudflare/kumo/components/empty";
 import { Flow } from "@cloudflare/kumo/components/flow";
 import { Table } from "@cloudflare/kumo/components/table";
 import { Text } from "@cloudflare/kumo/components/text";
-import { Tooltip } from "@cloudflare/kumo/components/tooltip";
 import { ArrowSquareOutIcon, CaretRightIcon, GraphIcon } from "@phosphor-icons/react";
 import { Fragment, useEffect, type CSSProperties, type ComponentPropsWithRef, type ReactElement, type ReactNode } from "react";
 
 import { definedAtLabel, usedAtLabel, type BindingKind } from "../lib/bindings";
 import {
-  bindingKind,
   commitGuarantee,
   delivery,
   intrinsicRedrive,
@@ -40,7 +38,7 @@ import { hashes } from "../lib/route";
 import { requirementKey, useApp, type DetailContext } from "../state/AppState";
 import {
   BindingChip, BindingKindTag, BindingRoots, ConditionView, Fact, FactBadge, IdLink, KeyComponents, Mono, Muted,
-  PredicateView, RefText, SectionCard, StatusBadge, StatusChips, selectableRow, useProgramNavigation,
+  PredicateView, RefText, SectionCard, SectionEmpty, StatusBadge, StatusChips, selectableRow, useProgramNavigation,
 } from "../panels/parts";
 import type { Effect, Id, Operation, OperationBlock, RequirementKind, ResultType, SelectorPredicate, Transaction, TransactionStep, TransitionSideEffect } from "../types/model";
 
@@ -894,24 +892,21 @@ function LocationLink({ onClick, children }: { onClick: () => void; children: Re
   );
 }
 
-/** Every name the program binds, in program order: its defining chip,
- *  kind, scope, where it is bound, and every step that uses it — each
- *  location a link into the flow. The cross-reference the chips in the
- *  flow are read against. */
+/** Every name the program binds, in program order: its defining chip —
+ *  which carries its kind — its scope, where it is bound, and every step
+ *  that uses it, each location a link into the flow. The cross-reference
+ *  the chips in the flow are read against. */
 function BindingsTable({ id }: { id: Id }) {
   const { bindings } = useApp();
   const { toProducer, toUse } = useProgramNavigation();
   const own = bindings.byOp.get(id);
   const defs = own ? [...own.defs.values()] : [];
 
-  if (!defs.length) return <Muted>the program binds no names</Muted>;
-
   return (
     <Table>
       <Table.Header variant="compact">
         <Table.Row>
           <Table.Head>binding</Table.Head>
-          <Table.Head>kind</Table.Head>
           <Table.Head>scope</Table.Head>
           <Table.Head>bound at</Table.Head>
           <Table.Head>used at</Table.Head>
@@ -922,10 +917,7 @@ function BindingsTable({ id }: { id: Id }) {
           const uses = own?.uses.get(def.name) ?? [];
           return (
             <Table.Row key={def.name}>
-              <Table.Cell className="whitespace-nowrap"><BindingChip role="defines" name={def.name} kind={def.kind} /></Table.Cell>
-              <Table.Cell className="whitespace-nowrap">
-                <Tooltip content={bindingKind(def.kind).summary} render={<span className="cursor-help text-kumo-default">{def.kind}</span>} />
-              </Table.Cell>
+              <Table.Cell className="w-0 whitespace-nowrap"><BindingChip role="defines" name={def.name} kind={def.kind} /></Table.Cell>
               <Table.Cell className="whitespace-nowrap">
                 {def.scope === "transaction" && def.transaction !== undefined ? (
                   <span className="inline-flex items-center gap-1">
@@ -944,15 +936,12 @@ function BindingsTable({ id }: { id: Id }) {
               </Table.Cell>
               <Table.Cell>
                 {uses.length ? (
-                  <span className="inline-flex flex-wrap items-center gap-x-1 gap-y-0.5">
+                  <span className="flex flex-wrap items-center gap-x-3 gap-y-1">
                     {uses.map((u, i) => (
-                      <Fragment key={i}>
-                        {i > 0 && <span className="text-kumo-inactive">,</span>}
-                        <span className="inline-flex items-center gap-1">
-                          <LocationLink onClick={() => toUse(id, u)}>{usedAtLabel(u)}</LocationLink>
-                          <span className="text-[11px] text-kumo-inactive">{u.how}</span>
-                        </span>
-                      </Fragment>
+                      <span key={i} className="inline-flex items-baseline gap-1 whitespace-nowrap">
+                        <LocationLink onClick={() => toUse(id, u)}>{usedAtLabel(u)}</LocationLink>
+                        <span className="text-[11px] text-kumo-inactive">{u.how}</span>
+                      </span>
                     ))}
                   </span>
                 ) : (
@@ -1077,7 +1066,7 @@ function RequirementsTable({ id, op }: { id: Id; op: Operation }) {
       ),
     }));
 
-  if (!rows.length) return <Muted>the operation and its transactions declare no requirements</Muted>;
+  if (!rows.length) return <SectionEmpty>the operation and its transactions declare no requirements</SectionEmpty>;
 
   return (
     <Table>
@@ -1418,10 +1407,16 @@ export function OperationView({ id }: { id: string }) {
           count={bindingCount}
           hint="every name a step introduces for later steps — ≔ where it is bound, ↑ where it is used"
         >
-          <BindingsLegend />
-          <div className="overflow-x-auto">
-            <BindingsTable id={id} />
-          </div>
+          {bindingCount > 0 ? (
+            <>
+              <BindingsLegend />
+              <div className="overflow-x-auto">
+                <BindingsTable id={id} />
+              </div>
+            </>
+          ) : (
+            <SectionEmpty>the program binds no names — no step reads, establishes, or observes a value for a later step</SectionEmpty>
+          )}
         </SectionCard>
       </div>
     </div>

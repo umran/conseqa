@@ -35,14 +35,18 @@ realization (`#/runtime`) and each of its declarations, the clients, an
 external system — so a deep link, the browser history, and the
 breadcrumbs agree on where the reader is. The pages hang off one
 topological hierarchy: the system holds services, topics, data models,
-schemas, the runtime, and the boundary the model stops at; a service
-holds its operations; an operation its inline transactions; a data
-model its objects and outboxes; an object the machine that governs it;
-the runtime its pools, routers, and storage layouts. The **navigator**
-on the left, always in view, is that tree — the page in view marked,
-its path kept open, a filter, and a status dot on every node for the
-worst verdict at or beneath it — and the **breadcrumbs** in the top bar
-are the path down the tree to the page, every step a link back up. The
+state machines, schemas, the runtime realization's declarations, and
+the boundary the model stops at; a service holds its operations; an
+operation its inline transactions; a data model its objects and
+outboxes. State machines and the runtime's pools, routers, and storage
+layouts are listed flat, each runtime declaration captioned with its
+kind; a machine's status dot rolls up the verdicts on its transitions.
+The **navigator** on the left, always in view, is that tree — the page
+in view marked, its path kept open, a filter, and a status dot on every
+node for the worst verdict at or beneath it — and the **breadcrumbs** in
+the top bar are the path down the tree to the page, every step a link
+back up. The runtime overview is the one page with no node of its own:
+it is the `runtime` step of every runtime declaration's breadcrumbs. The
 navigator's filter row, the top bar, and the headers of the panels on
 the right share one height, so their rule runs straight across. An id in prose is
 a link: one with a page opens it in the canvas, the way a link goes
@@ -234,8 +238,10 @@ transaction), an **output** (data the commit exports), an **intent**
 (work captured at commit, executed later), a **result** (an
 attempt-local observation whose ok and error payloads are reachable
 only inside the matching arm), and a **handle** (a synchronization
-artifact, not data). Wherever a step binds a name it shows a filled
-*defines* chip, `≔ name`, tagged with the kind; wherever a later step
+artifact, not data). A chip is always one line, at the height of a
+badge; a name too long for the room it has is cut with an ellipsis, and
+the chip's tooltip leads with the name in full. Wherever a step binds a
+name it shows a filled *defines* chip, `≔ name`, tagged with the kind; wherever a later step
 refers to one — a value source, a match, an intent execution, a
 barrier — it shows an outlined *uses* chip in the same colour that
 names where the binding was made and, clicked, selects the producing
@@ -245,9 +251,14 @@ as uses chips with the count of its other roots. Execution-site ids
 (`tx.x`, `effect.x`), inputs (tagged as such), schemas, and objects
 never wear the chip, which is how a reader tells a variable from a
 declaration. The **Bindings** section is the table behind the
-chips: every binding of the operation with its kind, its scope
+chips, under a legend of the five kinds: every binding of the operation
+as its defining chip, which carries the kind, its scope
 (transaction-local or the program), the step that binds it, and every
-step that uses it, each location a click away. An obligation's evidence names paths by the arms they take
+step that uses it, each location a click away. A program that binds no
+names says so on one padded line, with no legend, as every empty page
+section does. In the inspector, an operation's program summary lists
+what each transaction binds in two captioned groups — *inside the
+transaction* and *on commit* — one chip to a row. An obligation's evidence names paths by the arms they take
 (`ok(result.x) › then(step 3)`), which is how a reader finds the
 decision it points at. Selecting any row or card opens its detail
 panel.

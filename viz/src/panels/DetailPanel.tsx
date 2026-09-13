@@ -278,6 +278,19 @@ function ServiceDetail({ id }: { id: Id }) {
   );
 }
 
+/** A captioned group of binding chips: the caption above, one chip to a
+ *  row beneath it. */
+function BindingGroup({ caption, hint, children }: { caption: string; hint: string; children: ReactNode }) {
+  return (
+    <div className="min-w-0 space-y-1">
+      <div className="text-[10px] font-semibold uppercase tracking-wider text-kumo-inactive" title={hint}>
+        {caption}
+      </div>
+      <div className="flex min-w-0 flex-col items-start gap-1">{children}</div>
+    </div>
+  );
+}
+
 /** One block of the program as a nested ordered list. Each step is one
  *  row: kind label, principal id, the names it binds as defining chips,
  *  the names it consumes as using chips, and arms indented beneath
@@ -324,18 +337,24 @@ function ProgramSummary({ opId, block, depth = 0, startIndex = 0 }: {
               <span className="text-kumo-subtle">transaction </span>
               <IdLink id={tx.id}>{shortId(tx.id)}</IdLink>
               <span className="ml-1.5 text-kumo-inactive">{n} step{n === 1 ? "" : "s"}</span>
-              {reads.length > 0 && (
-                <div className="mt-1 flex flex-wrap items-center gap-1 text-kumo-subtle">
-                  <span>binds inside</span>
-                  {reads.map((r) => <BindingChip key={r} role="defines" name={r} kind="read" />)}
-                  <span className="text-kumo-inactive">· transaction-local</span>
-                </div>
-              )}
-              {established.length > 0 && (
-                <div className="mt-1 flex flex-wrap items-center gap-1 text-kumo-subtle">
-                  <span>establishes</span>
-                  {established.map((b) => <BindingChip key={b.name} role="defines" name={b.name} kind={b.kind} />)}
-                  <span className="text-kumo-inactive">· available on the committed path</span>
+              {(reads.length > 0 || established.length > 0) && (
+                // What the transaction binds, in two captioned groups: the
+                // names only its own steps can use, then the names its
+                // commit makes available to the steps after it. Each
+                // caption sits above its chips, one chip to a row, so a
+                // name has the column's whole width and is never broken
+                // across lines or cut short.
+                <div className="mt-2 space-y-2">
+                  {reads.length > 0 && (
+                    <BindingGroup caption="inside the transaction" hint="Transaction-local: never available outside the transaction.">
+                      {reads.map((r) => <BindingChip key={r} role="defines" name={r} kind="read" />)}
+                    </BindingGroup>
+                  )}
+                  {established.length > 0 && (
+                    <BindingGroup caption="on commit" hint="Established by the commit: available to the steps on the committed path.">
+                      {established.map((b) => <BindingChip key={b.name} role="defines" name={b.name} kind={b.kind} />)}
+                    </BindingGroup>
+                  )}
                 </div>
               )}
               {s.rejected ? (

@@ -5,7 +5,7 @@ import { Text } from "@cloudflare/kumo/components/text";
 import { StackIcon } from "@phosphor-icons/react";
 
 import { shortId } from "../lib/ids";
-import { IdLink, Mono, SectionCard } from "../panels/parts";
+import { IdLink, Mono, SectionCard, SectionEmpty } from "../panels/parts";
 import { useApp } from "../state/AppState";
 import type { Edge } from "../types/graph";
 
@@ -90,7 +90,7 @@ export function RuntimePage() {
                 </Table.Body>
               </Table>
             </div>
-          ) : <div className="p-3 text-sm text-kumo-inactive">none declared</div>}
+          ) : <SectionEmpty>none declared</SectionEmpty>}
         </SectionCard>
 
         <SectionCard title="Routers" count={routers.length} hint="how a request boundary's invocations are placed on a pool's members — affinity at most, never order">
@@ -123,7 +123,7 @@ export function RuntimePage() {
                 </Table.Body>
               </Table>
             </div>
-          ) : <div className="p-3 text-sm text-kumo-inactive">none declared</div>}
+          ) : <SectionEmpty>none declared</SectionEmpty>}
         </SectionCard>
 
         <SectionCard title="Subscription dispatch" count={subscriptions.length} hint="how a subscription's deliveries reach a pool — delivery, transport, and affinity facts">
@@ -163,7 +163,7 @@ export function RuntimePage() {
                 </Table.Body>
               </Table>
             </div>
-          ) : <div className="p-3 text-sm text-kumo-inactive">none declared</div>}
+          ) : <SectionEmpty>none declared</SectionEmpty>}
         </SectionCard>
 
         <SectionCard title="Outbox consumption" count={outboxes.length} hint="how an outbox's exclusive consumer is realized — partitioning, ordering, routing, batching">
@@ -201,7 +201,7 @@ export function RuntimePage() {
                 </Table.Body>
               </Table>
             </div>
-          ) : <div className="p-3 text-sm text-kumo-inactive">none declared</div>}
+          ) : <SectionEmpty>none declared</SectionEmpty>}
         </SectionCard>
 
         <SectionCard title="Topic transport" count={topics.length} hint="grouping and precedence a topic's transport provides, when declared on the topic">
@@ -226,7 +226,7 @@ export function RuntimePage() {
                 </Table.Body>
               </Table>
             </div>
-          ) : <div className="p-3 text-sm text-kumo-inactive">no topic-scoped transport declared</div>}
+          ) : <SectionEmpty>no topic-scoped transport declared</SectionEmpty>}
         </SectionCard>
 
         <SectionCard title="Storage layouts" count={layouts.length} hint="how an object is partitioned — where rows live, never an identity or a routing key">
@@ -253,7 +253,7 @@ export function RuntimePage() {
                 </Table.Body>
               </Table>
             </div>
-          ) : <div className="p-3 text-sm text-kumo-inactive">none declared</div>}
+          ) : <SectionEmpty>none declared</SectionEmpty>}
         </SectionCard>
       </div>
     </div>
