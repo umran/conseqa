@@ -271,28 +271,38 @@ svg.arch-canvas text { font-size: 12px; fill: var(--arch-text); user-select: non
 /* A chip is a button: it names one binding and takes the reader to its
    detail (a definition) or to the card that binds it (a use). A defining
    chip is filled and leads with `≔`; a using chip is outlined and leads
-   with `↑`, pointing back up the program to where the name was bound. */
+   with `↑`, pointing back up the program to where the name was bound.
+
+   A chip is always one line, at the height of a Kumo badge, so it sits
+   level with the badges and tags beside it. A name longer than the room
+   it has is cut with an ellipsis rather than wrapped, and the chip's
+   tooltip carries it in full. */
 .binding-chip {
   display: inline-flex;
-  flex-wrap: wrap;
-  align-items: baseline;
-  gap: 0 0.35em;
+  align-items: center;
+  gap: 0.3125rem;
+  min-width: 0;
   max-width: 100%;
-  padding: 0 0.45em;
-  border: 1px solid color-mix(in srgb, var(--binding-ink) 45%, transparent);
-  border-radius: 0.3rem;
+  height: 1.25rem;
+  padding: 0 0.4375rem;
+  border: 1px solid color-mix(in srgb, var(--binding-ink) 38%, transparent);
+  border-radius: 0.375rem;
   background: transparent;
   color: var(--binding-ink);
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   font-size: 12px;
-  line-height: 1.55;
+  line-height: 1;
+  white-space: nowrap;
   text-align: left;
-  vertical-align: baseline;
+  vertical-align: middle;
   cursor: pointer;
   transition: background-color 120ms ease, border-color 120ms ease;
 }
-.binding-chip .glyph { font-weight: 700; opacity: 0.85; }
-.binding-chip .name { overflow-wrap: anywhere; font-weight: 600; }
+.binding-chip .glyph { flex: none; font-weight: 700; opacity: 0.7; }
+.binding-chip .name { min-width: 0; overflow: hidden; text-overflow: ellipsis; font-weight: 600; }
+/* The kind tag of a defining chip sits snug inside its right edge. */
+.binding-chip .binding-kind { flex: none; margin-right: -0.1875rem; }
+.binding-chip .binding-arm { flex: none; }
 .binding-chip.defines {
   background: color-mix(in srgb, var(--binding-ink) var(--binding-fill-mix), var(--color-kumo-base));
   border-color: color-mix(in srgb, var(--binding-ink) 30%, transparent);
@@ -307,20 +317,22 @@ svg.arch-canvas text { font-size: 12px; fill: var(--arch-text); user-select: non
 /* The kind of a binding, as a small tag: inside a defining chip, and on
    its own in the legend. */
 .binding-kind {
-  display: inline-block;
-  padding: 0 0.4em;
-  border-radius: 0.25rem;
+  display: inline-flex;
+  align-items: center;
+  height: 0.875rem;
+  padding: 0 0.3125rem;
+  border-radius: 0.1875rem;
   background: color-mix(in srgb, var(--binding-ink) var(--binding-tag-mix), transparent);
   color: var(--binding-ink);
   font-family: system-ui, sans-serif;
   font-size: 9px;
   font-weight: 700;
   letter-spacing: 0.06em;
-  line-height: 1.6;
+  line-height: 1;
   text-transform: uppercase;
   white-space: nowrap;
 }
-.binding-kind.legend { font-size: 10px; padding: 0.1em 0.5em; cursor: help; }
+.binding-kind.legend { height: 1.125rem; padding: 0 0.4375rem; font-size: 10px; cursor: help; }
 
 /* Which arm's payload a result reference reads: the ok payload exists
    only inside the ok arm, an error payload only inside its class's arm. */
@@ -329,6 +341,7 @@ svg.arch-canvas text { font-size: 12px; fill: var(--arch-text); user-select: non
   font-size: 9px;
   font-weight: 700;
   letter-spacing: 0.06em;
+  line-height: 1;
   text-transform: uppercase;
   opacity: 0.85;
 }

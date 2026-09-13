@@ -3,17 +3,18 @@
 //
 // The main canvas shows one thing at a time, and everything it can show
 // has a place in one tree: the system holds services, topics, data
-// models, schemas, the runtime realization, and the boundary the model
-// stops at; a service holds its operations; an operation its inline
-// transactions; a data model its objects and outboxes; an object the
-// state machine that governs it; the runtime its pools, routers, and
-// storage layouts. The breadcrumbs are the path down that tree to the
-// page in view, and the navigator is the tree itself.
+// models, state machines, schemas, the runtime realization's
+// declarations, and the boundary the model stops at; a service holds its
+// operations; an operation its inline transactions; a data model its
+// objects and outboxes. The breadcrumbs are the path down that tree to
+// the page in view, and the navigator is the tree itself. The runtime
+// overview is the one page with no node of its own: it is the `runtime`
+// step of every L1 declaration's breadcrumbs.
 
 import { CLIENT_NODE_ID, EXTERNAL_PREFIX, type Graph } from "../types/graph";
-import type { Id, Model } from "../types/model";
+import type { Model } from "../types/model";
 import { shortId } from "./ids";
-import { findDataObject, operationTransactions, type ModelIndex } from "./index";
+import { operationTransactions, type ModelIndex } from "./index";
 import { hashes, type Route } from "./route";
 
 /** What a page in the main canvas can be about. */
@@ -120,15 +121,11 @@ function crumb(kind: PageKind, id: string): Crumb {
   return { kind, id, label: pageLabel(kind, id), hash: hashFor(kind, id) };
 }
 
-/** The data model that owns an object, or null. */
-function dataModelOf(model: Model, object: Id): Id | null {
-  return findDataObject(model, object)?.dataModel ?? null;
-}
-
 /** The path from the system to the page a route shows, the page last.
- *  A machine sits under the object it governs; a transaction under the
- *  operation whose program declares it; every L1 declaration under the
- *  runtime realization. */
+ *  A transaction sits under the operation whose program declares it, an
+ *  object or an outbox under its data model, and every L1 declaration
+ *  under the runtime realization; a state machine sits directly under
+ *  the system, as it does in the navigator. */
 export function ancestry(route: Route, model: Model, index: ModelIndex): Crumb[] {
   const root = crumb("system", "");
   switch (route.view) {
@@ -150,14 +147,8 @@ export function ancestry(route: Route, model: Model, index: ModelIndex): Crumb[]
         ? [root, crumb("service", op.service), crumb("operation", opId), crumb("transaction", route.id)]
         : [root, crumb("transaction", route.id)];
     }
-    case "machine": {
-      const machine = model.state_machines[route.id];
-      const object = machine?.subject.object ?? null;
-      const dm = object ? dataModelOf(model, object) : null;
-      return object && dm
-        ? [root, crumb("data_model", dm), crumb("object", object), crumb("machine", route.id)]
-        : [root, crumb("machine", route.id)];
-    }
+    case "machine":
+      return [root, crumb("machine", route.id)];
     case "entity": {
       const kind = pageKindOf(route.id, index);
       if (!kind) return [root, { kind: "system", id: route.id, label: route.id, hash: hashes.system() }];
@@ -188,9 +179,10 @@ export interface NavNode {
   kind: PageKind;
   label: string;
   hash: string;
-  /** The key the obligation index anchors this entity's verdicts under,
-   *  when verdicts can anchor to it. */
-  obKey?: string;
+  /** The keys the obligation index anchors this entity's verdicts under:
+   *  one for most entities, and for a state machine its own and each of
+   *  its transitions', which have no node of their own. */
+  obKeys: string[];
   children: NavNode[];
 }
 
@@ -203,7 +195,7 @@ export interface NavGroup {
 }
 
 function node(kind: PageKind, id: string, extra: Partial<NavNode> = {}): NavNode {
-  return { id, kind, label: pageLabel(kind, id), hash: hashFor(kind, id), children: [], ...extra };
+  return { id, kind, label: pageLabel(kind, id), hash: hashFor(kind, id), obKeys: [], children: [], ...extra };
 }
 
 const byId = (a: { id: string }, b: { id: string }) => a.id.localeCompare(b.id);
@@ -218,58 +210,49 @@ export function navigationTree(model: Model, graph: Graph): NavGroup[] {
         const op = model.operations[opId];
         const txs = op ? operationTransactions(op) : [];
         return node("operation", opId, {
-          obKey: opId,
-          children: txs.map((tx) => node("transaction", tx.id, { obKey: `${opId}/${tx.id}` })),
+          obKeys: [opId],
+          children: txs.map((tx) => node("transaction", tx.id, { obKeys: [`${opId}/${tx.id}`] })),
         });
       }),
     }),
   );
   groups.push({ key: "services", title: "services", nodes: services, open: true });
 
-  const topics = [...graph.topics].sort(byId).map((t) => node("topic", t.id, { obKey: t.id }));
+  const topics = [...graph.topics].sort(byId).map((t) => node("topic", t.id, { obKeys: [t.id] }));
   if (topics.length) groups.push({ key: "topics", title: "topics", nodes: topics, open: true });
 
-  // A machine governs one object's state field, so it hangs off that
-  // object; an object no machine governs is a leaf.
-  const machinesByObject = new Map<Id, Id[]>();
-  for (const [mId, m] of Object.entries(model.state_machines)) {
-    const list = machinesByObject.get(m.subject.object);
-    if (list) list.push(mId);
-    else machinesByObject.set(m.subject.object, [mId]);
-  }
   const data = Object.entries(model.data_models)
     .sort(([a], [b]) => a.localeCompare(b))
     .map(([dmId, dm]) =>
       node("data_model", dmId, {
         children: [
-          ...Object.keys(dm.objects).sort().map((objId) =>
-            node("object", objId, {
-              obKey: `${dmId}/${objId}`,
-              children: (machinesByObject.get(objId) ?? []).sort().map((mId) => node("machine", mId, { obKey: mId })),
-            }),
-          ),
+          ...Object.keys(dm.objects).sort().map((objId) => node("object", objId, { obKeys: [`${dmId}/${objId}`] })),
           ...Object.keys(dm.outboxes ?? {}).sort().map((obId) => node("outbox", obId)),
         ],
       }),
     );
   if (data.length) groups.push({ key: "data", title: "data", nodes: data, open: true });
 
+  // A machine's page is where its transitions are read, so a verdict on
+  // any transition rolls up into the machine's dot.
+  const machines = Object.entries(model.state_machines)
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([mId, m]) =>
+      node("machine", mId, { obKeys: [mId, ...Object.keys(m.transitions).map((t) => `${mId}/${t}`)] }),
+    );
+  if (machines.length) groups.push({ key: "machines", title: "state machines", nodes: machines, open: true });
+
   const schemas = Object.keys(model.schemas).sort().map((id) => node("schema", id));
   if (schemas.length) groups.push({ key: "schemas", title: "schemas", nodes: schemas, open: false });
 
+  // The declarations themselves, one level: pools, then routers, then
+  // storage layouts, each captioned with its kind.
   const runtime: NavNode[] = [
     ...[...graph.runtime.execution_pools].sort(byId).map((p) => node("pool", p.id)),
     ...[...graph.runtime.routers].sort(byId).map((r) => node("router", r.id)),
     ...[...graph.runtime.storage_layouts].sort(byId).map((s) => node("storage_layout", s.id)),
   ];
-  if (runtime.length) {
-    groups.push({
-      key: "runtime",
-      title: "runtime · L1",
-      nodes: [node("runtime", "", { label: "overview", children: runtime })],
-      open: false,
-    });
-  }
+  if (runtime.length) groups.push({ key: "runtime", title: "runtime · L1", nodes: runtime, open: false });
 
   const boundary: NavNode[] = [];
   if (graph.client) boundary.push(node("clients", CLIENT_NODE_ID));
