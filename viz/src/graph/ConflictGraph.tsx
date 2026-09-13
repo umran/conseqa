@@ -18,6 +18,10 @@ interface Props {
   /** The selected pair, when the parent owns the selection. */
   selectedPair?: string | null;
   onSelectPair?: (id: string | null) => void;
+  /** Drawn on a page rather than in a column: the drawing takes the
+   *  width it is given, up to a little over its natural size, and never
+   *  scrolls sideways. */
+  wide?: boolean;
 }
 
 /**
@@ -30,11 +34,11 @@ interface Props {
  * dependency is dashed and amber, and when the argument fails the
  * members of the cycle it fails through wear a halo.
  *
- * Clicking a node opens the operation page with the transaction
- * selected; clicking an arrow selects the pair, so the panel around the
- * drawing can show the dependencies behind it.
+ * Clicking a node opens that transaction's page; clicking an arrow
+ * selects the pair, so the panel around the drawing can show the
+ * dependencies behind it.
  */
-export function ConflictGraph({ view, selectedPair, onSelectPair }: Props) {
+export function ConflictGraph({ view, selectedPair, onSelectPair, wide = false }: Props) {
   const { navigateTo } = useApp();
   const [own, setOwn] = useState<string | null>(null);
   const controlled = selectedPair !== undefined;
@@ -61,14 +65,18 @@ export function ConflictGraph({ view, selectedPair, onSelectPair }: Props) {
   };
 
   return (
-    <div className="space-y-1.5">
-      <div className="arch-closure">
+    <div className="min-w-0 space-y-1.5">
+      <div className={wide ? "arch-closure arch-closure-wide" : "arch-closure"}>
         <svg
           xmlns="http://www.w3.org/2000/svg"
           width="100%"
           viewBox={`${viewBox.x} ${viewBox.y} ${viewBox.w} ${viewBox.h}`}
           preserveAspectRatio="xMidYMid meet"
-          style={{ minWidth: Math.min(viewBox.w * MIN_SCALE, MAX_MIN_WIDTH) }}
+          style={
+            wide
+              ? { maxWidth: Math.round(viewBox.w * 1.35), margin: "0 auto" }
+              : { minWidth: Math.min(viewBox.w * MIN_SCALE, MAX_MIN_WIDTH) }
+          }
           role="img"
           aria-label={`conflict closure of ${shortId(view.transaction)}: ${view.nodes.length} transactions, ${view.pairs.length} arrows`}
         >
@@ -95,7 +103,7 @@ export function ConflictGraph({ view, selectedPair, onSelectPair }: Props) {
               n={n}
               halo={cycle && n.node.in_cycle}
               pill={isolationRoute}
-              onOpen={() => navigateTo(hashes.op(n.node.operation), `tx:${n.node.transaction}`)}
+              onOpen={() => navigateTo(hashes.tx(n.node.transaction))}
               onKey={onKey}
             />
           ))}
@@ -175,7 +183,7 @@ function Node({
     `${node.transaction}\n${node.operation} · step ${node.location} · ${node.isolation}` +
     (node.root ? "\nthe requiring transaction" : "") +
     (halo ? "\nin an unconstrained cycle" : "") +
-    "\n(click to open the operation page)";
+    "\n(click to open the transaction's page)";
   return (
     <g className={classes.join(" ")} role="link" tabIndex={0} onClick={onOpen} onKeyDown={(e) => onKey(e, onOpen)}>
       {halo && (

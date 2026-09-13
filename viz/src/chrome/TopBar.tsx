@@ -4,10 +4,11 @@ import { Button } from "@cloudflare/kumo/components/button";
 import { Input } from "@cloudflare/kumo/components/input";
 import { Switch } from "@cloudflare/kumo/components/switch";
 import { Tooltip } from "@cloudflare/kumo/components/tooltip";
-import { ListChecksIcon, MoonIcon, SunIcon } from "@phosphor-icons/react";
+import { ListChecksIcon, MoonIcon, SidebarSimpleIcon, SunIcon } from "@phosphor-icons/react";
+import { Fragment } from "react";
 
+import { ancestry } from "../lib/navigation";
 import { STATUS_GLYPH, statusCounts } from "../lib/obligations";
-import { hashes } from "../lib/route";
 import { useApp } from "../state/AppState";
 
 /** The top bar sits in the content column and uses the pages' container,
@@ -21,10 +22,14 @@ import { useApp } from "../state/AppState";
 export function TopBar() {
   const app = useApp();
   const {
-    data, model, report, reportIssue, route, search, obligationsOpen, runtime, showRuntime,
+    data, model, index, report, reportIssue, route, search, obligationsOpen, navOpen, runtime, showRuntime,
     transactionProofs, showConflicts, theme, themeControllable,
   } = app;
   const hasTransactionProofs = transactionProofs.serializability.length > 0;
+  // The path down the model's hierarchy to the page in view: system,
+  // then the service, then the operation, then its transaction — every
+  // step a link back up.
+  const crumbs = ancestry(route, model, index);
   const counts = report ? statusCounts(report.obligations) : null;
   const tally = counts
     ? (["disproven", "unknown", "proven"] as const)
@@ -40,6 +45,21 @@ export function TopBar() {
     // not have.
     <header className="@container shrink-0 border-b border-kumo-hairline bg-kumo-base">
       <div className="mx-auto flex h-12 max-w-[1240px] items-center gap-3 px-4 @md:gap-4 @md:px-6">
+        <Tooltip
+          content={navOpen ? "Hide the navigator" : "Show the navigator — the model as a tree of pages"}
+          render={
+            <Button
+              className="shrink-0"
+              variant={navOpen ? "secondary" : "ghost"}
+              size="sm"
+              shape="square"
+              icon={SidebarSimpleIcon}
+              aria-label="Toggle the navigator"
+              aria-pressed={navOpen}
+              onClick={() => app.setNavOpen(!navOpen)}
+            />
+          }
+        />
         {/* The model, not the tool: the document title already reads
             "<model> · conseqa", and a host embedding these views has a
             name of its own in its chrome. */}
@@ -68,16 +88,15 @@ export function TopBar() {
 
         <div className="hidden min-w-0 flex-1 items-center gap-3 overflow-hidden @3xl:flex">
           <Breadcrumbs size="sm">
-            {route.view === "system" ? (
-              <Breadcrumbs.Current>system</Breadcrumbs.Current>
-            ) : (
-              <>
-                <Breadcrumbs.Link href={hashes.system()}>system</Breadcrumbs.Link>
-                <Breadcrumbs.Separator />
-                <Breadcrumbs.Current>{route.view === "op" ? "operation" : "machine"}</Breadcrumbs.Current>
-                <Breadcrumbs.Separator />
-                <Breadcrumbs.Current>{route.id}</Breadcrumbs.Current>
-              </>
+            {crumbs.map((c, i) =>
+              i < crumbs.length - 1 ? (
+                <Fragment key={c.hash}>
+                  <Breadcrumbs.Link href={c.hash}>{c.label}</Breadcrumbs.Link>
+                  <Breadcrumbs.Separator />
+                </Fragment>
+              ) : (
+                <Breadcrumbs.Current key={c.hash}>{c.label}</Breadcrumbs.Current>
+              ),
             )}
           </Breadcrumbs>
         </div>

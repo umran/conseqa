@@ -91,6 +91,10 @@ svg.arch-canvas text { font-size: 12px; fill: var(--arch-text); user-select: non
    fact commit-orders is dashed and amber, like every other unknown. */
 .arch-closure { overflow-x: auto; overflow-y: hidden; }
 .arch-closure svg { display: block; max-height: 360px; }
+/* On a transaction page the drawing is the section: it takes the width
+   it is given and as much height as it needs to stay legible. */
+.arch-closure-wide { overflow: visible; }
+.arch-closure-wide svg { max-height: 620px; }
 .arch-closure text { font-size: 12px; fill: var(--arch-text); user-select: none; pointer-events: none; }
 
 .arch-cx-node { cursor: pointer; }

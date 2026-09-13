@@ -13,9 +13,10 @@ import { modelBindings, type ModelBindings } from "../lib/bindings";
 import { citedIds } from "../lib/citations";
 import { indexTransactionProofs, type TransactionProofIndex } from "../lib/transactionProofs";
 import { buildIndex, type ModelIndex } from "../lib/index";
+import { pageHash } from "../lib/navigation";
 import { buildObligationIndex, reportRejection, type ObligationIndex } from "../lib/obligations";
 import { runtimeFacts, type RuntimeFacts } from "../lib/runtime";
-import { hashes, impliedSubject, navigate, routeKey, useRoute, type Route } from "../lib/route";
+import { hashes, impliedSubject, navigate, routeKey, routeSubject, useRoute, type Route } from "../lib/route";
 import type { Graph } from "../types/graph";
 import type { Id, Model, RequirementKind } from "../types/model";
 import type { PageData } from "../types/page";
@@ -83,6 +84,9 @@ interface AppState {
   expandedTx: ReadonlySet<string>;
   search: string;
   obligationsOpen: boolean;
+  /** Whether the navigator — the model as a tree of pages — is shown
+   *  beside the canvas. */
+  navOpen: boolean;
   /** Whether the L1 realization is drawn. L0 is always drawn: the
    *  application machine is the model, and the realization is a layer
    *  over it. */
@@ -101,10 +105,14 @@ interface AppState {
   /** Selects a graph element and, when given, shows its detail. */
   select: (key: string | null, detail?: DetailTarget) => void;
   openDetail: (id: string, ctx?: DetailContext) => void;
+  /** Shows an entity: in the main canvas when it has a page of its own,
+   *  else in the inspector on the page it belongs to. */
+  openEntity: (id: string) => void;
   closeDetail: () => void;
   toggleTx: (key: string) => void;
   setSearch: (value: string) => void;
   setObligationsOpen: (value: boolean) => void;
+  setNavOpen: (value: boolean) => void;
   setShowRuntime: (value: boolean) => void;
   setShowConflicts: (value: boolean) => void;
   setTheme: (value: Theme) => void;
@@ -117,10 +125,26 @@ interface AppState {
 const Context = createContext<AppState | null>(null);
 
 const THEME_KEY = "conseqa-viz-theme";
+const NAV_KEY = "conseqa-viz-nav";
 
 function initialTheme(): Theme {
   const stored = window.localStorage.getItem(THEME_KEY);
   return stored === "light" ? "light" : "dark";
+}
+
+/** The navigator starts open where there is room for it beside the
+ *  canvas — the tree is how a reader learns what the model contains —
+ *  and closed in a pane too narrow to hold both, where it would cover
+ *  the drawing. A reader's own choice is remembered either way. */
+function initialNavOpen(): boolean {
+  try {
+    const stored = window.localStorage.getItem(NAV_KEY);
+    if (stored === "open") return true;
+    if (stored === "closed") return false;
+  } catch {
+    // Storage may be unavailable; fall through to the width rule.
+  }
+  return window.innerWidth >= 1280;
 }
 
 export interface AppStateProviderProps {
@@ -181,6 +205,7 @@ export function AppStateProvider({ data, theme: hostTheme, children }: AppStateP
   const [expandedTx, setExpandedTx] = useState<ReadonlySet<string>>(() => new Set());
   const [search, setSearch] = useState("");
   const [obligationsOpen, setObligationsOpen] = useState(false);
+  const [navOpen, setNavOpenState] = useState(initialNavOpen);
   // Drawn by default wherever there is anything to draw: the hierarchy is
   // the model, and a layer hidden until asked for reads as an extra.
   const [showRuntime, setShowRuntimeState] = useState(runtime.declared);
@@ -199,17 +224,31 @@ export function AppStateProvider({ data, theme: hostTheme, children }: AppStateP
 
   // A route change resets the selection to whatever is pending from a
   // cross-view focus, else to the subject the route itself names. The
-  // detail panel survives so links keep their context, but when the
-  // route names a subject an open panel is retargeted to it, so history
-  // navigation and deep links show what the address bar says.
+  // detail panel survives so links keep their context — except when it
+  // is showing the very entity the new page is about, which the page
+  // now shows in full — and when the route names a subject an open
+  // panel is retargeted to it, so history navigation and deep links
+  // show what the address bar says.
+  const subject = routeSubject(route);
   useEffect(() => {
     const pending = pendingSelection.current;
     pendingSelection.current = null;
     setSelection(pending ?? (implied ? `t:${implied}` : null));
+    if (subject !== null) {
+      setDetail((current) => (current && current.id === subject && !current.ctx.txStep && !current.ctx.req ? null : current));
+    }
     if (pending === null && implied) {
       setDetail((current) => (current ? { id: implied, ctx: {} } : current));
     }
-  }, [key, implied]);
+  }, [key, implied, subject]);
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(NAV_KEY, navOpen ? "open" : "closed");
+    } catch {
+      // Storage may be unavailable; the choice then lasts the session.
+    }
+  }, [navOpen]);
 
   // The document belongs to whoever owns the mode: a host that supplies
   // one has already dressed the page, and writing `data-mode` or the
@@ -261,6 +300,13 @@ export function AppStateProvider({ data, theme: hostTheme, children }: AppStateP
 
   const requestFit = useCallback(() => setFitRequest((n) => n + 1), []);
 
+  // The navigator shares the row with the canvas, so showing or hiding
+  // it changes the canvas's width and the drawing is re-fitted to it.
+  const setNavOpen = useCallback((value: boolean) => {
+    setNavOpenState(value);
+    setFitRequest((n) => n + 1);
+  }, []);
+
   // Showing or hiding a layer changes how much drawing there is, so the
   // view is re-fitted to it: a band that appears off-screen has not
   // appeared.
@@ -286,6 +332,15 @@ export function AppStateProvider({ data, theme: hostTheme, children }: AppStateP
     navigate(hash);
   }, []);
 
+  const openEntity = useCallback(
+    (id: string) => {
+      const hash = pageHash(id, index);
+      if (hash) navigateTo(hash);
+      else openDetail(id);
+    },
+    [index, navigateTo, openDetail],
+  );
+
   const focusSubject = useCallback(
     (ob: Obligation) => {
       const s = ob.subject;
@@ -298,29 +353,30 @@ export function AppStateProvider({ data, theme: hostTheme, children }: AppStateP
           );
           break;
         }
-        case "transaction":
-          // A transaction requirement has a row of its own in the
-          // operation's requirements table; the transaction itself is
-          // the fallback for an obligation anchored to the whole of it.
-          navigateTo(
-            hashes.op(s.operation),
-            s.requirement !== undefined
-              ? requirementKey(ob.property.kind, s.requirement, s.transaction)
-              : `tx:${s.transaction}`,
-          );
+        case "transaction": {
+          // A transaction's page carries its requirements with their
+          // arguments drawn in full; an obligation on one requirement
+          // opens the page on that requirement.
+          const prop = ob.property.kind;
+          const req =
+            s.requirement !== undefined && (prop === "transaction_serializability" || prop === "transaction_ordering")
+              ? { prop, index: s.requirement }
+              : null;
+          navigateTo(hashes.tx(s.transaction, req));
           break;
+        }
         case "state_machine":
           navigateTo(hashes.machine(s.machine, s.transition));
           break;
         case "topic":
-          navigateTo(hashes.system(), s.topic);
+          navigateTo(hashes.entity("topic", s.topic));
           break;
         case "object":
-          openDetail(s.object);
+          navigateTo(hashes.entity("object", s.object));
           break;
       }
     },
-    [navigateTo, openDetail],
+    [navigateTo],
   );
 
   const value = useMemo<AppState>(
@@ -343,6 +399,7 @@ export function AppStateProvider({ data, theme: hostTheme, children }: AppStateP
       expandedTx,
       search,
       obligationsOpen,
+      navOpen,
       showRuntime,
       showConflicts,
       theme,
@@ -350,10 +407,12 @@ export function AppStateProvider({ data, theme: hostTheme, children }: AppStateP
       fitRequest,
       select,
       openDetail,
+      openEntity,
       closeDetail,
       toggleTx,
       setSearch,
       setObligationsOpen,
+      setNavOpen,
       setShowRuntime,
       setShowConflicts,
       setTheme,
@@ -363,9 +422,9 @@ export function AppStateProvider({ data, theme: hostTheme, children }: AppStateP
     }),
     [
       data, report, reportIssue, index, knownIds, obligations, citations, runtime, transactionProofs, bindings, route,
-      selection, detail, expandedTx, search, obligationsOpen, showRuntime, showConflicts, theme,
-      themeControllable, fitRequest, select, openDetail, closeDetail, toggleTx,
-      setTheme, setShowRuntime, setShowConflicts, requestFit, navigateTo, focusSubject,
+      selection, detail, expandedTx, search, obligationsOpen, navOpen, showRuntime, showConflicts, theme,
+      themeControllable, fitRequest, select, openDetail, openEntity, closeDetail, toggleTx,
+      setTheme, setNavOpen, setShowRuntime, setShowConflicts, requestFit, navigateTo, focusSubject,
     ],
   );
 

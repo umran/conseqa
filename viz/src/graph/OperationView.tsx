@@ -146,7 +146,11 @@ function Bindings({ children }: { children: ReactNode }) {
   return <div className="mt-2 space-y-1">{children}</div>;
 }
 
-function TxStepRow({ step, index, txId, opId }: { step: TransactionStep; index: number; txId: Id; opId: Id }) {
+/** One step of a transaction body as a selectable row: its kind, its
+ *  principal, what it binds and consumes, and whether it can reject the
+ *  transaction. Drawn inside the transaction card on the operation page
+ *  and in the steps section of the transaction's own page. */
+export function TxStepRow({ step, index, txId, opId }: { step: TransactionStep; index: number; txId: Id; opId: Id }) {
   const { selection, select, navigateTo } = useApp();
   const selKey = `ts:${txId}:${index}`;
   const selected = selection === selKey;
@@ -376,7 +380,7 @@ function ProgramBlock({ opId, op, block, hops, nested, startIndex = 0, fill = fa
   /** Fill the lane the block is drawn in rather than the section. */
   fill?: boolean;
 }) {
-  const { model, index, expandedTx, toggleTx } = useApp();
+  const { model, index, expandedTx, toggleTx, navigateTo } = useApp();
   const effectKind = (effectId: Id): EffectKind | null => effectDef(model, index, effectId)?.effect.kind ?? null;
 
   const stepCtx = (location: string): DetailContext => ({ step: { op: opId, location } });
@@ -426,7 +430,23 @@ function ProgramBlock({ opId, op, block, hops, nested, startIndex = 0, fill = fa
             <StepCard selKey={`tx:${tx.id}`} detailId={tx.id} stripe={STEP_STRIPE.tx}>
               <div className="flex items-center justify-between gap-2">
                 <Badge variant="neutral">transaction</Badge>
-                <StatusChips obKey={`${opId}/${tx.id}`} />
+                <span className="flex items-center gap-1.5">
+                  <StatusChips obKey={`${opId}/${tx.id}`} />
+                  {/* The transaction's own page: its requirements with
+                      their arguments drawn in full, its steps, its
+                      verdicts. */}
+                  <Button
+                    variant="ghost"
+                    size="xs"
+                    shape="square"
+                    icon={ArrowSquareOutIcon}
+                    aria-label="Open the transaction page"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      navigateTo(hashes.tx(tx.id));
+                    }}
+                  />
+                </span>
               </div>
               <StepTitle>{shortId(tx.id)}</StepTitle>
               <div className="mt-1.5 flex flex-wrap items-center gap-1.5 text-xs text-kumo-subtle">
@@ -972,15 +992,31 @@ function BindingsLegend() {
  *  transaction row's verdicts are the obligations anchored to that
  *  transaction and its requirement index. */
 function RequirementsTable({ id, op }: { id: Id; op: Operation }) {
-  const { obligations, selection, select, transactionProofs } = useApp();
+  const { obligations, selection, select, transactionProofs, navigateTo } = useApp();
   const reqs = op.requirements;
 
   // A transaction row ends with what its argument rests on — the
   // closure and the route, or the guard — so the shape of the proof is
-  // readable before the row is opened.
-  const argument = (tx: Id, prop: RequirementKind, i: number): ReactNode => {
+  // readable before the row is opened, and with the way to the
+  // transaction's page, which draws the argument in full.
+  const argument = (tx: Id, prop: "transaction_serializability" | "transaction_ordering", i: number): ReactNode => {
     const proof = transactionProofs.proofForRequirement(id, tx, prop, i);
-    return proof ? <span className="text-xs text-kumo-inactive">{proofSummary(proof)}</span> : null;
+    if (!proof) return null;
+    return (
+      <>
+        <span className="text-xs text-kumo-inactive">{proofSummary(proof)}</span>
+        <button
+          type="button"
+          className="cursor-pointer whitespace-nowrap text-xs text-kumo-link hover:underline"
+          onClick={(e) => {
+            e.stopPropagation();
+            navigateTo(hashes.tx(tx, { prop, index: i }));
+          }}
+        >
+          open the argument →
+        </button>
+      </>
+    );
   };
 
   const rows: { prop: RequirementKind; i: number; tx?: Id; label: string; declares: ReactNode }[] = [];

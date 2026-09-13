@@ -9,7 +9,7 @@ import { shortId } from "../lib/ids";
 import { subjectText } from "../lib/obligations";
 import { useApp } from "../state/AppState";
 import { propertyName, type Obligation } from "../types/report";
-import { OrderingProof, SerializabilityProof } from "./TransactionProof";
+import { ProofSummary } from "./TransactionProof";
 import { CitedText, IdLink, StatusBadge } from "./parts";
 
 /** The layer note a verdict carries.
@@ -69,8 +69,8 @@ export function ObligationCard({ ob, defaultOpen = false }: { ob: Obligation; de
   const { focusSubject, transactionProofs } = useApp();
   const [open, setOpen] = useState(defaultOpen);
   // A transaction-family verdict carries its argument as a structure —
-  // the conflict closure, the dependencies, the guard — drawn before
-  // the prose that records the same facts.
+  // the conflict closure, the dependencies, the guard. The card gives
+  // its summary; the transaction's page draws it in full.
   const proof = transactionProofs.proofForObligation(ob);
   const hasDetail = ob.assumptions.length > 0 || ob.evidence.length > 0 || !!ob.counterexample || !!proof;
   const layer = layerNote(ob);
@@ -98,17 +98,15 @@ export function ObligationCard({ ob, defaultOpen = false }: { ob: Obligation; de
               <StatusBadge status={ob.status} />
             </span>
           </div>
-          <div className="text-sm leading-snug text-kumo-default">{ob.summary}</div>
-          <div className="font-mono text-[11px] text-kumo-inactive">{subjectText(ob.subject)}</div>
+          <div className="break-words text-sm leading-snug text-kumo-default">{ob.summary}</div>
+          <div className="break-all font-mono text-[11px] text-kumo-inactive">{subjectText(ob.subject)}</div>
         </Collapsible.Trigger>
         <Collapsible.Panel>
-          <div className="space-y-3 border-t border-kumo-hairline px-3 py-2.5">
+          <div className="min-w-0 space-y-3 border-t border-kumo-hairline px-3 py-2.5">
             {proof && (
               <div>
                 <div className="mb-1.5 text-[11px] font-semibold uppercase tracking-wider text-kumo-subtle">why</div>
-                {proof.kind === "serializability"
-                  ? <SerializabilityProof view={proof.view} />
-                  : <OrderingProof view={proof.view} />}
+                <ProofSummary proof={proof} />
               </div>
             )}
             {ob.assumptions.length > 0 && (
@@ -168,9 +166,11 @@ export function ObligationCard({ ob, defaultOpen = false }: { ob: Obligation; de
               </div>
             )}
             {!hasDetail && <div className="text-sm text-kumo-inactive">no further detail recorded</div>}
-            <Button variant="ghost" size="xs" icon={CrosshairIcon} onClick={() => focusSubject(ob)}>
-              focus subject
-            </Button>
+            {!proof && (
+              <Button variant="ghost" size="xs" icon={CrosshairIcon} onClick={() => focusSubject(ob)}>
+                focus subject
+              </Button>
+            )}
           </div>
         </Collapsible.Panel>
       </div>

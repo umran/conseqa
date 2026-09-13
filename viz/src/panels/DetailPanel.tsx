@@ -1,4 +1,5 @@
 import { Button } from "@cloudflare/kumo/components/button";
+import { ClipboardText } from "@cloudflare/kumo/components/clipboard-text";
 import { Text } from "@cloudflare/kumo/components/text";
 import { ArrowSquareOutIcon, XIcon } from "@phosphor-icons/react";
 import { Fragment, type ReactNode } from "react";
@@ -21,18 +22,46 @@ import { predicateText, refString } from "../lib/text";
 import { useApp, useCitations, useObligationsAt, type DetailTarget } from "../state/AppState";
 import { CLIENT_NODE_ID, EXTERNAL_PREFIX, type Edge } from "../types/graph";
 import type { Id, IdempotencyKeyPropagation, OperationBlock, RequirementKind, ResultType } from "../types/model";
-import { OrderingProof, SerializabilityProof } from "./TransactionProof";
+import { useFrameMode } from "./frameMode";
+import { ProofSummary } from "./TransactionProof";
 import { ObligationCard } from "./ObligationCard";
 import {
   BindingChip, ConditionView, DerivationView, FactNote, IdLink, KeyComponents, KeyValue, List, Mono, Muted,
   NavLink, PredicateView, RefText, Section, Tag, TypeView, useProgramNavigation,
 } from "./parts";
 
-/** Chrome shared by every detail: kind label, close button, title block. */
+/** Chrome shared by every detail: kind label, close button, title block.
+ *
+ *  The same detail is drawn two ways. In the inspector beside the canvas
+ *  it is a narrow column with a close button; as a page in the canvas
+ *  it gets the page header the operation and machine pages have — the
+ *  kind, the name, the copyable id — and room to breathe. */
 function Frame({
   kind, title, subtitle, description, children,
 }: { kind: string; title: ReactNode; subtitle?: ReactNode; description?: ReactNode; children?: ReactNode }) {
   const { closeDetail } = useApp();
+  const mode = useFrameMode();
+  if (mode === "page") {
+    const idTitle = typeof title === "string" && !/\s/.test(title) ? title : null;
+    return (
+      <div className="h-full overflow-auto">
+        <div className="mx-auto max-w-[1240px] space-y-6 p-6">
+          <header className="space-y-3 border-b border-kumo-hairline pb-5">
+            <div className="text-[11px] font-semibold uppercase tracking-wider text-kumo-subtle">{kind}</div>
+            <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
+              <Text variant="heading" size="lg" as="h1">{idTitle !== null ? shortId(idTitle) : title}</Text>
+              {idTitle !== null && (
+                <ClipboardText text={idTitle} size="sm" tooltip={{ text: "Copy id", copiedText: "Copied" }} />
+              )}
+            </div>
+            {subtitle && <div className="text-sm text-kumo-subtle">{subtitle}</div>}
+            {description && <div className="max-w-3xl text-sm leading-relaxed text-kumo-default">{description}</div>}
+          </header>
+          <div className="max-w-[880px] space-y-3">{children}</div>
+        </div>
+      </div>
+    );
+  }
   return (
     <div className="flex h-full flex-col">
       <header className="flex shrink-0 items-center justify-between border-b border-kumo-hairline px-4 py-2">
@@ -186,10 +215,12 @@ function BindingKindNote({ kind }: { kind: BindingKind }) {
 export function DetailPanel() {
   const { detail } = useApp();
   if (!detail) return null;
-  return <Dispatch target={detail} />;
+  return <DetailBody target={detail} />;
 }
 
-function Dispatch({ target }: { target: DetailTarget }) {
+/** The detail of one target, whatever it names — drawn in the frame the
+ *  surrounding mode asks for. */
+export function DetailBody({ target }: { target: DetailTarget }) {
   const { index, graph } = useApp();
   const { id, ctx } = target;
 
@@ -1272,14 +1303,31 @@ function HandleDetail({ opId, effectId, location, id }: { opId: Id; effectId: Id
 }
 
 function TransactionDetail({ opId, id }: { opId: Id; id: Id }) {
-  const { model, openDetail, transactionProofs } = useApp();
+  const { model, openDetail, transactionProofs, navigateTo } = useApp();
   const op = model.operations[opId];
   const site = findTransactionSite(op, id);
   if (!site) return <Frame kind="transaction" title={id} subtitle={<span>inline transaction of <IdLink id={opId} /></span>} />;
   const tx = site.transaction;
   const rejected = site.rejected;
   return (
-    <Frame kind="transaction" title={id} subtitle={<span>inline transaction of <IdLink id={opId} /> · step {site.location}</span>}>
+    <Frame
+      kind="transaction"
+      title={
+        <button
+          type="button"
+          className="inline-flex max-w-full cursor-pointer items-center gap-1.5 text-left text-kumo-link hover:underline"
+          title="Open the transaction page"
+          onClick={() => navigateTo(hashes.tx(id))}
+        >
+          <span className="break-all">{id}</span>
+          <ArrowSquareOutIcon size={13} className="shrink-0" />
+        </button>
+      }
+      subtitle={<span>inline transaction of <IdLink id={opId} /> · step {site.location}</span>}
+    >
+      <Button variant="secondary" size="xs" icon={ArrowSquareOutIcon} onClick={() => navigateTo(hashes.tx(id))}>
+        open transaction page
+      </Button>
       <KeyValue rows={[
         ["data model", tx.data_model ? <IdLink key="d" id={tx.data_model} /> : <Muted key="d">none (framework artifacts only)</Muted>],
       ]} />
@@ -1300,11 +1348,11 @@ function TransactionDetail({ opId, id }: { opId: Id; id: Id }) {
         <Section title="requirements" count={tx.requirements.serializability.length + tx.requirements.ordering.length}>
           <p className="text-xs leading-relaxed text-kumo-subtle">
             Obligations over this transaction's committed history, proven from the transactions
-            alone — never from runtime topology.
+            alone — never from runtime topology. The transaction page draws each argument in full.
           </p>
-          {/* Each declaration, then its argument as the checker made it:
-              the closure drawn, the guard drawn, the rest behind a
-              toggle. */}
+          {/* Each declaration, then its argument in summary — the
+              verdict, the route, the headline — and the way to the page
+              that draws it. */}
           {tx.requirements.serializability.map((r, i) => {
             const proof = transactionProofs.proofForRequirement(opId, id, "transaction_serializability", i);
             return (
@@ -1312,7 +1360,7 @@ function TransactionDetail({ opId, id }: { opId: Id; id: Id }) {
                 <FactNote fact={serializabilityRequirement(r.key)}>
                   <span className="text-xs text-kumo-subtle">key <RefText value={r.key} /></span>
                 </FactNote>
-                {proof?.kind === "serializability" && <SerializabilityProof view={proof.view} compact />}
+                {proof && <ProofSummary proof={proof} />}
               </div>
             );
           })}
@@ -1323,7 +1371,7 @@ function TransactionDetail({ opId, id }: { opId: Id; id: Id }) {
                 <FactNote fact={orderingRequirement(r.key, r.position)}>
                   <span className="text-xs text-kumo-subtle">key <RefText value={r.key} /> · position <RefText value={r.position} /></span>
                 </FactNote>
-                {proof?.kind === "ordering" && <OrderingProof view={proof.view} compact />}
+                {proof && <ProofSummary proof={proof} />}
               </div>
             );
           })}
@@ -1417,12 +1465,11 @@ function RequirementDetail({ opId, prop, reqIndex, transaction }: { opId: Id; pr
         description="An obligation over this transaction's committed history, together with every transaction it may conflict with. Proven from the transactions alone — isolation, locks, the version protocol, cursors, fences — and never from runtime topology, so its verdict survives any change of realization.">
         {rows.length > 0 && <KeyValue rows={rows} />}
         {fact && <FactNote fact={fact} />}
-        {/* The argument itself, drawn, before the verdict that records it. */}
+        {/* The argument in summary, before the verdict that records it;
+            the transaction's page draws it in full. */}
         {proof && (
           <Section title={`${family} argument`}>
-            {proof.kind === "serializability"
-              ? <SerializabilityProof view={proof.view} />
-              : <OrderingProof view={proof.view} />}
+            <ProofSummary proof={proof} />
           </Section>
         )}
         {transaction !== undefined && (

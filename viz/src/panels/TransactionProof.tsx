@@ -2,26 +2,39 @@ import { Badge } from "@cloudflare/kumo/components/badge";
 import { Button } from "@cloudflare/kumo/components/button";
 import { Collapsible } from "@cloudflare/kumo/components/collapsible";
 import { Tooltip } from "@cloudflare/kumo/components/tooltip";
-import { CaretDownIcon, CaretRightIcon } from "@phosphor-icons/react";
+import { ArrowSquareOutIcon, CaretDownIcon, CaretRightIcon } from "@phosphor-icons/react";
 import { useEffect, useId, useMemo, useRef, useState, type ReactNode } from "react";
 
 import { ConflictGraph } from "../graph/ConflictGraph";
 import { cursorRule, fence, serializabilityRoute, type Explanation } from "../lib/explain";
 import { shortId } from "../lib/ids";
+import { hashes } from "../lib/route";
+import { routeText, type ObligationProof } from "../lib/transactionProofs";
+import { useApp } from "../state/AppState";
 import type { DependencyKind, DependencyView, OrderingView, PairView, SerializabilityView } from "../types/transactionProofs";
 import { CitedText, FactBadge, FactNote, Mono, Section, StatusBadge } from "./parts";
 
-// The two transaction proofs, drawn. A serializability
-// verdict is an argument over the conflict closure; an ordering verdict
-// is that argument plus one guard step. Everything here is read off the
+// The two transaction proofs, drawn. A serializability verdict is an
+// argument over the conflict closure; an ordering verdict is that
+// argument plus one guard step. Everything here is read off the
 // argument the page data carries — the checker's own — and nothing
 // here consults runtime topology, because no such proof does.
+//
+// The drawing needs room, so it lives on the transaction's page. The
+// inspector and an obligation card show the argument's summary — the
+// verdict, the route, the headline, the counts — and the way to the
+// page.
 
 const KIND_TONE: Record<DependencyKind, "info" | "orange" | "purple"> = {
   wr: "info",
   rw: "orange",
   ww: "purple",
 };
+
+/** How the argument is laid out: a `column` stacks the drawing over the
+ *  dependencies, as a page section does; `wide` sets the dependencies
+ *  beside the drawing when there is room. */
+export type ProofLayout = "column" | "wide";
 
 function Heading({ children }: { children: ReactNode }) {
   return <div className="mb-1 text-[11px] font-semibold uppercase tracking-wider text-kumo-subtle">{children}</div>;
@@ -57,8 +70,79 @@ function Obstacles({ items }: { items: string[] }) {
 function RevealToggle({ open, onToggle }: { open: boolean; onToggle: () => void }) {
   return (
     <Button variant="ghost" size="xs" icon={open ? CaretDownIcon : CaretRightIcon} onClick={onToggle}>
-      {open ? "hide the argument" : "show the argument"}
+      {open ? "hide the dependencies" : "show the dependencies"}
     </Button>
+  );
+}
+
+/** The hash of the page that draws an argument in full. */
+export function proofHash(proof: ObligationProof): string {
+  return hashes.tx(proof.view.transaction, {
+    prop: proof.kind === "serializability" ? "transaction_serializability" : "transaction_ordering",
+    index: proof.view.requirement,
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Summary
+// ---------------------------------------------------------------------------
+
+/**
+ * The argument in a few lines: the verdict and the route, the checker's
+ * headline, the closure's size and how many of its arrows nothing
+ * orders — or the guard and where it stops — and the way to the page
+ * that draws it. What the inspector and an obligation card show, since
+ * a column is no place for the drawing.
+ */
+export function ProofSummary({ proof }: { proof: ObligationProof }) {
+  const { navigateTo, route } = useApp();
+  const hash = proofHash(proof);
+  const onPage = route.view === "tx" && route.id === proof.view.transaction;
+  const { view } = proof;
+  const open = proof.kind === "serializability" ? proof.view.pairs.filter((p) => !p.constrained).length : 0;
+  return (
+    <div className="min-w-0 space-y-2 rounded-md border border-kumo-hairline bg-kumo-elevated/40 p-2.5">
+      <div className="flex flex-wrap items-center gap-1.5">
+        <StatusBadge status={view.proven ? "proven" : "unknown"} />
+        {proof.kind === "serializability" ? (
+          <FactBadge fact={serializabilityRoute(proof.view.route)} />
+        ) : (
+          <Tooltip
+            content={guardFact(proof.view).summary}
+            render={
+              <span className="inline-flex">
+                <Badge variant={proof.view.mechanism ? "info" : "warning"}>{guardLabel(proof.view)}</Badge>
+              </span>
+            }
+          />
+        )}
+      </div>
+      <p className="text-sm leading-relaxed text-kumo-default">
+        <CitedText text={view.headline} />
+      </p>
+      <div className="text-xs text-kumo-subtle">
+        {proof.kind === "serializability" ? (
+          <>
+            closure of {proof.view.nodes.length} · {proof.view.pairs.length} arrow{proof.view.pairs.length === 1 ? "" : "s"}
+            {open > 0 && <> · <span className="text-kumo-warning">{open} unconstrained</span></>}
+            {proof.view.cycles.length > 0 && (
+              <> · cycle through {proof.view.cycles[0].map(shortId).join(" ↔ ")}</>
+            )}
+            {" · "}{routeText(proof.view)}
+          </>
+        ) : (
+          <>
+            {proof.view.mechanism
+              ? <>{proof.view.mechanism.kind === "cursor" ? `advance_cursor · ${proof.view.mechanism.rule ?? "cursor"}` : "fence"} on <Mono>{shortId(proof.view.mechanism.object)}.{proof.view.mechanism.field}</Mono> at step {proof.view.mechanism.step}</>
+              : "no cursor or fence carries the position"}
+            {" · over serializability "}{proof.view.serializability.proven ? "proven" : "unproven"}
+          </>
+        )}
+      </div>
+      <Button variant="secondary" size="xs" icon={ArrowSquareOutIcon} onClick={() => navigateTo(hash)}>
+        {onPage ? "show the argument" : "open the argument"}
+      </Button>
+    </div>
   );
 }
 
@@ -68,11 +152,14 @@ function RevealToggle({ open, onToggle }: { open: boolean; onToggle: () => void 
 
 /**
  * `SerializableBy(key)`, argued: the status and the route, the
- * headline, the closure drawn, and — expanded — the dependencies each
- * arrow stands for and the obstacles when the argument fails. Compact
- * shows the headline and the drawing, with the rest behind a toggle.
+ * headline, the closure drawn, and the dependencies each arrow stands
+ * for with the obstacles when the argument fails. Compact keeps the
+ * dependencies behind a toggle — for a proven argument nested under an
+ * ordering one, whose drawing already says everything.
  */
-export function SerializabilityProof({ view, compact = false }: { view: SerializabilityView; compact?: boolean }) {
+export function SerializabilityProof({
+  view, compact = false, layout = "column",
+}: { view: SerializabilityView; compact?: boolean; layout?: ProofLayout }) {
   const [selected, setSelected] = useState<string | null>(null);
   const [expanded, setExpanded] = useState(!compact);
   const select = (id: string | null) => {
@@ -80,21 +167,22 @@ export function SerializabilityProof({ view, compact = false }: { view: Serializ
     if (id) setExpanded(true);
   };
 
-  return (
-    <div className="space-y-3">
-      <div className="space-y-1.5">
-        <div className="flex flex-wrap items-center gap-1.5">
-          <StatusBadge status={view.proven ? "proven" : "unknown"} />
-          <FactBadge fact={serializabilityRoute(view.route)} />
-          <span className="text-xs text-kumo-inactive">
-            closure of {view.nodes.length} · {view.edges.length} dependenc{view.edges.length === 1 ? "y" : "ies"}
-          </span>
-        </div>
-        <p className="text-sm leading-relaxed text-kumo-default">
-          <CitedText text={view.headline} />
-        </p>
+  const header = (
+    <div className="space-y-1.5">
+      <div className="flex flex-wrap items-center gap-1.5">
+        <StatusBadge status={view.proven ? "proven" : "unknown"} />
+        <FactBadge fact={serializabilityRoute(view.route)} />
+        <span className="text-xs text-kumo-inactive">
+          closure of {view.nodes.length} · {view.edges.length} dependenc{view.edges.length === 1 ? "y" : "ies"}
+        </span>
       </div>
-      <ConflictGraph view={view} selectedPair={selected} onSelectPair={select} />
+      <p className="text-sm leading-relaxed text-kumo-default">
+        <CitedText text={view.headline} />
+      </p>
+    </div>
+  );
+  const rest = (
+    <>
       {compact && <RevealToggle open={expanded} onToggle={() => setExpanded((v) => !v)} />}
       {expanded && (
         <>
@@ -102,6 +190,25 @@ export function SerializabilityProof({ view, compact = false }: { view: Serializ
           {!view.proven && <Obstacles items={view.obstacles} />}
         </>
       )}
+    </>
+  );
+
+  if (layout === "wide") {
+    return (
+      <div className="space-y-3">
+        {header}
+        <div className="grid gap-4 @3xl:grid-cols-[minmax(0,1fr)_minmax(320px,400px)]">
+          <ConflictGraph view={view} selectedPair={selected} onSelectPair={select} wide />
+          <div className="min-w-0 space-y-3">{rest}</div>
+        </div>
+      </div>
+    );
+  }
+  return (
+    <div className="space-y-3">
+      {header}
+      <ConflictGraph view={view} selectedPair={selected} onSelectPair={select} />
+      {rest}
     </div>
   );
 }
@@ -125,7 +232,7 @@ function Dependencies({
       <p className="text-xs leading-relaxed text-kumo-subtle">
         {isolationRoute
           ? "The isolation route does not consult them; shown for reference. Each is a potential dependency between two steps that could close a cycle, with the fact that would commit-order it under the graph route."
-          : "Each is a potential dependency between two steps that could close a cycle, and the declared fact that commit-orders it — or what is missing. An open row is the argument's gap."}
+          : "Each is a potential dependency between two steps that could close a cycle, and the declared fact that commit-orders it — or what is missing. An open row is the argument's gap. Select an arrow in the drawing to open its group."}
       </p>
       {view.pairs.map((pair) => (
         <PairGroup
@@ -156,7 +263,7 @@ function PairGroup({
     <Collapsible.Root open={open} onOpenChange={setOpen}>
       <div
         ref={ref}
-        className={`rounded-md border border-l-2 border-kumo-hairline bg-kumo-elevated/40 ${stripe} ${selected ? "ring-1 ring-kumo-brand" : ""}`}
+        className={`min-w-0 rounded-md border border-l-2 border-kumo-hairline bg-kumo-elevated/40 ${stripe} ${selected ? "ring-1 ring-kumo-brand" : ""}`}
       >
         <Collapsible.Trigger
           className="flex w-full cursor-pointer items-center justify-between gap-2 px-2.5 py-1.5 text-left"
@@ -200,7 +307,7 @@ function DependencyRow({ dep }: { dep: DependencyView }) {
   // fields`; only the single field reads as a member of the object.
   const single = /^[A-Za-z0-9_.]+$/.test(dep.fields);
   return (
-    <li className="rounded bg-kumo-base px-2 py-1.5 text-xs">
+    <li className="min-w-0 rounded bg-kumo-base px-2 py-1.5 text-xs">
       <div className="flex flex-wrap items-center gap-x-1.5 gap-y-1">
         <Tooltip
           content={dep.kind_label}
@@ -215,7 +322,7 @@ function DependencyRow({ dep }: { dep: DependencyView }) {
         <span className="text-kumo-inactive">→</span>
         <Mono className="text-kumo-strong">step {dep.target_step}</Mono>
         <span className="text-kumo-subtle">({dep.target_mode})</span>
-        <Mono className="text-kumo-subtle">
+        <Mono className="break-all text-kumo-subtle">
           {single ? `${shortId(dep.object)}.${dep.fields}` : `${shortId(dep.object)} · ${dep.fields}`}
         </Mono>
         <Badge variant="outline">{dep.overlap}</Badge>
@@ -265,17 +372,21 @@ function guardFact(view: OrderingView): Explanation {
   return { label: "cursor", tone: "info", summary: "An advance_cursor step admits the incoming position after the stored one under its rule." };
 }
 
+function guardLabel(view: OrderingView): string {
+  const m = view.mechanism;
+  return m ? (m.kind === "cursor" ? "cursor" : "fence") : "no guard";
+}
+
 /**
  * `OrderedBy(key, position)`, argued: the guard that carries the
  * position onto a managed field of the keyed object, drawn as a strip,
- * over the serializability argument the ordering presupposes. Compact
- * shows the headline and the strip, with the rest behind a toggle.
+ * over the serializability argument the ordering presupposes — which
+ * keeps its dependencies behind a toggle when it is proven, since its
+ * drawing already says so.
  */
-export function OrderingProof({ view, compact = false }: { view: OrderingView; compact?: boolean }) {
-  const [expanded, setExpanded] = useState(!compact);
+export function OrderingProof({ view, layout = "column" }: { view: OrderingView; layout?: ProofLayout }) {
   const m = view.mechanism;
   const guard = guardFact(view);
-  const routeLabel = m ? (m.kind === "cursor" ? "cursor" : "fence") : "no guard";
 
   return (
     <div className="space-y-3">
@@ -286,7 +397,7 @@ export function OrderingProof({ view, compact = false }: { view: OrderingView; c
             content={guard.summary}
             render={
               <span className="inline-flex">
-                <Badge variant={m ? "info" : "warning"}>{routeLabel}</Badge>
+                <Badge variant={m ? "info" : "warning"}>{guardLabel(view)}</Badge>
               </span>
             }
           />
@@ -296,20 +407,15 @@ export function OrderingProof({ view, compact = false }: { view: OrderingView; c
         </p>
       </div>
       <MechanismStrip view={view} guard={guard} />
-      {compact && <RevealToggle open={expanded} onToggle={() => setExpanded((v) => !v)} />}
-      {expanded && (
-        <>
-          <div className="text-xs leading-relaxed text-kumo-subtle">
-            within each <Mono className="text-kumo-default"><CitedText text={view.key} /></Mono>, committed executions take
-            effect in the order of <Mono className="text-kumo-default"><CitedText text={view.position} /></Mono>
-          </div>
-          <div className="space-y-2 rounded-md border border-kumo-hairline p-2.5">
-            <Heading>rests on serializability over that key</Heading>
-            <SerializabilityProof view={view.serializability} compact={view.serializability.proven} />
-          </div>
-          {!view.proven && <Obstacles items={view.obstacles} />}
-        </>
-      )}
+      <div className="text-xs leading-relaxed text-kumo-subtle">
+        within each <Mono className="text-kumo-default"><CitedText text={view.key} /></Mono>, committed executions take
+        effect in the order of <Mono className="text-kumo-default"><CitedText text={view.position} /></Mono>
+      </div>
+      <div className="space-y-2 rounded-md border border-kumo-hairline p-2.5">
+        <Heading>rests on serializability over that key</Heading>
+        <SerializabilityProof view={view.serializability} compact={view.serializability.proven} layout={layout} />
+      </div>
+      {!view.proven && <Obstacles items={view.obstacles} />}
     </div>
   );
 }

@@ -123,25 +123,39 @@ export function SystemView() {
       return set;
     }
 
-    // L0 selection: a service stands for its operations; light the
-    // one-hop neighbourhood, then its realizations and accessed objects.
-    for (const op of graph.services.find((s) => s.id === selection)?.operations ?? []) set.add(op);
+    // L0 selection: a service stands for its operations. What stays lit
+    // is exactly the one-hop neighbourhood of that seed — its edges and
+    // what they join — read off a fixed seed, never off the growing set:
+    // a neighbour's neighbour, an operation two hops away that shares a
+    // topic or a table with this one, is dimmed.
+    const seed = new Set<string>([selection]);
+    for (const op of graph.services.find((s) => s.id === selection)?.operations ?? []) seed.add(op);
+    for (const id of seed) set.add(id);
     for (const e of graph.edges) {
-      if (e.id === selection || set.has(e.from) || set.has(e.to)) {
+      if (e.id === selection || seed.has(e.from) || seed.has(e.to)) {
         set.add(e.id);
         set.add(e.from);
         set.add(e.to);
       }
     }
+    // A realization vertex stays lit when it belongs to a seeded
+    // operation or sits on a lit edge into one, with its pool and the
+    // approach through it.
     for (const link of runtime.links) {
-      if (set.has(link.operation)) {
+      const onLitEdge = graph.edges.some(
+        (e) => set.has(e.id) && "input" in e && e.to === link.operation && e.input === link.input,
+      );
+      if (seed.has(link.operation) || onLitEdge) {
         set.add(link.id);
         set.add(link.pool);
         pathInto(link.id);
       }
     }
+    // The objects a seeded operation persists to, by its own access
+    // edges — never the other operations that touch the same object;
+    // those light up when the object itself is selected.
     for (const a of plane?.access ?? []) {
-      if (set.has(a.operation)) {
+      if (seed.has(a.operation)) {
         set.add(a.id);
         set.add(a.object);
       }
@@ -227,7 +241,7 @@ export function SystemView() {
       {layout.services.map((box) => {
         const svc = graph.services.find((s) => s.id === box.id);
         return (
-          <g key={box.id} className={`arch-service${isDim(box.id) ? " dimmed" : ""}`} data-sel={sel({ key: box.id, id: box.id })}>
+          <g key={box.id} className={`arch-service${isDim(box.id) ? " dimmed" : ""}`} data-sel={sel({ key: box.id, id: box.id })} data-dbl={hashes.entity("service", box.id)}>
             <rect className="box" x={box.x} y={box.y} width={box.w} height={box.h} rx={10} />
             <text className="label" x={box.x + 12} y={box.y + 20}>
               {truncate(shortId(box.id), 22)}
@@ -297,6 +311,7 @@ export function SystemView() {
                 },
               },
             })}
+            data-dbl={hashes.tx(c.view.transaction, { prop: "transaction_serializability", index: c.view.requirement })}
           >
             <path className={classes.join(" ")} d={c.d} />
             <path className="arch-conflict-hit" d={c.d} />
@@ -333,7 +348,7 @@ export function SystemView() {
             <text className="badge-text" x={p.x + 10} y={p.y + 52}>
               {badges.join("  ")}
             </text>
-            <title>{op.id + (op.description ? `\n${op.description}` : "") + "\n(double-click to open the program)"}</title>
+            <title>{op.id + (op.description ? `\n${op.description}` : "") + "\n(double-click to open the operation page)"}</title>
             <StatusChip x={p.x + p.w - 6} y={p.y} obKey={op.id} />
           </g>
         );
@@ -365,7 +380,7 @@ export function SystemView() {
           ? `${t.grouping === "none" ? "ungrouped" : "keyed groups"} · ${ORDER_TEXT[t.ordering] ?? t.ordering}`
           : "per-subscription transport";
         return (
-          <g key={t.id} className={classes.join(" ")} data-sel={sel({ key: t.id, id: t.id })}>
+          <g key={t.id} className={classes.join(" ")} data-sel={sel({ key: t.id, id: t.id })} data-dbl={hashes.entity("topic", t.id)}>
             <StatusRing x={p.x} y={p.y} w={p.w} h={p.h} rx={24} obKey={t.id} />
             <rect className="body" x={p.x} y={p.y} width={p.w} height={p.h} rx={24} />
             <text className="title" x={p.x + p.w / 2} y={p.y + (drawRuntime ? 21 : 25)} textAnchor="middle">
@@ -394,7 +409,7 @@ export function SystemView() {
         const n = o.messages.length;
         const identity = o.message_identity === "keyed" ? "keyed identity" : "no message identity";
         return (
-          <g key={o.id} className={classes.join(" ")} data-sel={sel({ key: o.id, id: o.id })}>
+          <g key={o.id} className={classes.join(" ")} data-sel={sel({ key: o.id, id: o.id })} data-dbl={hashes.entity("outbox", o.id)}>
             <StatusRing x={p.x} y={p.y} w={p.w} h={p.h} rx={10} obKey={o.id} />
             <rect className="body" x={p.x} y={p.y} width={p.w} height={p.h} rx={10} />
             <text className="title" x={p.x + p.w / 2} y={p.y + 21} textAnchor="middle">
@@ -419,7 +434,7 @@ ${identity}`}</title>
         if (isDim(ext.id)) classes.push("dimmed");
         if (selection === ext.id) classes.push("selected");
         return (
-          <g key={ext.id} className={classes.join(" ")} data-sel={sel({ key: ext.id, id: ext.id })}>
+          <g key={ext.id} className={classes.join(" ")} data-sel={sel({ key: ext.id, id: ext.id })} data-dbl={hashes.external(ext.name)}>
             <rect className="body" x={p.x} y={p.y} width={p.w} height={p.h} rx={6} />
             <text className="title" x={p.x + p.w / 2} y={p.y + 21} textAnchor="middle">
               {truncate(ext.name, 24)}
@@ -438,7 +453,7 @@ ${identity}`}</title>
         if (isDim(graph.client.id)) classes.push("dimmed");
         if (selection === graph.client.id) classes.push("selected");
         return (
-          <g className={classes.join(" ")} data-sel={sel({ key: graph.client.id, id: graph.client.id })}>
+          <g className={classes.join(" ")} data-sel={sel({ key: graph.client.id, id: graph.client.id })} data-dbl={hashes.clients()}>
             <rect className="body" x={p.x} y={p.y} width={p.w} height={p.h} rx={10} />
             <text className="title" x={p.x + p.w / 2} y={p.y + 24} textAnchor="middle">
               clients
@@ -524,7 +539,7 @@ function DataObject({ obj, dimmed, selected }: { obj: DataObjectBox; dimmed: boo
     ? `${obj.object}\npartitioned`
     : `${obj.object}\nno storage layout declared`;
   return (
-    <g className={classes.join(" ")} data-sel={sel({ key: obj.object, id: obj.object })}>
+    <g className={classes.join(" ")} data-sel={sel({ key: obj.object, id: obj.object })} data-dbl={hashes.entity("object", obj.object)}>
       <rect className="body" x={obj.x} y={obj.y} width={obj.w} height={obj.h} rx={8} />
       {obj.partitioned && <rect className="spine" x={obj.x + 5} y={obj.y + 6} width={3} height={obj.h - 12} rx={1.5} />}
       <text className="title" x={obj.x + 16} y={obj.y + 26}>

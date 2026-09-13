@@ -25,6 +25,31 @@ rendering proceeds anyway, so imperfect models can still be inspected
 
 ## Views
 
+**Pages and navigation.** The canvas shows one page at a time and is
+the primary focus: the **system view** by default, else the entity the
+address bar names. Every entity with an identity of its own has a
+page — a service (`#/service/<id>`), an operation (`#/op/<id>`), one
+of its transactions (`#/tx/<id>`), a state machine (`#/machine/<id>`),
+a topic, an outbox, a data model, an object, a schema, the runtime
+realization (`#/runtime`) and each of its declarations, the clients, an
+external system — so a deep link, the browser history, and the
+breadcrumbs agree on where the reader is. The pages hang off one
+topological hierarchy: the system holds services, topics, data models,
+schemas, the runtime, and the boundary the model stops at; a service
+holds its operations; an operation its inline transactions; a data
+model its objects and outboxes; an object the machine that governs it;
+the runtime its pools, routers, and storage layouts. The **navigator**
+on the left is that tree — the page in view marked, its path kept
+open, a filter, and a status dot on every node for the worst verdict
+at or beneath it — and the **breadcrumbs** in the top bar are the path
+down the tree to the page, every step a link back up. An id in prose is
+a link: one with a page opens it in the canvas, the way a link goes
+somewhere; a sub-element with no page of its own — a step, a binding,
+an input, a transition — opens in the **inspector** on the right, which
+is the detail of whatever is selected on the page and survives
+navigation so a link keeps its context. Double-clicking anything on the
+system graph opens its page.
+
 **System view** (`#/system`). Services are drawn as boundary boxes with
 their operations inside; topics, outboxes, external systems, and a
 synthetic "clients" vertex (for request inputs no modeled operation
@@ -56,8 +81,9 @@ step executes; a solid edge's detail names the program steps that
 execute the effect, by location. Effects owned by state-machine
 transitions are attributed to the operations whose transactions bind
 them through transition applications and marked "via transition".
-Click anything for a structured detail panel; double-click an
-operation to drill in. The top bar's filter box dims non-matching
+Click anything for its detail in the inspector; double-click anything
+— an operation, a service, a topic, an object, a conflict arc — to
+open its page. The top bar's filter box dims non-matching
 vertices, and a fit control in the canvas corner re-centres the graph.
 
 *Layout.* The graph is layered left to right along the flow of
@@ -113,8 +139,9 @@ not. A transaction that races a concurrent execution of itself, the
 write-skew shape when nothing orders it, is a small loop beside its
 operation's status chip in the same colours. Hovering an arc names the
 objects and the dependencies it stands for; selecting it opens the
-requiring transaction's serializability requirement with its argument
-drawn (below) and keeps both operations lit. None of this is a
+requiring transaction's serializability requirement in the inspector,
+summarized, and keeps both operations lit; double-clicking it opens the
+transaction's page with the argument drawn in full. None of this is a
 topology fact: the arcs come from the transactions' accesses, and their
 colour from the transactions' declarations alone.
 
@@ -125,8 +152,11 @@ nothing wider: a router or a subscription lights only its own path — the
 caller edges, the vertex, the operation — not the operation's other
 edges; a pool lights every path it runs, which is what a shared pool is;
 an access edge lights just its operation and object. Selecting the
-operation itself still lights its one-hop neighbourhood, its
-realizations, and the objects it writes. Nothing is a parallel graph
+operation itself lights exactly its one-hop neighbourhood — its edges
+and what they join, its own realizations, the objects it writes — and
+never a neighbour's neighbour: an operation two hops away, sharing a
+topic or an object with it, stays dimmed. Selecting an object lights
+every operation that touches it. Nothing is a parallel graph
 joined by on-demand links: the realization sits on the paths and the
 entities it is about.
 
@@ -209,6 +239,23 @@ step that uses it, each location a click away. An obligation's evidence names pa
 decision it points at. Selecting any row or card opens its detail
 panel.
 
+**Transaction page** (`#/tx/<id>`, optionally opened on one requirement
+with `?req=serializability.N` or `?req=ordering.N`). A page header
+(name, copyable id, the operation and program step it belongs to, data
+model, isolation, commit guarantee, whether it can reject, verdict
+tally), then **Requirements** — each declared `SerializableBy` or
+`OrderedBy` with its argument drawn in full, which a column beside the
+canvas never had room for: the conflict closure at page width with the
+dependency groups beside it, the mechanism strip for an ordering, the
+obstacles when it fails; the requirement a link names is ringed and
+scrolled into view — then **Steps** (the body as selectable rows, commit
+guards marked), **Outcomes** (where control goes on commit and on
+rejection, with the way back to the program), and **Obligations** (the
+report's verdicts on the transaction). The page is reached from the
+transaction card and the requirement rows of the operation page, from
+an obligation card's argument summary, from a conflict arc (double
+click), from the nodes of any closure drawing, and from the navigator.
+
 **State machine view** (`#/machine/<id>`). A page header (name,
 copyable id, governed object and state field, initial state, counts,
 verdict tally), the state graph as a section — legal states, initial
@@ -223,7 +270,8 @@ deep link or history navigation selects what the address bar names.
 
 ## Panels
 
-**Detail panel.** Every model entity — service, operation, topic,
+**Inspector.** The detail panel beside the canvas: the detail of
+whatever is selected on the page in view. Every model entity — service, operation, topic,
 schema, data object, state machine, state, transition, input, inline
 effect, read binding, intent binding, transaction-output binding, result binding,
 inline transaction, transaction step, program step, requirement, graph
@@ -247,8 +295,9 @@ change to the topology would put back in question can be read off the
 declaration itself. Topics and inputs carry the same list, being where
 L1 facts attach to L0 entities.
 
-**Top bar.** Model name and revision, breadcrumbs for the current
-page, the id filter on the system view, and — when a report is loaded
+**Top bar.** The navigator toggle, model name and revision,
+breadcrumbs — the path down the model's hierarchy to the current page,
+every step a link — the id filter on the system view, and — when a report is loaded
 — an "Obligations" button carrying the report's tally that opens the
 obligations panel. It names the model, not the tool: the document
 title already reads `<model> · conseqa`, and a host embedding the
@@ -292,11 +341,12 @@ position, the guard's rule (successor, monotonic after, or a fence),
 and the managed field it advances, with the step that carries it — or
 the amber note that no guard carries the position — and then the
 serializability argument over the same key, which an ordered history
-presupposes. The proof appears wherever the verdict does: in the
-obligation card, in a transaction requirement's detail panel, and, in
-compact form, in the transaction's own panel; the requirement rows of
-the operation page summarize it in a phrase (closure size and route,
-or the cursor and its rule).
+presupposes. The argument is drawn in full on the **transaction
+page**, where it has the width it needs; wherever else the verdict
+appears — an obligation card, a requirement's or a transaction's
+inspector detail, the requirement rows of the operation page — it is
+summarized (verdict, route, headline, closure size and open arrows, or
+the guard and its rule) with the way to the page.
 
 **Obligations panel.** The checker's obligations, grouped by the
 operation (or data model, machine, topic) they anchor to, with a
@@ -453,10 +503,15 @@ src/viz/
 viz/
   src/types/   TypeScript mirrors of the model, graph, transaction proofs,
                and report JSON
-  src/lib/     id index, obligation index, routing, text helpers
-  src/state/   app state (selection, detail target, filters, theme)
-  src/graph/   SVG canvas (pan/zoom), layouts, the three views
-  src/panels/  detail panel, obligations panel, shared Kumo parts
-  src/chrome/  top bar
+  src/lib/     id index, obligation index, routing, the page hierarchy
+               (navigation.ts), text helpers
+  src/state/   app state (selection, inspector target, filters, theme)
+  src/graph/   SVG canvas (pan/zoom), layouts, the system, operation,
+               and machine views, the closure drawing
+  src/pages/   the transaction page, the runtime overview, the generic
+               entity page (an inspector detail drawn as a page)
+  src/panels/  the inspector's details, obligations panel, transaction
+               proofs, shared Kumo parts
+  src/chrome/  top bar, navigator
   dist/        committed single-file production bundle
 ```

@@ -31,14 +31,18 @@ import type {
 } from "../types/model";
 import type { Status } from "../types/report";
 
-/** A clickable model id that opens its detail. */
+/** A clickable model id. An entity with a page of its own — a service,
+ *  an operation, a transaction, a topic, an object, an L1 declaration —
+ *  opens in the main canvas, the way a link goes somewhere; a
+ *  sub-element with no page — a step, a binding, an input, a
+ *  transition — opens in the inspector. */
 export function IdLink({ id, children }: { id: string; children?: ReactNode }) {
-  const { openDetail } = useApp();
+  const { openEntity } = useApp();
   return (
     <button
       type="button"
       className="cursor-pointer break-all text-left font-mono text-[12px] text-kumo-link hover:underline"
-      onClick={() => openDetail(id)}
+      onClick={() => openEntity(id)}
     >
       {children ?? id}
     </button>
