@@ -20,7 +20,7 @@ import {
 import { propertyMatchesRequirement } from "../lib/obligations";
 import { accessKeysToPartition, objectAccesses, partitionKeyOf } from "../lib/runtime";
 import { hashes } from "../lib/route";
-import { conditionText } from "../lib/text";
+import { conditionText, predicateText, refString } from "../lib/text";
 import { useApp, useCitations, useObligationsAt, type DetailTarget } from "../state/AppState";
 import { CLIENT_NODE_ID, EXTERNAL_PREFIX, type Edge } from "../types/graph";
 import type { Id, IdempotencyKeyPropagation, OperationBlock, RequirementKind, ResultType } from "../types/model";
@@ -1171,10 +1171,36 @@ function TransactionDetail({ opId, id }: { opId: Id; id: Id }) {
             <span className="text-sm">{s.kind.replace(/_/g, " ")}</span>
             {s.kind === "read" && <Mono className="text-kumo-subtle">{shortId(s.bind)}</Mono>}
             {s.kind === "transition" && <Mono className="text-kumo-subtle">{shortId(s.transition)}</Mono>}
-            {(s.kind === "write" || s.kind === "delete" || s.kind === "lock" || s.kind === "validate_version" || s.kind === "bump_version")
+            {(s.kind === "write" || s.kind === "delete" || s.kind === "lock")
               && <Mono className="text-kumo-subtle">{shortId(s.target.object)}</Mono>}
-            {(s.kind === "advance_cursor" || s.kind === "fence")
-              && <Mono className="text-kumo-subtle">{shortId(s.target.object)}.{pathText(s.field)}</Mono>}
+            {/* A guard's operands are the whole story of the step: which
+                instance it selects, and what it compares against — the
+                version an earlier read of this transaction observed, the
+                incoming position, the token. Naming only the object left
+                readers guessing where a version comes from. */}
+            {s.kind === "validate_version" && (
+              <span className="text-xs text-kumo-subtle">
+                <Mono>{shortId(s.target.object)}</Mono> where {predicateText(s.target.predicate)} still has
+                version <Mono>{refString(s.expected)}</Mono> at commit
+              </span>
+            )}
+            {s.kind === "bump_version" && (
+              <span className="text-xs text-kumo-subtle">
+                <Mono>{shortId(s.target.object)}</Mono> where {predicateText(s.target.predicate)} · version + 1
+              </span>
+            )}
+            {s.kind === "advance_cursor" && (
+              <span className="text-xs text-kumo-subtle">
+                <Mono>{shortId(s.target.object)}.{pathText(s.field)}</Mono> where {predicateText(s.target.predicate)} ←{" "}
+                <Mono>{refString(s.incoming)}</Mono> · {s.rule.replace(/_/g, " ")}
+              </span>
+            )}
+            {s.kind === "fence" && (
+              <span className="text-xs text-kumo-subtle">
+                <Mono>{shortId(s.target.object)}.{pathText(s.field)}</Mono> where {predicateText(s.target.predicate)} · token{" "}
+                <Mono>{refString(s.token)}</Mono>
+              </span>
+            )}
             {s.kind === "insert" && <Mono className="text-kumo-subtle">{shortId(s.object)}</Mono>}
             {s.kind === "establish_transaction_output" && <Mono className="text-kumo-subtle">{shortId(s.bind)}</Mono>}
             {s.kind === "establish_effect_intent" && <Mono className="text-kumo-subtle">{shortId(s.bind)}</Mono>}
