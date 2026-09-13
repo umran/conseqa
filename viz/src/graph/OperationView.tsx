@@ -25,6 +25,7 @@ import {
   subscriptionRouting,
   transactionRejection,
 } from "../lib/explain";
+import { proofSummary } from "../lib/consistency";
 import { pathText, shortId } from "../lib/ids";
 import {
   effectDef, effectSummary, errArm, locationLabel, operationTransactions, stepRejects, walkProgram,
@@ -654,8 +655,16 @@ function ProgramBlock({ opId, op, block, hops, nested }: { opId: Id; op: Operati
  *  transaction row's verdicts are the obligations anchored to that
  *  transaction and its requirement index. */
 function RequirementsTable({ id, op }: { id: Id; op: Operation }) {
-  const { obligations, selection, select } = useApp();
+  const { obligations, selection, select, consistency } = useApp();
   const reqs = op.requirements;
+
+  // A transaction row ends with what its argument rests on — the
+  // closure and the route, or the guard — so the shape of the proof is
+  // readable before the row is opened.
+  const argument = (tx: Id, prop: RequirementKind, i: number): ReactNode => {
+    const proof = consistency.proofForRequirement(id, tx, prop, i);
+    return proof ? <span className="text-xs text-kumo-inactive">{proofSummary(proof)}</span> : null;
+  };
 
   const rows: { prop: RequirementKind; i: number; tx?: Id; label: string; declares: ReactNode }[] = [];
   for (const tx of operationTransactions(op)) {
@@ -669,6 +678,7 @@ function RequirementsTable({ id, op }: { id: Id; op: Operation }) {
           <>
             <span className="text-xs text-kumo-subtle">key</span>
             <RefText value={r.key} />
+            {argument(tx.id, "transaction_serializability", i)}
           </>
         ),
       }));
@@ -684,6 +694,7 @@ function RequirementsTable({ id, op }: { id: Id; op: Operation }) {
             <RefText value={r.key} />
             <span className="text-xs text-kumo-subtle">position</span>
             <RefText value={r.position} />
+            {argument(tx.id, "transaction_ordering", i)}
           </>
         ),
       }));

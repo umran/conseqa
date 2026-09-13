@@ -412,7 +412,7 @@ impl TransactionSerializabilityObstacle {
 }
 
 /// A transaction chain as a sentence names it: `a → b → a`.
-pub(crate) fn chain(members: &[TransactionRef]) -> String {
+pub fn chain(members: &[TransactionRef]) -> String {
     let mut labels: Vec<String> = members
         .iter()
         .map(|member| format!("`{}`", member.transaction))
@@ -426,7 +426,7 @@ pub(crate) fn chain(members: &[TransactionRef]) -> String {
 }
 
 /// The gaps of an unconstrained dependency, as sentences.
-pub(crate) fn gap_sentences(gaps: &[DependencyGap]) -> String {
+pub fn gap_sentences(gaps: &[DependencyGap]) -> String {
     if gaps.is_empty() {
         return String::new();
     }
@@ -502,7 +502,7 @@ fn gap_sentence(gap: &DependencyGap) -> String {
 }
 
 /// The evidence constraining one dependency, as a sentence.
-pub(crate) fn evidence_sentence(dependency: &DependencyEvidence) -> String {
+pub fn evidence_sentence(dependency: &DependencyEvidence) -> String {
     let edge = format!(
         "the {} from `{}` (step {}) to `{}` (step {}) on `{}`",
         dependency.kind,

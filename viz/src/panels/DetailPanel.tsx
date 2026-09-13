@@ -24,6 +24,7 @@ import { conditionText } from "../lib/text";
 import { useApp, useCitations, useObligationsAt, type DetailTarget } from "../state/AppState";
 import { CLIENT_NODE_ID, EXTERNAL_PREFIX, type Edge } from "../types/graph";
 import type { Id, IdempotencyKeyPropagation, OperationBlock, RequirementKind, ResultType } from "../types/model";
+import { OrderingProof, SerializabilityProof } from "./ConsistencyProof";
 import { ObligationCard } from "./ObligationCard";
 import {
   DerivationView, FactNote, IdLink, KeyComponents, KeyValue, List, Mono, Muted, NavLink,
@@ -1105,7 +1106,7 @@ function HandleDetail({ opId, effectId, location, id }: { opId: Id; effectId: Id
 }
 
 function TransactionDetail({ opId, id }: { opId: Id; id: Id }) {
-  const { model, openDetail } = useApp();
+  const { model, openDetail, consistency } = useApp();
   const op = model.operations[opId];
   const site = findTransactionSite(op, id);
   if (!site) return <Frame kind="transaction" title={id} subtitle={<span>inline transaction of <IdLink id={opId} /></span>} />;
@@ -1135,16 +1136,31 @@ function TransactionDetail({ opId, id }: { opId: Id; id: Id }) {
             Obligations over this transaction's committed history, proven from the transactions
             alone — never from runtime topology.
           </p>
-          {tx.requirements.serializability.map((r, i) => (
-            <FactNote key={`s${i}`} fact={serializabilityRequirement(r.key)}>
-              <span className="text-xs text-kumo-subtle">key <RefText value={r.key} /></span>
-            </FactNote>
-          ))}
-          {tx.requirements.ordering.map((r, i) => (
-            <FactNote key={`o${i}`} fact={orderingRequirement(r.key, r.position)}>
-              <span className="text-xs text-kumo-subtle">key <RefText value={r.key} /> · position <RefText value={r.position} /></span>
-            </FactNote>
-          ))}
+          {/* Each declaration, then its argument as the checker made it:
+              the closure drawn, the guard drawn, the rest behind a
+              toggle. */}
+          {tx.requirements.serializability.map((r, i) => {
+            const proof = consistency.proofForRequirement(opId, id, "transaction_serializability", i);
+            return (
+              <div key={`s${i}`} className="space-y-2">
+                <FactNote fact={serializabilityRequirement(r.key)}>
+                  <span className="text-xs text-kumo-subtle">key <RefText value={r.key} /></span>
+                </FactNote>
+                {proof?.kind === "serializability" && <SerializabilityProof view={proof.view} compact />}
+              </div>
+            );
+          })}
+          {tx.requirements.ordering.map((r, i) => {
+            const proof = consistency.proofForRequirement(opId, id, "transaction_ordering", i);
+            return (
+              <div key={`o${i}`} className="space-y-2">
+                <FactNote fact={orderingRequirement(r.key, r.position)}>
+                  <span className="text-xs text-kumo-subtle">key <RefText value={r.key} /> · position <RefText value={r.position} /></span>
+                </FactNote>
+                {proof?.kind === "ordering" && <OrderingProof view={proof.view} compact />}
+              </div>
+            );
+          })}
         </Section>
       )}
       <Section title="steps" count={tx.steps.length}>
@@ -1177,11 +1193,12 @@ function TransactionDetail({ opId, id }: { opId: Id; id: Id }) {
  *  an operation family by the operation and its index. The verdicts are
  *  the obligations anchored to exactly that declaration. */
 function RequirementDetail({ opId, prop, reqIndex, transaction }: { opId: Id; prop: RequirementKind; reqIndex: number; transaction?: Id }) {
-  const { model } = useApp();
+  const { model, consistency } = useApp();
   const op = model.operations[opId];
 
   if (prop === "transaction_serializability" || prop === "transaction_ordering") {
     const family = prop === "transaction_serializability" ? "serializability" : "ordering";
+    const proof = transaction !== undefined ? consistency.proofForRequirement(opId, transaction, prop, reqIndex) : null;
     const sub = (
       <span>
         declared on transaction {transaction !== undefined ? <IdLink id={transaction} /> : "?"} of <IdLink id={opId} />
@@ -1208,6 +1225,14 @@ function RequirementDetail({ opId, prop, reqIndex, transaction }: { opId: Id; pr
         description="An obligation over this transaction's committed history, together with every transaction it may conflict with. Proven from the transactions alone — isolation, locks, the version protocol, cursors, fences — and never from runtime topology, so its verdict survives any change of realization.">
         {rows.length > 0 && <KeyValue rows={rows} />}
         {fact && <FactNote fact={fact} />}
+        {/* The argument itself, drawn, before the verdict that records it. */}
+        {proof && (
+          <Section title={`${family} argument`}>
+            {proof.kind === "serializability"
+              ? <SerializabilityProof view={proof.view} />
+              : <OrderingProof view={proof.view} />}
+          </Section>
+        )}
         {transaction !== undefined && (
           <Obligations
             obKey={`${opId}/${transaction}`}

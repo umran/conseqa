@@ -22,6 +22,7 @@ import type {
   Topic,
   ValueRef,
 } from "../types/model";
+import type { SerializabilityRoute } from "../types/consistency";
 import { pathText } from "./ids";
 import { refString } from "./text";
 
@@ -384,6 +385,45 @@ export function orderingRequirement(key: ValueRef, position: ValueRef): Explanat
       "on a managed field of the keyed object, whose incoming value is the position. Transport " +
       "precedence is never a route.",
   };
+}
+
+/** The route a serializability argument took — or that neither route
+ *  closes. A property of the argument, not of the verdict: the status
+ *  badge beside it says whether the argument holds. */
+export function serializabilityRoute(route: SerializabilityRoute | null): Explanation {
+  switch (route) {
+    case "serializable_isolation":
+      return {
+        label: "serializable isolation",
+        tone: "info",
+        summary:
+          "Every transaction of the conflict closure declares serializable isolation, so the " +
+          "database itself orders their committed executions and no per-dependency evidence is " +
+          "consulted. The route needs the whole closure: a serializable transaction is " +
+          "serializable only with respect to other serializable ones.",
+      };
+    case "conflict_graph":
+      return {
+        label: "serialization graph",
+        tone: "info",
+        summary:
+          "Every potential dependency among the closure's members that could close a cycle — " +
+          "write→read, read→write anti-dependency, write→write — is commit-ordered by a declared " +
+          "fact: a strict lock, a version validation against a bumped version, an ordered cursor, " +
+          "atomic write order, or a committed read. With no cycle left unconstrained, every " +
+          "committed history is equivalent to a serial one. Runtime topology is never a route.",
+      };
+    case null:
+      return {
+        label: "no route",
+        tone: "warning",
+        summary:
+          "Neither route closes: the closure is not uniformly serializable, and its serialization " +
+          "graph keeps a strongly connected component with a dependency no declared fact " +
+          "commit-orders, so a non-serializable committed history cannot be excluded. Runtime " +
+          "topology is never a route.",
+      };
+  }
 }
 
 /** How an `advance_cursor` step admits an incoming position. */

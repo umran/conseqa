@@ -1,3 +1,4 @@
+import type { ConsistencyView } from "./consistency";
 import type { Graph } from "./graph";
 import type { Model } from "./model";
 import type { ProverReport } from "./report";
@@ -8,6 +9,8 @@ export interface PageData {
   title: string;
   model: Model;
   graph: Graph;
+  /** The transaction consistency arguments, drawn from the model. */
+  consistency: ConsistencyView;
   report: ProverReport | null;
 }
 

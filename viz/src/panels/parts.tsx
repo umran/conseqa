@@ -73,11 +73,21 @@ export function NavLink({ hash, selection, children }: { hash: string; selection
   );
 }
 
-/** A titled, collapsible block of the panel. */
+/** A titled, collapsible block of the panel. Uncontrolled by default;
+ *  a parent that must open it on the reader's behalf — a selection made
+ *  in a drawing that lands inside it — passes `open` and `onOpenChange`. */
 export function Section({
-  title, count, children, defaultOpen = true,
-}: { title: string; count?: number; children: ReactNode; defaultOpen?: boolean }) {
-  const [open, setOpen] = useState(defaultOpen);
+  title, count, children, defaultOpen = true, open: controlled, onOpenChange,
+}: {
+  title: string; count?: number; children: ReactNode; defaultOpen?: boolean;
+  open?: boolean; onOpenChange?: (open: boolean) => void;
+}) {
+  const [own, setOwn] = useState(defaultOpen);
+  const open = controlled ?? own;
+  const setOpen = (next: boolean) => {
+    if (controlled === undefined) setOwn(next);
+    onOpenChange?.(next);
+  };
   return (
     <Collapsible.Root open={open} onOpenChange={setOpen} className="border-t border-kumo-hairline pt-2">
       <Collapsible.DefaultTrigger className="w-full text-xs font-semibold uppercase tracking-wider text-kumo-subtle">

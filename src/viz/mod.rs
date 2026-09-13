@@ -6,6 +6,7 @@
 //! wrappers (§4 of the confluence spec). The obligation-report format
 //! the overlay consumes is the analyzer's own (`analyzer::report`).
 
+pub mod consistency;
 pub mod graph;
 pub mod render;
 

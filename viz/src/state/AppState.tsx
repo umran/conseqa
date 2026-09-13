@@ -10,6 +10,7 @@ import {
 } from "react";
 
 import { citedIds } from "../lib/citations";
+import { consistencyViews, type ConsistencyViews } from "../lib/consistency";
 import { buildIndex, type ModelIndex } from "../lib/index";
 import { buildObligationIndex, reportRejection, type ObligationIndex } from "../lib/obligations";
 import { runtimeFacts, type RuntimeFacts } from "../lib/runtime";
@@ -67,6 +68,9 @@ interface AppState {
   citations: ObligationIndex;
   /** The declared L1 realization, as the views draw it. */
   runtime: RuntimeFacts;
+  /** The transaction consistency arguments, indexed by the obligation
+   *  and the requirement they belong to. */
+  consistency: ConsistencyViews;
   route: Route;
 
   selection: string | null;
@@ -78,6 +82,11 @@ interface AppState {
    *  application machine is the model, and the realization is a layer
    *  over it. */
   showRuntime: boolean;
+  /** Whether the system view draws the transaction conflict overlay:
+   *  an arc between two operations whose transactions may conflict,
+   *  coloured by whether every dependency between them is commit-ordered
+   *  by a declared fact. An L0 reading of the model — never topology. */
+  showConsistency: boolean;
   theme: Theme;
   /** False when a host owns the colour mode, so the app offers no
    *  control of its own. */
@@ -92,6 +101,7 @@ interface AppState {
   setSearch: (value: string) => void;
   setObligationsOpen: (value: boolean) => void;
   setShowRuntime: (value: boolean) => void;
+  setShowConsistency: (value: boolean) => void;
   setTheme: (value: Theme) => void;
   requestFit: () => void;
   /** Navigates to a view, applying a selection once it has rendered. */
@@ -134,6 +144,7 @@ export function AppStateProvider({ data, theme: hostTheme, children }: AppStateP
 
   const index = useMemo(() => buildIndex(data.model), [data.model]);
   const runtime = useMemo(() => runtimeFacts(data.model, data.graph), [data.model, data.graph]);
+  const consistency = useMemo(() => consistencyViews(data), [data]);
 
   // A report this build cannot read is dropped here, once, rather than
   // being half-rendered: the panel would list verdicts the graph could
@@ -167,6 +178,9 @@ export function AppStateProvider({ data, theme: hostTheme, children }: AppStateP
   // Drawn by default wherever there is anything to draw: the hierarchy is
   // the model, and a layer hidden until asked for reads as an extra.
   const [showRuntime, setShowRuntimeState] = useState(runtime.declared);
+  // On by default for the same reason: a declared argument is part of
+  // what the model says, and the overlay is how the system view says it.
+  const [showConsistency, setShowConsistencyState] = useState(true);
   const [ownTheme, setOwnTheme] = useState<Theme>(initialTheme);
   const [fitRequest, setFitRequest] = useState(0);
 
@@ -249,6 +263,13 @@ export function AppStateProvider({ data, theme: hostTheme, children }: AppStateP
     setFitRequest((n) => n + 1);
   }, []);
 
+  // The overlay's arcs rise above the cards, so the drawing's extent
+  // changes with it and the view is re-fitted the same way.
+  const setShowConsistency = useCallback((value: boolean) => {
+    setShowConsistencyState(value);
+    setFitRequest((n) => n + 1);
+  }, []);
+
   const navigateTo = useCallback((hash: string, nextSelection?: string) => {
     if (window.location.hash === hash) {
       // Already there: no route change will apply the selection for us.
@@ -308,6 +329,7 @@ export function AppStateProvider({ data, theme: hostTheme, children }: AppStateP
       obligations,
       citations,
       runtime,
+      consistency,
       route,
       selection,
       detail,
@@ -315,6 +337,7 @@ export function AppStateProvider({ data, theme: hostTheme, children }: AppStateP
       search,
       obligationsOpen,
       showRuntime,
+      showConsistency,
       theme,
       themeControllable,
       fitRequest,
@@ -325,16 +348,17 @@ export function AppStateProvider({ data, theme: hostTheme, children }: AppStateP
       setSearch,
       setObligationsOpen,
       setShowRuntime,
+      setShowConsistency,
       setTheme,
       requestFit,
       navigateTo,
       focusSubject,
     }),
     [
-      data, report, reportIssue, index, knownIds, obligations, citations, runtime, route,
-      selection, detail, expandedTx, search, obligationsOpen, showRuntime, theme,
+      data, report, reportIssue, index, knownIds, obligations, citations, runtime, consistency, route,
+      selection, detail, expandedTx, search, obligationsOpen, showRuntime, showConsistency, theme,
       themeControllable, fitRequest, select, openDetail, closeDetail, toggleTx,
-      setTheme, setShowRuntime, requestFit, navigateTo, focusSubject,
+      setTheme, setShowRuntime, setShowConsistency, requestFit, navigateTo, focusSubject,
     ],
   );
 

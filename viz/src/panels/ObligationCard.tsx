@@ -9,6 +9,7 @@ import { shortId } from "../lib/ids";
 import { subjectText } from "../lib/obligations";
 import { useApp } from "../state/AppState";
 import { propertyName, type Obligation } from "../types/report";
+import { OrderingProof, SerializabilityProof } from "./ConsistencyProof";
 import { CitedText, IdLink, StatusBadge } from "./parts";
 
 /** The layer note a verdict carries.
@@ -65,9 +66,13 @@ const STRIPE: Record<Obligation["status"], string> = {
 };
 
 export function ObligationCard({ ob, defaultOpen = false }: { ob: Obligation; defaultOpen?: boolean }) {
-  const { focusSubject } = useApp();
+  const { focusSubject, consistency } = useApp();
   const [open, setOpen] = useState(defaultOpen);
-  const hasDetail = ob.assumptions.length > 0 || ob.evidence.length > 0 || !!ob.counterexample;
+  // A transaction-family verdict carries its argument as a structure —
+  // the conflict closure, the dependencies, the guard — drawn before
+  // the prose that records the same facts.
+  const proof = consistency.proofForObligation(ob);
+  const hasDetail = ob.assumptions.length > 0 || ob.evidence.length > 0 || !!ob.counterexample || !!proof;
   const layer = layerNote(ob);
 
   return (
@@ -98,6 +103,14 @@ export function ObligationCard({ ob, defaultOpen = false }: { ob: Obligation; de
         </Collapsible.Trigger>
         <Collapsible.Panel>
           <div className="space-y-3 border-t border-kumo-hairline px-3 py-2.5">
+            {proof && (
+              <div>
+                <div className="mb-1.5 text-[11px] font-semibold uppercase tracking-wider text-kumo-subtle">why</div>
+                {proof.kind === "serializability"
+                  ? <SerializabilityProof view={proof.view} />
+                  : <OrderingProof view={proof.view} />}
+              </div>
+            )}
             {ob.assumptions.length > 0 && (
               <div>
                 <div className="mb-1 text-[11px] font-semibold uppercase tracking-wider text-kumo-subtle">

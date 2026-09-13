@@ -4,6 +4,7 @@ import { shortId, truncate } from "../lib/ids";
 import { hashes } from "../lib/route";
 import { useApp } from "../state/AppState";
 import type { Edge } from "../types/graph";
+import { layoutConflicts } from "./layoutConflicts";
 import { layoutSystem, type DataObjectBox, type RealizationBox } from "./layoutSystem";
 import { LegendChip, LegendLine, SvgCanvas, sel } from "./SvgCanvas";
 import { StatusChip, StatusRing } from "./status";
@@ -31,13 +32,21 @@ function edgeShortLabel(e: Edge): string {
 }
 
 export function SystemView() {
-  const { graph, report, selection, search, runtime, showRuntime } = useApp();
+  const { graph, report, selection, search, runtime, showRuntime, consistency, showConsistency } = useApp();
   const drawRuntime = showRuntime && runtime.declared;
   const layout = useMemo(
     () => layoutSystem(graph, { runtime: drawRuntime ? runtime : null }),
     [graph, runtime, drawRuntime],
   );
   const plane = layout.runtime;
+
+  // The conflict overlay: contention between operations, read off the
+  // serializability arguments. Nothing about it is topology.
+  const drawConsistency = showConsistency && consistency.serializability.length > 0;
+  const conflicts = useMemo(
+    () => (drawConsistency ? layoutConflicts(consistency.serializability, layout.pos) : []),
+    [drawConsistency, consistency, layout],
+  );
 
   const q = search.trim().toLowerCase();
   const matches = (id: string) =>
@@ -65,6 +74,15 @@ export function SystemView() {
         }
       }
     };
+
+    // Conflict arc: the two operations whose transactions contend, and
+    // nothing more — the contention is between exactly those two.
+    const arc = conflicts.find((c) => c.key === selection);
+    if (arc) {
+      set.add(arc.a);
+      set.add(arc.b);
+      return set;
+    }
 
     // Router / subscription vertex: only its own path.
     const vertex = runtime.links.find((l) => l.id === selection);
@@ -128,8 +146,12 @@ export function SystemView() {
         set.add(a.object);
       }
     }
+    // An operation's own conflicts stay lit; a neighbour's do not.
+    for (const c of conflicts) {
+      if (c.a === selection || c.b === selection) set.add(c.key);
+    }
     return set;
-  }, [graph, runtime, plane, selection]);
+  }, [graph, runtime, plane, selection, conflicts]);
 
   const isDim = (key: string) => (q && !matches(key)) || (!!selection && !related.has(key));
 
@@ -157,6 +179,12 @@ export function SystemView() {
           <LegendChip color="var(--arch-l1)" label="L1 realization" />
           <LegendLine color="var(--arch-l1)" label="access, partition-keyed" />
           <LegendLine color="var(--arch-l1)" label="access, not keyed" dashed />
+        </>
+      )}
+      {drawConsistency && (
+        <>
+          <LegendLine color="var(--arch-proven)" label="conflict, commit-ordered" />
+          <LegendLine color="var(--arch-unknown)" label="conflict, unconstrained" dashed />
         </>
       )}
       {report && (
@@ -236,6 +264,43 @@ export function SystemView() {
                 {edgeShortLabel(e)}
               </text>
             )}
+          </g>
+        );
+      })}
+
+      {/* Conflict arcs above the service boxes and the edges, behind the
+          cards they join: contention is a fact about the pair, and the
+          cards stay in front of it. A loop marks an operation whose
+          transaction may conflict with a concurrent execution of
+          itself. */}
+      {conflicts.map((c) => {
+        const dimmed = selection ? !related.has(c.key) : q ? !(matches(c.a) || matches(c.b)) : false;
+        const classes = ["arch-conflict", c.constrained ? "proven" : "open"];
+        if (dimmed) classes.push("dimmed");
+        if (selection === c.key) classes.push("selected");
+        const title =
+          (c.loop ? `${shortId(c.a)} ↔ a concurrent execution of itself` : `${shortId(c.a)} ↔ ${shortId(c.b)}`) +
+          `\nobjects: ${c.objects.map(shortId).join(", ")}\n` +
+          (c.constrained ? "every dependency commit-ordered by a declared fact" : "a dependency no declared fact commit-orders") +
+          `\n${c.summaries.join("\n")}`;
+        return (
+          <g
+            key={c.key}
+            data-sel={sel({
+              key: c.key,
+              id: c.view.operation,
+              ctx: {
+                req: {
+                  prop: "transaction_serializability",
+                  index: c.view.requirement,
+                  transaction: c.view.transaction,
+                },
+              },
+            })}
+          >
+            <path className={classes.join(" ")} d={c.d} />
+            <path className="arch-conflict-hit" d={c.d} />
+            <title>{title}</title>
           </g>
         );
       })}

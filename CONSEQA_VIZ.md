@@ -101,8 +101,25 @@ L1 fact is a fact about some L0 thing:
 - A **topic** carries its transport facts (grouping, ordering) on its
   own node, since topic-scoped transport is a fact about the topic.
 
-The switch is disabled for a model that declares no L1 facts, and with
-L1 off none of the above appears — those are facts of the layer that
+A second switch, **consistency**, offered whenever a transaction
+declares a serializability requirement, draws the **conflict arcs**:
+one arc between every two operations whose transactions may conflict
+on a persistent object — bowed over the plane between columns, nested
+brackets beside the cards of one column — and undirected, since
+contention is mutual. The arc is green when every dependency it stands
+for is commit-ordered by a declared fact — a strict lock, the version
+protocol, an ordered cursor — and amber, dashed, when at least one is
+not. A transaction that races a concurrent execution of itself, the
+write-skew shape when nothing orders it, is a small loop beside its
+operation's status chip in the same colours. Hovering an arc names the
+objects and the dependencies it stands for; selecting it opens the
+requiring transaction's serializability requirement with its argument
+drawn (below) and keeps both operations lit. None of this is a
+topology fact: the arcs come from the transactions' accesses, and their
+colour from the transactions' declarations alone.
+
+The L1 switch is disabled for a model that declares no L1 facts, and with
+L1 off none of the realization appears — those are facts of the layer that
 declares them. Selection follows what a thing is a fact *about*, and
 nothing wider: a router or a subscription lights only its own path — the
 caller edges, the vertex, the operation — not the operation's other
@@ -211,6 +228,38 @@ crowded one.
 single obligation — today, a subscription that admits duplicate
 deliveries while its operation declares no idempotency requirement
 keyed from it — appear at the top of the obligations panel.
+
+**Consistency proofs.** A transaction serializability or ordering
+verdict is not paraphrased but drawn. The requiring transaction's
+**conflict closure** — every transaction of the model that may read or
+write what it writes, transitively — is a small graph: one node per
+transaction (its operation and isolation beneath it, the requiring one
+marked), and one arrow per ordered pair of transactions, standing for
+every potential serialization dependency between them (`wr`, `rw`,
+`ww`, on the objects and fields they meet on). A green arrow's
+dependencies are all commit-ordered by a declared fact; an amber,
+dashed one carries at least one that nothing orders, and the
+transactions of an unconstrained cycle are haloed — that cycle is the
+history the checker could not exclude. A loop on a node is the
+transaction against its own concurrent execution. The route is badged:
+*serializable isolation* when every closure member declares it and the
+database orders the closure itself, *serialization graph* when the
+arrows carry the argument. Beneath the drawing, each arrow expands to
+its dependencies — step to step, access modes, object and fields,
+overlap — each with its evidence pill (strict lock, version
+validation, ordered cursor, atomic write order, committed read) or its
+gap pills (no lock on the reader, no version validation, overlap not
+proven disjoint, …) and the checker's sentence, ids linked. An
+ordering verdict adds the **mechanism strip** above that argument: the
+position, the guard's rule (successor, monotonic after, or a fence),
+and the managed field it advances, with the step that carries it — or
+the amber note that no guard carries the position — and then the
+serializability argument over the same key, which an ordered history
+presupposes. The proof appears wherever the verdict does: in the
+obligation card, in a transaction requirement's detail panel, and, in
+compact form, in the transaction's own panel; the requirement rows of
+the operation page summarize it in a phrase (closure size and route,
+or the cursor and its rule).
 
 **Obligations panel.** The checker's obligations, grouped by the
 operation (or data model, machine, topic) they anchor to, with a
@@ -323,7 +372,8 @@ npm run build   # typecheck + single-file bundle → dist/index.html
 The production build is one `dist/index.html` with every script and
 stylesheet inlined (`vite-plugin-singlefile`). `conseqa::viz::render`
 embeds that file at compile time (`include_str!`) and injects the page
-data — title, model, derived graph, report — as `window.CONSEQA`, so
+data — title, model, derived graph, the consistency arguments, report —
+as `window.CONSEQA`, so
 `cargo` needs no Node toolchain. During development the app fetches
 `public/conseqa.json` instead; regenerate it with `npm run data`, or
 directly with `conseqa-viz <model> --verify --json --out <path>`.
@@ -349,14 +399,23 @@ binary reaches it only on its next start.
 ```
 src/bin/viz/
   main.rs      CLI: parse, validate, verify or load a report, render
+
+src/viz/
   graph.rs     Model → system graph (vertices, edges, indexes);
                resolves intents, transition ownership, message
                selectors so the front end never re-implements them
-  report.rs    re-export of conseqa::analyzer::report
+  consistency.rs
+               Model → the transaction consistency arguments: per
+               declared requirement, the conflict closure, every
+               dependency with its commit-order evidence or gaps,
+               the arrows they group into, the unconstrained cycles,
+               and the ordering guard — joined to the report by
+               obligation id, so the front end draws the proof
   render.rs    embeds viz/dist/index.html and injects the page data
 
 viz/
-  src/types/   TypeScript mirrors of the model, graph, and report JSON
+  src/types/   TypeScript mirrors of the model, graph, consistency,
+               and report JSON
   src/lib/     id index, obligation index, routing, text helpers
   src/state/   app state (selection, detail target, filters, theme)
   src/graph/   SVG canvas (pan/zoom), layouts, the three views
