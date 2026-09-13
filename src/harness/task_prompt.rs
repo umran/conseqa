@@ -122,7 +122,11 @@ the coordinator's. A transaction that applies a transition, validates \
 a version, advances a cursor, or fences can reject at commit and must \
 carry a `rejected` block saying what control does then; one that \
 cannot reject must not. A write or transition of a versioned object \
-must be accompanied by a `bump_version` of the same instance, and a \
+must be accompanied by a `bump_version` of the same instance (the \
+unconditional increment that publishes the change), and a transaction \
+that relies on what it read of a versioned instance declares a \
+`validate_version` naming that read (the commit-time equality check \
+that rejects a stale observation) — neither implies the other. A \
 `match_result` needs one arm per error class of the matched result's \
 contract. An operation declares no concurrency of its own: \
 where its invocations execute and how many run at once are facts about \

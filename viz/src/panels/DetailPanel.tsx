@@ -1379,7 +1379,7 @@ function TxStepDetail({ opId, txId, stepIndex }: { opId: Id; txId: Id; stepIndex
       const version = findDataObject(model, step.target.object)?.object.version;
       return (
         <Frame kind="transaction step" title={`validate version · ${shortId(step.target.object)}`} subtitle={sub}
-          description="The optimistic-concurrency commit guard: the transaction commits only if the selected instance's version at commit arbitration still equals the version an earlier read observed. A mismatch rejects the transaction — nothing commits, and control enters the step's rejected block — so a stale observation never participates in a successful commit. That is what makes it serializability evidence.">
+          description="The observation guard of the version protocol. At commit the transaction proceeds only if the selected instance's version still equals the version an earlier read of this transaction observed; any change rejects it — nothing commits, and control enters the rejected block. The guard compares and never increments, holds no lock across the read-to-commit window, and is evaluated at commit wherever it sits in the step list. It is never required by validation: it is declared where the transaction relies on what it read, and a serializability proof over a read-then-write needs it on the reader's side together with the writer's bump_version — without the bump there is nothing for the guard to detect.">
           <KeyValue rows={[
             ["object", <IdLink key="o" id={step.target.object} />],
             ["predicate", <PredicateView key="p" predicate={step.target.predicate} />],
@@ -1393,7 +1393,7 @@ function TxStepDetail({ opId, txId, stepIndex }: { opId: Id; txId: Id; stepIndex
       const version = findDataObject(model, step.target.object)?.object.version;
       return (
         <Frame kind="transaction step" title={`bump version · ${shortId(step.target.object)}`} subtitle={sub}
-          description="Advances the selected instance's version by one, atomically with the commit. Required beside every write or transition of a live versioned instance, so any transaction that validates the version it observed rejects if this one commits first. It never rejects by itself, and the version is never assigned through a derivation.">
+          description="The publishing half of the version protocol: at commit the selected instance's version becomes one higher than it is at that moment, unconditionally. The step compares nothing and never rejects; its purpose is other transactions, whose validate_version guards detect the moved token. Required beside every write or transition of a live versioned instance, at most once per instance; insert and delete need none. A bump on an instance the transaction never read is a legitimate blind write. With a validate_version on the same instance the two compose into a compare-and-swap from the observed version to that version plus one.">
           <KeyValue rows={[
             ["object", <IdLink key="o" id={step.target.object} />],
             ["predicate", <PredicateView key="p" predicate={step.target.predicate} />],

@@ -341,7 +341,7 @@ object.order:
     field: version
 ```
 
-The field must be a non-optional `int` on the object's canonical schema and must not be part of the identity (`InvalidObjectVersionField`). It is **managed**: never assigned by an ordinary `Write` (`DirectWriteToVersionField`). `Insert` creates the initial version; every `Write` or `Transition` of a live versioned instance must be accompanied by a `BumpVersion` of the same selected instance in the same transaction (`MissingVersionBump`, `DuplicateVersionBump`); `Delete` removes the instance; and `ValidateVersion` turns a version observed by an earlier read into a commit guard (§20). Together these are the optimistic-concurrency evidence a serializability proof may cite (§17): a transaction that validates the version it observed cannot commit over a mutation it did not see.
+The field must be a non-optional `int` on the object's canonical schema and must not be part of the identity (`InvalidObjectVersionField`). It is **managed**: no ordinary `Write` may name it (`DirectWriteToVersionField`); only the protocol moves it. `Insert` creates the initial version, `bump_version` advances it, `Delete` removes the instance, and `validate_version` checks it at commit. The token changes whenever the instance changes, so a transaction that checks the token it read cannot commit over a change it did not see. What the two steps promise, when each is required, and why a proof needs both, is §20 — read it before using either.
 
 Absence is epistemic. An object without a version carries no version protocol — the absence of the OCC route, not a claim that concurrent mutation of it is safe.
 
@@ -2608,11 +2608,42 @@ Deletion replay behavior depends on what the model guarantees when the selected 
 
 ### Version protocol steps
 
-`validate_version { target, expected }` turns a version observed earlier in the transaction into a commit guard: if the selected instance's version field no longer equals `expected` when the transaction commits, the transaction **rejects** (§16). `expected` must be a version the transaction observed — a `transaction_read` binding of the same selected instance whose field selection included the version field (`VersionValidationWithoutObservedVersion`).
+Two steps use a versioned object's token, and they make different promises. Neither is evaluated where it is written: both take effect at **commit arbitration**, atomically with the commit.
 
-`bump_version { target }` advances the selected instance's version. Every `Write` or `Transition` of a live versioned instance requires exactly one bump of the same selected instance in the transaction (`MissingVersionBump`, `DuplicateVersionBump`); `Insert` creates the initial version and `Delete` removes the instance, so neither needs one. Both steps require the object to declare a version (`VersionProtocolOnUnversionedObject`).
+**`bump_version { target }` publishes a change.** At commit, the selected instance's version becomes one higher than it is at that moment — unconditionally. The step compares nothing and never rejects. Its purpose is other transactions: a version that moved is what their guards detect.
 
-Together they are the optimistic-concurrency evidence of §17: a stale observation cannot take part in a successful commit. A bump depends on the state it advances, so it is not naturally replayable; a transaction containing one recovers its artifacts only through a keyed commit.
+**`validate_version { target, expected }` guards an observation.** The transaction commits only if the selected instance's version at commit still **equals** `expected`; otherwise the transaction **rejects** (§16). `expected` must be a version this transaction itself observed: a `transaction_read` binding of the same selected instance whose field selection included the version field (`VersionValidationWithoutObservedVersion`). The guard checks equality, not an increment — a version moved by one or by fifty rejects alike — and it performs no increment of its own.
+
+When each is required:
+
+- Every `Write` or `Transition` of a live versioned instance must be accompanied by exactly one `bump_version` of the same selected instance in the same transaction (`MissingVersionBump`, `DuplicateVersionBump`). `Insert` creates the initial version and `Delete` removes the instance, so neither bumps. This is a validation rule: a mutation nobody can detect is not a versioned mutation.
+- `validate_version` is never required by validation. It is declared where the transaction relies on an observation staying true until commit, and a serializability proof over a read-then-write needs it on the reader's side (below).
+- Both steps require the object to declare a version (`VersionProtocolOnUnversionedObject`).
+
+**Neither step implies the other.** A transaction may validate an instance it only reads — the revision's own example validates a global limit it never writes while it writes and bumps an account — which is a pure compare. A transaction may bump an instance it never read — a blind write still publishes — which is a pure increment. When one transaction validates and bumps the same instance, the two compose into the familiar compare-and-swap: commit only if the version is still `expected`, and in that same commit set it to `expected + 1`. That composition is the common shape, not the definition of either half.
+
+**Why a proof needs both halves.** Take two executions of one transaction that reads a row's `balance` and `version`, computes a new balance, writes it, and bumps:
+
+```text
+A reads  version 7, balance 100          B reads  version 7, balance 100
+A commits: balance 100 + a, version 8
+                                         B at commit: validate(7) finds 8 → rejects
+```
+
+Without B's validation, B commits `100 + b` and bumps 8 to 9: A's amount is lost, and nothing objected. Without A's bump, B's validation finds 7 = 7 and commits the same stale balance. So the serialization-graph route (§17) cites version validation on a read-write dependency only when the reader validates the version it observed **and** the writer bumps it; missing either is a named gap (`VersionValidationMissing`, `VersionBumpMissing`). Note what the cursor of the next section does not do here: an `advance_cursor` compares the incoming position against the *stored* one at commit, so B's cursor can pass while B's balance is stale. The cursor orders positions; the version guards observations.
+
+**Realization.** A conforming implementation makes the check and the advance atomic with the commit. On a relational store that is one conditional statement, with the transaction rejecting when it affects no row:
+
+```sql
+UPDATE ledger SET balance = ?, version = version + 1
+WHERE id = ? AND version = ?;
+```
+
+A conditional put, an ETag or `If-Match` precondition, or a compare-and-swap column realize the same guarantee. The DSL names the guarantee and none of the mechanisms; in particular the guard holds no lock across the read-to-commit window, which is what makes the route optimistic and distinguishes it from a `lock` step (§21).
+
+**Placement.** `validate_version` carries no timing meaning; it is evaluated at commit wherever it sits. It must follow the read whose binding it names, and it reads best beside that read, before the work that depends on the observation.
+
+A bump depends on the state it advances, so it is not naturally replayable; a transaction containing one recovers its artifacts only through a keyed commit.
 
 ### Cursor and fence steps
 

@@ -1775,8 +1775,9 @@ PATCH — {"mutations": [<mutation>, ...]}; each mutation {"kind": K, ...}:
      "version":{"field":["version"]}}}. version optional: the object's
      application concurrency token, a non-optional int outside the
      identity, managed by the version protocol alone — insert creates
-     it, bump_version advances it, validate_version guards on it, and
-     no ordinary write may name it.
+     it, bump_version advances it (required with every write or
+     transition of the instance), validate_version checks it at commit
+     against a preceding read, and no ordinary write may name it.
      outboxes optional: {"outbox.x":{"messages":["schema.X"],
      "message_identity":{"kind":"keyed","mapping":{"schema.X":[["event_id"]]}}}}.
      An outbox is a typed transactional message collection of the data
@@ -1934,12 +1935,23 @@ Transaction steps beyond read/write/insert/delete/lock/transition/
 establish_effect_intent/establish_transaction_output/write_outbox:
   {"kind":"validate_version","target":<object selector>,
    "expected":{"source":"transaction_read:read.x","path":"version"}}
-    (commit guard: commits only if the instance's version at commit still
-     equals the version a PRECEDING read of the same instance observed —
-     expected must be that read's version field. Mismatch rejects.)
+    (the observation guard: at commit the transaction proceeds only if
+     the selected instance's version STILL EQUALS expected — the version
+     field of a PRECEDING read of the same instance in this transaction.
+     Any change rejects; the guard compares and never increments, holds
+     no lock, and is evaluated at commit wherever it sits. Never required
+     by validation: declare it where the transaction relies on what it
+     read, which a serializability proof of a read-then-write needs on
+     the reader's side.)
   {"kind":"bump_version","target":<object selector>}
-    (version := version + 1 atomically; REQUIRED beside every write or
-     transition of a live versioned instance, at most once per instance.)
+    (publishes a change: version := version + 1 at commit, unconditional,
+     never rejects. REQUIRED beside every write or transition of a live
+     versioned instance, at most once per instance; insert and delete
+     need none. Neither step implies the other — validate-only guards a
+     read, bump-only is a blind write; both on one instance compose into
+     a compare-and-swap from expected to expected + 1, and a proof over
+     a read-then-write needs the reader's validation AND the writer's
+     bump.)
   {"kind":"advance_cursor","target":<object selector>,"field":["seq"],
    "incoming":<value ref>,"rule":"successor"}
     (rule: successor — commits only when incoming = stored + 1 — or

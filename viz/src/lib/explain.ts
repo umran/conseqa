@@ -354,9 +354,12 @@ export function objectVersion(field: FieldPath): Explanation {
     label: `versioned by ${pathText(field)}`,
     tone: "success",
     summary:
-      "The object's application concurrency token: a transaction that observed the version " +
-      "validates it at commit, so a stale read rejects instead of committing, and every " +
-      "mutation of a live instance bumps it. Never assigned directly, and no part of the identity.",
+      "The object's application concurrency token, moved only by the protocol. bump_version " +
+      "publishes a change: an unconditional increment at commit, required with every write or " +
+      "transition of a live instance. validate_version guards an observation: the transaction " +
+      "commits only if the version still equals the one its own earlier read saw, else it " +
+      "rejects. Neither implies the other; a proof over a read-then-write needs the reader's " +
+      "validation and the writer's bump. Never assigned directly, and no part of the identity.",
   };
 }
 

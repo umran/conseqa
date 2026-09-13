@@ -90,12 +90,14 @@ pub struct DataObject {
 /// managed by the version protocol and never assigned directly:
 /// `Insert` creates the initial version, every `Write` or `Transition`
 /// of a live versioned instance must be accompanied by a `BumpVersion`
-/// of that instance, `Delete` removes the versioned instance, and an
-/// ordinary `Write` may not name the field. `ValidateVersion` turns a
-/// version observed by an earlier read into a commit guard: the
-/// transaction commits only if the version is still the observed one
-/// at commit arbitration, so a stale read can never silently
-/// participate in a successful commit.
+/// of that instance (the unconditional increment that publishes the
+/// change), `Delete` removes the versioned instance, and an ordinary
+/// `Write` may not name the field. `ValidateVersion` is the other
+/// half: the transaction commits only if the version still equals the
+/// one an earlier read of this transaction observed, so a stale read
+/// can never silently participate in a successful commit. A proof over
+/// a read-then-write needs the reader's validation and the writer's
+/// bump; neither step implies the other.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ObjectVersion {

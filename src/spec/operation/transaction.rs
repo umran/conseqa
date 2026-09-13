@@ -755,16 +755,26 @@ pub struct TransitionEffectApplication {
     pub values: Derivation,
 }
 
-/// The optimistic-concurrency commit guard: the transaction may commit
-/// only if the selected instance's version at commit arbitration still
-/// equals `expected`.
+/// The observation guard of the version protocol: the transaction
+/// commits only if the selected instance's version at commit
+/// arbitration still *equals* `expected`; otherwise it rejects.
 ///
-/// `expected` must be a `transaction_read` of the same target's
-/// declared version field, observed by a preceding read of the same
-/// instance. Mismatch is logical rejection — the check is a commit
-/// guard, not a comparison performed at the step's wall-clock instant
-/// — so a stale observation can never silently participate in a
-/// successful commit. That is what makes it serialization evidence.
+/// `expected` must be a version this transaction itself observed — a
+/// `transaction_read` binding of the same selected instance whose
+/// field selection included the version field. The guard compares, it
+/// never increments, and it is evaluated at commit wherever it sits in
+/// the step list, never at the step's wall-clock instant. It holds no
+/// lock across the read-to-commit window, which is what makes the route
+/// optimistic.
+///
+/// Validation never requires this step: it is declared where the
+/// transaction relies on what it read staying true until commit, and a
+/// serializability proof over a read-then-write needs it on the
+/// reader's side — together with the writer's `BumpVersion`, without
+/// which there is nothing for the guard to detect. Neither step implies
+/// the other: validating an instance the transaction only reads is a
+/// pure compare; validating and bumping one instance composes into a
+/// compare-and-swap from `expected` to `expected + 1`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ValidateVersion {
@@ -772,10 +782,18 @@ pub struct ValidateVersion {
     pub expected: ValueRef,
 }
 
-/// `version := version + 1` on the selected instance, atomically with
-/// the commit. The version field is never assigned through a
-/// derivation, and one transaction bumps one selected instance at most
-/// once.
+/// The publishing half of the version protocol: at commit the selected
+/// instance's version becomes one higher than it is at that moment —
+/// unconditionally. The step compares nothing and never rejects; its
+/// purpose is other transactions, whose `ValidateVersion` guards detect
+/// the moved token.
+///
+/// Required beside every `Write` or `Transition` of a live versioned
+/// instance, at most once per selected instance; `Insert` creates the
+/// initial version and `Delete` removes the instance, so neither bumps.
+/// A bump on an instance the transaction never read is a legitimate
+/// blind write. The version field is never assigned through a
+/// derivation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BumpVersion {
