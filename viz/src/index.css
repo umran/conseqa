@@ -185,6 +185,9 @@ svg.arch-canvas text { font-size: 12px; fill: var(--arch-text); user-select: non
   stroke-width: 1.2;
 }
 .arch-real.subscription .body { stroke-dasharray: 5 3; }
+/* An outbox consumer's dispatch wears the outbox node's own dash, so the
+   vertex reads as the continuation of the edge it sits on. */
+.arch-real.outbox .body { stroke-dasharray: 7 3; }
 .arch-real:hover .body { stroke: var(--arch-l1); }
 .arch-real.selected .body { stroke: var(--arch-l1); stroke-width: 2; }
 .arch-real .kind-mark { font-size: 9.5px; fill: var(--arch-text-subtle); font-weight: 600; letter-spacing: 0.02em; }

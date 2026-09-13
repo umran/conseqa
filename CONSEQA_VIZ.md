@@ -107,15 +107,21 @@ a label, not a control: the machine is the model, not an overlay on it),
 and it is laid *onto* the machine rather than beside it, because every
 L1 fact is a fact about some L0 thing:
 
-- A **router** or a **subscription dispatch** realizes a boundary — the
-  way a caller or a topic enters an operation — so it is an intermediate
-  vertex *on that edge*: the caller/topic edge ends at the vertex and a
-  short arm carries on into the operation (caller → [router] → op, topic
-  → [dispatch] → op). The vertex is marked request (solid) or subscribe
-  (dashed) and names the execution pool, its member concurrency, and the
-  routing/affinity fact. The pool name is its own target: a pool is a
-  shared population, and selecting one lights every vertex that names it
-  — which is all "shared pool" means (§52), with no pool node to say it.
+- A **router**, a **subscription dispatch**, or an **outbox dispatch**
+  realizes a boundary — the way a caller, a topic, or an outbox enters
+  an operation — so it is an intermediate vertex *on that edge*: the
+  caller/topic/outbox edge ends at the vertex and a short arm carries on
+  into the operation (caller → [router] → op, topic → [dispatch] → op,
+  outbox → [dispatch] → op). The three boundaries are separate
+  primitives with one shape — a routing key and a member assignment
+  terminating at a pool — so they are drawn the same way. The vertex is
+  marked request (solid), subscribe (dashed), or consume (the outbox's
+  own dash) and names the execution pool, its member concurrency, and
+  the routing/affinity fact; every vertex of a drawing takes the width
+  the longest of those texts needs, so nothing on it overlaps. The pool
+  name is its own target: a pool is a shared population, and selecting
+  one lights every vertex that names it — which is all "shared pool"
+  means (§52), with no pool node to say it.
 - A **storage layout** is a fact about an object, so the objects
   operations persist to are drawn as a downstream data tier, wired to
   the operations that touch them by always-visible access edges. Each
@@ -148,9 +154,9 @@ colour from the transactions' declarations alone.
 The L1 switch is disabled for a model that declares no L1 facts, and with
 L1 off none of the realization appears — those are facts of the layer that
 declares them. Selection follows what a thing is a fact *about*, and
-nothing wider: a router or a subscription lights only its own path — the
-caller edges, the vertex, the operation — not the operation's other
-edges; a pool lights every path it runs, which is what a shared pool is;
+nothing wider: a router or a dispatch lights only its own path — the
+caller, topic, or outbox edge, the vertex, the operation — not the
+operation's other edges; a pool lights every path it runs, which is what a shared pool is;
 an access edge lights just its operation and object. Selecting the
 operation itself lights exactly its one-hop neighbourhood — its edges
 and what they join, its own realizations, the objects it writes — and

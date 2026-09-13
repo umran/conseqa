@@ -1,4 +1,4 @@
-import type { BoundaryLink, RuntimeFacts } from "../lib/runtime";
+import { vertexWidth, type BoundaryLink, type RuntimeFacts } from "../lib/runtime";
 import type { Edge, Graph } from "../types/graph";
 import type { Id } from "../types/model";
 
@@ -90,7 +90,8 @@ export const SYS = {
   COL_GAP: 130, ROW_GAP: 48,
   /** With the L1 plane on, a realization vertex sits in the gutter on the
    *  approach into an operation, so the gutter is widened to give the
-   *  caller → vertex → operation path a visible run on both sides. */
+   *  caller → vertex → operation path a visible run on both sides. The
+   *  least it is; a wider vertex widens it. */
   COL_GAP_L1: 236,
   TOPIC_W: 220, TOPIC_H: 54,
   EXT_W: 186, EXT_H: 50,
@@ -105,9 +106,13 @@ export const SYS = {
   /** Below this width a drawing still fits at a readable size, so it is
    *  left on one line however wide it looks. Roughly eight columns. */
   WRAP_THRESHOLD: 2800,
-  /** Realization vertex box; ARM is the run from the vertex to the
-   *  operation's input edge, so the vertex is not flush against it. */
-  REAL_W: 128, REAL_H: 32, REAL_VGAP: 10, REAL_ARM: 52,
+  /** Realization vertex box: the least width, its text padding and the
+   *  gap between the two texts of its first line; ARM is the run from
+   *  the vertex to the operation's input edge and RUN the run into it
+   *  from the gutter, so the vertex is flush against neither. The box
+   *  grows to fit the longest texts any vertex of the drawing carries,
+   *  and every vertex takes that one width, so the lane stays clean. */
+  REAL_W: 128, REAL_H: 32, REAL_VGAP: 10, REAL_ARM: 52, REAL_RUN: 56, REAL_PAD: 8, REAL_TEXT_GAP: 12,
   /** The data tier below the machine: object nodes and the gap down to
    *  them from the operations that persist to them. */
   DATA_GAP: 104, DATA_TITLE: 30,
@@ -436,7 +441,13 @@ export function layoutSystem(graph: Graph, options: LayoutOptions = {}): SystemL
   // Gutters widen when the realization is drawn, so the vertex that sits
   // on the approach into an operation has a run of edge on each side of
   // it rather than being wedged against the caller and the card.
-  const colGap = runtime ? SYS.COL_GAP_L1 : SYS.COL_GAP;
+  // Every realization vertex is as wide as the widest needs to be for
+  // its texts not to collide, and the gutter holds that width with a
+  // run on either side.
+  const realW = runtime
+    ? Math.max(SYS.REAL_W, ...runtime.links.map((link) => vertexWidth(link, SYS.REAL_PAD, SYS.REAL_TEXT_GAP)))
+    : SYS.REAL_W;
+  const colGap = runtime ? Math.max(SYS.COL_GAP_L1, realW + SYS.REAL_ARM + SYS.REAL_RUN) : SYS.COL_GAP;
   const columnWidth = columns.map((column) => Math.max(0, ...column.map((m) => m.w)));
   const columnHeight = columns.map(
     (column) => column.reduce((sum, m) => sum + m.h, 0) + Math.max(0, column.length - 1) * SYS.ROW_GAP,
@@ -527,8 +538,9 @@ export function layoutSystem(graph: Graph, options: LayoutOptions = {}): SystemL
 
   // Realization vertices are placed before the edges are routed, so the
   // edges that feed a realized boundary can terminate *at* the vertex —
-  // caller → [router] → operation, topic → [dispatch] → operation — with
-  // the vertex a real waypoint on the path, not a tag beside its end.
+  // caller → [router] → operation, topic → [dispatch] → operation,
+  // outbox → [dispatch] → operation — with the vertex a real waypoint on
+  // the path, not a tag beside its end.
   const realizations: RealizationBox[] = [];
   const retarget = new Map<string, string>();
   const vertexColumn = new Map<string, number>();
@@ -548,7 +560,7 @@ export function layoutSystem(graph: Graph, options: LayoutOptions = {}): SystemL
       // Vertices for one operation share an x — a clean lane in the
       // gutter — and stack on their own pitch, centred on the card, so
       // several realized inputs never overlap.
-      const x = op.x - SYS.REAL_W - SYS.REAL_ARM;
+      const x = op.x - realW - SYS.REAL_ARM;
       const pitch = SYS.REAL_H + SYS.REAL_VGAP;
       const first = op.y + op.h / 2 - ((n - 1) * pitch) / 2;
       links.forEach((link, i) => {
@@ -556,13 +568,13 @@ export function layoutSystem(graph: Graph, options: LayoutOptions = {}): SystemL
         const y = cy - SYS.REAL_H / 2;
         realizations.push({
           link,
-          x, y, w: SYS.REAL_W, h: SYS.REAL_H,
+          x, y, w: realW, h: SYS.REAL_H,
           connector: roundedPolyline(
-            [{ x: x + SYS.REAL_W, y: cy }, { x: (x + SYS.REAL_W + op.x) / 2, y: cy }, { x: op.x, y: cy }],
+            [{ x: x + realW, y: cy }, { x: (x + realW + op.x) / 2, y: cy }, { x: op.x, y: cy }],
             8,
           ),
         });
-        pos.set(link.id, { x, y, w: SYS.REAL_W, h: SYS.REAL_H });
+        pos.set(link.id, { x, y, w: realW, h: SYS.REAL_H });
         vertexColumn.set(link.id, columnFor(opId));
       });
     }

@@ -2,6 +2,7 @@ import { useMemo } from "react";
 
 import { shortId, truncate } from "../lib/ids";
 import { hashes } from "../lib/route";
+import { BOUNDARY_KIND, vertexLabels } from "../lib/runtime";
 import { useApp } from "../state/AppState";
 import type { Edge } from "../types/graph";
 import { layoutConflicts } from "./layoutConflicts";
@@ -470,8 +471,9 @@ ${identity}`}</title>
 }
 
 /** One boundary's realization, on the approach into the operation it
- *  realizes. The pool name is its own click target: selecting a pool
- *  lights every tab that names it. */
+ *  realizes — a router on a request boundary, a dispatch on a
+ *  subscription or an outbox consumer. The pool name is its own click
+ *  target: selecting a pool lights every tab that names it. */
 function Realization({
   r,
   dimmed,
@@ -487,9 +489,9 @@ function Realization({
   const classes = ["arch-real", link.kind];
   if (dimmed) classes.push("dimmed");
   if (selected || poolSelected) classes.push("selected");
-  const affinity = link.routingKey ? `keyed · ${concurrencyShort(link.concurrency)}` : concurrencyShort(link.concurrency);
+  const labels = vertexLabels(link);
   const title =
-    `${link.kind === "request" ? "request boundary" : "subscription"} of ${link.operation} · ${link.input}\n` +
+    `${BOUNDARY_KIND[link.kind].title} of ${link.operation} · ${link.input}\n` +
     `pool ${link.pool} — ${link.concurrency} per member\n` +
     (link.routingKey ? `routed by ${link.routingKey} (${link.memberAssignment})` : "no member-affinity fact declared");
   return (
@@ -498,10 +500,10 @@ function Realization({
       <g data-sel={sel({ key: link.id, id: link.detail })}>
         <rect className="body" x={r.x} y={r.y} width={r.w} height={r.h} rx={7} />
         <text className="kind-mark" x={r.x + 8} y={r.y + 14}>
-          {link.kind === "request" ? "▸ request" : "◃ subscribe"}
+          {labels.mark}
         </text>
         <text className="affinity" x={r.x + r.w - 8} y={r.y + 14} textAnchor="end">
-          {affinity}
+          {labels.affinity}
         </text>
         <title>{title}</title>
       </g>
@@ -513,18 +515,10 @@ function Realization({
         y={r.y + 27}
         data-sel={sel({ key: link.pool, id: link.pool })}
       >
-        {truncate(shortId(link.pool), 22)}
+        {labels.pool}
       </text>
     </g>
   );
-}
-
-/** Concurrency, compressed for a tab: "bounded(1)" → "1/mbr". */
-function concurrencyShort(concurrency: string): string {
-  const m = concurrency.match(/^bounded\((\d+)\)$/);
-  if (m) return `${m[1]}/mbr`;
-  if (concurrency === "unbounded") return "∞/mbr";
-  return "?/mbr";
 }
 
 /** A persistent object, drawn so a partitioned store is distinct on
