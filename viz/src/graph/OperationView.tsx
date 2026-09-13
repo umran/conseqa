@@ -42,10 +42,7 @@ import {
   BindingChip, BindingKindTag, BindingRoots, ConditionView, Fact, FactBadge, IdLink, KeyComponents, Mono, Muted,
   PredicateView, RefText, SectionCard, StatusBadge, StatusChips, selectableRow, useProgramNavigation,
 } from "../panels/parts";
-import type {
-  Effect, Id, Operation, OperationBlock, RequirementKind, ResultType, SelectorPredicate,
-  TransactionStep, TransitionSideEffect,
-} from "../types/model";
+import type { Effect, Id, Operation, OperationBlock, RequirementKind, ResultType, SelectorPredicate, Transaction, TransactionStep, TransitionSideEffect } from "../types/model";
 
 type EffectKind = (Effect | TransitionSideEffect)["kind"];
 
@@ -370,12 +367,14 @@ function DecisionArm({ opId, op, label, block, hops, tone = "outline", caption, 
 /** One block of the program as a vertical sequence of step cards. The
  *  top-level block is a Kumo Flow with connectors; nested arm blocks are
  *  plain stacks, so arbitrary nesting stays legible. */
-function ProgramBlock({ opId, op, block, hops, nested, startIndex = 0 }: {
+function ProgramBlock({ opId, op, block, hops, nested, startIndex = 0, fill = false }: {
   opId: Id; op: Operation; block: OperationBlock; hops: StepHop[]; nested?: boolean;
   /** The index in the enclosing block of `block.steps[0]`, so a tail
-   *  rendered inside a transaction's committed arm keeps the locations
-   *  the checker names its steps by. */
+   *  drawn as a fork's committed lane keeps the locations the checker
+   *  names its steps by. */
   startIndex?: number;
+  /** Fill the lane the block is drawn in rather than the section. */
+  fill?: boolean;
 }) {
   const { model, index, expandedTx, toggleTx } = useApp();
   const effectKind = (effectId: Id): EffectKind | null => effectDef(model, index, effectId)?.effect.kind ?? null;
@@ -409,58 +408,17 @@ function ProgramBlock({ opId, op, block, hops, nested, startIndex = 0 }: {
         // collapsed card so the names are visible without expanding.
         const reads = tx.steps.flatMap((inner) => (inner.kind === "read" ? [inner.bind] : []));
 
-        // The artifacts a committed execution establishes — the
-        // bindings later control consumes. Bound names lead: the flow
-        // must say what each step binds without expanding it.
-        const established: ReactNode[] = tx.steps.flatMap((inner, ti) => {
-          switch (inner.kind) {
-            case "establish_effect_intent":
-              return [
-                <BindingRow key={ti} kind="intent" name={inner.bind}
-                  from={<span>captures <Mono>{shortId(inner.effect_id)}</Mono></span>} />,
-              ];
-            case "establish_transaction_output":
-              return [
-                <BindingRow key={ti} kind="output" name={inner.bind}
-                  from={<span>a <Mono>{shortId(inner.schema)}</Mono> value</span>} />,
-              ];
-            case "transition":
-              return Object.entries(inner.effect_intents).map(([effectId, intent]) => (
-                <BindingRow key={`${ti}:${effectId}`} kind="intent" name={intent.bind}
-                  from={<span>side effect <Mono>{shortId(effectId)}</Mono></span>} />
-              ));
-            default:
-              return [];
-          }
-        });
+        const established = establishedBindings(tx);
 
-        // What a commit makes available to the steps that follow —
-        // the caption of the committed arm, or of the card when the
-        // transaction cannot reject.
+        // What a commit makes available to the steps that follow. On
+        // a transaction that cannot reject it is shown on the card; on
+        // one that can, it heads the committed lane of the fork below.
         const available = established.length ? (
           <div className="space-y-1">
             {established}
-            <div>available from here on</div>
+            <div className="text-[11px] text-kumo-subtle">available from here on</div>
           </div>
-        ) : (
-          "establishes no binding"
-        );
-
-        // The committed continuation: the rest of this block, drawn
-        // inside the arm with its own locations. Empty inside an arm
-        // means the committed path falls through to the enclosing join.
-        const continuation: OperationBlock | null = step.rejected
-          ? { steps: block.steps.slice(offset + 1) }
-          : null;
-        const continuationEmpty = continuation !== null && continuation.steps.length === 0;
-
-        // A rejected block that does not terminate rejoins the
-        // committed path after this step; say where.
-        const rejoins = step.rejected && !blockTerminates(step.rejected)
-          ? continuationEmpty
-            ? "falls through · rejoins the committed path at the end of this block"
-            : `falls through · rejoins the committed path at step ${locationLabel([...hops, { step: si + 1 }])}`
-          : null;
+        ) : null;
 
         return {
           key: location,
@@ -524,23 +482,11 @@ function ProgramBlock({ opId, op, block, hops, nested, startIndex = 0 }: {
                   A body with no guard cannot reject, so it gets one
                   full-width committed strip and no arm to pretend
                   otherwise. */}
-              {step.rejected && continuation ? (
-                <div className="mt-2 grid gap-2 sm:grid-cols-2">
-                  <DecisionArm
-                    opId={opId} op={op} label="committed" tone="success"
-                    block={continuationEmpty ? null : continuation} hops={hops} startIndex={si + 1}
-                    caption={available}
-                  />
-                  <DecisionArm
-                    opId={opId} op={op} label="rejected" tone="warning" block={step.rejected} hops={under("rejected")}
-                    caption={rejoins ? <>nothing committed · no binding above is available here<br />{rejoins}</> : "nothing committed · no binding above is available here"}
-                  />
-                </div>
-              ) : (
-                <div className="mt-2">
-                  <ArmBox label="committed" tone="success" note="always commits" caption={available}>{null}</ArmBox>
-                </div>
-              )}
+              {/* A transaction that can reject forks the flow below this
+                  card — see the outcome lanes the block draws after it.
+                  One that cannot only says what its commit makes
+                  available. */}
+              {!step.rejected && available && <div className="mt-2">{available}</div>}
             </StepCard>
           ),
         };
@@ -780,6 +726,48 @@ function ProgramBlock({ opId, op, block, hops, nested, startIndex = 0 }: {
     }
   });
 
+  // The fork after a transaction that can reject: two lanes of the same
+  // form, side by side. The committed lane is this block's own flow
+  // continuing — the steps after the transaction, its terminal
+  // included, drawn as the explicit cards they are, with the locations
+  // the checker names them by. The rejected lane is the rejected block,
+  // located beneath the transaction as `n.rejected.m`. Neither lane is
+  // inside the transaction card, and nothing after the card is drawn
+  // as a sequence with it.
+  const fork = (() => {
+    if (forkAt === -1) return null;
+    const step = block.steps[forkAt];
+    if (step.kind !== "transaction" || !step.rejected) return null;
+    const si = startIndex + forkAt;
+    const tail: OperationBlock = { steps: block.steps.slice(forkAt + 1) };
+    const established = establishedBindings(step.transaction);
+    const rejoins = blockTerminates(step.rejected)
+      ? null
+      : tail.steps.length
+        ? `falls through · rejoins the committed lane at step ${locationLabel([...hops, { step: si + 1 }])}`
+        : "falls through · rejoins the committed lane at the end of this block";
+    return (
+      <div className="mt-3 grid gap-4 sm:grid-cols-2">
+        <OutcomeLane label="committed" tone="success" glyph="↓"
+          caption={established.length ? <>{established}<div>available from here on</div></> : "establishes no binding"}>
+          {tail.steps.length ? (
+            <ProgramBlock opId={opId} op={op} block={tail} hops={hops} startIndex={si + 1} nested={nested} fill />
+          ) : (
+            <Muted>{hops.length ? "falls through to the enclosing join" : "end of program"}</Muted>
+          )}
+        </OutcomeLane>
+        <OutcomeLane label="rejected" tone="warning" glyph="↘"
+          caption={<>nothing committed · no binding above is available{rejoins && <><br />{rejoins}</>}</>}>
+          {step.rejected.steps.length ? (
+            <ProgramBlock opId={opId} op={op} block={step.rejected} hops={[...hops, { step: si, arm: "rejected" }]} nested={nested} fill />
+          ) : (
+            <Muted>empty block · falls through</Muted>
+          )}
+        </OutcomeLane>
+      </div>
+    );
+  })();
+
   if (nested) {
     // Arm blocks stack without connectors; the surrounding decision card
     // already communicates the sequence.
@@ -788,6 +776,7 @@ function ProgramBlock({ opId, op, block, hops, nested, startIndex = 0 }: {
         {nodes.map((n) => (
           <div key={n.key}>{n.element}</div>
         ))}
+        {fork}
       </div>
     );
   }
@@ -795,15 +784,62 @@ function ProgramBlock({ opId, op, block, hops, nested, startIndex = 0 }: {
   return (
     // Step cards size to the section body (a container), capped for
     // readability; the 12px accounts for the diagram's own padding,
-    // which keeps selection rings clear of its clipping edge.
-    <div className="arch-flow" style={{ "--step-w": "min(640px, 100cqw - 12px)" } as CSSProperties}>
+    // which keeps selection rings clear of its clipping edge. A lane
+    // of a fork fills its column instead.
+    <div className="arch-flow" style={{ "--step-w": fill ? "100%" : "min(640px, 100cqw - 12px)" } as CSSProperties}>
       <Flow orientation="vertical" canvas={false} padding={{ x: 6, y: 6 }}>
         {nodes.map((n) => (
           <Flow.Node key={n.key} id={n.key} render={n.element} />
         ))}
       </Flow>
+      {fork}
     </div>
   );
+}
+
+/** One lane of a transaction's fork: a branch tick, its label with the
+ *  glyph of the direction it takes, a caption, and the flow it holds. */
+function OutcomeLane({ label, tone, glyph, caption, children }: {
+  label: string; tone: ArmTone; glyph: string; caption: ReactNode; children: ReactNode;
+}) {
+  return (
+    <div className="min-w-0">
+      <div aria-hidden className="ml-5 h-3 w-0 border-l-2 border-dashed border-kumo-line" />
+      <div className={`rounded-md border px-2 py-1.5 ${ARM_BOX[tone]}`}>
+        <div className="flex flex-wrap items-center gap-1.5">
+          <Badge variant={tone}>{`${glyph} ${label}`}</Badge>
+        </div>
+        <div className="mt-1 text-[11px] leading-snug text-kumo-subtle">{caption}</div>
+      </div>
+      <div className="mt-2">{children}</div>
+    </div>
+  );
+}
+
+/** The bindings a commit of the transaction establishes — outputs and
+ *  intents, the names later control consumes — as defines rows. */
+function establishedBindings(tx: Transaction): ReactNode[] {
+  return tx.steps.flatMap((inner, ti) => {
+    switch (inner.kind) {
+      case "establish_effect_intent":
+        return [
+          <BindingRow key={ti} kind="intent" name={inner.bind}
+            from={<span>captures <Mono>{shortId(inner.effect_id)}</Mono></span>} />,
+        ];
+      case "establish_transaction_output":
+        return [
+          <BindingRow key={ti} kind="output" name={inner.bind}
+            from={<span>a <Mono>{shortId(inner.schema)}</Mono> value</span>} />,
+        ];
+      case "transition":
+        return Object.entries(inner.effect_intents).map(([effectId, intent]) => (
+          <BindingRow key={`${ti}:${effectId}`} kind="intent" name={intent.bind}
+            from={<span>side effect <Mono>{shortId(effectId)}</Mono></span>} />
+        ));
+      default:
+        return [];
+    }
+  });
 }
 
 // ---------------------------------------------------------------------------

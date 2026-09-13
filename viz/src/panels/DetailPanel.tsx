@@ -267,20 +267,14 @@ function ProgramSummary({ opId, block, depth = 0, startIndex = 0 }: {
       <BindingChip role="uses" name={name} kind={kind} />
     </span>
   );
-  // A transaction that can reject forks the path, and the steps after
-  // it are the committed path's: they are listed under its committed
-  // row, beside the rejected row, and the block's own list ends there.
-  const forkAt = block.steps.findIndex((step) => step.kind === "transaction" && step.rejected !== undefined);
-  const ownSteps = forkAt === -1 ? block.steps : block.steps.slice(0, forkAt + 1);
-
-  const rows: ReactNode[] = ownSteps.map((s, offset) => {
+  const rows: ReactNode[] = block.steps.map((s, offset) => {
     const i = startIndex + offset;
     const number = <span className="shrink-0"><Tag>{i + 1}</Tag></span>;
     switch (s.kind) {
       case "transaction": {
         const tx = s.transaction;
         const n = tx.steps.length;
-        const continuation: OperationBlock = { steps: block.steps.slice(offset + 1) };
+        const tail = block.steps.slice(offset + 1);
         const reads = tx.steps.flatMap((inner) => (inner.kind === "read" ? [inner.bind] : []));
         const established = tx.steps.flatMap((inner): { name: Id; kind: BindingKind }[] => {
           switch (inner.kind) {
@@ -312,32 +306,29 @@ function ProgramSummary({ opId, block, depth = 0, startIndex = 0 }: {
                 </div>
               )}
               {s.rejected ? (
-                // The two outcomes as sibling rows, each with its
-                // steps: the committed path continues with the rest of
-                // this block; the rejected block runs instead.
+                // The fork: the rejected block, indented under its
+                // label, and the committed path — which is the rest of
+                // this list, continuing explicitly below at this level.
                 <div className="mt-1 space-y-2">
-                  <div className="space-y-1 border-l-2 border-kumo-success/50 pl-2">
-                    <div className="flex flex-wrap items-center gap-1.5">
-                      <Tag variant="success">committed</Tag>
-                      {continuation.steps.length === 0 && (
-                        <span className="text-kumo-subtle">{depth > 0 ? "falls through to the enclosing join" : "end of program"}</span>
-                      )}
-                    </div>
-                    {continuation.steps.length > 0 && (
-                      <ProgramSummary opId={opId} block={continuation} depth={depth + 1} startIndex={i + 1} />
-                    )}
-                  </div>
                   <div className="space-y-1 border-l-2 border-kumo-warning/50 pl-2">
                     <div className="flex flex-wrap items-center gap-1.5">
-                      <Tag variant="warning">rejected</Tag>
+                      <Tag variant="warning">↘ rejected</Tag>
                       <span className="text-kumo-subtle">nothing committed · no binding above is available</span>
                       {!blockTerminates(s.rejected) && (
                         <span className="text-kumo-inactive">
-                          · falls through, rejoining the committed path{continuation.steps.length ? ` at step ${i + 2}` : ""}
+                          · falls through, rejoining the committed path{tail.length ? ` at step ${i + 2}` : ""}
                         </span>
                       )}
                     </div>
                     <ProgramSummary opId={opId} block={s.rejected} depth={depth + 1} />
+                  </div>
+                  <div className="flex flex-wrap items-center gap-1.5 border-l-2 border-kumo-success/50 pl-2">
+                    <Tag variant="success">↓ committed</Tag>
+                    <span className="text-kumo-subtle">
+                      {tail.length
+                        ? `continues with step ${i + 2} below`
+                        : depth > 0 ? "falls through to the enclosing join" : "end of program"}
+                    </span>
                   </div>
                 </div>
               ) : (
