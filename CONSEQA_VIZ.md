@@ -133,7 +133,7 @@ entities it is about.
 **Operation view** (`#/op/<id>`). A page header (name, copyable id,
 description, and a fact strip: service, transaction and
 program-step counts, the state machines it drives, verdict tally),
-then three sections as Kumo layer cards. **Requirements** is a table —
+then four sections as Kumo layer cards. **Requirements** is a table —
 one row per declared requirement, the operation's own and those of
 every transaction in its program, with its key (and position, for
 ordering), its semantics (replay-consistent result, guaranteed
@@ -167,7 +167,39 @@ rendered as text — each arm a nested sequence of the same step cards;
 `return` cards name the request input and the variant and provenance
 of the payload they construct, and `complete` cards close a
 subscription-driven path. Transition steps link into the owning state
-machine. An obligation's evidence names paths by the arms they take
+machine.
+
+A transaction card ends in its two **outcomes**, drawn as sibling arms
+the way a decision's are: **committed**, listing the bindings the
+commit makes available from there on and naming the step control
+continues with, and **rejected**, holding the rejected block with the
+note that nothing committed and none of those bindings exists there.
+A transaction that cannot reject shows one committed strip that says
+so. The flow never reads as "commit, then reject": the continuation
+after the card is the committed arm's, and the rejected arm's steps
+are located beneath the transaction as `n.rejected.m`.
+
+**Bindings** — the names a step introduces for later steps — have one
+visual identity everywhere. There are five kinds and nothing else is a
+binding: a **read** (transaction-local, never available outside its
+transaction), an **output** (data the commit exports), an **intent**
+(work captured at commit, executed later), a **result** (an
+attempt-local observation whose ok and error payloads are reachable
+only inside the matching arm), and a **handle** (a synchronization
+artifact, not data). Wherever a step binds a name it shows a filled
+*defines* chip, `≔ name`, tagged with the kind; wherever a later step
+refers to one — a value source, a match, an intent execution, a
+barrier — it shows an outlined *uses* chip in the same colour that
+names where the binding was made and, clicked, selects the producing
+card and scrolls it into view. A result reference carries its `ok` or
+`err` arm tag, and a card whose derivation reads bindings shows them
+as uses chips with the count of its other roots. Execution-site ids
+(`tx.x`, `effect.x`), inputs (tagged as such), schemas, and objects
+never wear the chip, which is how a reader tells a variable from a
+declaration. The **Bindings** section is the table behind the
+chips: every binding of the operation with its kind, its scope
+(transaction-local or the program), the step that binds it, and every
+step that uses it, each location a click away. An obligation's evidence names paths by the arms they take
 (`ok(result.x) › then(step 3)`), which is how a reader finds the
 decision it points at. Selecting any row or card opens its detail
 panel.
@@ -188,7 +220,7 @@ deep link or history navigation selects what the address bar names.
 
 **Detail panel.** Every model entity — service, operation, topic,
 schema, data object, state machine, state, transition, input, inline
-effect, intent binding, transaction-output binding, result binding,
+effect, read binding, intent binding, transaction-output binding, result binding,
 inline transaction, transaction step, program step, requirement, graph
 edge, or L1 declaration (execution pool, router, storage layout) —
 opens a detail panel organized into collapsible, counted sections

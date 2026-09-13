@@ -9,6 +9,7 @@ import {
   type ReactNode,
 } from "react";
 
+import { modelBindings, type ModelBindings } from "../lib/bindings";
 import { citedIds } from "../lib/citations";
 import { consistencyViews, type ConsistencyViews } from "../lib/consistency";
 import { buildIndex, type ModelIndex } from "../lib/index";
@@ -71,6 +72,9 @@ interface AppState {
   /** The transaction consistency arguments, indexed by the obligation
    *  and the requirement they belong to. */
   consistency: ConsistencyViews;
+  /** Every binding each program defines and where it uses it, and every
+   *  definition by name — how a name is drawn the same way at both ends. */
+  bindings: ModelBindings;
   route: Route;
 
   selection: string | null;
@@ -145,6 +149,7 @@ export function AppStateProvider({ data, theme: hostTheme, children }: AppStateP
   const index = useMemo(() => buildIndex(data.model), [data.model]);
   const runtime = useMemo(() => runtimeFacts(data.model, data.graph), [data.model, data.graph]);
   const consistency = useMemo(() => consistencyViews(data), [data]);
+  const bindings = useMemo(() => modelBindings(data.model), [data.model]);
 
   // A report this build cannot read is dropped here, once, rather than
   // being half-rendered: the panel would list verdicts the graph could
@@ -330,6 +335,7 @@ export function AppStateProvider({ data, theme: hostTheme, children }: AppStateP
       citations,
       runtime,
       consistency,
+      bindings,
       route,
       selection,
       detail,
@@ -355,7 +361,7 @@ export function AppStateProvider({ data, theme: hostTheme, children }: AppStateP
       focusSubject,
     }),
     [
-      data, report, reportIssue, index, knownIds, obligations, citations, runtime, consistency, route,
+      data, report, reportIssue, index, knownIds, obligations, citations, runtime, consistency, bindings, route,
       selection, detail, expandedTx, search, obligationsOpen, showRuntime, showConsistency, theme,
       themeControllable, fitRequest, select, openDetail, closeDetail, toggleTx,
       setTheme, setShowRuntime, setShowConsistency, requestFit, navigateTo, focusSubject,

@@ -28,6 +28,10 @@ export type IndexEntry =
   /** A transaction-output binding with its declared schema and the
    *  inline transaction that establishes it. */
   | { kind: "output"; op: Id; schema: Id; transaction: Id }
+  /** A transaction-local read binding: `step` is the 0-based index of
+   *  the `read` step inside the inline transaction that binds it. Never
+   *  available outside that transaction. */
+  | { kind: "read"; op: Id; transaction: Id; step: number }
   /** A result binding declared by a program step; `effect` is what it observes. */
   | { kind: "binding"; op: Id; effect: Id; location: string }
   /** An async handle bound by a launch step: an operation-local
@@ -224,8 +228,10 @@ export function buildIndex(model: Model): ModelIndex {
       } else if (step.kind === "transaction") {
         const tx = step.transaction;
         put(tx.id, { kind: "transaction", op: opId });
-        for (const inner of tx.steps) {
-          if (inner.kind === "establish_effect_intent") {
+        tx.steps.forEach((inner, i) => {
+          if (inner.kind === "read") {
+            put(inner.bind, { kind: "read", op: opId, transaction: tx.id, step: i });
+          } else if (inner.kind === "establish_effect_intent") {
             put(inner.effect_id, { kind: "effect", op: opId });
             put(inner.bind, { kind: "intent", op: opId, effect: inner.effect_id, transaction: tx.id });
           } else if (inner.kind === "write_outbox") {
@@ -243,7 +249,7 @@ export function buildIndex(model: Model): ModelIndex {
               });
             }
           }
-        }
+        });
       }
     }
 

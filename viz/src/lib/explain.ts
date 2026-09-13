@@ -23,6 +23,7 @@ import type {
   ValueRef,
 } from "../types/model";
 import type { SerializabilityRoute } from "../types/consistency";
+import type { BindingKind } from "./bindings";
 import { pathText } from "./ids";
 import { refString } from "./text";
 
@@ -708,6 +709,70 @@ export function transactionOutput(): Explanation {
       "steps that follow. It is data, not work: an effect intent is the artifact for that. A " +
       "transaction read never leaves its transaction; this is the only way an observation does.",
   };
+}
+
+/** One of the five kinds of binding: what it is, its scope and lifetime,
+ *  and what it is not. A binding is a name one step introduces for later
+ *  steps; execution-site ids, inputs, schemas, and objects are not
+ *  bindings. */
+export function bindingKind(kind: BindingKind): Explanation {
+  switch (kind) {
+    case "read":
+      return {
+        label: "transaction read",
+        tone: "neutral",
+        summary:
+          "The name a read step gives to what the transaction observed of one object. " +
+          "Transaction-local: available to the later steps of the same transaction and to " +
+          "nothing else — not to any program step after the transaction, not to its rejected " +
+          "block, and never to the outside of it. What leaves a transaction is what its commit " +
+          "establishes: an output or an intent.",
+      };
+    case "output":
+      return {
+        label: "transaction output",
+        tone: "success",
+        summary:
+          "A typed value the transaction establishes atomically with its commit and exports to " +
+          "the program from that step on — on the committed path only; a rejected attempt " +
+          "establishes nothing. It is data, not work, and it is recovered together with a keyed " +
+          "commit: a retry that resolves the prior commit finds the same output. Without a " +
+          "keyed commit it exists only for the attempt that committed.",
+      };
+    case "intent":
+      return {
+        label: "effect intent",
+        tone: "info",
+        summary:
+          "Pending work captured atomically with the transaction's commit: the exact effect " +
+          "instance to execute later, established on the committed path only and available " +
+          "from the transaction on. It is executed by an execute-intent step, which is where " +
+          "the effect actually happens — establishing the intent does nothing to the outside " +
+          "world by itself. Not data: it cannot be read, returned, or derived from.",
+      };
+    case "result":
+      return {
+        label: "effect result",
+        tone: "info",
+        summary:
+          "An attempt-local observation of one effect execution's Result<ok, errors>, bound " +
+          "where the execution completes and available to the steps that follow. Its ok " +
+          "payload is reachable only inside the ok arm of a match on it, and an error payload " +
+          "only inside the arm of its own class. Not a transaction artifact and not durable: a " +
+          "retry re-executes the effect and observes afresh.",
+      };
+    case "handle":
+      return {
+        label: "async handle",
+        tone: "neutral",
+        summary:
+          "A synchronization artifact naming one in-flight asynchronous execution, bound by " +
+          "the launch and consumed only by a join_all or race. Not data: it has no schema and " +
+          "cannot be persisted, returned, or derived from; it does not identify the logical " +
+          "effect — the effect id does. The execution's result, if any, becomes a binding " +
+          "only at the barrier that waits for it.",
+      };
+  }
 }
 
 /** A result binding: an operation-local observation of an effect's outcome. */

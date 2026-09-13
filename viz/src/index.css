@@ -232,3 +232,115 @@ svg.arch-canvas text { font-size: 12px; fill: var(--arch-text); user-select: non
 .arch-object.selected .body { stroke: var(--arch-l1); stroke-width: 2; stroke-dasharray: none; }
 .arch-object .title { font-weight: 600; font-size: 12px; }
 .arch-object .subtitle { fill: var(--arch-text-subtle); font-size: 10px; }
+
+/* ---------- bindings ---------- */
+
+/* The five kinds of binding, one hue each, on Kumo's badge and text
+   tokens: the ink is a colour Kumo already uses for text of that hue
+   (dark on a light ground, light on a dark one), so a chip reads as a
+   name, not a fill; the tint is that ink washed into the base surface.
+   Purple has no text token, so it is pulled toward the strong text
+   colour — further in dark mode, where the badge hue is darker. */
+:root {
+  --binding-read-ink: var(--text-color-kumo-badge-teal-subtle);
+  --binding-output-ink: var(--text-color-kumo-success);
+  --binding-intent-ink: color-mix(in srgb, var(--color-kumo-badge-purple) 78%, var(--text-color-kumo-strong));
+  --binding-result-ink: var(--text-color-kumo-info);
+  --binding-handle-ink: var(--text-color-kumo-badge-orange-subtle);
+  --binding-fill-mix: 11%;
+  --binding-tag-mix: 16%;
+}
+[data-mode="dark"] {
+  --binding-intent-ink: color-mix(in srgb, var(--color-kumo-badge-purple) 40%, var(--text-color-kumo-strong));
+  --binding-fill-mix: 16%;
+  --binding-tag-mix: 24%;
+}
+.binding-read { --binding-ink: var(--binding-read-ink); }
+.binding-output { --binding-ink: var(--binding-output-ink); }
+.binding-intent { --binding-ink: var(--binding-intent-ink); }
+.binding-result { --binding-ink: var(--binding-result-ink); }
+.binding-handle { --binding-ink: var(--binding-handle-ink); }
+
+/* A chip is a button: it names one binding and takes the reader to its
+   detail (a definition) or to the card that binds it (a use). A defining
+   chip is filled and leads with `≔`; a using chip is outlined and leads
+   with `↑`, pointing back up the program to where the name was bound. */
+.binding-chip {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0 0.35em;
+  max-width: 100%;
+  padding: 0 0.45em;
+  border: 1px solid color-mix(in srgb, var(--binding-ink) 45%, transparent);
+  border-radius: 0.3rem;
+  background: transparent;
+  color: var(--binding-ink);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  line-height: 1.55;
+  text-align: left;
+  vertical-align: baseline;
+  cursor: pointer;
+  transition: background-color 120ms ease, border-color 120ms ease;
+}
+.binding-chip .glyph { font-weight: 700; opacity: 0.85; }
+.binding-chip .name { overflow-wrap: anywhere; font-weight: 600; }
+.binding-chip.defines {
+  background: color-mix(in srgb, var(--binding-ink) var(--binding-fill-mix), var(--color-kumo-base));
+  border-color: color-mix(in srgb, var(--binding-ink) 30%, transparent);
+}
+.binding-chip.defines .name { font-weight: 700; }
+.binding-chip:hover {
+  border-color: var(--binding-ink);
+  background: color-mix(in srgb, var(--binding-ink) var(--binding-fill-mix), var(--color-kumo-base));
+}
+.binding-chip:focus-visible { outline: 2px solid var(--color-kumo-focus); outline-offset: 1px; }
+
+/* The kind of a binding, as a small tag: inside a defining chip, and on
+   its own in the legend. */
+.binding-kind {
+  display: inline-block;
+  padding: 0 0.4em;
+  border-radius: 0.25rem;
+  background: color-mix(in srgb, var(--binding-ink) var(--binding-tag-mix), transparent);
+  color: var(--binding-ink);
+  font-family: system-ui, sans-serif;
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  line-height: 1.6;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+.binding-kind.legend { font-size: 10px; padding: 0.1em 0.5em; cursor: help; }
+
+/* Which arm's payload a result reference reads: the ok payload exists
+   only inside the ok arm, an error payload only inside its class's arm. */
+.binding-arm {
+  font-family: system-ui, sans-serif;
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  opacity: 0.85;
+}
+
+/* A value source that is not a binding — an input — carries a plain
+   kind tag instead, so the reader never mistakes it for a name a step
+   bound. */
+.ref-tag {
+  display: inline-block;
+  margin-right: 0.35em;
+  padding: 0 0.4em;
+  border: 1px solid var(--color-kumo-hairline);
+  border-radius: 0.25rem;
+  color: var(--text-color-kumo-subtle);
+  font-family: system-ui, sans-serif;
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  line-height: 1.6;
+  text-transform: uppercase;
+  vertical-align: baseline;
+}

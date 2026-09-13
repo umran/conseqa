@@ -6,10 +6,13 @@ import { Empty } from "@cloudflare/kumo/components/empty";
 import { Flow } from "@cloudflare/kumo/components/flow";
 import { Table } from "@cloudflare/kumo/components/table";
 import { Text } from "@cloudflare/kumo/components/text";
+import { Tooltip } from "@cloudflare/kumo/components/tooltip";
 import { ArrowSquareOutIcon, CaretRightIcon, GraphIcon } from "@phosphor-icons/react";
-import type { CSSProperties, ComponentPropsWithRef, ReactElement, ReactNode } from "react";
+import { Fragment, useEffect, type CSSProperties, type ComponentPropsWithRef, type ReactElement, type ReactNode } from "react";
 
+import { definedAtLabel, usedAtLabel, type BindingKind } from "../lib/bindings";
 import {
+  bindingKind,
   commitGuarantee,
   delivery,
   intrinsicRedrive,
@@ -33,10 +36,16 @@ import {
 } from "../lib/index";
 import { propertyMatchesRequirement, worstStatus } from "../lib/obligations";
 import { hashes } from "../lib/route";
-import { conditionText, predicateText, refString } from "../lib/text";
+import { stepHeadline } from "../lib/text";
 import { requirementKey, useApp, type DetailContext } from "../state/AppState";
-import { Fact, FactBadge, IdLink, KeyComponents, Mono, Muted, RefText, SectionCard, StatusBadge, StatusChips, selectableRow } from "../panels/parts";
-import type { Effect, Id, Operation, OperationBlock, RequirementKind, ResultType, TransactionStep, TransitionSideEffect } from "../types/model";
+import {
+  BindingChip, BindingKindTag, BindingRoots, ConditionView, Fact, FactBadge, IdLink, KeyComponents, Mono, Muted,
+  PredicateView, RefText, SectionCard, StatusBadge, StatusChips, selectableRow, useProgramNavigation,
+} from "../panels/parts";
+import type {
+  Effect, Id, Operation, OperationBlock, OperationStep, RequirementKind, ResultType, SelectorPredicate,
+  TransactionStep, TransitionSideEffect,
+} from "../types/model";
 
 type EffectKind = (Effect | TransitionSideEffect)["kind"];
 
@@ -104,6 +113,7 @@ function StepCard({ selKey, detailId, ctx, stripe, dashed, children, className, 
       className={`w-(--step-w) rounded-lg border border-kumo-hairline bg-kumo-base p-3 text-left shadow-sm transition-shadow hover:shadow-md ${selected ? "ring-2 ring-kumo-brand" : ""} ${className ?? ""}`}
       // Flow.Node pins `cursor: default` inline; the card is interactive.
       style={{ ...style, cursor: "pointer", borderLeft: `3px ${dashed ? "dashed" : "solid"} ${stripe}` }}
+      data-selkey={selKey}
     >
       {children}
     </div>
@@ -115,15 +125,15 @@ function StepTitle({ children }: { children: ReactNode }) {
 }
 
 /** One name a step makes available to later control, said as an
- *  assignment: the kind of binding, the full bound name — exactly the
- *  name later value references and synchronizations use — and what
- *  produces it. Every producing step renders one of these, so a
- *  reader can scan the flow for what each step binds. */
-function BindingRow({ label, name, from }: { label: string; name: string; from?: ReactNode }) {
+ *  assignment: the defining chip — the kind of binding and the full
+ *  bound name, exactly the name later value references and
+ *  synchronizations use — and what produces it. Every producing step
+ *  renders one of these, so a reader can scan the flow for what each
+ *  step binds. */
+function BindingRow({ name, kind, from }: { name: Id; kind: BindingKind; from?: ReactNode }) {
   return (
     <div className="flex flex-wrap items-center gap-x-1.5 gap-y-0.5 rounded-md border border-kumo-hairline bg-kumo-tint px-2 py-1">
-      <span className="text-[9.5px] font-semibold uppercase tracking-wider text-kumo-subtle">{label}</span>
-      <Mono className="break-all text-[12px] font-bold text-kumo-strong">{name}</Mono>
+      <BindingChip role="defines" name={name} kind={kind} />
       {from && (
         <span className="inline-flex min-w-0 flex-wrap items-center gap-1 text-xs text-kumo-subtle">
           <span className="text-kumo-inactive">←</span>
@@ -144,69 +154,117 @@ function TxStepRow({ step, index, txId, opId }: { step: TransactionStep; index: 
   const selKey = `ts:${txId}:${index}`;
   const selected = selection === selKey;
 
-  // A binding step leads with the full bound name — emphasized the
-  // same way program-level bindings are — and its note reads as the
-  // producer, after an arrow. A commit guard — a step that can reject
-  // the whole transaction — is marked as one.
+  // A binding step leads with its defining chip — the same chip the
+  // program-level producers render — and its note reads as the
+  // producer, after an arrow. A step that consumes a binding renders the
+  // binding's using chip in its note. A commit guard — a step that can
+  // reject the whole transaction — is marked as one.
+  const where = (target: { predicate: SelectorPredicate }) => (
+    <span className="inline-flex flex-wrap items-center gap-1">
+      <span>where</span>
+      <PredicateView predicate={target.predicate} />
+    </span>
+  );
   let kind: string;
-  let title: string;
-  let bound = false;
-  let note: string;
+  let title: ReactNode;
+  let note: ReactNode;
   switch (step.kind) {
     case "read":
-      kind = "read"; title = step.bind; bound = true;
-      note = `← ${shortId(step.target.object)} where ${predicateText(step.target.predicate)}`;
+      kind = "read";
+      title = <BindingChip role="defines" name={step.bind} kind="read" />;
+      note = (
+        <>
+          <span className="text-kumo-inactive">←</span>
+          <Mono>{shortId(step.target.object)}</Mono>
+          {where(step.target)}
+          <span className="text-kumo-inactive">· transaction-local</span>
+        </>
+      );
       break;
     case "write":
-      kind = "write"; title = shortId(step.target.object);
-      note = `${step.fields.map(pathText).join(", ")} · ${step.values.kind}`;
+      kind = "write"; title = <Mono className="text-kumo-strong">{shortId(step.target.object)}</Mono>;
+      note = <><span>{step.fields.map(pathText).join(", ")} · {step.values.kind}</span><BindingRoots value={step.values} /></>;
       break;
     case "insert":
-      kind = "insert"; title = shortId(step.object); note = `values: ${step.values.kind}`;
+      kind = "insert"; title = <Mono className="text-kumo-strong">{shortId(step.object)}</Mono>;
+      note = <><span>values: {step.values.kind}</span><BindingRoots value={step.values} /></>;
       break;
     case "delete":
-      kind = "delete"; title = shortId(step.target.object); note = `where ${predicateText(step.target.predicate)}`;
+      kind = "delete"; title = <Mono className="text-kumo-strong">{shortId(step.target.object)}</Mono>;
+      note = where(step.target);
       break;
     case "lock":
-      kind = "lock"; title = shortId(step.target.object); note = `${step.mode} · order ${step.order.kind}`;
+      kind = "lock"; title = <Mono className="text-kumo-strong">{shortId(step.target.object)}</Mono>;
+      note = <span>{step.mode} · order {step.order.kind}</span>;
       break;
     case "transition": {
-      kind = "transition"; title = shortId(step.transition);
-      const binds = Object.values(step.effect_intents).map((intent) => intent.bind);
-      const admissions = Object.keys(step.effects ?? {}).length;
-      const parts = [shortId(step.machine)];
-      if (binds.length) parts.push(`binds ${binds.join(", ")}`);
-      if (admissions) parts.push(`admits ${admissions} outbox message${admissions === 1 ? "" : "s"}`);
-      note = parts.join(" · ");
+      kind = "transition"; title = <Mono className="text-kumo-strong">{shortId(step.transition)}</Mono>;
+      const intents = Object.values(step.effect_intents);
+      const admissions = Object.entries(step.effects ?? {});
+      note = (
+        <>
+          <span>{shortId(step.machine)}</span>
+          {intents.map((intent) => (
+            <Fragment key={intent.bind}>
+              <span className="text-kumo-inactive">· binds</span>
+              <BindingChip role="defines" name={intent.bind} kind="intent" />
+              <BindingRoots value={intent.values} />
+            </Fragment>
+          ))}
+          {admissions.length > 0 && (
+            <span className="text-kumo-inactive">· admits {admissions.length} outbox message{admissions.length === 1 ? "" : "s"}</span>
+          )}
+          {admissions.map(([effectId, application]) => (
+            <BindingRoots key={effectId} value={application.values} />
+          ))}
+        </>
+      );
       break;
     }
     case "establish_effect_intent":
-      kind = "establish intent"; title = step.bind; bound = true;
-      note = `← captures ${shortId(step.effect_id)} · values: ${step.values.kind}`;
+      kind = "establish intent";
+      title = <BindingChip role="defines" name={step.bind} kind="intent" />;
+      note = (
+        <>
+          <span><span className="text-kumo-inactive">←</span> captures <Mono>{shortId(step.effect_id)}</Mono> · values: {step.values.kind}</span>
+          <BindingRoots value={step.values} />
+        </>
+      );
       break;
     case "establish_transaction_output":
-      kind = "establish output"; title = step.bind; bound = true;
-      note = `← a ${shortId(step.schema)} value · values: ${step.values.kind}`;
+      kind = "establish output";
+      title = <BindingChip role="defines" name={step.bind} kind="output" />;
+      note = (
+        <>
+          <span><span className="text-kumo-inactive">←</span> a <Mono>{shortId(step.schema)}</Mono> value · values: {step.values.kind}</span>
+          <BindingRoots value={step.values} />
+        </>
+      );
       break;
     case "write_outbox":
-      kind = "write outbox"; title = shortId(step.effect.outbox);
-      note = `admits ${shortId(step.effect.schema)} atomically with the commit · values: ${step.values.kind}`;
+      kind = "write outbox"; title = <Mono className="text-kumo-strong">{shortId(step.effect.outbox)}</Mono>;
+      note = (
+        <>
+          <span>admits {shortId(step.effect.schema)} atomically with the commit · values: {step.values.kind}</span>
+          <BindingRoots value={step.values} />
+        </>
+      );
       break;
     case "validate_version":
-      kind = "validate version"; title = shortId(step.target.object);
-      note = `expects ${refString(step.expected)} at commit · where ${predicateText(step.target.predicate)}`;
+      kind = "validate version"; title = <Mono className="text-kumo-strong">{shortId(step.target.object)}</Mono>;
+      note = <><span>expects</span><RefText value={step.expected} /><span>at commit ·</span>{where(step.target)}</>;
       break;
     case "bump_version":
-      kind = "bump version"; title = shortId(step.target.object);
-      note = `version + 1 atomically with the commit · where ${predicateText(step.target.predicate)}`;
+      kind = "bump version"; title = <Mono className="text-kumo-strong">{shortId(step.target.object)}</Mono>;
+      note = <><span>version + 1 atomically with the commit ·</span>{where(step.target)}</>;
       break;
     case "advance_cursor":
-      kind = "advance cursor"; title = `${shortId(step.target.object)}.${pathText(step.field)}`;
-      note = `← ${refString(step.incoming)} · ${step.rule} · where ${predicateText(step.target.predicate)}`;
+      kind = "advance cursor"; title = <Mono className="text-kumo-strong">{shortId(step.target.object)}.{pathText(step.field)}</Mono>;
+      note = <><span className="text-kumo-inactive">←</span><RefText value={step.incoming} /><span>· {step.rule} ·</span>{where(step.target)}</>;
       break;
     case "fence":
-      kind = "fence"; title = `${shortId(step.target.object)}.${pathText(step.field)}`;
-      note = `token ${refString(step.token)} · where ${predicateText(step.target.predicate)}`;
+      kind = "fence"; title = <Mono className="text-kumo-strong">{shortId(step.target.object)}.{pathText(step.field)}</Mono>;
+      note = <><span>token</span><RefText value={step.token} /><span>·</span>{where(step.target)}</>;
       break;
   }
   const guard = stepRejects(step);
@@ -229,17 +287,16 @@ function TxStepRow({ step, index, txId, opId }: { step: TransactionStep; index: 
         }
       }}
       className={`flex cursor-pointer items-start gap-2 rounded-md px-2 py-1.5 hover:bg-kumo-tint ${selected ? "bg-kumo-tint ring-1 ring-kumo-brand" : ""}`}
+      data-selkey={selKey}
     >
       <Badge variant="neutral">{index + 1}</Badge>
       <div className="min-w-0 flex-1">
         <div className="flex flex-wrap items-center gap-1.5">
           <span className="text-[11px] uppercase tracking-wider text-kumo-subtle">{kind}</span>
-          {bound
-            ? <Mono className="break-all rounded bg-kumo-tint px-1 py-px font-bold text-kumo-strong">{title}</Mono>
-            : <Mono className="text-kumo-strong">{title}</Mono>}
+          {title}
           {guard && <Badge variant="warning">commit guard</Badge>}
         </div>
-        <div className="truncate text-xs text-kumo-subtle">{note}</div>
+        <div className="flex flex-wrap items-center gap-x-1 gap-y-0.5 text-xs text-kumo-subtle">{note}</div>
       </div>
       {step.kind === "transition" && (
         <Button
@@ -258,16 +315,41 @@ function TxStepRow({ step, index, txId, opId }: { step: TransactionStep; index: 
   );
 }
 
+type ArmTone = "outline" | "warning" | "success";
+
+const ARM_BOX: Record<ArmTone, string> = {
+  outline: "border-kumo-hairline bg-kumo-elevated/30",
+  warning: "border-kumo-warning/40 bg-kumo-warning-tint/60",
+  success: "border-kumo-success/40 bg-kumo-success-tint/60",
+};
+
+/** One box of a set of alternatives — a decision's arm, a transaction's
+ *  outcome: its label, an optional note beside it, an optional caption
+ *  under it, and whatever the alternative holds. */
+function ArmBox({ label, tone = "outline", note, caption, children }: {
+  label: string; tone?: ArmTone; note?: ReactNode; caption?: ReactNode; children: ReactNode;
+}) {
+  return (
+    <div className={`min-w-0 space-y-2 rounded-md border p-2 ${ARM_BOX[tone]}`}>
+      <div className="flex flex-wrap items-center gap-1.5">
+        <Badge variant={tone}>{label}</Badge>
+        {note && <span className="text-xs text-kumo-subtle">{note}</span>}
+      </div>
+      {caption && <div className="text-[11px] leading-snug text-kumo-subtle">{caption}</div>}
+      {children}
+    </div>
+  );
+}
+
 /** One arm of a decision — or the rejection block of a transaction
  *  step: its label, as the checker spells it in a step location, and
  *  its block, rendered recursively. */
-function DecisionArm({ opId, op, label, block, hops, tone = "outline" }: {
+function DecisionArm({ opId, op, label, block, hops, tone = "outline", caption }: {
   opId: Id; op: Operation; label: string; block: OperationBlock | null; hops: StepHop[];
-  tone?: "outline" | "warning";
+  tone?: ArmTone; caption?: ReactNode;
 }) {
   return (
-    <div className="min-w-0 space-y-2 rounded-md border border-kumo-hairline bg-kumo-elevated/30 p-2">
-      <Badge variant={tone}>{label}</Badge>
+    <ArmBox label={label} tone={tone} caption={caption}>
       {block ? (
         block.steps.length ? (
           <ProgramBlock opId={opId} op={op} block={block} hops={hops} nested />
@@ -277,6 +359,36 @@ function DecisionArm({ opId, op, label, block, hops, tone = "outline" }: {
       ) : (
         <Muted>falls through</Muted>
       )}
+    </ArmBox>
+  );
+}
+
+/** What control does after a transaction commits: the next step of the
+ *  enclosing block, named and selectable, or the end of that block — the
+ *  end of the program at the top level, a fall-through to after the
+ *  enclosing step inside an arm. */
+function Continuation({ opId, next, location, nested }: {
+  opId: Id; next: OperationStep | undefined; location: string; nested: boolean;
+}) {
+  const { toStep } = useProgramNavigation();
+  if (!next) {
+    return <div className="text-xs text-kumo-subtle">{nested ? "end of block · falls through" : "end of program"}</div>;
+  }
+  return (
+    <div className="text-xs text-kumo-subtle">
+      continues with{" "}
+      <button
+        type="button"
+        className="cursor-pointer font-mono text-[12px] text-kumo-link hover:underline"
+        onClick={(e) => {
+          e.stopPropagation();
+          toStep(opId, location);
+        }}
+      >
+        step {location}
+      </button>
+      {" · "}
+      <Mono>{stepHeadline(next)}</Mono>
     </div>
   );
 }
@@ -301,6 +413,11 @@ function ProgramBlock({ opId, op, block, hops, nested }: { opId: Id; op: Operati
         const expanded = expandedTx.has(location);
         const rejects = step.rejected !== undefined;
 
+        // The transaction-local names: bound by read steps, consumed
+        // only inside the body, never available after it. Listed on the
+        // collapsed card so the names are visible without expanding.
+        const reads = tx.steps.flatMap((inner) => (inner.kind === "read" ? [inner.bind] : []));
+
         // The artifacts a committed execution establishes — the
         // bindings later control consumes. Bound names lead: the flow
         // must say what each step binds without expanding it.
@@ -308,23 +425,45 @@ function ProgramBlock({ opId, op, block, hops, nested }: { opId: Id; op: Operati
           switch (inner.kind) {
             case "establish_effect_intent":
               return [
-                <BindingRow key={ti} label="intent" name={inner.bind}
+                <BindingRow key={ti} kind="intent" name={inner.bind}
                   from={<span>captures <Mono>{shortId(inner.effect_id)}</Mono></span>} />,
               ];
             case "establish_transaction_output":
               return [
-                <BindingRow key={ti} label="output" name={inner.bind}
+                <BindingRow key={ti} kind="output" name={inner.bind}
                   from={<span>a <Mono>{shortId(inner.schema)}</Mono> value</span>} />,
               ];
             case "transition":
               return Object.entries(inner.effect_intents).map(([effectId, intent]) => (
-                <BindingRow key={`${ti}:${effectId}`} label="intent" name={intent.bind}
+                <BindingRow key={`${ti}:${effectId}`} kind="intent" name={intent.bind}
                   from={<span>side effect <Mono>{shortId(effectId)}</Mono></span>} />
               ));
             default:
               return [];
           }
         });
+
+        // The committed outcome: what the commit made available, and
+        // where control goes next — the next step of this block, or its
+        // end.
+        const committed = (
+          <>
+            {established.length ? (
+              <div className="space-y-1">
+                {established}
+                <div className="text-[11px] text-kumo-subtle">available from here on</div>
+              </div>
+            ) : (
+              <div className="text-xs text-kumo-inactive">establishes no binding</div>
+            )}
+            <Continuation
+              opId={opId}
+              next={block.steps[si + 1]}
+              location={locationLabel([...hops, { step: si + 1 }])}
+              nested={hops.length > 0}
+            />
+          </>
+        );
 
         return {
           key: location,
@@ -356,7 +495,13 @@ function ProgramBlock({ opId, op, block, hops, nested }: { opId: Id; op: Operati
                   ))}
                 </div>
               )}
-              {established.length > 0 && <Bindings>{established}</Bindings>}
+              {!expanded && reads.length > 0 && (
+                <div className="mt-2 flex flex-wrap items-center gap-1.5 text-xs text-kumo-subtle">
+                  <span>binds inside</span>
+                  {reads.map((r) => <BindingChip key={r} role="defines" name={r} kind="read" />)}
+                  <span className="text-kumo-inactive">· transaction-local</span>
+                </div>
+              )}
               <Collapsible.Root open={expanded} onOpenChange={() => toggleTx(location)}>
                 <Collapsible.Trigger
                   className="mt-2 flex w-full cursor-pointer items-center gap-1 text-xs text-kumo-link hover:underline"
@@ -373,13 +518,26 @@ function ProgramBlock({ opId, op, block, hops, nested }: { opId: Id; op: Operati
                   </div>
                 </Collapsible.Panel>
               </Collapsible.Root>
-              {step.rejected && (
-                // The block control enters when a commit guard rejects:
-                // nothing committed, no artifact established. It is an
-                // arm of this step the way a decision's arms are, and
-                // its steps are located beneath it as `n.rejected.m`.
+              {/* The two outcomes of an attempt, side by side like a
+                  decision's arms — never "commit, then reject". Left,
+                  what a commit establishes and where control continues;
+                  right, the block control enters when a commit guard
+                  rejects: nothing committed, no artifact established,
+                  its steps located beneath this one as `n.rejected.m`.
+                  A body with no guard cannot reject, so it gets one
+                  full-width committed strip and no arm to pretend
+                  otherwise. */}
+              {step.rejected ? (
+                <div className="mt-2 grid gap-2 sm:grid-cols-2">
+                  <ArmBox label="committed" tone="success">{committed}</ArmBox>
+                  <DecisionArm
+                    opId={opId} op={op} label="rejected" tone="warning" block={step.rejected} hops={under("rejected")}
+                    caption="nothing committed · no binding above is available here"
+                  />
+                </div>
+              ) : (
                 <div className="mt-2">
-                  <DecisionArm opId={opId} op={op} label="rejected" tone="warning" block={step.rejected} hops={under("rejected")} />
+                  <ArmBox label="committed" tone="success" note="always commits">{committed}</ArmBox>
                 </div>
               )}
             </StepCard>
@@ -398,12 +556,13 @@ function ProgramBlock({ opId, op, block, hops, nested }: { opId: Id; op: Operati
               </div>
               <StepTitle>{shortId(step.effect_id)}</StepTitle>
               <div className="mt-1 text-xs text-kumo-subtle">{effectSummary(model, index, step.effect_id)}</div>
-              <div className="mt-1 text-xs text-kumo-subtle">
+              <div className="mt-1 flex flex-wrap items-center gap-1 text-xs text-kumo-subtle">
                 instance: <Badge variant={step.values.kind === "deterministic" ? "info" : "warning"}>{step.values.kind}</Badge>
+                <BindingRoots value={step.values} />
               </div>
               {step.bind && (
                 <Bindings>
-                  <BindingRow label="result" name={step.bind}
+                  <BindingRow kind="result" name={step.bind}
                     from={<span>this execution's <Mono>Result</Mono></span>} />
                 </Bindings>
               )}
@@ -425,11 +584,11 @@ function ProgramBlock({ opId, op, block, hops, nested }: { opId: Id; op: Operati
                 <EffectKindBadge kind={effKind} />
                 {via && <Badge variant="info">via transition</Badge>}
               </div>
-              <StepTitle>{step.intent}</StepTitle>
+              <StepTitle><BindingChip role="uses" name={step.intent} kind="intent" /></StepTitle>
               <div className="mt-1 text-xs text-kumo-subtle">{eff ? effectSummary(model, index, eff) : "unresolved intent"}</div>
               {step.bind && (
                 <Bindings>
-                  <BindingRow label="result" name={step.bind}
+                  <BindingRow kind="result" name={step.bind}
                     from={<span>this execution's <Mono>Result</Mono></span>} />
                 </Bindings>
               )}
@@ -449,12 +608,13 @@ function ProgramBlock({ opId, op, block, hops, nested }: { opId: Id; op: Operati
               </div>
               <StepTitle>{shortId(step.effect_id)}</StepTitle>
               <div className="mt-1 text-xs text-kumo-subtle">{effectSummary(model, index, step.effect_id)}</div>
-              <div className="mt-1 text-xs text-kumo-subtle">
+              <div className="mt-1 flex flex-wrap items-center gap-1 text-xs text-kumo-subtle">
                 instance: <Badge variant={step.values.kind === "deterministic" ? "info" : "warning"}>{step.values.kind}</Badge>
-                <span className="ml-1.5">· control does not wait</span>
+                <BindingRoots value={step.values} />
+                <span className="ml-1">· control does not wait</span>
               </div>
               <Bindings>
-                <BindingRow label="handle" name={step.handle} from={<span>this launch — no result until a barrier</span>} />
+                <BindingRow kind="handle" name={step.handle} from={<span>this launch — no result until a barrier</span>} />
               </Bindings>
             </StepCard>
           ),
@@ -474,11 +634,11 @@ function ProgramBlock({ opId, op, block, hops, nested }: { opId: Id; op: Operati
                 <EffectKindBadge kind={effKind} />
                 {via && <Badge variant="info">via transition</Badge>}
               </div>
-              <StepTitle>{step.intent}</StepTitle>
+              <StepTitle><BindingChip role="uses" name={step.intent} kind="intent" /></StepTitle>
               <div className="mt-1 text-xs text-kumo-subtle">{eff ? effectSummary(model, index, eff) : "unresolved intent"}</div>
               <div className="mt-1 text-xs text-kumo-subtle">control does not wait</div>
               <Bindings>
-                <BindingRow label="handle" name={step.handle} from={<span>this launch — no result until a barrier</span>} />
+                <BindingRow kind="handle" name={step.handle} from={<span>this launch — no result until a barrier</span>} />
               </Bindings>
             </StepCard>
           ),
@@ -498,11 +658,11 @@ function ProgramBlock({ opId, op, block, hops, nested }: { opId: Id; op: Operati
               <Bindings>
                 {step.handles.map((entry) =>
                   entry.bind ? (
-                    <BindingRow key={entry.handle} label="result" name={entry.bind}
-                      from={<span>completion of <Mono>{entry.handle}</Mono></span>} />
+                    <BindingRow key={entry.handle} kind="result" name={entry.bind}
+                      from={<span className="inline-flex items-center gap-1">completion of <BindingChip role="uses" name={entry.handle} kind="handle" /></span>} />
                   ) : (
                     <div key={entry.handle} className="flex flex-wrap items-center gap-1.5 px-2 text-xs">
-                      <Mono className="text-kumo-strong">{entry.handle}</Mono>
+                      <BindingChip role="uses" name={entry.handle} kind="handle" />
                       <span className="text-kumo-inactive">awaited · no result bound</span>
                     </div>
                   ),
@@ -525,12 +685,12 @@ function ProgramBlock({ opId, op, block, hops, nested }: { opId: Id; op: Operati
               </div>
               <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
                 {step.handles.map((h) => (
-                  <Mono key={h} className="text-xs text-kumo-strong">{h}</Mono>
+                  <BindingChip key={h} role="uses" name={h} kind="handle" />
                 ))}
               </div>
               {step.bind && (
                 <Bindings>
-                  <BindingRow label="result" name={step.bind}
+                  <BindingRow kind="result" name={step.bind}
                     from={<span>the winner's <Mono>Result</Mono> — first completion, whichever candidate</span>} />
                 </Bindings>
               )}
@@ -548,7 +708,7 @@ function ProgramBlock({ opId, op, block, hops, nested }: { opId: Id; op: Operati
                 <Badge variant="neutral">match result</Badge>
                 <Badge variant="outline">step {location}</Badge>
               </div>
-              <StepTitle>{step.result}</StepTitle>
+              <StepTitle><BindingChip role="uses" name={step.result} kind="result" /></StepTitle>
               {/* One arm per outcome the contract declares: ok, then an
                   arm per error class, labelled as the checker locates
                   its steps. */}
@@ -576,7 +736,7 @@ function ProgramBlock({ opId, op, block, hops, nested }: { opId: Id; op: Operati
                 {step.condition.kind === "unspecified" && <Badge variant="warning">condition unspecified</Badge>}
               </div>
               <StepTitle>
-                <span className="break-words font-normal text-kumo-subtle">{conditionText(step.condition)}</span>
+                <span className="break-words font-normal text-kumo-subtle"><ConditionView condition={step.condition} /></span>
               </StepTitle>
               <div className="mt-2 grid gap-2 sm:grid-cols-2">
                 <DecisionArm opId={opId} op={op} label="then" block={step.then} hops={under("then")} />
@@ -598,8 +758,9 @@ function ProgramBlock({ opId, op, block, hops, nested }: { opId: Id; op: Operati
                 </Badge>
               </div>
               <StepTitle>{shortId(step.request)}</StepTitle>
-              <div className="mt-1 text-xs text-kumo-subtle">
+              <div className="mt-1 flex flex-wrap items-center gap-1 text-xs text-kumo-subtle">
                 payload: <Badge variant={step.outcome.values.kind === "deterministic" ? "info" : "warning"}>{step.outcome.values.kind}</Badge>
+                <BindingRoots value={step.outcome.values} />
               </div>
             </StepCard>
           ),
@@ -640,6 +801,125 @@ function ProgramBlock({ opId, op, block, hops, nested }: { opId: Id; op: Operati
           <Flow.Node key={n.key} id={n.key} render={n.element} />
         ))}
       </Flow>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Bindings
+// ---------------------------------------------------------------------------
+
+const BINDING_KINDS: BindingKind[] = ["read", "output", "intent", "result", "handle"];
+
+/** Where each kind of binding is available, in a few words: the
+ *  legend's caption beside the kind's coloured tag. */
+const BINDING_SCOPE: Record<BindingKind, string> = {
+  read: "transaction-local",
+  output: "program · committed path",
+  intent: "program · committed path",
+  result: "program · from the step on",
+  handle: "program · from the launch on",
+};
+
+/** A program location as a link into the flow. */
+function LocationLink({ onClick, children }: { onClick: () => void; children: ReactNode }) {
+  return (
+    <button
+      type="button"
+      className="cursor-pointer whitespace-nowrap font-mono text-[12px] text-kumo-link hover:underline"
+      onClick={(e) => {
+        e.stopPropagation();
+        onClick();
+      }}
+    >
+      {children}
+    </button>
+  );
+}
+
+/** Every name the program binds, in program order: its defining chip,
+ *  kind, scope, where it is bound, and every step that uses it — each
+ *  location a link into the flow. The cross-reference the chips in the
+ *  flow are read against. */
+function BindingsTable({ id }: { id: Id }) {
+  const { bindings } = useApp();
+  const { toProducer, toUse } = useProgramNavigation();
+  const own = bindings.byOp.get(id);
+  const defs = own ? [...own.defs.values()] : [];
+
+  if (!defs.length) return <Muted>the program binds no names</Muted>;
+
+  return (
+    <Table>
+      <Table.Header variant="compact">
+        <Table.Row>
+          <Table.Head>binding</Table.Head>
+          <Table.Head>kind</Table.Head>
+          <Table.Head>scope</Table.Head>
+          <Table.Head>bound at</Table.Head>
+          <Table.Head>used at</Table.Head>
+        </Table.Row>
+      </Table.Header>
+      <Table.Body>
+        {defs.map((def) => {
+          const uses = own?.uses.get(def.name) ?? [];
+          return (
+            <Table.Row key={def.name}>
+              <Table.Cell className="whitespace-nowrap"><BindingChip role="defines" name={def.name} kind={def.kind} /></Table.Cell>
+              <Table.Cell className="whitespace-nowrap">
+                <Tooltip content={bindingKind(def.kind).summary} render={<span className="cursor-help text-kumo-default">{def.kind}</span>} />
+              </Table.Cell>
+              <Table.Cell className="whitespace-nowrap">
+                {def.scope === "transaction" && def.transaction !== undefined ? (
+                  <span className="inline-flex items-center gap-1">
+                    <span className="text-kumo-subtle">transaction</span>
+                    <IdLink id={def.transaction}>{shortId(def.transaction)}</IdLink>
+                  </span>
+                ) : (
+                  <span className="text-kumo-subtle">program</span>
+                )}
+              </Table.Cell>
+              <Table.Cell className="whitespace-nowrap">
+                <span className="inline-flex flex-wrap items-center gap-1.5">
+                  <LocationLink onClick={() => toProducer(def)}>{definedAtLabel(def)}</LocationLink>
+                  <span className="text-xs text-kumo-inactive">{def.producer}</span>
+                </span>
+              </Table.Cell>
+              <Table.Cell>
+                {uses.length ? (
+                  <span className="inline-flex flex-wrap items-center gap-x-1 gap-y-0.5">
+                    {uses.map((u, i) => (
+                      <Fragment key={i}>
+                        {i > 0 && <span className="text-kumo-inactive">,</span>}
+                        <span className="inline-flex items-center gap-1">
+                          <LocationLink onClick={() => toUse(id, u)}>{usedAtLabel(u)}</LocationLink>
+                          <span className="text-[11px] text-kumo-inactive">{u.how}</span>
+                        </span>
+                      </Fragment>
+                    ))}
+                  </span>
+                ) : (
+                  <span className="text-kumo-inactive">unused</span>
+                )}
+              </Table.Cell>
+            </Table.Row>
+          );
+        })}
+      </Table.Body>
+    </Table>
+  );
+}
+
+/** The five kinds, each in its colour, with where it is available. */
+function BindingsLegend() {
+  return (
+    <div className="flex flex-wrap items-center gap-x-4 gap-y-1 border-b border-kumo-hairline px-3 py-2 text-xs text-kumo-subtle">
+      {BINDING_KINDS.map((kind) => (
+        <span key={kind} className="inline-flex items-center gap-1.5">
+          <BindingKindTag kind={kind} legend />
+          <span>{BINDING_SCOPE[kind]}</span>
+        </span>
+      ))}
     </div>
   );
 }
@@ -975,8 +1255,18 @@ function InputsTable({ opId, op }: { opId: Id; op: Operation }) {
 // ---------------------------------------------------------------------------
 
 export function OperationView({ id }: { id: string }) {
-  const { model, navigateTo, obligations } = useApp();
+  const { model, navigateTo, obligations, selection, bindings } = useApp();
   const op = model.operations[id];
+
+  // A selection made from elsewhere — a binding's chip, the bindings
+  // table, the detail panel — must be visible to have happened: the
+  // selected card is brought into view. A card already on screen does
+  // not move.
+  useEffect(() => {
+    if (!selection) return;
+    const card = document.querySelector<HTMLElement>(`[data-selkey="${CSS.escape(selection)}"]`);
+    card?.scrollIntoView({ block: "nearest", behavior: "smooth" });
+  }, [selection]);
 
   if (!op) {
     return (
@@ -994,6 +1284,7 @@ export function OperationView({ id }: { id: string }) {
   const inputCount = Object.keys(op.inputs).length;
   const transactionCount = transactions.length;
   const stepCount = walkProgram(op.program).length;
+  const bindingCount = bindings.byOp.get(id)?.defs.size ?? 0;
   const machines = [...new Set(
     transactions.flatMap((tx) => tx.steps.flatMap((s) => (s.kind === "transition" ? [s.machine] : []))),
   )];
@@ -1047,6 +1338,17 @@ export function OperationView({ id }: { id: string }) {
           ) : (
             <Empty size="sm" title="operation declares no program steps" />
           )}
+        </SectionCard>
+
+        <SectionCard
+          title="Bindings"
+          count={bindingCount}
+          hint="every name a step introduces for later steps — ≔ where it is bound, ↑ where it is used"
+        >
+          <BindingsLegend />
+          <div className="overflow-x-auto">
+            <BindingsTable id={id} />
+          </div>
         </SectionCard>
       </div>
     </div>
