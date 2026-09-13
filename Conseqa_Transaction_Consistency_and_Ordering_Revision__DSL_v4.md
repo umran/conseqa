@@ -608,12 +608,12 @@ Extend the transition declaration:
 
 ```rust
 pub struct Transition {
-    pub id: Id,
-    pub from: BTreeSet<StateId>,
-    pub to: StateId,
+    pub from: BTreeSet<Id>,
+    pub to: Id,
+    pub side_effects: BTreeMap<Id, TransitionSideEffect>,
 
     #[serde(default)]
-    pub effects: Vec<TransitionEffect>,
+    pub effects: BTreeMap<Id, TransitionEffect>,
 }
 ```
 
@@ -625,9 +625,85 @@ pub enum TransitionEffect {
 }
 ```
 
+and, on the applying `transition` transaction step, the derivation of each admitted message:
+
+```rust
+pub struct StateTransition {
+    pub machine: Id,
+    pub transition: Id,
+    pub subject: ObjectSelector,
+    pub effect_intents: BTreeMap<Id, TransitionEffectIntent>,
+
+    #[serde(default)]
+    pub effects: BTreeMap<Id, TransitionEffectApplication>,
+}
+
+pub struct TransitionEffectApplication {
+    pub values: Derivation,
+}
+```
+
 V4 deliberately keeps this surface narrow.
 
 No direct effect-execution kind is valid as a transition effect.
+
+## 15.1 Amendment: keyed effects and application-site derivations
+
+The first draft of this section declared `effects: Vec<TransitionEffect>` on the transition and nothing on the applying step. The implementation keys the declaration by effect id and pairs it with a derivation map on the applying step. This amendment records the shape as shipped, and the reasons.
+
+An admission is a message instance, and the model must know where the instance's values come from. That derivation cannot live on the state machine, which is shared by every operation that applies it and knows nothing about any one transaction's inputs or reads. It belongs at the applying step, evaluated in the enclosing transaction context — exactly where `effect_intents` already places the derivations of transition side effects. A step can refer to a declared effect only by name; pairing derivations positionally against a list would silently re-pair every applying site whenever the machine's list is reordered.
+
+The effect id is also the admission site's stable identity, as an `effect_id` is for every other effect occurrence: lineage, diagnostics, proof evidence, visualization, and — decisively — the target of an `idempotency_key_propagation`, which names its effect as `effect:<id>`. A nameless admission could declare no propagation, so outbox lineage could not be traced through a transition-scoped write.
+
+Finally, `Transition.side_effects` and `StateTransition.effect_intents` already form this exact pair of maps under an exact-match rule. Two adjacent collections of effects on one struct with different shapes would be one more thing to learn for no semantic gain.
+
+Consequences:
+
+- the effect id lives in the global identifier namespace, so a collision with any other id is `DuplicateId`, as for a side-effect id;
+- `StateTransition.effects.keys()` must equal `Transition.effects.keys()`; a missing or unexpected derivation is `InvalidTransitionOutboxDerivation { transaction, transition, missing, unexpected }`, the outbox counterpart of `TransitionEffectIntentsMismatch`;
+- a transition without outbox effects omits both maps;
+- the admissions of one transition commit together, so the map's id order carries no meaning. A future transition effect kind for which declaration order mattered would need an ordering fact of its own.
+
+Surface form:
+
+```yaml
+state_machines:
+  machine.order_lifecycle:
+    transitions:
+      transition.order.mark_paid:
+        from: [state.order.pending]
+        to: state.order.paid
+        side_effects: {}
+        effects:
+          effect.order.paid_admitted:
+            kind: outbox_write
+            outbox: outbox.order_events
+            schema: schema.OrderPaid
+            idempotency_key_propagation: []
+```
+
+```yaml
+# the applying site, a step of tx.apply_payment
+- kind: transition
+  machine: machine.order_lifecycle
+  transition: transition.order.mark_paid
+  subject:
+    object: object.order
+    predicate:
+      kind: eq
+      field: order_id
+      value: { source: input:input.apply_payment.captured, path: order_id }
+  effect_intents: {}
+  effects:
+    effect.order.paid_admitted:
+      values:
+        kind: deterministic
+        from:
+          - { source: transaction_read:read.apply_payment.order, path: order_id }
+          - { source: input:input.apply_payment.captured, path: event_id }
+```
+
+The atomicity contract of §16, the exclusions of §17, the provenance distinction of §18, and the proof treatment of §19 are unchanged by the shape.
 
 ---
 
