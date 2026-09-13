@@ -80,7 +80,6 @@ fn put_pool(name: &str, bound: u32) -> Mutation {
             member_concurrency: MemberConcurrency::Bounded(
                 NonZeroU32::new(bound).expect("non-zero"),
             ),
-            execution_handoff: Some(conseqa::spec::ExecutionHandoff::ExclusiveOwnership),
         },
     }
 }
@@ -120,7 +119,10 @@ async fn commits_publish_before_analysis_finishes() {
     };
 
     assert_eq!(analysis.revision, receipt.revision);
-    assert_eq!(analysis.obligations.model_revision, Some(receipt.revision.0));
+    assert_eq!(
+        analysis.obligations.model_revision,
+        Some(receipt.revision.0)
+    );
 }
 
 #[tokio::test]
@@ -180,7 +182,6 @@ async fn draft_heads_report_precise_assembly_gaps_until_programs_arrive() {
             service: id("service.checkout"),
             description: None,
             inputs: BTreeMap::new(),
-            invocation_lock: None,
         }),
     );
 
@@ -209,13 +210,9 @@ async fn draft_heads_report_precise_assembly_gaps_until_programs_arrive() {
         WriteScope::operation_synthesis(id("operation.noop")),
     );
 
-    let receipt = submit(
-        &engine,
-        &a,
-        vec![truncate_program("operation.noop")],
-    )
-    .await
-    .expect("the synthesis commit is accepted");
+    let receipt = submit(&engine, &a, vec![truncate_program("operation.noop")])
+        .await
+        .expect("the synthesis commit is accepted");
 
     let AnalysisState::Ready(analysis) = ready(&engine, receipt.revision).await else {
         panic!("the assembled model validates and verifies");
@@ -323,12 +320,14 @@ async fn requirement_reports_serve_verdicts_and_guard_repairs() {
 
     assert_eq!(report["analysis"], "ready");
 
-    let obligations = report["obligations"].as_array().expect("obligations listed");
+    let obligations = report["obligations"]
+        .as_array()
+        .expect("obligations listed");
 
-    // charge_payment declares serialization, ordering, and idempotency
-    // requirements — and the fixture's card charge is deliberately not
-    // deduplicated, so idempotency is unproven.
-    assert_eq!(obligations.len(), 3, "{obligations:?}");
+    // charge_payment declares one idempotency requirement — and the
+    // fixture's card charge is deliberately not deduplicated, so it is
+    // unproven.
+    assert_eq!(obligations.len(), 1, "{obligations:?}");
 
     let idempotency = obligations
         .iter()
@@ -346,10 +345,7 @@ async fn requirement_reports_serve_verdicts_and_guard_repairs() {
         )
         .expect("the filtered report is ready");
 
-    assert_eq!(
-        filtered["obligations"].as_array().expect("listed").len(),
-        1
-    );
+    assert_eq!(filtered["obligations"].as_array().expect("listed").len(), 1);
 
     // The scoped report recorded the operation's sub-symbols, so a
     // concurrent change to the operation invalidates the repair task.
@@ -359,9 +355,13 @@ async fn requirement_reports_serve_verdicts_and_guard_repairs() {
         WriteScope::operation_synthesis(id("operation.charge_payment")),
     );
 
-    submit(&engine, &writer, vec![truncate_program("operation.charge_payment")])
-        .await
-        .expect("the writer commits");
+    submit(
+        &engine,
+        &writer,
+        vec![truncate_program("operation.charge_payment")],
+    )
+    .await
+    .expect("the writer commits");
 
     assert_eq!(
         engine.task_status(repair.id).unwrap(),
@@ -437,7 +437,7 @@ async fn context_bundles_slice_and_track() {
             repair.id,
             &BundleSpec {
                 operation: Some(id("operation.charge_payment")),
-                requirements: vec![(RequirementFamily::Idempotency, 0)],
+                requirements: vec![(RequirementFamily::Idempotency, None, 0)],
                 include: Vec::new(),
             },
         )
@@ -528,18 +528,18 @@ async fn bundles_fall_back_to_interfaces_before_analysis_and_use_summaries_after
                 id("input.gateway.paid"),
                 Input::Subscription(SubscriptionInput {
                     topic: id("topic.order_events"),
-                    messages: MessageSelector::Only(
-                        [id("schema.OrderPaid")].into_iter().collect(),
-                    ),
+                    messages: MessageSelector::Only([id("schema.OrderPaid")].into_iter().collect()),
                     acknowledge_on_success: None,
                 }),
             )]),
-            invocation_lock: None,
         }),
     );
 
     {
-        let draft = workspace.operations.get_mut(&id("operation.gateway")).unwrap();
+        let draft = workspace
+            .operations
+            .get_mut(&id("operation.gateway"))
+            .unwrap();
 
         draft.program = Some(OperationBlock {
             steps: vec![
@@ -655,10 +655,11 @@ async fn a_broken_program_is_rejected_in_session_then_repaired() {
     let mut broken = valid.clone();
 
     for step in &mut broken.steps {
-        if let OperationStep::Transaction(transaction) = step
-            && transaction.id == id("tx.create_order.new")
+        if let OperationStep::Transaction(execute) = step
+            && execute.transaction.id == id("tx.create_order.new")
         {
-            transaction
+            execute
+                .transaction
                 .steps
                 .retain(|inner| !matches!(inner, TransactionStep::EstablishEffectIntent(_)));
         }

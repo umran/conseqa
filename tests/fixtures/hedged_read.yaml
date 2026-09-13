@@ -1,4 +1,4 @@
-dsl: 3
+dsl: 4
 revision: 1
 
 services:
@@ -60,7 +60,8 @@ operations:
           kind: unspecified
         result:
           ok: schema.Row
-          err: schema.Miss
+          errors:
+            miss: schema.Miss
     program:
       steps:
       - kind: execute_effect_async
@@ -75,7 +76,8 @@ operations:
           result_replay: unspecified
           result:
             ok: schema.Row
-            err: schema.Miss
+            errors:
+              miss: schema.Miss
         values:
           kind: deterministic
           from:
@@ -93,7 +95,8 @@ operations:
           result_replay: unspecified
           result:
             ok: schema.Row
-            err: schema.Miss
+            errors:
+              miss: schema.Miss
         values:
           kind: deterministic
           from:
@@ -138,20 +141,20 @@ operations:
                 from:
                 - source: effect_result_ok:result.read
                   path: id
-        err:
-          steps:
-          - kind: return
-            request: input.hedged_read.request
-            outcome:
-              kind: err
-              values:
-                kind: deterministic
-                from:
-                - source: effect_result_err:result.read
-                  path: reason
+        errors:
+          miss:
+            steps:
+            - kind: return
+              request: input.hedged_read.request
+              outcome:
+                kind: err
+                error: miss
+                values:
+                  kind: deterministic
+                  from:
+                  - source: effect_result_err:result.read
+                    path: reason
     requirements:
-      serialization: []
-      ordering: []
       idempotency: []
       recoverability: []
   operation.record_read:
@@ -182,7 +185,5 @@ operations:
             path: id
       - kind: complete
     requirements:
-      serialization: []
-      ordering: []
       idempotency: []
       recoverability: []

@@ -10,17 +10,18 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use conseqa::confluence::{
     CommitReceipt, CommitRejection, CommitRequest, ConfluenceEngine, CreateTask, EngineError,
-    EngineEvent, GraphQuery, InvalidationCause, Mutation,
-    OperationDraftStage, OperationInterfaceDraft, OperationReadMode, PatchId, PromptObligation,
-    PromptObligationId, PromptObligationStatus, ProposalStatus, ProposedRequirement,
-    RequirementOrigin, RequirementSubmission, RunId, RunMetadata, SpecPatch, SymbolKey,
-    TaskBudget, TaskHandle, TaskKind, TaskState, WorkspaceState, WriteGrant, WriteScope,
+    EngineEvent, GraphQuery, InvalidationCause, Mutation, OperationDraftStage,
+    OperationInterfaceDraft, OperationReadMode, PatchId, PromptObligation, PromptObligationId,
+    PromptObligationStatus, ProposalStatus, ProposedRequirement, RequirementOrigin,
+    RequirementSubmission, RunId, RunMetadata, SpecPatch, SymbolKey, TaskBudget, TaskHandle,
+    TaskKind, TaskState, WorkspaceState, WriteGrant, WriteScope,
 };
 use conseqa::spec::{
-    Derivation, FieldPath, Id, IdempotencyGuarantee, Input, MessageSelector, ObjectSelector,
-    OperationBlock, OperationStep, Revision, SelectorPredicate,
-    SerializationRequirement, SubscriptionInput, Transaction, TransactionIsolation,
-    Service, ServiceKind, TransactionStep, ValueRef, ValueSource, Write,
+    Derivation, ExecuteTransaction, FieldPath, Id, IdempotencyGuarantee, IdempotencyKey,
+    IdempotencyRequirement, Input, MessageSelector, ObjectSelector, OperationBlock, OperationStep,
+    ResultReplayRequirement, Revision, SelectorPredicate, Service, ServiceKind, SubscriptionInput,
+    Transaction, TransactionIsolation, TransactionSerializabilityRequirement, TransactionStep,
+    ValueRef, ValueSource, Write,
 };
 use uuid::Uuid;
 
@@ -89,12 +90,16 @@ fn probe_program(operation: &str, marker: u32) -> Mutation {
         operation: id(operation),
         program: OperationBlock {
             steps: vec![
-                OperationStep::Transaction(conseqa::spec::Transaction {
-                    id: id(&format!("tx.{short}.probe{marker}")),
-                    data_model: None,
-                    isolation: conseqa::spec::TransactionIsolation::ReadCommitted,
-                    idempotency: IdempotencyGuarantee::NotDeduplicated,
-                    steps: Vec::new(),
+                OperationStep::Transaction(ExecuteTransaction {
+                    transaction: conseqa::spec::Transaction {
+                        id: id(&format!("tx.{short}.probe{marker}")),
+                        data_model: None,
+                        isolation: conseqa::spec::TransactionIsolation::ReadCommitted,
+                        idempotency: IdempotencyGuarantee::NotDeduplicated,
+                        requirements: Default::default(),
+                        steps: Vec::new(),
+                    },
+                    rejected: None,
                 }),
                 OperationStep::Complete,
             ],
@@ -161,14 +166,16 @@ fn ping_interface() -> OperationInterfaceDraft {
                 ),
                 result: conseqa::spec::ResultType {
                     ok: id("schema.PingResponse"),
-                    err: conseqa::spec::ErrorResultType {
-                        schema: id("schema.Rejected"),
-                        disposition: conseqa::spec::ErrorDisposition::Terminal,
-                    },
+                    errors: BTreeMap::from([(
+                        id("rejected"),
+                        conseqa::spec::ErrorResultType {
+                            schema: id("schema.Rejected"),
+                            disposition: conseqa::spec::ErrorDisposition::Terminal,
+                        },
+                    )]),
                 },
             }),
         )]),
-        invocation_lock: None,
     }
 }
 
@@ -189,23 +196,36 @@ fn ping_program() -> OperationBlock {
 }
 
 /// A program writing `object.order.status` directly — a new writer for
-/// phantom tests.
+/// phantom tests. The order is versioned, so the write carries the
+/// version bump the protocol requires.
 fn status_writer_program() -> OperationBlock {
     OperationBlock {
         steps: vec![
-            OperationStep::Transaction(Transaction {
-                id: id("tx.admin_force"),
-                data_model: Some(id("data.checkout")),
-                isolation: TransactionIsolation::ReadCommitted,
-                idempotency: IdempotencyGuarantee::Unspecified,
-                steps: vec![TransactionStep::Write(Write {
-                    target: ObjectSelector {
-                        object: id("object.order"),
-                        predicate: SelectorPredicate::All,
-                    },
-                    fields: BTreeSet::from([path("status")]),
-                    values: Derivation::Unspecified,
-                })],
+            OperationStep::Transaction(ExecuteTransaction {
+                transaction: Transaction {
+                    id: id("tx.admin_force"),
+                    data_model: Some(id("data.checkout")),
+                    isolation: TransactionIsolation::ReadCommitted,
+                    idempotency: IdempotencyGuarantee::Unspecified,
+                    requirements: Default::default(),
+                    steps: vec![
+                        TransactionStep::Write(Write {
+                            target: ObjectSelector {
+                                object: id("object.order"),
+                                predicate: SelectorPredicate::All,
+                            },
+                            fields: BTreeSet::from([path("status")]),
+                            values: Derivation::Unspecified,
+                        }),
+                        TransactionStep::BumpVersion(conseqa::spec::BumpVersion {
+                            target: ObjectSelector {
+                                object: id("object.order"),
+                                predicate: SelectorPredicate::All,
+                            },
+                        }),
+                    ],
+                },
+                rejected: None,
             }),
             OperationStep::Complete,
         ],
@@ -264,7 +284,10 @@ fn interactive_session_commits_repeatedly_under_one_token() {
 
     // Each commit rolled the token to a distinct successor task.
     assert_eq!(
-        task_ids.iter().collect::<std::collections::BTreeSet<_>>().len(),
+        task_ids
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len(),
         3,
         "each commit rolled to a fresh task"
     );
@@ -290,7 +313,10 @@ fn interactive_session_commits_repeatedly_under_one_token() {
         match event {
             EngineEvent::TaskCommitted { .. } => commits += 1,
             EngineEvent::TaskInvalidated { task, .. } => {
-                assert!(!task_ids.contains(&task), "the session was never invalidated");
+                assert!(
+                    !task_ids.contains(&task),
+                    "the session was never invalidated"
+                );
             }
             _ => {}
         }
@@ -375,12 +401,10 @@ fn an_interactive_session_builds_a_new_project_from_empty() {
     submit_session(
         &engine,
         &token,
-        vec![
-            Mutation::ReplaceOperationProgram {
-                operation: id("operation.ping"),
-                program: ping_program(),
-            },
-        ],
+        vec![Mutation::ReplaceOperationProgram {
+            operation: id("operation.ping"),
+            program: ping_program(),
+        }],
     );
 
     assert_eq!(engine.head_revision().0, 2);
@@ -621,7 +645,6 @@ fn phantom_new_writer_invalidates_the_querying_task() {
                     service: id("service.checkout"),
                     description: Some("Force an order state.".to_string()),
                     inputs: BTreeMap::new(),
-                    invocation_lock: None,
                 },
             },
             Mutation::ReplaceOperationProgram {
@@ -743,7 +766,6 @@ fn unobserved_reference_is_rejected_then_fixable() {
                 service: id("service.checkout"),
                 description: Some("Calls create_order.".to_string()),
                 inputs: BTreeMap::new(),
-                invocation_lock: None,
             },
         },
         Mutation::ReplaceOperationProgram {
@@ -783,7 +805,11 @@ fn unobserved_reference_is_rejected_then_fixable() {
 
     // Reading the callee interface fixes it.
     engine
-        .read_operation(a.id, &id("operation.create_order"), OperationReadMode::Interface)
+        .read_operation(
+            a.id,
+            &id("operation.create_order"),
+            OperationReadMode::Interface,
+        )
         .expect("a reads the callee interface");
 
     submit(&engine, &a, mutations).expect("the resubmission commits");
@@ -945,7 +971,6 @@ fn only_the_topology_scope_may_write_the_runtime_model() {
             member_concurrency: conseqa::spec::MemberConcurrency::Bounded(
                 std::num::NonZeroU32::new(1).expect("non-zero"),
             ),
-            execution_handoff: None,
         },
     };
 
@@ -1001,23 +1026,27 @@ fn draft_validation_failure_is_precise_and_fixable() {
             operation: id("operation.charge_payment"),
             program: OperationBlock {
                 steps: vec![
-                    OperationStep::Transaction(Transaction {
-                        id: id("tx.bogus"),
-                        data_model: None,
-                        isolation: TransactionIsolation::Unspecified,
-                        idempotency: IdempotencyGuarantee::Unspecified,
-                        steps: vec![TransactionStep::EstablishTransactionOutput(
-                            conseqa::spec::EstablishTransactionOutput {
-                                bind: id("output.bogus"),
-                                schema: id("schema.ChargeAccepted"),
-                                values: Derivation::Deterministic {
-                                    from: vec![ValueRef {
-                                        source: ValueSource::Input(id("input.does_not_exist")),
-                                        path: path("event_id"),
-                                    }],
+                    OperationStep::Transaction(ExecuteTransaction {
+                        transaction: Transaction {
+                            id: id("tx.bogus"),
+                            data_model: None,
+                            isolation: TransactionIsolation::Unspecified,
+                            idempotency: IdempotencyGuarantee::Unspecified,
+                            requirements: Default::default(),
+                            steps: vec![TransactionStep::EstablishTransactionOutput(
+                                conseqa::spec::EstablishTransactionOutput {
+                                    bind: id("output.bogus"),
+                                    schema: id("schema.ChargeAccepted"),
+                                    values: Derivation::Deterministic {
+                                        from: vec![ValueRef {
+                                            source: ValueSource::Input(id("input.does_not_exist")),
+                                            path: path("event_id"),
+                                        }],
+                                    },
                                 },
-                            },
-                        )],
+                            )],
+                        },
+                        rejected: None,
                     }),
                     OperationStep::Complete,
                 ],
@@ -1041,12 +1070,12 @@ fn draft_validation_failure_is_precise_and_fixable() {
     assert_eq!(engine.task_status(a.id).unwrap(), TaskState::Running);
 }
 
-/// The gate judges an interface's invocation lock structurally, so a
-/// broken declaration is fixed in the same session: the key must
-/// source an input the interface itself declares, and that input must
-/// be its only one.
+/// The gate judges a transaction's requirement keys structurally, so a
+/// broken declaration is fixed in the same session: a serializability
+/// or ordering key must source an input the operation's interface
+/// declares.
 #[test]
-fn the_gate_refuses_a_broken_invocation_lock() {
+fn the_gate_refuses_a_transaction_requirement_keyed_from_an_undeclared_input() {
     let engine = engine();
 
     let decomposer = task(&engine, TaskKind::Decompose, WriteScope::shared_skeleton());
@@ -1055,49 +1084,74 @@ fn the_gate_refuses_a_broken_invocation_lock() {
         SymbolKey::Service(id("service.checkout")),
         SymbolKey::Topic(id("topic.order_events")),
         SymbolKey::Schema(id("schema.OrderPaid")),
-        SymbolKey::Schema(id("schema.OrderCreated")),
     ] {
         engine
             .read_symbol(decomposer.id, &key)
             .expect("the decomposer reads what it references");
     }
 
-    let paid_input = || {
-        (
-            id("input.notify.paid"),
-            Input::Subscription(SubscriptionInput {
-                topic: id("topic.order_events"),
-                messages: MessageSelector::Only(BTreeSet::from([id("schema.OrderPaid")])),
-                acknowledge_on_success: None,
-            }),
-        )
-    };
+    submit(
+        &engine,
+        &decomposer,
+        vec![Mutation::PutOperationInterface {
+            operation: id("operation.notify"),
+            value: OperationInterfaceDraft {
+                service: id("service.checkout"),
+                description: Some("Notify on payment.".to_string()),
+                inputs: BTreeMap::from([(
+                    id("input.notify.paid"),
+                    Input::Subscription(SubscriptionInput {
+                        topic: id("topic.order_events"),
+                        messages: MessageSelector::Only(BTreeSet::from([id("schema.OrderPaid")])),
+                        acknowledge_on_success: None,
+                    }),
+                )]),
+            },
+        }],
+    )
+    .expect("the interface commits");
 
-    let interface = |inputs, invocation_lock| Mutation::PutOperationInterface {
+    let synthesizer = task(
+        &engine,
+        TaskKind::OperationSynthesis,
+        WriteScope::operation_synthesis(id("operation.notify")),
+    );
+
+    let program = |input: &str| Mutation::ReplaceOperationProgram {
         operation: id("operation.notify"),
-        value: OperationInterfaceDraft {
-            service: id("service.checkout"),
-            description: Some("Notify on payment.".to_string()),
-            inputs,
-            invocation_lock,
+        program: OperationBlock {
+            steps: vec![
+                OperationStep::Transaction(ExecuteTransaction {
+                    transaction: Transaction {
+                        id: id("tx.notify"),
+                        data_model: None,
+                        isolation: TransactionIsolation::Serializable,
+                        idempotency: IdempotencyGuarantee::Unspecified,
+                        requirements: conseqa::spec::TransactionRequirements {
+                            serializability: vec![TransactionSerializabilityRequirement {
+                                key: ValueRef {
+                                    source: ValueSource::Input(id(input)),
+                                    path: path("order_id"),
+                                },
+                            }],
+                            ordering: Vec::new(),
+                        },
+                        steps: Vec::new(),
+                    },
+                    rejected: None,
+                }),
+                OperationStep::Complete,
+            ],
         },
     };
 
     // Keyed on an input the interface does not declare.
     let rejection = submit(
         &engine,
-        &decomposer,
-        vec![interface(
-            BTreeMap::from([paid_input()]),
-            Some(conseqa::spec::InvocationLock {
-                key: ValueRef {
-                    source: ValueSource::Input(id("input.notify.undeclared")),
-                    path: path("order_id"),
-                },
-            }),
-        )],
+        &synthesizer,
+        vec![program("input.notify.undeclared")],
     )
-    .expect_err("an undeclared lock input is refused");
+    .expect_err("an undeclared key input is refused");
 
     let CommitRejection::DraftValidationFailed { diagnostics } = &rejection else {
         panic!("expected draft validation failure, got {rejection:?}");
@@ -1106,70 +1160,27 @@ fn the_gate_refuses_a_broken_invocation_lock() {
     assert!(
         diagnostics
             .iter()
-            .any(|diagnostic| diagnostic.message.contains("which the interface does not declare")),
+            .any(|diagnostic| diagnostic.message.contains("input.notify.undeclared")),
         "{diagnostics:?}"
     );
 
-    // Keyed on one input while the interface admits another.
-    let rejection = submit(
-        &engine,
-        &decomposer,
-        vec![interface(
-            BTreeMap::from([
-                paid_input(),
-                (
-                    id("input.notify.created"),
-                    Input::Subscription(SubscriptionInput {
-                        topic: id("topic.order_events"),
-                        messages: MessageSelector::Only(BTreeSet::from([id(
-                            "schema.OrderCreated",
-                        )])),
-                        acknowledge_on_success: None,
-                    }),
-                ),
-            ]),
-            Some(conseqa::spec::InvocationLock {
-                key: ValueRef {
-                    source: ValueSource::Input(id("input.notify.paid")),
-                    path: path("order_id"),
-                },
-            }),
-        )],
-    )
-    .expect_err("an uncovered input is refused");
+    assert!(!rejection.is_stale_context());
 
-    let CommitRejection::DraftValidationFailed { diagnostics } = &rejection else {
-        panic!("expected draft validation failure, got {rejection:?}");
-    };
-
-    assert!(
-        diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.message.contains("carry no value for its invocation lock")),
-        "{diagnostics:?}"
-    );
-
-    // Keyed on the interface's only input: commits.
-    submit(
-        &engine,
-        &decomposer,
-        vec![interface(
-            BTreeMap::from([paid_input()]),
-            Some(conseqa::spec::InvocationLock {
-                key: ValueRef {
-                    source: ValueSource::Input(id("input.notify.paid")),
-                    path: path("order_id"),
-                },
-            }),
-        )],
-    )
-    .expect("a coherent lock commits");
+    // Keyed on the interface's input: commits, and the requirement
+    // lands on the transaction.
+    submit(&engine, &synthesizer, vec![program("input.notify.paid")])
+        .expect("a coherent requirement commits");
 
     let head = engine.head_snapshot();
     let draft = &head.workspace.operations[&id("operation.notify")];
 
-    assert!(draft.invocation_lock.is_some());
-    assert_eq!(draft.interface().invocation_lock, draft.invocation_lock);
+    let transaction = draft
+        .program
+        .as_ref()
+        .and_then(|program| program.transaction(&id("tx.notify")))
+        .expect("the program declares the transaction");
+
+    assert_eq!(transaction.requirements.serializability.len(), 1);
 }
 
 #[test]
@@ -1211,7 +1222,6 @@ fn planned_operation_commits_as_draft_and_requirements_flow_through_proposals() 
                             acknowledge_on_success: None,
                         }),
                     )]),
-                    invocation_lock: None,
                 },
             },
             Mutation::PutPromptObligation {
@@ -1247,11 +1257,14 @@ fn planned_operation_commits_as_draft_and_requirements_flow_through_proposals() 
         vec![Mutation::ProposeRequirements {
             operation: id("operation.notify"),
             proposals: vec![RequirementSubmission {
-                requirement: ProposedRequirement::Serialization(SerializationRequirement {
-                    key: ValueRef {
-                        source: ValueSource::Input(id("input.notify.paid")),
-                        path: path("order_id"),
+                requirement: ProposedRequirement::Idempotency(IdempotencyRequirement {
+                    key: IdempotencyKey {
+                        components: vec![ValueRef {
+                            source: ValueSource::Input(id("input.notify.paid")),
+                            path: path("event_id"),
+                        }],
                     },
+                    result: ResultReplayRequirement::Unspecified,
                 }),
                 origin: RequirementOrigin::ExplicitPrompt {
                     obligation: obligation.clone(),
@@ -1264,12 +1277,14 @@ fn planned_operation_commits_as_draft_and_requirements_flow_through_proposals() 
     let head = engine.head_snapshot();
     let draft = &head.workspace.operations[&id("operation.notify")];
 
-    assert_eq!(draft.requirements.serialization.len(), 1);
+    assert_eq!(draft.requirements.idempotency.len(), 1);
 
     let proposal = &head.workspace.requirement_proposals[0];
 
-    assert!(matches!(&proposal.status, ProposalStatus::Adopted { reference }
-        if reference.operation == id("operation.notify") && reference.index == 0));
+    assert!(
+        matches!(&proposal.status, ProposalStatus::Adopted { reference }
+        if reference.operation == id("operation.notify") && reference.index == 0)
+    );
 
     assert!(matches!(
         &head.workspace.prompt_obligations[&obligation].status,
@@ -1373,13 +1388,25 @@ fn invalidation_notes_carry_causes_and_the_salvageable_patch() {
         "a running task has no note"
     );
 
-    let interloper = task(&engine, TaskKind::Decompose, WriteScope::of([WriteGrant::All]));
+    let interloper = task(
+        &engine,
+        TaskKind::Decompose,
+        WriteScope::of([WriteGrant::All]),
+    );
 
-    submit(&engine, &interloper, vec![probe_program("operation.create_order", 1)])
-        .expect("the interloper commits");
+    submit(
+        &engine,
+        &interloper,
+        vec![probe_program("operation.create_order", 1)],
+    )
+    .expect("the interloper commits");
 
-    let rejection = submit(&engine, &a, vec![probe_program("operation.create_order", 2)])
-        .expect_err("the write target moved under the task");
+    let rejection = submit(
+        &engine,
+        &a,
+        vec![probe_program("operation.create_order", 2)],
+    )
+    .expect_err("the write target moved under the task");
 
     assert!(rejection.is_stale_context(), "{rejection:?}");
     assert_eq!(engine.task_status(a.id).unwrap(), TaskState::Invalidated);
@@ -1411,13 +1438,24 @@ fn invalidation_notes_carry_causes_and_the_salvageable_patch() {
     );
 
     engine
-        .read_symbol(c.id, &SymbolKey::OperationProgram(id("operation.transfer_stock")))
+        .read_symbol(
+            c.id,
+            &SymbolKey::OperationProgram(id("operation.transfer_stock")),
+        )
         .expect("c observes a peer's program");
 
-    let interloper = task(&engine, TaskKind::Decompose, WriteScope::of([WriteGrant::All]));
+    let interloper = task(
+        &engine,
+        TaskKind::Decompose,
+        WriteScope::of([WriteGrant::All]),
+    );
 
-    submit(&engine, &interloper, vec![probe_program("operation.transfer_stock", 3)])
-        .expect("the second interloper commits");
+    submit(
+        &engine,
+        &interloper,
+        vec![probe_program("operation.transfer_stock", 3)],
+    )
+    .expect("the second interloper commits");
 
     assert_eq!(engine.task_status(c.id).unwrap(), TaskState::Invalidated);
 

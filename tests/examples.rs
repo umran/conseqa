@@ -71,7 +71,35 @@ fn video_streaming_example_proves_everything() {
 
     let report = report::obligations(&model, &verification);
 
-    assert_eq!(report.obligations.len(), 15);
+    // 2 transaction serializability + 5 idempotency + 1 result replay
+    // + 4 recoverability.
+    assert_eq!(report.obligations.len(), 12);
+
+    // Same-video work is serializable by the serializable-isolation
+    // route: every transaction in each closure declares serializable
+    // isolation, and no runtime fact is consumed.
+    for (transaction, key) in [
+        ("tx.transcode_video.complete", "video_id"),
+        ("tx.publish_video.ready", "video_id"),
+    ] {
+        let check = verification
+            .transaction_serializability
+            .iter()
+            .find(|check| check.transaction == Id(transaction.into()))
+            .expect("the transaction declares serializability");
+
+        assert!(
+            matches!(
+                &check.verdict,
+                verification::TransactionSerializabilityVerdict::Proven {
+                    proof: verification::TransactionSerializabilityProof::SerializableIsolationClosure { .. },
+                    ..
+                }
+            ),
+            "expected {transaction} proven by serializable isolation over {key}:\n{:#?}",
+            check.verdict
+        );
+    }
 
     let unproven: Vec<&str> = report
         .obligations
@@ -98,9 +126,10 @@ fn transactional_outbox_example_is_valid() {
 /// The acceptance architecture of the outbox revision (§105): a
 /// request-driven producer whose transaction atomically mutates state
 /// and admits an outbox message, the outbox's one consuming relay, and
-/// a topic subscriber — with idempotency traced through the outbox,
-/// ordering discharged from the outbox runtime, and completion driven
-/// by the outbox's intrinsic durable re-drive.
+/// a topic subscriber — with idempotency traced through the outbox and
+/// completion driven by the outbox's intrinsic durable re-drive. The
+/// relay declares no ordering: it commits no transaction, and the
+/// outbox runtime's partitioning is a placement fact, not a proof.
 #[test]
 fn transactional_outbox_example_proves_everything() {
     let model = load("transactional_outbox.yaml");
@@ -136,13 +165,16 @@ fn transactional_outbox_example_proves_everything() {
     };
 
     assert!(
-        paths.iter().flat_map(|path| path.effects.iter()).any(|effect| {
-            matches!(
-                &effect.safety,
-                verification::EffectSafety::TransactionDeduplicated { transaction, .. }
-                    if transaction == &Id("tx.create_order".into())
-            )
-        }),
+        paths
+            .iter()
+            .flat_map(|path| path.effects.iter())
+            .any(|effect| {
+                matches!(
+                    &effect.safety,
+                    verification::EffectSafety::TransactionDeduplicated { transaction, .. }
+                        if transaction == &Id("tx.create_order".into())
+                )
+            }),
         "the outbox write should be discharged by the keyed commit:\n{paths:#?}"
     );
 
@@ -166,24 +198,10 @@ fn transactional_outbox_example_proves_everything() {
         relay.lineage
     );
 
-    // The relay's ordering rests on the outbox runtime.
-    let ordering = verification
-        .ordering
-        .iter()
-        .find(|check| check.operation == Id("operation.publish_order_event".into()))
-        .expect("the relay declares ordering");
-
-    assert!(
-        matches!(
-            &ordering.verdict,
-            verification::OrderingVerdict::Proven {
-                proof: verification::OrderingProof::OutboxRoutedOrder { .. },
-                ..
-            }
-        ),
-        "relay ordering should prove from the outbox runtime:\n{:#?}",
-        ordering.verdict
-    );
+    // No transaction property is declared anywhere in the model, so
+    // the transaction families are empty rather than vacuously proven.
+    assert!(verification.transaction_serializability.is_empty());
+    assert!(verification.transaction_ordering.is_empty());
 }
 
 #[test]
@@ -203,8 +221,8 @@ fn payment_capture_example_is_valid() {
 /// relay onto a keyed topic, and two independent subscribers. The
 /// producer's duplicate write is suppressed by its keyed commit; the
 /// relay's duplicate publication collapses at every modeled consumer;
-/// per-account relay order and ledger completion rest on the declared
-/// runtime. Everything proves, and nothing is left warned about.
+/// ledger completion rests on the declared runtime's at-least-once
+/// delivery. Everything proves, and nothing is left warned about.
 #[test]
 fn payment_capture_example_proves_everything() {
     let model = load("payment_capture.yaml");
@@ -246,14 +264,17 @@ fn payment_capture_example_proves_everything() {
     };
 
     assert!(
-        paths.iter().flat_map(|path| path.effects.iter()).any(|effect| {
-            effect.effect == Id("effect.capture_payment.outbox_captured".into())
-                && matches!(
-                    &effect.safety,
-                    verification::EffectSafety::TransactionDeduplicated { transaction, .. }
-                        if transaction == &Id("tx.capture_payment".into())
-                )
-        }),
+        paths
+            .iter()
+            .flat_map(|path| path.effects.iter())
+            .any(|effect| {
+                effect.effect == Id("effect.capture_payment.outbox_captured".into())
+                    && matches!(
+                        &effect.safety,
+                        verification::EffectSafety::TransactionDeduplicated { transaction, .. }
+                            if transaction == &Id("tx.capture_payment".into())
+                    )
+            }),
         "the outbox write should be discharged by the keyed commit:\n{paths:#?}"
     );
 
@@ -297,7 +318,9 @@ fn payment_capture_example_proves_everything() {
 
     assert!(
         consumers.iter().any(|(operation, _)| **operation == ledger)
-            && consumers.iter().any(|(operation, _)| **operation == receipts),
+            && consumers
+                .iter()
+                .any(|(operation, _)| **operation == receipts),
         "the cascade should collapse at both subscribers:\n{consumers:#?}"
     );
 
@@ -314,37 +337,23 @@ fn payment_capture_example_proves_everything() {
         ..
     } = &receipt_check.verdict
     else {
-        panic!("receipts idempotency should prove: {:#?}", receipt_check.verdict);
+        panic!(
+            "receipts idempotency should prove: {:#?}",
+            receipt_check.verdict
+        );
     };
 
     assert!(
-        paths.iter().flat_map(|path| path.effects.iter()).any(|effect| {
-            matches!(
-                &effect.safety,
-                verification::EffectSafety::ExternallyIdempotent { .. }
-            )
-        }),
+        paths
+            .iter()
+            .flat_map(|path| path.effects.iter())
+            .any(|effect| {
+                matches!(
+                    &effect.safety,
+                    verification::EffectSafety::ExternallyIdempotent { .. }
+                )
+            }),
         "the email send should be externally idempotent:\n{paths:#?}"
-    );
-
-    // Per-account relay order rests on the outbox runtime's keyed
-    // partitioning and partition ordering.
-    let ordering = verification
-        .ordering
-        .iter()
-        .find(|check| check.operation == Id("operation.publish_payment_event".into()))
-        .expect("the relay declares ordering");
-
-    assert!(
-        matches!(
-            &ordering.verdict,
-            verification::OrderingVerdict::Proven {
-                proof: verification::OrderingProof::OutboxRoutedOrder { batching: None, .. },
-                ..
-            }
-        ),
-        "relay ordering should prove from the outbox runtime:\n{:#?}",
-        ordering.verdict
     );
 
     // The ledger's guaranteed completion is driven by at-least-once
@@ -451,4 +460,192 @@ fn hedged_read_example_exposes_async_executions_to_the_graph() {
     );
 
     assert_eq!(synchronous, ["effect.record_read.ledger"]);
+}
+
+#[test]
+fn tenant_ledger_example_is_valid() {
+    let model = load("tenant_ledger.yaml");
+
+    let errors = validation::validate(&model);
+
+    assert!(
+        errors.is_empty(),
+        "tenant ledger example should validate:\n{errors:#?}"
+    );
+}
+
+/// A partitioned accounts store written through a request boundary, an
+/// outbox partitioned by tenant, a relay pool routed by tenant, a
+/// per-tenant-ordered topic, and two subscribers — one applying the
+/// events to a second partitioned store in sequence order. Every
+/// transport fact is placement; every proof is a transaction's own.
+#[test]
+fn tenant_ledger_example_proves_everything() {
+    let model = load("tenant_ledger.yaml");
+
+    let verification = verification::verify(&model);
+
+    let report = report::obligations(&model, &verification);
+
+    // 2 serializability + 1 ordering + 4 idempotency + 1 result replay
+    // + 4 recoverability.
+    assert_eq!(report.obligations.len(), 12);
+
+    let unproven: Vec<&str> = report
+        .obligations
+        .iter()
+        .filter(|obligation| obligation.status != Status::Proven)
+        .map(|obligation| obligation.id.as_str())
+        .collect();
+
+    assert_eq!(unproven, [""; 0], "every obligation should prove");
+    assert_eq!(verification.notes, vec![]);
+
+    // The producer assigns the sequence under the tenant row's
+    // exclusive lock: its read-then-write of last_sequence is
+    // commit-ordered by strict locking.
+    let post = verification
+        .transaction_serializability
+        .iter()
+        .find(|check| check.transaction == Id("tx.post_entry".into()))
+        .expect("post_entry declares serializability");
+
+    let verification::TransactionSerializabilityVerdict::Proven {
+        proof: verification::TransactionSerializabilityProof::ConflictGraph { dependencies, .. },
+        scope: verification::ProofScope::L0Only,
+    } = &post.verdict
+    else {
+        panic!("post_entry should prove by the graph route:\n{:#?}", post.verdict);
+    };
+
+    assert!(
+        dependencies.iter().any(|dependency| matches!(
+            dependency.evidence,
+            verification::CommitOrderEvidence::StrictLock { .. }
+        )),
+        "{dependencies:#?}"
+    );
+
+    // The ledger writer: serializable per tenant by the version
+    // protocol, and ordered by sequence through the successor cursor.
+    let apply = verification
+        .transaction_serializability
+        .iter()
+        .find(|check| check.transaction == Id("tx.apply_entry".into()))
+        .expect("apply_entry declares serializability");
+
+    let verification::TransactionSerializabilityVerdict::Proven {
+        proof: verification::TransactionSerializabilityProof::ConflictGraph { dependencies, .. },
+        ..
+    } = &apply.verdict
+    else {
+        panic!("apply_entry should prove by the graph route:\n{:#?}", apply.verdict);
+    };
+
+    assert!(
+        dependencies.iter().any(|dependency| matches!(
+            dependency.evidence,
+            verification::CommitOrderEvidence::VersionValidation { .. }
+        )),
+        "{dependencies:#?}"
+    );
+
+    let ordering = verification
+        .transaction_ordering
+        .iter()
+        .find(|check| check.transaction == Id("tx.apply_entry".into()))
+        .expect("apply_entry declares ordering");
+
+    assert!(
+        matches!(
+            &ordering.verdict,
+            verification::TransactionOrderingVerdict::Proven {
+                proof: verification::TransactionOrderingProof::Cursor {
+                    rule: conseqa::spec::CursorAdvanceRule::Successor,
+                    ..
+                },
+                scope: verification::ProofScope::L0Only,
+            }
+        ),
+        "{:#?}",
+        ordering.verdict
+    );
+
+    // The relay's duplicate publication is the same logical message,
+    // and both subscribers collapse it: the ledger by its keyed
+    // commit, the notifier at the gateway's own deduplication.
+    let relay = verification
+        .idempotency
+        .iter()
+        .find(|check| check.operation == Id("operation.relay_tenant_event".into()))
+        .expect("the relay declares idempotency");
+
+    let IdempotencyVerdict::Proven {
+        proof: verification::IdempotencyProof::RetrySafePaths { paths },
+        ..
+    } = &relay.verdict
+    else {
+        panic!("relay idempotency should prove: {:#?}", relay.verdict);
+    };
+
+    let consumers: Vec<&Id> = paths
+        .iter()
+        .flat_map(|path| path.effects.iter())
+        .filter_map(|effect| match &effect.safety {
+            verification::EffectSafety::SameLogicalMessage { consumers, .. } => Some(consumers),
+            _ => None,
+        })
+        .flatten()
+        .map(|consumer| match consumer {
+            verification::ConsumerCollapse::ProvenRequirement { operation, .. }
+            | verification::ConsumerCollapse::SingleDelivery { operation, .. } => operation,
+        })
+        .collect();
+
+    assert!(consumers.contains(&&Id("operation.apply_entry".into())), "{consumers:?}");
+    assert!(consumers.contains(&&Id("operation.notify_entry".into())), "{consumers:?}");
+
+    // Completion drivers: the relay's intrinsic re-drive, the
+    // subscribers' at-least-once delivery.
+    let driver_of = |operation: &str| {
+        let check = verification
+            .recoverability
+            .iter()
+            .find(|check| check.operation == Id(operation.into()))
+            .unwrap_or_else(|| panic!("{operation} declares recoverability"));
+
+        match &check.verdict {
+            verification::RecoverabilityVerdict::Proven {
+                proof: verification::RecoverabilityProof::Guaranteed { driver, .. },
+                ..
+            } => driver.clone(),
+            other => panic!("{operation} should prove guaranteed completion: {other:#?}"),
+        }
+    };
+
+    assert!(matches!(
+        driver_of("operation.relay_tenant_event"),
+        verification::RetryDriver::IntrinsicOutboxRedrive { .. }
+    ));
+
+    for operation in ["operation.apply_entry", "operation.notify_entry"] {
+        assert!(
+            matches!(driver_of(operation), verification::RetryDriver::AtLeastOnceDelivery { .. }),
+            "{operation}"
+        );
+    }
+
+    // The posting's result — entry id and assigned sequence — is
+    // recovered from its keyed commit, so retries answer alike.
+    let result = verification
+        .result_replay
+        .iter()
+        .find(|check| check.operation == Id("operation.post_entry".into()))
+        .expect("post_entry declares a replay-consistent result");
+
+    assert!(
+        matches!(result.verdict, verification::ResultReplayVerdict::Proven { .. }),
+        "{:#?}",
+        result.verdict
+    );
 }

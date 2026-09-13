@@ -73,8 +73,9 @@ use serde::{Deserialize, Serialize};
 use crate::spec::{
     Derivation, ErrorDisposition, ExternalEffect, ExternalIdentity, ExternalResultReplay,
     FieldPath, Id, IdempotencyGuarantee, IdempotencyKey, Input, MessageIdentity,
-    MessageIdentityKey, MessageSelector, Model, Operation, RequestIdentity, RequestIdentityKey,
-    ResultVariant, StepLocation, Transaction, TransactionStep, ValueRef, ValueSource,
+    MessageIdentityKey, MessageSelector, Model, Operation, OutboxWriteEffect, RequestIdentity,
+    RequestIdentityKey, ResultArm, StepLocation, Transaction, TransactionOutcome, TransactionStep,
+    ValueRef, ValueSource,
 };
 
 use super::paths::{Decision, DecisionTaken, Path, PathStep, Terminal};
@@ -132,12 +133,12 @@ pub enum StabilityRule {
     /// in the class observes equally: the boundary declares its
     /// terminal result replay-stable over a class-fixed interaction
     /// identity, so equal identities are one logical interaction with
-    /// one fixed terminal result, and the referenced variant is
-    /// terminal — `Ok` by definition, `Err` by declared disposition.
+    /// one fixed terminal result, and the referenced arm is terminal —
+    /// `ok` by definition, an error class by its declared disposition.
     ReplayStableExternalResult {
         result: Id,
         effect: Id,
-        variant: ResultVariant,
+        arm: ResultArm,
     },
 }
 
@@ -250,6 +251,14 @@ pub enum ReplayGap {
     /// Route A: the transaction deletes objects; deletion replay
     /// outcomes are not defined (§20).
     ContainsDelete,
+
+    /// Route A: the transaction bumps an object version, which
+    /// re-execution would advance a second time.
+    ContainsVersionBump,
+
+    /// Route A: the transaction advances a cursor, which re-execution
+    /// with the same incoming position would reject as stale.
+    ContainsCursorAdvance,
 
     /// Route A: a mutation target depends on an unstable root.
     MutationTargetRootUnstable { root: ValueRef, gap: StabilityGap },
@@ -381,11 +390,10 @@ pub enum ResultStabilityRule {
     /// over an interaction identity that is class-fixed through the
     /// cited roots, so same-class attempts address one logical
     /// external interaction, whose terminal result the guarantee
-    /// fixes — and the observed variant is terminal: `Ok` by
-    /// definition, `Err` by the contract's declared `terminal`
-    /// disposition (§13.3).
+    /// fixes — and the observed arm is terminal: `ok` by definition,
+    /// an error class by its declared `terminal` disposition (§13.3).
     ExternalTerminalResult {
-        variant: ResultVariant,
+        arm: ResultArm,
         identity_key: Vec<StableRoot>,
     },
 }
@@ -445,45 +453,58 @@ pub enum ResultGap {
     RaceWinnerNondeterministic { candidates: Vec<Id> },
 }
 
-/// The replay judgments of one bound result, per observed variant.
-/// Stability is variant-sensitive (§18 rule 6): a deduplicated
-/// external boundary's terminal `Ok` is stable while the same
-/// binding's retryable `Err` is not. A request result carries one
-/// judgment in both variants — the target's replay-consistent
-/// requirement covers variant and payload together.
+/// The replay judgments of one bound result, per observed arm.
+/// Stability is arm-sensitive (§18 rule 6): a deduplicated external
+/// boundary's terminal `ok` is stable while the same binding's
+/// retryable error class is not. A request result carries one
+/// judgment in every arm — the target's replay-consistent requirement
+/// covers arm and payload together.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BoundResult {
     pub ok: ResultReplay,
-    pub err: ResultReplay,
+
+    /// Per declared error class.
+    pub errors: BTreeMap<Id, ResultReplay>,
+
+    /// The judgment of an error arm the contract does not declare —
+    /// validation rejects the shape; the engine stays total.
+    fallback: ResultReplay,
 }
 
 impl BoundResult {
-    /// One judgment in both variants.
+    /// One judgment in every arm.
     fn both(replay: ResultReplay) -> Self {
         Self {
             ok: replay.clone(),
-            err: replay,
+            errors: BTreeMap::new(),
+            fallback: replay,
         }
     }
 
-    /// The judgment for the observed variant.
-    pub fn variant(&self, variant: ResultVariant) -> &ResultReplay {
-        match variant {
-            ResultVariant::Ok => &self.ok,
-            ResultVariant::Err => &self.err,
+    /// The judgment for the observed arm.
+    pub fn arm(&self, arm: &ResultArm) -> &ResultReplay {
+        match arm {
+            ResultArm::Ok => &self.ok,
+            ResultArm::Err { error } => self.errors.get(error).unwrap_or(&self.fallback),
         }
     }
 }
 
 /// What a path has made available so far: every established artifact
-/// with its replay route, every bound result with its per-variant
-/// replay judgments, and every launched async handle with the
-/// judgment its result would carry if joined.
+/// with its replay route, every bound result with its per-arm replay
+/// judgments, every launched async handle with the judgment its result
+/// would carry if joined, and the arm each matched result is selected
+/// into on this path.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PathContext {
     pub artifacts: BTreeMap<Id, ArtifactReplay>,
     pub results: BTreeMap<Id, BoundResult>,
     pub handles: BTreeMap<Id, AsyncLaunch>,
+
+    /// The arm selected by the innermost match on each result the path
+    /// has entered, so an `effect_result_err` reference resolves to
+    /// the error class in scope.
+    pub selected: BTreeMap<Id, ResultArm>,
 }
 
 /// The analyzer's bookkeeping for one asynchronous launch: the
@@ -525,6 +546,25 @@ pub enum DecisionRule {
     /// replay continues to require the decision itself to replay,
     /// because divergent terminals may construct divergent results.
     IdempotencyInertContinuation,
+
+    /// The transaction committed under a keyed commit over a stable
+    /// key, so every attempt in the class re-encountering it resolves
+    /// the same single commit: the committed continuation is the one
+    /// every attempt takes.
+    ResolvedCommit {
+        transaction: Id,
+        key: Vec<StableRoot>,
+    },
+
+    /// A transaction outcome not established to replay, admitted by the
+    /// idempotency family alone: a rejected execution commits nothing
+    /// and performs only its rejection block's work, and a committed
+    /// one only its continuation's, each judged duplicate-safe on its
+    /// own path — so divergence between rejection and commit cannot
+    /// duplicate modeled work, and the class performs at most one
+    /// commit's worth. Result replay still requires the outcome to
+    /// replay, since a rejection may return a different result.
+    OutcomeDivergenceAddsNoWork { transaction: Id },
 }
 
 /// Why a retry is not established to take the same arm (§16).
@@ -546,6 +586,16 @@ pub enum DecisionGap {
         result: Id,
         effect: Id,
         gap: ResultGap,
+    },
+
+    /// A rejectable transaction's outcome is not fixed across the
+    /// class: a rejection commits nothing, so a retry may commit
+    /// instead; a commit without a stable keyed commit may not be the
+    /// one a retry resolves, so the retry may reject instead.
+    TransactionOutcomeUnstable {
+        transaction: Id,
+        outcome: TransactionOutcome,
+        recovery: Vec<ReplayGap>,
     },
 }
 
@@ -679,12 +729,15 @@ struct IntentSite<'a> {
     contract: EffectContract<'a>,
 }
 
-/// One transactional outbox write of a traced transaction, with its
+/// One transactional outbox admission of a traced transaction — a
+/// `write_outbox` step, or a transition-scoped admission — with its
 /// instance judged at its step position and the context in force
-/// there — the transaction-entry context plus the artifacts earlier
+/// there: the transaction-entry context plus the artifacts earlier
 /// steps of the same transaction established.
 pub(crate) struct OutboxWriteTrace<'a> {
-    pub step: &'a crate::spec::WriteOutboxEffect,
+    pub effect_id: &'a Id,
+    pub effect: &'a OutboxWriteEffect,
+    pub values: &'a Derivation,
     pub before: PathContext,
     pub instance: Result<InstanceStability, InstanceGap>,
 }
@@ -868,7 +921,8 @@ impl<'a> ReplayAnalysis<'a> {
     fn payload_stability(&self, declaration: &Input) -> Result<(), PayloadIdentityGap> {
         match declaration {
             Input::Request(request) => {
-                let RequestIdentity::Keyed(RequestIdentityKey { fields }) = &request.identity else {
+                let RequestIdentity::Keyed(RequestIdentityKey { fields }) = &request.identity
+                else {
                     return Err(PayloadIdentityGap::NotDeclared);
                 };
 
@@ -1072,9 +1126,19 @@ impl<'a> ReplayAnalysis<'a> {
             },
 
             ValueSource::EffectResultOk(result) | ValueSource::EffectResultErr(result) => {
-                let variant = match &root.source {
-                    ValueSource::EffectResultOk(_) => ResultVariant::Ok,
-                    _ => ResultVariant::Err,
+                // The arm in scope: `ok`, or the error class the
+                // innermost match on this result selected on the path.
+                // An error reference outside any error arm is a
+                // validation error; the engine judges it by the
+                // fallback rather than panicking.
+                let arm = match &root.source {
+                    ValueSource::EffectResultOk(_) => ResultArm::Ok,
+                    _ => match context.selected.get(result) {
+                        Some(arm @ ResultArm::Err { .. }) => arm.clone(),
+                        _ => ResultArm::Err {
+                            error: Id(String::new()),
+                        },
+                    },
                 };
 
                 match context.results.get(result) {
@@ -1082,7 +1146,7 @@ impl<'a> ReplayAnalysis<'a> {
                         result: result.clone(),
                     }),
 
-                    Some(bound) => match bound.variant(variant) {
+                    Some(bound) => match bound.arm(&arm) {
                         ResultReplay::Unstable { effect, gap } => {
                             Err(StabilityGap::ResultUnstable {
                                 result: result.clone(),
@@ -1103,7 +1167,7 @@ impl<'a> ReplayAnalysis<'a> {
                                 StabilityRule::ReplayStableExternalResult {
                                     result: result.clone(),
                                     effect: effect.clone(),
-                                    variant,
+                                    arm,
                                 }
                             }
                         }),
@@ -1148,6 +1212,11 @@ impl<'a> ReplayAnalysis<'a> {
         let mut context = PathContext::default();
         let mut steps = Vec::new();
 
+        // The keyed-commit judgment of each transaction committed on
+        // the path, for the outcome decision that follows a rejectable
+        // one.
+        let mut commits: BTreeMap<&Id, Result<Vec<StableRoot>, Vec<ReplayGap>>> = BTreeMap::new();
+
         for step in &path.steps {
             match step {
                 PathStep::Transaction {
@@ -1159,6 +1228,8 @@ impl<'a> ReplayAnalysis<'a> {
                     let (recovery, natural, writes) =
                         self.apply_transaction(&mut context, transaction);
 
+                    commits.insert(&transaction.id, recovery.clone());
+
                     steps.push(TracedStep::Transaction {
                         location: location.clone(),
                         transaction,
@@ -1167,21 +1238,22 @@ impl<'a> ReplayAnalysis<'a> {
                         natural,
                     });
 
-                    // Each contained outbox write is a real effect
-                    // occurrence of the path, surfaced in step order
-                    // after its transaction so a verifier sees the
-                    // transaction's replay routes before judging the
-                    // writes that commit with it. The write binds no
-                    // result.
+                    // Each contained outbox admission — a write step
+                    // or a transition-scoped admission — is a real
+                    // effect occurrence of the path, surfaced in step
+                    // order after its transaction so a verifier sees
+                    // the transaction's replay routes before judging
+                    // the admissions that commit with it. An admission
+                    // binds no result.
                     for write in writes {
                         steps.push(TracedStep::Effect {
                             location: location.clone(),
                             site: EffectSite::OutboxWrite {
-                                effect: &write.step.effect_id,
-                                values: &write.step.values,
+                                effect: write.effect_id,
+                                values: write.values,
                                 transaction: &transaction.id,
                             },
-                            contract: Some(EffectContract::OutboxWrite(&write.step.effect)),
+                            contract: Some(EffectContract::OutboxWrite(write.effect)),
                             before: write.before,
                             instance: write.instance,
                             result: None,
@@ -1344,11 +1416,17 @@ impl<'a> ReplayAnalysis<'a> {
                     let candidates: Vec<Id> = handles
                         .iter()
                         .filter_map(|handle| {
-                            context.handles.get(handle).map(|launch| launch.effect.clone())
+                            context
+                                .handles
+                                .get(handle)
+                                .map(|launch| launch.effect.clone())
                         })
                         .collect();
 
-                    let effect = candidates.first().cloned().unwrap_or_else(|| (*bind).clone());
+                    let effect = candidates
+                        .first()
+                        .cloned()
+                        .unwrap_or_else(|| (*bind).clone());
 
                     context.results.insert(
                         (*bind).clone(),
@@ -1360,7 +1438,15 @@ impl<'a> ReplayAnalysis<'a> {
                 }
 
                 PathStep::Decision { location, decision } => {
-                    let (taken, replay) = self.decision_replay(&context, location, decision);
+                    let (taken, replay) =
+                        self.decision_replay(&context, &commits, location, decision);
+
+                    // Entering a match arm selects the result's arm for
+                    // the rest of the path, so error-class references
+                    // beneath it resolve to the class in scope.
+                    if let Decision::Match { result, arm } = decision {
+                        context.selected.insert((*result).clone(), arm.clone());
+                    }
 
                     steps.push(TracedStep::Decision {
                         location: location.clone(),
@@ -1484,9 +1570,7 @@ impl<'a> ReplayAnalysis<'a> {
         };
 
         let request = match contract {
-            None
-            | Some(EffectContract::Publication(_))
-            | Some(EffectContract::OutboxWrite(_)) => {
+            None | Some(EffectContract::Publication(_)) | Some(EffectContract::OutboxWrite(_)) => {
                 return unstable(ResultGap::NoResultContract);
             }
 
@@ -1609,29 +1693,44 @@ impl<'a> ReplayAnalysis<'a> {
             });
         }
 
-        let terminal = |variant| ResultReplay::Stable {
+        let terminal = |arm: ResultArm| ResultReplay::Stable {
             effect: effect.clone(),
             rule: ResultStabilityRule::ExternalTerminalResult {
-                variant,
+                arm,
                 identity_key: stable.clone(),
             },
         };
 
+        // Each error class is judged by its own disposition: only a
+        // terminal error is the interaction's fixed terminal result.
+        let errors = result
+            .errors
+            .iter()
+            .map(|(class, declared)| {
+                let replay = match declared.disposition {
+                    ErrorDisposition::Terminal => terminal(ResultArm::err(class)),
+
+                    ErrorDisposition::Retryable => ResultReplay::Unstable {
+                        effect: effect.clone(),
+                        gap: ResultGap::ExternalErrorRetryable,
+                    },
+
+                    ErrorDisposition::Unspecified => ResultReplay::Unstable {
+                        effect: effect.clone(),
+                        gap: ResultGap::ExternalErrorDispositionUnspecified,
+                    },
+                };
+
+                (class.clone(), replay)
+            })
+            .collect();
+
         BoundResult {
-            ok: terminal(ResultVariant::Ok),
-
-            err: match result.err.disposition {
-                ErrorDisposition::Terminal => terminal(ResultVariant::Err),
-
-                ErrorDisposition::Retryable => ResultReplay::Unstable {
-                    effect: effect.clone(),
-                    gap: ResultGap::ExternalErrorRetryable,
-                },
-
-                ErrorDisposition::Unspecified => ResultReplay::Unstable {
-                    effect: effect.clone(),
-                    gap: ResultGap::ExternalErrorDispositionUnspecified,
-                },
+            ok: terminal(ResultArm::Ok),
+            errors,
+            fallback: ResultReplay::Unstable {
+                effect: effect.clone(),
+                gap: ResultGap::ExternalErrorDispositionUnspecified,
             },
         }
     }
@@ -1640,6 +1739,7 @@ impl<'a> ReplayAnalysis<'a> {
     fn decision_replay(
         &self,
         context: &PathContext,
+        commits: &BTreeMap<&Id, Result<Vec<StableRoot>, Vec<ReplayGap>>>,
         location: &StepLocation,
         decision: &Decision<'_>,
     ) -> (DecisionTaken, Result<DecisionRule, DecisionGap>) {
@@ -1648,20 +1748,20 @@ impl<'a> ReplayAnalysis<'a> {
                 let taken = DecisionTaken::Match {
                     location: location.clone(),
                     result: (*result).clone(),
-                    arm: *arm,
+                    arm: arm.clone(),
                 };
 
-                // The arm taken on this path fixes the observed
-                // variant, so the decision rests on that variant's
-                // judgment: a stable terminal `Ok` re-selects the ok
-                // arm even where the same binding's `Err` would not
-                // replay (§18 rule 6).
+                // The arm taken on this path fixes the observed arm,
+                // so the decision rests on that arm's judgment: a
+                // stable terminal `ok` re-selects the ok arm even
+                // where the same binding's retryable error class would
+                // not replay (§18 rule 6).
                 let replay = match context.results.get(*result) {
                     None => Err(DecisionGap::ResultNotInContext {
                         result: (*result).clone(),
                     }),
 
-                    Some(bound) => match bound.variant(*arm) {
+                    Some(bound) => match bound.arm(arm) {
                         ResultReplay::Unstable { effect, gap } => {
                             Err(DecisionGap::ResultUnstable {
                                 result: (*result).clone(),
@@ -1681,10 +1781,55 @@ impl<'a> ReplayAnalysis<'a> {
                 (taken, replay)
             }
 
+            Decision::Transaction {
+                transaction,
+                outcome,
+            } => {
+                let taken = DecisionTaken::Transaction {
+                    location: location.clone(),
+                    transaction: (*transaction).clone(),
+                    outcome: *outcome,
+                };
+
+                // A commit under a keyed commit over a stable key is
+                // the single commit every attempt in the class
+                // resolves, so the committed continuation is fixed. A
+                // rejection commits nothing and fixes nothing: the
+                // next attempt may commit.
+                let replay = match outcome {
+                    TransactionOutcome::Committed => match commits.get(*transaction) {
+                        Some(Ok(key)) => Ok(DecisionRule::ResolvedCommit {
+                            transaction: (*transaction).clone(),
+                            key: key.clone(),
+                        }),
+
+                        Some(Err(recovery)) => Err(DecisionGap::TransactionOutcomeUnstable {
+                            transaction: (*transaction).clone(),
+                            outcome: *outcome,
+                            recovery: recovery.clone(),
+                        }),
+
+                        None => Err(DecisionGap::TransactionOutcomeUnstable {
+                            transaction: (*transaction).clone(),
+                            outcome: *outcome,
+                            recovery: Vec::new(),
+                        }),
+                    },
+
+                    TransactionOutcome::Rejected => Err(DecisionGap::TransactionOutcomeUnstable {
+                        transaction: (*transaction).clone(),
+                        outcome: *outcome,
+                        recovery: Vec::new(),
+                    }),
+                };
+
+                (taken, replay)
+            }
+
             Decision::Branch { condition, arm } => {
                 let taken = DecisionTaken::Branch {
                     location: location.clone(),
-                    arm: *arm,
+                    arm: arm.clone(),
                 };
 
                 if !condition.is_deterministic() {
@@ -1766,6 +1911,33 @@ impl<'a> ReplayAnalysis<'a> {
 
                         context.artifacts.insert(intent.bind.clone(), replay);
                     }
+
+                    // A transition-scoped admission is an outbox
+                    // write of this transaction, conditioned on the
+                    // transition applying: on the committed path it
+                    // did, so the admission is judged exactly as a
+                    // `write_outbox` step is.
+                    let declared = self
+                        .model
+                        .state_machines
+                        .get(&transition.machine)
+                        .and_then(|machine| machine.transitions.get(&transition.transition));
+
+                    for (effect_id, application) in &transition.effects {
+                        let Some(admission) =
+                            declared.and_then(|declared| declared.effects.get(effect_id))
+                        else {
+                            continue;
+                        };
+
+                        writes.push(OutboxWriteTrace {
+                            effect_id,
+                            effect: admission.outbox_write(),
+                            values: &application.values,
+                            before: context.clone(),
+                            instance: self.direct_instance(context, &application.values),
+                        });
+                    }
                 }
 
                 TransactionStep::WriteOutbox(write) => {
@@ -1776,7 +1948,9 @@ impl<'a> ReplayAnalysis<'a> {
                     // A transaction-read root stays unstable here as
                     // everywhere.
                     writes.push(OutboxWriteTrace {
-                        step: write,
+                        effect_id: &write.effect_id,
+                        effect: &write.effect,
+                        values: &write.values,
                         before: context.clone(),
                         instance: self.direct_instance(context, &write.values),
                     });
@@ -1887,6 +2061,21 @@ impl<'a> ReplayAnalysis<'a> {
                 // on natural replay while the duplicate admission goes
                 // unjudged.
                 TransactionStep::WriteOutbox(_) => {}
+
+                // Re-execution advances the version again, and
+                // re-presents an already-accepted cursor position,
+                // which the successor and monotonic rules both reject
+                // as stale: neither reproduces the first commit.
+                TransactionStep::BumpVersion(_) => push(&mut gaps, ReplayGap::ContainsVersionBump),
+
+                TransactionStep::AdvanceCursor(_) => {
+                    push(&mut gaps, ReplayGap::ContainsCursorAdvance)
+                }
+
+                // A validation re-observes the current version and a
+                // fence re-presents the same token, which an equal
+                // fence accepts: neither changes what commits.
+                TransactionStep::ValidateVersion(_) | TransactionStep::Fence(_) => {}
 
                 TransactionStep::Read(_)
                 | TransactionStep::Lock(_)

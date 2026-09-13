@@ -58,8 +58,9 @@ export type Schema =
 export interface DataModel {
   objects: Record<Id, DataObject>;
   /** Typed transactional message collections of this data model:
-   *  written only by a transaction's `write_outbox` step, atomically
-   *  with its commit, and consumed by outbox inputs. */
+   *  written only by a transaction's `write_outbox` step or a
+   *  transition-scoped admission, atomically with its commit, and
+   *  consumed by outbox inputs. */
   outboxes?: Record<Id, Outbox>;
 }
 
@@ -71,9 +72,21 @@ export interface Outbox {
   message_identity: MessageIdentity;
 }
 
+/** A versioned object's one monotonically increasing application
+ *  concurrency token: a non-optional `int` on the canonical schema,
+ *  outside the identity, managed only by the version protocol —
+ *  `validate_version` and `bump_version` — never assigned directly. */
+export interface ObjectVersion {
+  field: FieldPath;
+}
+
 export interface DataObject {
   schema: Id;
   identity: FieldPath[];
+  /** The object's application concurrency token, when it declares one.
+   *  Absent is the absence of the OCC route — no claim that concurrent
+   *  mutation is safe. */
+  version?: ObjectVersion;
 }
 
 export type MessageIdentity =
@@ -94,15 +107,30 @@ export interface StateMachine {
   transitions: Record<Id, Transition>;
 }
 
+/** One transition: an explicitly fallible commit guard over the
+ *  subject's state field. Applied to a subject not in a `from` state,
+ *  it rejects the containing transaction — nothing commits, no intent
+ *  is established, no admission is made, and control enters the
+ *  transaction step's `rejected` block. */
 export interface Transition {
   from: Id[];
   to: Id;
   side_effects: Record<Id, TransitionSideEffect>;
+  /** Outbox messages admitted atomically with a successful application
+   *  of this transition, keyed by effect id exactly as `side_effects`
+   *  is; the applying transaction step supplies each derivation under
+   *  the same key. */
+  effects?: Record<Id, TransitionEffect>;
 }
 
 export type TransitionSideEffect =
   | ({ kind: "publication" } & PublicationEffect)
   | ({ kind: "request" } & RequestEffect);
+
+/** An effect admitted atomically with the transition's containing
+ *  transaction, conditioned on the transition applying. The one kind
+ *  is a transactional outbox write. */
+export type TransitionEffect = { kind: "outbox_write" } & OutboxWriteEffect;
 
 export type ValueSourceKind =
   | "input"
@@ -165,24 +193,26 @@ export type ExternalIdempotency =
 /** Terminal-result replay behaviour, relative to the identity. */
 export type ExternalResultReplay = "unspecified" | "unstable" | "replay_stable";
 
-/** Whether observing the contract's `Err` terminally resolves the
- *  logical interaction (`terminal`), conclusively ends one attempt
- *  while admitting another (`retryable`), or says nothing
- *  (`unspecified`). */
+/** Whether observing an error class terminally resolves the logical
+ *  interaction (`terminal`), conclusively ends one attempt while
+ *  admitting another (`retryable`), or says nothing (`unspecified`). */
 export type ErrorDisposition = "unspecified" | "terminal" | "retryable";
 
-/** The `Err` half of a result contract: the payload schema and the
- *  declared disposition of observing that error. */
+/** One named error class of a result contract: the payload schema and
+ *  the declared disposition of observing that error. The disposition
+ *  belongs to the contract, not the schema — one error schema may be
+ *  terminal in one class and retryable in another. */
 export interface ErrorResultType {
   schema: Id;
   disposition: ErrorDisposition;
 }
 
-/** A first-class `Result<Ok, Err>` contract: two schemas, exactly one
- *  of which shapes a given outcome. */
+/** A first-class result contract: the `ok` schema and the named logical
+ *  error classes, keyed by class id. Exactly one arm shapes a given
+ *  outcome; a contract with no classes returns `Ok` alone. */
 export interface ResultType {
   ok: Id;
-  err: ErrorResultType;
+  errors: Record<Id, ErrorResultType>;
 }
 
 export type ResultVariant = "ok" | "err";
@@ -194,7 +224,8 @@ export interface PublicationEffect {
 }
 
 /** Transactional admission of one message to a data-model outbox; its
- *  only legal execution site is a transaction's `write_outbox` step. */
+ *  legal execution sites are a transaction's `write_outbox` step and a
+ *  transition-scoped admission. */
 export interface OutboxWriteEffect {
   outbox: Id;
   schema: Id;
@@ -287,6 +318,18 @@ export interface TransitionEffectIntent {
   values: Derivation;
 }
 
+/** One transition-scoped outbox admission's application facts: the
+ *  provenance of the admitted message. Nothing is bound — an admission
+ *  has no synchronous result. */
+export interface TransitionEffectApplication {
+  values: Derivation;
+}
+
+/** How an `advance_cursor` step admits an incoming position `P` after
+ *  the stored position `S`: `successor` admits exactly `P = S + 1`,
+ *  `monotonic_after` any `P > S`. */
+export type CursorAdvanceRule = "successor" | "monotonic_after";
+
 export type TransactionStep =
   | { kind: "read"; bind: Id; target: ObjectSelector; fields: FieldSelection }
   | { kind: "write"; target: ObjectSelector; fields: FieldPath[]; values: Derivation }
@@ -294,15 +337,63 @@ export type TransactionStep =
   | { kind: "delete"; target: ObjectSelector }
   | { kind: "lock"; target: ObjectSelector; mode: "shared" | "exclusive"; order: LockOrder }
   | {
+      /** A commit guard over the subject's state: rejects the
+       *  transaction when the subject is not in a `from` state. */
       kind: "transition";
       machine: Id;
       transition: Id;
       subject: ObjectSelector;
       effect_intents: Record<Id, TransitionEffectIntent>;
+      /** Derivations of the transition's declared outbox admissions,
+       *  keyed by the transition's effect id. */
+      effects?: Record<Id, TransitionEffectApplication>;
     }
   | { kind: "establish_effect_intent"; bind: Id; effect_id: Id; effect: Effect; values: Derivation }
   | { kind: "establish_transaction_output"; bind: Id; schema: Id; values: Derivation }
-  | { kind: "write_outbox"; effect_id: Id; effect: OutboxWriteEffect; values: Derivation };
+  | { kind: "write_outbox"; effect_id: Id; effect: OutboxWriteEffect; values: Derivation }
+  /** The optimistic-concurrency commit guard: the transaction commits
+   *  only if the instance's version at commit arbitration still equals
+   *  the version an earlier read observed; a mismatch rejects. */
+  | { kind: "validate_version"; target: ObjectSelector; expected: ValueRef }
+  /** `version := version + 1` on the instance, atomically with the
+   *  commit; required beside every write or transition of a live
+   *  versioned instance. */
+  | { kind: "bump_version"; target: ObjectSelector }
+  /** The ordered-cursor commit guard: commits only when `incoming` is
+   *  admissible after the stored position under `rule`, then sets the
+   *  cursor to it; an inadmissible position rejects. */
+  | {
+      kind: "advance_cursor";
+      target: ObjectSelector;
+      field: FieldPath;
+      incoming: ValueRef;
+      rule: CursorAdvanceRule;
+    }
+  /** The fencing commit guard: a token older than the persisted fence
+   *  rejects, an equal one leaves it, a newer one advances it. */
+  | { kind: "fence"; target: ObjectSelector; field: FieldPath; token: ValueRef };
+
+/** `SerializableBy(key)`: within each key value, committed executions
+ *  of the transaction and every transaction it may conflict with are
+ *  equivalent to some serial order. */
+export interface TransactionSerializabilityRequirement {
+  key: ValueRef;
+}
+
+/** `OrderedBy(key, position)`: within each key value, committed
+ *  executions take effect in `position` order. */
+export interface TransactionOrderingRequirement {
+  key: ValueRef;
+  position: ValueRef;
+}
+
+/** The obligations declared on one transaction's committed history,
+ *  serializability and ordering — never on an operation, and never discharged by
+ *  runtime topology. Always present; both lists may be empty. */
+export interface TransactionRequirements {
+  serializability: TransactionSerializabilityRequirement[];
+  ordering: TransactionOrderingRequirement[];
+}
 
 /** An inline transaction: declared and executed at the program step
  *  that carries it. `id` is its stable logical identity. */
@@ -311,6 +402,7 @@ export interface Transaction {
   data_model: Id | null;
   isolation: "unspecified" | "read_committed" | "snapshot" | "serializable";
   idempotency: IdempotencyGuarantee;
+  requirements: TransactionRequirements;
   steps: TransactionStep[];
 }
 
@@ -323,9 +415,11 @@ export type Condition =
   | { kind: "not"; condition: Condition }
   | { kind: "present"; value: ValueRef };
 
+/** Which arm of the request's result a `return` constructs: `ok`, or
+ *  the named error class, which the request's contract must declare. */
 export type ResultOutcome =
   | { kind: "ok"; values: Derivation }
-  | { kind: "err"; values: Derivation };
+  | { kind: "err"; error: Id; values: Derivation };
 
 export interface OperationBlock {
   steps: OperationStep[];
@@ -339,7 +433,12 @@ export interface AsyncJoin {
 }
 
 export type OperationStep =
-  | ({ kind: "transaction" } & Transaction)
+  /** One transaction execution site. A transaction attempt commits,
+   *  rejects, or is interrupted: on rejection nothing commits and
+   *  control enters `rejected`, which is present exactly when the body
+   *  contains a rejecting step — a transition, `validate_version`,
+   *  `advance_cursor`, or `fence`. */
+  | { kind: "transaction"; transaction: Transaction; rejected?: OperationBlock }
   | { kind: "execute_effect"; effect_id: Id; effect: Effect; values: Derivation; bind: Id | null }
   /** Constructs and initiates the same instance an `execute_effect`
    *  would, without waiting for completion; binds only the handle. */
@@ -354,47 +453,57 @@ export type OperationStep =
    *  execution completes — first completion, not first success; the
    *  losers are not cancelled. */
   | { kind: "race"; handles: Id[]; bind: Id | null }
-  | { kind: "match_result"; result: Id; ok: OperationBlock; err: OperationBlock }
+  /** Destructures a bound result into its `ok` arm and one arm per
+   *  error class the result's contract declares — exhaustive, mutually
+   *  exclusive. */
+  | { kind: "match_result"; result: Id; ok: OperationBlock; errors: Record<Id, OperationBlock> }
   | { kind: "branch"; condition: Condition; then: OperationBlock; otherwise: OperationBlock | null }
   | { kind: "return"; request: Id; outcome: ResultOutcome }
   | { kind: "complete" };
 
 export type ResultReplayRequirement = "unspecified" | "replay_consistent";
 
+/** The operation-level requirement families: obligations over repeated
+ *  or interrupted attempts at one logical invocation. Serializability
+ *  and ordering are transaction requirements, declared on the
+ *  transaction they constrain. */
 export interface OperationRequirements {
-  serialization: { key: ValueRef }[];
-  ordering: { key: ValueRef }[];
   idempotency: { key: IdempotencyKey; result: ResultReplayRequirement }[];
   recoverability: { key: IdempotencyKey; completion: "resumable" | "guaranteed" }[];
 }
 
-export type RequirementKind = keyof OperationRequirements;
+/** A requirement family a chip or a detail refers to. The transaction
+ *  families are addressed by operation id, transaction id, and index
+ *  into that transaction's requirement list; the operation families by
+ *  operation id and index. */
+export type RequirementKind =
+  | "transaction_serializability"
+  | "transaction_ordering"
+  | keyof OperationRequirements;
 
-/** An operation: invocation sources, one causal program, requirements,
- *  and execution facts. Transactions, direct effects, transaction
- *  outputs, and effect intents are declared inline at the program or
+/** An operation: invocation sources, one causal program, and
+ *  requirements. Transactions, direct effects, transaction outputs,
+ *  and effect intents are declared inline at the program or
  *  transaction site that executes or establishes them — the program is
  *  the source of truth for every operation-owned execution
- *  occurrence. */
+ *  occurrence. An operation declares no entry synchronization and no
+ *  serializability or ordering requirement of its own. */
 export interface Operation {
   service: Id;
   description: string | null;
   inputs: Record<Id, Input>;
-  /** Entry synchronization: an exclusive lock on the evaluated key,
-   *  held from operation entry to the invocation's terminal. */
-  invocation_lock?: InvocationLock | null;
   program: OperationBlock;
   requirements: OperationRequirements;
-}
-
-export interface InvocationLock {
-  key: ValueRef;
 }
 
 // ---------------------------------------------------------------------
 // L1 — runtime topology and realization semantics
 // ---------------------------------------------------------------------
 
+/** The declared runtime realization. It describes placement, transport,
+ *  grouping, precedence, and runtime capacity; it provides no
+ *  serializability or ordering guarantee, and no transaction proof
+ *  consumes any fact declared here. */
 export interface RuntimeModel {
   topics?: Record<Id, TopicRuntime>;
   subscriptions?: Record<Id, Record<Id, SubscriptionRuntime>>;
@@ -496,19 +605,21 @@ export interface RequestRouting {
   member_assignment: MemberAssignment;
 }
 
+/** How a routing domain is placed on a pool member. A placement fact
+ *  and nothing more: it asserts nothing about overlap between a stale
+ *  owner and its successor, and no correctness proof consumes it. */
 export type MemberAssignment = { kind: "consistent_hash" } | { kind: "round_robin" };
 
 /** A logical population of interchangeable runtime members. Carries no
  *  cardinality: member counts are external scenario inputs. */
 export interface ExecutionPool {
   member_concurrency: MemberConcurrency;
-  /** Continuity of exclusive execution authority across ownership and
-   *  member transitions. Absent means no fact about such overlap. */
-  execution_handoff?: ExecutionHandoff | null;
 }
 
-export type ExecutionHandoff = "exclusive_ownership";
-
+/** How many invocations one member may execute at once — a capacity
+ *  fact. `bounded(1)` proves no transaction property: a member running
+ *  one invocation at a time still overlaps every other member, its own
+ *  replacement, and a stale incarnation of itself. */
 export type MemberConcurrency =
   | { kind: "unspecified" }
   | { kind: "bounded"; value: number }

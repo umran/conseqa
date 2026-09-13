@@ -111,19 +111,22 @@ which obligations are proven and which are not. Fix what it names — \
 narrowly, yourself, or with another request_design pass.
 
 An unproven obligation carries a `remedy` saying which layer the \
-missing facts belong to. `runtime` means no program change can help: \
-the fix is the L1 runtime topology — transport grouping and ordering, \
-subscription delivery and dispatch, outbox partitioning, ordering, \
-and dispatch, execution pools and their member concurrency, \
-request routers, storage layouts. Author it here, after \
-the programs exist and verification has said what it has to discharge, \
-not while drafting the skeleton: L1 exists to make specific \
-requirements provable, and before you know which ones, declaring it is \
-guesswork. Serialization and ordering are proven almost entirely from \
-this layer — a grouping domain owned by one pool member whose \
-concurrency is bounded(1) is what proves same-key invocations never \
-overlap. Never invent topology to make a proof pass; leaving a \
-requirement unproven is a legitimate outcome.
+missing facts belong to. `application` means the fix is in the L0 \
+model: transaction serializability and ordering are proven only from \
+transaction primitives — declared isolation, shared and exclusive \
+locks, object versions with validate_version and bump_version, \
+ordered cursors, fences — over the model-wide conflict closure of \
+the transaction, never from runtime topology. `runtime` means no \
+program change can help: the fix is the L1 runtime topology — \
+transport grouping and ordering, subscription delivery and dispatch, \
+outbox partitioning, ordering, and dispatch, execution pools and \
+their member concurrency, request routers, storage layouts. L1 \
+describes placement, transport, grouping, precedence, and capacity; \
+it provides no serializability or ordering guarantee, and only the replay \
+families consume its delivery facts. Author it after the programs \
+exist and verification has said what it has to discharge, not while \
+drafting the skeleton. Never invent topology to make a proof pass; \
+leaving a requirement unproven is a legitimate outcome.
 7. export_spec delivers the result: the canonical YAML, the \
 verification report, and a self-contained interactive HTML \
 visualization, written to a directory you choose — show these to the \
@@ -415,9 +418,14 @@ impl ConseqaMcp {
 
     /// The bearer credential of a request.
     fn bearer(context: &RequestContext<RoleServer>) -> Result<String, ResolveError> {
-        let parts = context.extensions.get::<http::request::Parts>().ok_or_else(|| {
-            ResolveError::Unauthorized("the transport did not carry HTTP request parts".to_string())
-        })?;
+        let parts = context
+            .extensions
+            .get::<http::request::Parts>()
+            .ok_or_else(|| {
+                ResolveError::Unauthorized(
+                    "the transport did not carry HTTP request parts".to_string(),
+                )
+            })?;
 
         parts
             .headers
@@ -478,16 +486,16 @@ impl ConseqaMcp {
 
     /// The project host for the project-selection tools, authenticated
     /// as appropriate for the backing.
-    fn project_host(
-        &self,
-        context: &RequestContext<RoleServer>,
-    ) -> Result<ProjectHost, McpError> {
+    fn project_host(&self, context: &RequestContext<RoleServer>) -> Result<ProjectHost, McpError> {
         match &self.backing {
             Backing::Multi { host, api_key } => {
                 let bearer = Self::bearer(context).map_err(resolve_to_mcp_error)?;
 
                 if &bearer != api_key {
-                    return Err(McpError::invalid_request("the API key is not recognized", None));
+                    return Err(McpError::invalid_request(
+                        "the API key is not recognized",
+                        None,
+                    ));
                 }
 
                 Ok(host.clone())
@@ -508,11 +516,14 @@ impl ProjectHost {
     fn active_resolved(&self) -> Result<Resolved, ResolveError> {
         let session = self.active.read().clone().ok_or(ResolveError::NoProject)?;
 
-        let task = session.engine.resolve_token(&session.token).ok_or_else(|| {
-            ResolveError::Unauthorized(
-                "the project session has ended; open a project again".to_string(),
-            )
-        })?;
+        let task = session
+            .engine
+            .resolve_token(&session.token)
+            .ok_or_else(|| {
+                ResolveError::Unauthorized(
+                    "the project session has ended; open a project again".to_string(),
+                )
+            })?;
 
         Ok(Resolved {
             engine: session.engine,
@@ -791,8 +802,7 @@ impl ConseqaMcp {
         let (engine, task) = (resolved.engine, resolved.task);
         let params = params.0;
 
-        let mode: OperationReadMode =
-            parse_arg!(serde_json::Value::String(params.mode), "mode");
+        let mode: OperationReadMode = parse_arg!(serde_json::Value::String(params.mode), "mode");
 
         match engine.read_operation(task, &id_from(&params.operation), mode) {
             Ok(view) => json_result(serde_json::to_value(view).expect("view serializes")),
@@ -1160,11 +1170,9 @@ impl ConseqaMcp {
         }
     }
 
-    #[tool(
-        description = "Create a new isolated project and make it active, \
+    #[tool(description = "Create a new isolated project and make it active, \
                        seeded with an optional natural-language prompt describing the system \
-                       to build. Errors if a project of that name already exists."
-    )]
+                       to build. Errors if a project of that name already exists.")]
     async fn create_project(
         &self,
         params: Parameters<CreateProjectParams>,
@@ -1277,7 +1285,10 @@ impl ConseqaMcp {
         // A design run is reported before waiting on analysis: while
         // workers are committing, the head moves under us and the
         // caller's next step is to keep polling, not to read a verdict.
-        let design = self.launcher.as_ref().and_then(|launcher| launcher.status());
+        let design = self
+            .launcher
+            .as_ref()
+            .and_then(|launcher| launcher.status());
 
         let running = design
             .as_ref()
@@ -1404,8 +1415,7 @@ impl ConseqaMcp {
         };
 
         if let Some(report) = report {
-            let json = serde_json::to_string_pretty(report)
-                .unwrap_or_else(|_| "{}".to_string());
+            let json = serde_json::to_string_pretty(report).unwrap_or_else(|_| "{}".to_string());
 
             if let Some(result) = write_artifact(
                 &dir.join("verification-report.json"),
@@ -1494,9 +1504,8 @@ fn analysis_json(state: &AnalysisState) -> serde_json::Value {
                     proven += 1;
                 } else {
                     open.push(
-                        serde_json::to_value(obligation).unwrap_or_else(|_| {
-                            serde_json::Value::String(obligation.id.clone())
-                        }),
+                        serde_json::to_value(obligation)
+                            .unwrap_or_else(|_| serde_json::Value::String(obligation.id.clone())),
                     );
                 }
             }
@@ -1567,9 +1576,8 @@ fn write_artifact(
 }
 
 fn rejection_body(rejection: &CommitRejection) -> serde_json::Value {
-    serde_json::to_value(rejection).unwrap_or_else(|_| {
-        serde_json::json!({ "kind": "unserializable_rejection" })
-    })
+    serde_json::to_value(rejection)
+        .unwrap_or_else(|_| serde_json::json!({ "kind": "unserializable_rejection" }))
 }
 
 #[tool_handler]
@@ -1621,10 +1629,7 @@ pub async fn serve_stdio(
 
     let mcp = ConseqaMcp::local(manager, launcher);
 
-    let service = mcp
-        .serve(stdio())
-        .await
-        .map_err(std::io::Error::other)?;
+    let service = mcp.serve(stdio()).await.map_err(std::io::Error::other)?;
 
     service.waiting().await.map_err(std::io::Error::other)?;
 
@@ -1698,10 +1703,7 @@ pub async fn serve(engine: ConfluenceEngine, bind: SocketAddr) -> std::io::Resul
 
 /// Serves an already composed router (the daemon's admin surface rides
 /// along).
-pub async fn serve_router(
-    router: axum::Router,
-    bind: SocketAddr,
-) -> std::io::Result<McpServer> {
+pub async fn serve_router(router: axum::Router, bind: SocketAddr) -> std::io::Result<McpServer> {
     let listener = tokio::net::TcpListener::bind(bind).await?;
     let local_addr = listener.local_addr()?;
 
@@ -1769,35 +1771,55 @@ PATCH — {"mutations": [<mutation>, ...]}; each mutation {"kind": K, ...}:
   {"kind":"put_service","id":"service.x","value":{"kind":"backend"}}
   {"kind":"put_schema","id":"schema.X","value":<schema declaration>}
   {"kind":"put_data_model","id":"data.x","value":{"objects":{...},"outboxes":{...}}}
-    (outboxes optional: {"outbox.x":{"messages":["schema.X"],
+    (objects: {"object.x":{"schema":"schema.X","identity":[["id"]],
+     "version":{"field":["version"]}}}. version optional: the object's
+     application concurrency token, a non-optional int outside the
+     identity, managed by the version protocol alone — insert creates
+     it, bump_version advances it (required with every write or
+     transition of the instance), validate_version checks it at commit
+     against a preceding read, and no ordinary write may name it.
+     outboxes optional: {"outbox.x":{"messages":["schema.X"],
      "message_identity":{"kind":"keyed","mapping":{"schema.X":[["event_id"]]}}}}.
      An outbox is a typed transactional message collection of the data
      model: a transaction on the model may mutate objects AND admit
      messages to its outboxes in one atomic commit. Written only by a
-     transaction's write_outbox step; consumed by exactly one outbox
-     input, whose operation is its exclusive logical consumer.)
+     transaction's write_outbox step or a transition's outbox effect;
+     consumed by exactly one outbox input, whose operation is its
+     exclusive logical consumer.)
   {"kind":"put_topic","id":"topic.x","value":{"messages":[...],"message_identity":...}}
   {"kind":"put_state_machine","id":"machine.x","value":{...}}
+    (a transition: {"from":["state.a"],"to":"state.b","side_effects":{...},
+     "effects":{"effect.x.paid":{"kind":"outbox_write","outbox":"outbox.x",
+                                 "schema":"schema.X","idempotency_key_propagation":[]}}}.
+     A transition is an explicit commit guard: applied when the subject's
+     state is not in `from`, it REJECTS the containing transaction. Its
+     `effects` (optional) are outbox messages admitted atomically with the
+     transition applying — the only kind is outbox_write; the outbox must
+     belong to the data model owning the subject object and admit the
+     schema. The applying transaction step supplies each message's
+     derivation under the same key.)
   {"kind":"put_operation_interface","operation":"operation.x",
-   "value":{"service":"service.x","description":"...","inputs":{...},
-            "invocation_lock":{"key":{"source":"input:input.x.request",
-                                      "path":["tenant_id"]}}}}
-    (invocation_lock optional: an exclusive lock on the evaluated key,
-     acquired at operation entry before any program step and held to the
-     invocation's terminal — equal keys never execute concurrently. L0:
-     it proves SerializedBy(key) with no topology at all, and survives
-     any topology change. The key must source an input of the operation,
-     and its ONLY input — every invocation acquires the lock, and an
-     invocation via another input has no value for the key. No FIFO
-     guarantee: it never proves ordering. Async effects that outlive the
-     terminal are not kept under it.)
+   "value":{"service":"service.x","description":"...","inputs":{...}}}
   {"kind":"replace_operation_program","operation":"operation.x","program":{"steps":[...]}}
   {"kind":"replace_operation_requirements","operation":"operation.x","requirements":{...}}
+    (operation requirements are idempotency and recoverability only;
+     serializability and ordering are declared on the transaction they
+     constrain, inside the program — see the transaction step below.)
   {"kind":"propose_requirements","operation":"operation.x","proposals":[
      {"requirement":{"family":"idempotency","requirement":{"key":{"components":[...]},
        "result":"replay_consistent"}},
-      "origin":{"kind":"explicit_prompt","obligation":"obl.x"}}]}
-    (origins: explicit_prompt {obligation}; strongly_implied {rationale, evidence};
+      "origin":{"kind":"explicit_prompt","obligation":"obl.x"}},
+     {"requirement":{"family":"transaction_serializability",
+       "requirement":{"transaction":"tx.x","requirement":{"key":<value ref>}}},
+      "origin":{"kind":"strongly_implied","rationale":"...","evidence":[]}},
+     {"requirement":{"family":"transaction_ordering",
+       "requirement":{"transaction":"tx.x",
+                      "requirement":{"key":<value ref>,"position":<value ref>}}},
+      "origin":{"kind":"recommended","rationale":"...","evidence":[]}}]}
+    (families: transaction_serializability | transaction_ordering — each
+     names an inline transaction of the operation's program, which must
+     exist — | idempotency | recoverability.
+     origins: explicit_prompt {obligation}; strongly_implied {rationale, evidence};
      recommended {rationale, evidence})
 L1 RUNTIME TOPOLOGY (all shared-skeleton writes; L1 is optional):
   {"kind":"put_topic_runtime","topic":"topic.x",
@@ -1813,29 +1835,23 @@ L1 RUNTIME TOPOLOGY (all shared-skeleton writes; L1 is optional):
      Never both scopes — there is no inheritance and no override.
      `within_group` requires a keyed grouping at the same scope.)
   {"kind":"put_execution_pool","id":"pool.x",
-   "value":{"member_concurrency":{"kind":"bounded","value":1},
-            "execution_handoff":"exclusive_ownership"}}
+   "value":{"member_concurrency":{"kind":"bounded","value":1}}}
     (member_concurrency kinds: unspecified | unbounded | bounded{value}.
-     execution_handoff optional, sole value "exclusive_ownership": when
-     execution authority for a routing domain transfers between members
-     or member incarnations, exclusive execution ownership is preserved
-     — a stale owner cannot overlap its successor. Omitted means no
-     fact about overlap across such transitions. Topology serialization
-     and ordering proofs REQUIRE it alongside consistent_hash and
-     bounded(1): affinity is per stable epoch only, and bounded(1)
-     binds each member separately, so neither bridges a replacement or
-     rebalance. Declare it only where the runtime genuinely fences or
-     drains the old owner; a polling lease alone does not.)
+     A capacity fact an external scenario reads; bounded(1) proves no
+     transaction property — a member running one invocation at a time
+     still overlaps every other member, its own replacement, and a
+     stale incarnation of itself.)
   {"kind":"put_router","id":"router.x",
    "value":{"boundary":{"operation":"operation.x","input":"input.x.request"},
             "pool":"pool.x",
             "routing":{"key":["order_id"],
                        "member_assignment":{"kind":"consistent_hash"}}}}
-    (member_assignment: consistent_hash | round_robin. Omit "routing"
-     entirely to assign the boundary to a pool and declare no member
-     affinity; that is not the same as round_robin, which states that
-     affinity is known NOT to exist. Neither proves serialization or
-     ordering, but they are different facts.)
+    (member_assignment: consistent_hash | round_robin — placement facts
+     only. Omit "routing" entirely to assign the boundary to a pool and
+     declare no member affinity; that is not the same as round_robin,
+     which states that affinity is known NOT to exist. Neither proves
+     serializability or ordering: no L1 fact is commit-order
+     evidence.)
   {"kind":"put_subscription_runtime","operation":"operation.x","input":"input.x.events",
    "value":{"delivery":"at_least_once",
             "dispatch":{"pool":"pool.x",
@@ -1866,9 +1882,8 @@ L1 RUNTIME TOPOLOGY (all shared-skeleton writes; L1 is optional):
      declared partition domain and requires keyed partitioning. batching
      is optional; when present its "ordering" is explicit: "preserved" |
      "unspecified". Batching is an opaque L1 realization over
-     per-message logical invocations: "preserved" lets an established
-     order pass through the stage, and its presence stops any
-     serialization proof regardless.)
+     per-message logical invocations; like every other L1 fact it
+     proves no transaction property.)
   {"kind":"put_storage_layout","id":"layout.x",
    "value":{"object":{"data_model":"data.x","object":"object.y"},
             "partition_key":["channel_id","bucket"]}}
@@ -1890,6 +1905,76 @@ Conseqa model YAML structure, as JSON. An outbox input:
      to several consumers belongs to a topic, not an outbox. One
      committed message = one logical invocation; no batch payload
      exists at L0.)
+A TRANSACTION STEP declares and executes one inline transaction:
+  {"kind":"transaction",
+   "transaction":{"id":"tx.x","data_model":"data.x","isolation":"read_committed",
+                  "idempotency":{"kind":"deduplicated_by","key":{"components":[...]}},
+                  "requirements":{"serializability":[{"key":<value ref>}],
+                                  "ordering":[{"key":<value ref>,"position":<value ref>}]},
+                  "steps":[...]},
+   "rejected":{"steps":[...]}}
+    (requirements optional. SerializableBy(key): the transaction's
+     executions, with every transaction they may conflict with, commit in
+     a history equivalent to some serial order. OrderedBy(key, position):
+     within each key domain, executions take effect in position order —
+     the position must be a non-optional int, decimal, or timestamp and
+     must be persisted by an advance_cursor or fence step. Both key and
+     position must be available at transaction entry: an input, a prior
+     transaction output, or a bound result — never a transaction_read of
+     this transaction. Proven from the model-wide conflict closure by
+     serializable isolation, strict S/X locks, version validation, or a
+     shared ordered cursor; never from runtime topology.
+     rejected: REQUIRED iff the body contains a commit guard — a
+     transition, validate_version, advance_cursor, or fence — and
+     forbidden otherwise. On rejection nothing commits, no artifact or
+     outbox admission exists, and control enters the block; if it falls
+     through, control rejoins after the step with the transaction's
+     artifacts unavailable. Interruption (crash, deadlock, timeout) never
+     enters rejected and is never an Err.)
+Transaction steps beyond read/write/insert/delete/lock/transition/
+establish_effect_intent/establish_transaction_output/write_outbox:
+  {"kind":"validate_version","target":<object selector>,
+   "expected":{"source":"transaction_read:read.x","path":"version"}}
+    (the observation guard: at commit the transaction proceeds only if
+     the selected instance's version STILL EQUALS expected — the version
+     field of a PRECEDING read of the same instance in this transaction.
+     Any change rejects; the guard compares and never increments, holds
+     no lock, and is evaluated at commit wherever it sits. Never required
+     by validation: declare it where the transaction relies on what it
+     read, which a serializability proof of a read-then-write needs on
+     the reader's side.)
+  {"kind":"bump_version","target":<object selector>}
+    (publishes a change: version := version + 1 at commit, unconditional,
+     never rejects. REQUIRED beside every write or transition of a live
+     versioned instance, at most once per instance; insert and delete
+     need none. Neither step implies the other — validate-only guards a
+     read, bump-only is a blind write; both on one instance compose into
+     a compare-and-swap from expected to expected + 1, and a proof over
+     a read-then-write needs the reader's validation AND the writer's
+     bump.)
+  {"kind":"advance_cursor","target":<object selector>,"field":["seq"],
+   "incoming":<value ref>,"rule":"successor"}
+    (rule: successor — commits only when incoming = stored + 1 — or
+     monotonic_after — commits only when incoming > stored — then sets the
+     cursor atomically. The field is a non-optional int (successor) or
+     int/decimal/timestamp (monotonic_after); no ordinary write may name
+     it. The route for OrderedBy when incoming is the position.)
+  {"kind":"fence","target":<object selector>,"field":["generation"],
+   "token":<value ref>}
+    (token < fence rejects; = leaves it; > advances it atomically. A
+     lower authority generation cannot commit after a higher one is
+     accepted; equal tokens order nothing.)
+  {"kind":"lock","target":<object selector>,"mode":"exclusive",
+   "order":{"kind":"unspecified"}}
+    (mode: shared | exclusive; held to termination; protects only
+     accesses AFTER it. S/X locking proves serializable commit order and
+     says nothing about deadlock.)
+  {"kind":"transition","machine":"machine.x","transition":"transition.y",
+   "subject":<object selector>,"effect_intents":{...},
+   "effects":{"effect.x.paid":{"values":<derivation>}}}
+    (effects: one derivation per outbox effect the transition declares,
+     admitted iff the transition applies. Rejects the transaction when
+     the subject's state is not in the transition's `from`.)
 A transactional outbox write, legal ONLY as a transaction step:
   {"kind":"write_outbox","effect_id":"effect.x.outbox",
    "effect":{"outbox":"outbox.x","schema":"schema.X",
@@ -1899,13 +1984,29 @@ A transactional outbox write, legal ONLY as a transaction step:
      admission is atomic with the commit; the step binds no result. The
      kind is rejected under execute_effect, execute_effect_async, and
      establish_effect_intent.)
+RESULT CONTRACTS name their error classes:
+  {"ok":"schema.Ok",
+   "errors":{"conflict":{"schema":"schema.Conflict","disposition":"retryable"},
+             "declined":{"schema":"schema.Declined","disposition":"terminal"}}}
+    (errors optional; each class keeps its own disposition: unspecified |
+     terminal | retryable. A bare schema id declares disposition
+     unspecified. Interruption is never an Err.)
+  {"kind":"return","request":"input.x.request",
+   "outcome":{"kind":"err","error":"conflict","values":<derivation>}}
+    (the class must exist in the request's contract; ok outcomes carry
+     no class.)
+  {"kind":"match_result","result":"result.x","ok":{"steps":[...]},
+   "errors":{"conflict":{"steps":[...]},"declined":{"steps":[...]}}}
+    (arms are exhaustive: exactly one per declared error class. Inside an
+     error arm, effect_result_err:<result> resolves to that class's
+     schema.)
 An external effect declares three orthogonal boundary facts:
   {"kind":"external","name":"provider.op",
    "identity":{"kind":"keyed","key":{"components":[<value ref>...]}},
    "idempotency":"identical_per_identity",
    "result_replay":"replay_stable",
    "result":{"ok":"schema.Ok",
-             "err":{"schema":"schema.Err","disposition":"terminal"}}}
+             "errors":{"declined":{"schema":"schema.Err","disposition":"terminal"}}}}
     (identity: unspecified | keyed — what makes applications one logical
      interaction. idempotency: unspecified | distinguishable |
      identical_per_identity | side_effect_free — duplicate-side-effect
@@ -1950,8 +2051,10 @@ ASYNC PROGRAM STEPS — launch effects without waiting, then synchronize:
 /// The prose that introduces [`PROGRAM_EXAMPLE_JSON`] in the reference.
 const PROGRAM_EXAMPLE_PREAMBLE: &str = "
 WORKED EXAMPLE — a valid program (the body of a `replace_operation_program`
-patch). An effect intent must be established before it is executed, by the
-same binding id: executing an intent no transaction established is the
+patch). The transaction step nests its declaration under `transaction`; it
+carries no `rejected` block because nothing in the body can reject. An
+effect intent must be established before it is executed, by the same
+binding id: executing an intent no transaction established is the
 `unknown effect intent` error the commit gate rejects. A transaction output
 is bound once and then consumed by the `return`.
 ";
@@ -1962,20 +2065,21 @@ is bound once and then consumed by the `return`.
 /// checked by a test (`the_worked_example_is_a_valid_program`), so the
 /// reference cannot drift into an invalid shape.
 const PROGRAM_EXAMPLE_JSON: &str = r#"{"steps":[
-  {"kind":"transaction","id":"tx.example","data_model":null,
-   "isolation":"read_committed","idempotency":{"kind":"not_deduplicated"},
-   "steps":[
-     {"kind":"establish_effect_intent",
-      "bind":"intent.example.notify","effect_id":"effect.example.notify",
-      "effect":{"kind":"publication","topic":"topic.example",
-                "schema":"schema.Event","idempotency_key_propagation":[]},
-      "values":{"kind":"deterministic",
-                "from":[{"source":"input:input.example.request","path":"id"}]}},
-     {"kind":"establish_transaction_output",
-      "bind":"output.example","schema":"schema.Result",
-      "values":{"kind":"deterministic",
-                "from":[{"source":"input:input.example.request","path":"id"}]}}
-   ]},
+  {"kind":"transaction",
+   "transaction":{"id":"tx.example","data_model":null,
+     "isolation":"read_committed","idempotency":{"kind":"not_deduplicated"},
+     "steps":[
+       {"kind":"establish_effect_intent",
+        "bind":"intent.example.notify","effect_id":"effect.example.notify",
+        "effect":{"kind":"publication","topic":"topic.example",
+                  "schema":"schema.Event","idempotency_key_propagation":[]},
+        "values":{"kind":"deterministic",
+                  "from":[{"source":"input:input.example.request","path":"id"}]}},
+       {"kind":"establish_transaction_output",
+        "bind":"output.example","schema":"schema.Result",
+        "values":{"kind":"deterministic",
+                  "from":[{"source":"input:input.example.request","path":"id"}]}}
+     ]}},
   {"kind":"execute_effect_intent","intent":"intent.example.notify"},
   {"kind":"return","request":"input.example.request",
    "outcome":{"kind":"ok","values":{"kind":"deterministic",
@@ -2069,9 +2173,9 @@ fn guide_lookup(topic: &str) -> String {
         .into_iter()
         .filter(|(header, body)| {
             header.to_lowercase().contains(&query)
-                || body.lines().any(|line| {
-                    line.starts_with("### ") && line.to_lowercase().contains(&query)
-                })
+                || body
+                    .lines()
+                    .any(|line| line.starts_with("### ") && line.to_lowercase().contains(&query))
         })
         .collect();
 
@@ -2118,7 +2222,6 @@ mod tests {
             service: Id("service.example".to_string()),
             description: None,
             inputs: BTreeMap::new(),
-            invocation_lock: None,
             program,
             requirements: Default::default(),
         };
@@ -2175,8 +2278,7 @@ mod tests {
         let section = super::guide_lookup("effect intents");
 
         assert!(
-            section.contains("EstablishEffectIntent")
-                && section.contains("ExecuteEffectIntent"),
+            section.contains("EstablishEffectIntent") && section.contains("ExecuteEffectIntent"),
             "the effect-intents section should explain both sides of the wiring:\n{section}"
         );
     }

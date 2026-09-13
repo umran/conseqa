@@ -56,18 +56,25 @@ export function citedIds(ob: Obligation, known: ReadonlySet<Id>): Id[] {
 export type TextRun = { kind: "text"; text: string } | { kind: "id"; id: Id; text: string };
 
 /** Splits prose into plain runs and the declared ids it names, so a
- *  verdict's reasoning can be read *and* followed. */
+ *  verdict's reasoning can be read *and* followed. The checker quotes an
+ *  id in backticks; a pair that encloses exactly the resolved id is
+ *  absorbed into its link, since the link is the quotation. */
 export function splitCitations(text: string, known: ReadonlySet<Id>): TextRun[] {
   const runs: TextRun[] = [];
   let cursor = 0;
   for (const match of text.matchAll(TOKEN)) {
     const token = match[0];
-    const at = match.index ?? 0;
+    let at = match.index ?? 0;
     const id = resolve(token, known);
     if (!id) continue;
+    let end = at + id.length;
+    if (at > cursor && text[at - 1] === "`" && text[end] === "`") {
+      at -= 1;
+      end += 1;
+    }
     if (at > cursor) runs.push({ kind: "text", text: text.slice(cursor, at) });
     runs.push({ kind: "id", id, text: id });
-    cursor = at + id.length;
+    cursor = end;
   }
   if (cursor < text.length) runs.push({ kind: "text", text: text.slice(cursor) });
   return runs;

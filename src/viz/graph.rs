@@ -89,11 +89,6 @@ pub struct ExecutionPoolNode {
     pub id: Id,
     pub member_concurrency: String,
 
-    /// The declared execution-handoff guarantee, `None` when the pool
-    /// declares none.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub execution_handoff: Option<String>,
-
     /// Operation inputs assigned to this pool, request and
     /// subscription alike — the shared execution population made
     /// visible.
@@ -129,10 +124,13 @@ pub struct StorageLayoutNode {
     pub partition_key: Vec<String>,
 }
 
+/// How many requirements of each family the operation declares — the
+/// transaction families summed over every inline transaction of its
+/// program.
 #[derive(Debug, Clone, Serialize)]
 pub struct RequirementBadges {
-    pub serialization: usize,
-    pub ordering: usize,
+    pub transaction_serializability: usize,
+    pub transaction_ordering: usize,
     pub idempotency: usize,
     pub recoverability: usize,
 }
@@ -279,7 +277,9 @@ pub enum EdgeDetail {
     },
 
     /// A transactional outbox write: admission is atomic with the
-    /// named transaction's commit.
+    /// named transaction's commit — a `write_outbox` step, or a
+    /// transition-scoped admission conditioned on the transition
+    /// applying.
     OutboxWrite {
         operation: Id,
         effect: Id,
@@ -289,6 +289,10 @@ pub enum EdgeDetail {
         /// absent only for the structurally invalid direct-site shape,
         /// which validation rejects.
         transaction: Option<Id>,
+
+        /// Set when the admission is scoped to a state-machine
+        /// transition rather than declared as a transaction step.
+        via_transition: Option<TransitionKey>,
 
         /// Program steps whose transaction stages the write.
         executed_at: Vec<String>,
@@ -425,11 +429,9 @@ pub fn extract(model: &Model) -> Graph {
                                         .effective_grouping(op_id, input_id, &sub.topic)
                                         .as_ref(),
                                 ),
-                                ordering: ordering_label(model.effective_ordering(
-                                    op_id,
-                                    input_id,
-                                    &sub.topic,
-                                )),
+                                ordering: ordering_label(
+                                    model.effective_ordering(op_id, input_id, &sub.topic),
+                                ),
                                 routing: runtime.map(|runtime| match &runtime.dispatch.routing {
                                     Some(routing) => to_tag(&routing.key),
                                     None => "none".to_string(),
@@ -484,8 +486,7 @@ pub fn extract(model: &Model) -> Graph {
                             operation: op_id.clone(),
                             input: input_id.clone(),
                             schemas,
-                            partitioning: runtime
-                                .map(|runtime| to_tag(&runtime.partitioning)),
+                            partitioning: runtime.map(|runtime| to_tag(&runtime.partitioning)),
                             ordering: runtime.map(|runtime| to_tag(&runtime.ordering)),
                             pool: runtime.map(|runtime| runtime.dispatch.pool.clone()),
                             routing: runtime.map(|runtime| match &runtime.dispatch.routing {
@@ -621,6 +622,7 @@ pub fn extract(model: &Model) -> Graph {
                             effect: effect_id,
                             schema: write.schema.clone(),
                             transaction: None,
+                            via_transition,
                             executed_at,
                         },
                     });
@@ -631,19 +633,7 @@ pub fn extract(model: &Model) -> Graph {
         // Transactional outbox writes: one edge per `write_outbox`
         // site, executed where its transaction step sits.
         for (transaction_id, write) in op.program.outbox_write_declarations() {
-            let executed_at: Vec<String> = op
-                .program
-                .steps_with_locations()
-                .into_iter()
-                .filter_map(|(location, step)| match step {
-                    OperationStep::Transaction(transaction)
-                        if &transaction.id == transaction_id =>
-                    {
-                        Some(location.to_string())
-                    }
-                    _ => None,
-                })
-                .collect();
+            let executed_at = transaction_locations(op, transaction_id);
 
             edges.push(Edge {
                 id: next_edge_id(),
@@ -654,9 +644,51 @@ pub fn extract(model: &Model) -> Graph {
                     effect: write.effect_id.clone(),
                     schema: write.effect.schema.clone(),
                     transaction: Some(transaction_id.clone()),
+                    via_transition: None,
                     executed_at,
                 },
             });
+        }
+
+        // Transition-scoped admissions: one edge per admission the
+        // operation's transition applications carry, admitted where
+        // the applying transaction step sits.
+        for (_, transaction) in op.program.transactions() {
+            for step in &transaction.steps {
+                let TransactionStep::Transition(step) = step else {
+                    continue;
+                };
+
+                for effect_id in step.effects.keys() {
+                    let Some(admission) = model
+                        .state_machines
+                        .get(&step.machine)
+                        .and_then(|machine| machine.transitions.get(&step.transition))
+                        .and_then(|declared| declared.effects.get(effect_id))
+                    else {
+                        continue;
+                    };
+
+                    let write = admission.outbox_write();
+
+                    edges.push(Edge {
+                        id: next_edge_id(),
+                        from: op_id.to_string(),
+                        to: write.outbox.to_string(),
+                        detail: EdgeDetail::OutboxWrite {
+                            operation: op_id.clone(),
+                            effect: effect_id.clone(),
+                            schema: write.schema.clone(),
+                            transaction: Some(transaction.id.clone()),
+                            via_transition: Some(TransitionKey {
+                                machine: step.machine.clone(),
+                                transition: step.transition.clone(),
+                            }),
+                            executed_at: transaction_locations(op, &transaction.id),
+                        },
+                    });
+                }
+            }
         }
 
         // Machines referenced by transition steps in inline
@@ -669,6 +701,17 @@ pub fn extract(model: &Model) -> Graph {
             }
         }
 
+        let (transaction_serializability, transaction_ordering) = op
+            .program
+            .transactions()
+            .iter()
+            .fold((0, 0), |(serializability, ordering), (_, transaction)| {
+                (
+                    serializability + transaction.requirements.serializability.len(),
+                    ordering + transaction.requirements.ordering.len(),
+                )
+            });
+
         operations.push(OperationNode {
             id: op_id.clone(),
             service: op.service.clone(),
@@ -677,8 +720,8 @@ pub fn extract(model: &Model) -> Graph {
             steps: op.program.steps_with_locations().len(),
             machines: machines.into_iter().collect(),
             requirements: RequirementBadges {
-                serialization: op.requirements.serialization.len(),
-                ordering: op.requirements.ordering.len(),
+                transaction_serializability,
+                transaction_ordering,
                 idempotency: op.requirements.idempotency.len(),
                 recoverability: op.requirements.recoverability.len(),
             },
@@ -758,6 +801,21 @@ pub fn extract(model: &Model) -> Graph {
     }
 }
 
+/// The program steps at which an operation executes the named inline
+/// transaction, as step locations.
+fn transaction_locations(op: &crate::spec::Operation, transaction_id: &Id) -> Vec<String> {
+    op.program
+        .steps_with_locations()
+        .into_iter()
+        .filter_map(|(location, step)| match step {
+            OperationStep::Transaction(execute) if &execute.transaction.id == transaction_id => {
+                Some(location.to_string())
+            }
+            _ => None,
+        })
+        .collect()
+}
+
 fn collect_effect_owners(model: &Model) -> BTreeMap<Id, EffectOwner> {
     let mut owners = BTreeMap::new();
 
@@ -783,7 +841,11 @@ fn collect_effect_owners(model: &Model) -> BTreeMap<Id, EffectOwner> {
 
     for (machine_id, machine) in &model.state_machines {
         for (transition_id, transition) in &machine.transitions {
-            for effect_id in transition.side_effects.keys() {
+            for effect_id in transition
+                .side_effects
+                .keys()
+                .chain(transition.effects.keys())
+            {
                 owners.insert(
                     effect_id.clone(),
                     EffectOwner::Transition {
@@ -1006,13 +1068,6 @@ fn runtime_view(model: &Model) -> RuntimeView {
             .map(|(id, pool)| ExecutionPoolNode {
                 id: id.clone(),
                 member_concurrency: member_concurrency_label(pool.member_concurrency),
-                execution_handoff: pool.execution_handoff.map(|handoff| {
-                    match handoff {
-                        crate::spec::ExecutionHandoff::ExclusiveOwnership => {
-                            "exclusive_ownership".to_string()
-                        }
-                    }
-                }),
                 assigned: assignments.get(id).cloned().unwrap_or_default(),
             })
             .collect(),
@@ -1198,7 +1253,7 @@ mod tests {
         assert_eq!(refs.len(), 1);
         assert_eq!(refs[0].operation.0, "operation.cancel_order");
         assert_eq!(refs[0].transaction.0, "tx.cancel_order");
-        assert_eq!(refs[0].step, 0);
+        assert_eq!(refs[0].step, 2);
     }
 
     #[test]

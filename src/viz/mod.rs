@@ -8,5 +8,6 @@
 
 pub mod graph;
 pub mod render;
+pub mod transaction_proofs;
 
 pub use render::{page_data_json, render};

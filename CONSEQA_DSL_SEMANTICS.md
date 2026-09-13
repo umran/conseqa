@@ -1,13 +1,14 @@
 # Conseqa DSL Semantics
 
 **Status:** Normative semantic contract for the DSL and the V1 verifiers — the single authoritative semantics document. The design drafts and revision documents that preceded it are retired; their normative content is consolidated here, and what they left open is §27.  
-**DSL contract version:** This document specifies **DSL contract version 3** (`DSL_VERSION`, `src/spec/model.rs`). The version names the normative semantic contract as a whole, not the parse schema: any normative change bumps it — vocabulary, validation, or proof semantics alike — while purely internal changes do not. Every specification document declares the version it is authored in (`dsl: 3`, the model root's first field, stamped at assembly and never authored); a consumer probes it before strict parsing and refuses a mismatch or absence by name. Version 3 is the serialization-semantics revision: serialization gains the L0 `invocation_lock` proof route, member assignment asserts stable-epoch affinity only, and every topology serialization and ordering proof requires the explicit `execution_handoff = exclusive_ownership` fact (§7, §9, §10.5, §10.6).
+**DSL contract version:** This document specifies **DSL contract version 4** (`DSL_VERSION`, `src/spec/model.rs`). The version names the normative semantic contract as a whole, not the parse schema: any normative change bumps it — vocabulary, validation, or proof semantics alike — while purely internal changes do not. Every specification document declares the version it is authored in (`dsl: 4`, the model root's first field, stamped at assembly and never authored); a consumer probes it before strict parsing and refuses a mismatch or absence by name. Version 4 is the transaction serializability and ordering revision: both become properties of transactions, declared on the transaction they constrain and proven from transactions alone — serializable isolation across a conflict closure, strict locks, an object version protocol, ordered cursors, and fences — while the runtime topology describes placement, transport, grouping, precedence, and capacity and provides no serializability or ordering guarantee (§7, §9, §10, §16, §17, §20, §22). Transactions are explicitly rejectable, transitions fallible, and request results carry named error classes.
 
 | dsl | defined by |
 |---|---|
 | 1 | the External Boundary Guarantees and Decision Vocabulary revision — external `identity` / `idempotency` / `result_replay`, versioning itself; everything earlier is unversioned prehistory, refused as predating versioning |
 | 2 | the Outbox Semantics revision — exactly one `OutboxInput` per outbox, intrinsic durable re-drive in place of declared delivery and acknowledgement, `OutboxDispatch.routing` in place of a bare member assignment |
 | 3 | the Serialization Semantics revision — the L0 `Operation.invocation_lock` proof route; `MemberAssignment` reduced to stable-epoch affinity, its implicit safe-ownership-transfer rule removed; the explicit `ExecutionPool.execution_handoff` leg required by every topology serialization and ordering proof |
+| 4 | the Transaction Serializability and Ordering revision (specified in `Conseqa_Transaction_Consistency_and_Ordering_Revision__DSL_v4.md`) — operation-level serialization and ordering, `Operation.invocation_lock`, and `ExecutionPool.execution_handoff` removed; `Transaction.requirements` (`SerializableBy`, `OrderedBy`) proven from serializable-isolation closures and serialization graphs over strict locks, the object `version` protocol, ordered cursors, and fences; explicit transaction rejection (`rejected` arm, fallible transitions); transition-scoped outbox effects; named error classes on result contracts |
 
 **Implementation namespace:** `src/spec/` (surface), `src/analyzer/` (validation and verification).
 
@@ -34,7 +35,7 @@ The governing rule:
 
 L1 is **optional**. An L0-only model is complete, structurally valid, and analyzable; it simply has fewer facts from which its obligations can be discharged. Removing L1 from a valid model never makes it invalid — it only makes proofs that consumed runtime facts unavailable.
 
-The analyzer reasons across both layers: an L0 obligation may well be discharged from L1 facts. Every proof therefore records its **scope** (§25.1): `l0_only` when no L1 fact was required, `runtime_dependent` when at least one was. A runtime-dependent proof holds of the declared realization and must be re-examined whenever that realization changes.
+The analyzer reasons across both layers, but the layers discharge different things. A transaction's serializability and ordering are proven from L0 alone (§17): L1 describes placement, transport, grouping, precedence, and runtime capacity, and **it provides no serializability or ordering guarantee** (§10). A progress obligation may cite a delivery fact of L1 (§9). Every proof therefore records its **scope** (§25.1): `l0_only` when no L1 fact was required, `runtime_dependent` when at least one was. A runtime-dependent proof holds of the declared realization and must be re-examined whenever that realization changes.
 
 ### A layer is not a correctness layer
 
@@ -51,8 +52,8 @@ Independently of layer, a declaration belongs to one of three semantic categorie
 | Category | Meaning | Examples |
 |---|---|---|
 | **Structural fact** | Describes what the modeled program can do or how entities relate. | operations, programs, effects, transactions, transaction outputs, result contracts, schemas, execution-pool identity |
-| **Implementation guarantee / assumption** | A fact the model claims the implementation or external system provides. The verifier may rely on it, subject to implementation conformance. | topic transport ordering, delivery semantics, member assignment, member concurrency, transaction isolation, locks, effect idempotency, request/message identity |
-| **Requirement / obligation** | A property the architecture says must hold. It is **not** a guarantee merely because it is declared. The verifier must prove it from facts and structure. | operation serialization, operation ordering, operation idempotency, result replay consistency, recoverability |
+| **Implementation guarantee / assumption** | A fact the model claims the implementation or external system provides. The verifier may rely on it, subject to implementation conformance. | topic transport ordering, delivery semantics, member assignment, member concurrency, transaction isolation, locks, the object version protocol, cursors and fences, effect idempotency, request/message identity |
+| **Requirement / obligation** | A property the architecture says must hold. It is **not** a guarantee merely because it is declared. The verifier must prove it from facts and structure. | transaction serializability, transaction ordering, operation idempotency, result replay consistency, recoverability |
 
 A structurally valid model is therefore not necessarily a safe model. Validation establishes that declarations are coherent and references are meaningful. Verification establishes whether the declared requirements follow from the declared facts and architecture.
 
@@ -327,6 +328,27 @@ It does **not** mean that `tenant_id` and `account_id` are alternative independe
 
 Object identity is what selector precision, insert uniqueness, alias and interference analysis, locking, state-machine subject identity, and transaction reasoning rest on. The declared identity is intrinsic to the logical object model: two distinct successfully created instances cannot share the same complete identity.
 
+### `version`
+
+An object may declare one **version field** — its application concurrency token:
+
+```yaml
+object.order:
+  schema: schema.OrderRecord
+  identity:
+    - [order_id]
+  version:
+    field: version
+```
+
+The field must be a non-optional `int` on the object's canonical schema and must not be part of the identity (`InvalidObjectVersionField`). It is **managed**: no ordinary `Write` may name it (`DirectWriteToVersionField`); only the protocol moves it. `Insert` creates the initial version, `bump_version` advances it, `Delete` removes the instance, and `validate_version` checks it at commit. The token changes whenever the instance changes, so a transaction that checks the token it read cannot commit over a change it did not see. What the two steps promise, when each is required, and why a proof needs both, is §20 — read it before using either.
+
+Absence is epistemic. An object without a version carries no version protocol — the absence of the OCC route, not a claim that concurrent mutation of it is safe.
+
+### Managed fields
+
+A field advanced by `AdvanceCursor` or guarded by `Fence` (§20) is managed in the same way as the version field: one role per field (`ManagedFieldRoleConflict`), never written by an ordinary `Write` (`DirectWriteToManagedField`), and typed for its role (`InvalidManagedFieldType`) — a cursor field is a non-optional `int`, `decimal`, or `timestamp` of the same type as the positions advanced through it, a fence field a non-optional `int`. The protocol step is the only ordinary update mechanism for such a field, which is what lets a proof read the field's committed history as the order of the commits that advanced it.
+
 ### Object-history requirements are deferred
 
 A `DataObject` declares no requirements; in particular, no object-history requirement (such as a `linearizable` obligation) exists in the active DSL.
@@ -335,13 +357,13 @@ The reason is scope, not doubt about the property. Linearizability is a meaningf
 
 Nothing else is weakened by the removal:
 
-- transaction isolation, explicit locks, lock ordering, object identity, selector overlap, transaction conflicts, operation serialization, and operation ordering keep their declared meanings;
+- transaction isolation, explicit locks, lock ordering, object identity, selector overlap, transaction conflicts, transaction serializability, and transaction ordering keep their declared meanings;
 - `serializable` continues to mean transaction serializability under §17 and must **not** be reinterpreted as linearizability;
-- no V1 verifier emits a verdict on object linearizability, and none infers it — from serializable isolation, locks, operation serialization, or transport ordering. Those facts retain only their own semantics.
+- no V1 verifier emits a verdict on object linearizability, and none infers it — from serializable isolation, locks, the version protocol, transaction serializability, or transport ordering. Those facts retain only their own semantics.
 
 The scope rule for this iteration is:
 
-> Conseqa models transaction and operation correctness without declaring end-to-end persistent-object history consistency requirements.
+> Conseqa models transaction and operation correctness — including the serializability and ordering of committed transaction histories — without declaring end-to-end persistent-object history consistency requirements.
 
 Object-history requirements are to be reconsidered, as a coherent family rather than an isolated flag, when Conseqa begins modeling distributed persistence and availability. Their exact vocabulary is not predeclared here.
 
@@ -439,7 +461,7 @@ It does **not** imply:
 - that effects produced by the consumer cannot overtake one another,
 - or that independent producers had a meaningful business-level happens-before relationship.
 
-To carry transport ordering through operation execution, routing and member-concurrency facts must also support it (§10.6).
+Transport order reaches the committed state only through the transactions that apply the messages: an ordered cursor on the keyed object (§17, §20) is what refuses an earlier message applied late — whatever the routing and member concurrency, which describe placement and are never commit-order evidence (§10).
 
 ### Ordered transport does not invent business order
 
@@ -464,45 +486,13 @@ Its declaration contains possible invocation sources, one explicit causal progra
 
 The causal program may contain **explicit asynchronous effect lifetimes**: an `execute_effect_async` or `execute_effect_intent_async` step initiates an effect execution without waiting for it to complete, and `join_all` / `race` steps add explicit completion dependencies (§16). This is an L0 program semantic — intentional overlap between logical effects of one invocation — and is completely independent of L1 `ExecutionPool.member_concurrency`, which is runtime invocation capacity. Neither implies the other: a `bounded(1)` member may execute one invocation whose own program has several effects in flight, and a concurrent member may execute many invocations whose individual programs are entirely sequential.
 
-An operation declares **no execution-concurrency fact**. Runtime concurrency is a property of the execution resource an invocation is assigned to, not of the logical unit of behaviour, and is declared exclusively by `ExecutionPool.member_concurrency` (§10.5). There is deliberately no global execution gate hidden inside `Operation`: if serialization follows from runtime execution topology, the model should expose the routing and pool facts that realize it; if it follows from L0 locks or transactions, those proof routes remain available.
+An operation declares **no execution-concurrency fact**. Runtime concurrency is a property of the execution resource an invocation is assigned to, not of the logical unit of behaviour, and is declared exclusively by `ExecutionPool.member_concurrency` (§10.5) — a capacity fact from which no transaction property follows. There is deliberately no global execution gate hidden inside `Operation`, and no entry lock either: whether two invocations may overlap is not a question the model answers at the operation boundary.
 
 `description` is documentation only and has no proof semantics.
 
-### `invocation_lock`
+### Serializability and ordering are properties of transactions
 
-An operation may declare one entry synchronization fact:
-
-```
-operations:
-  <operation>:
-    invocation_lock:
-      key: { source: input:<input>, path: [ <field>, ... ] }
-```
-
-Semantics — a conforming realization behaves as:
-
-```
-evaluate key from invocation context
-    -> acquire exclusive InvocationLock(key)
-    -> execute first program step
-    -> ...
-    -> operation terminal (return | complete)
-    -> release InvocationLock(key)
-```
-
-The lock is acquired before any operation program step executes and held until the invocation reaches `return` or `complete`. Two invocations whose evaluated lock keys are equal cannot execute their operation programs concurrently:
-
-```
-InvocationLock(K)  =>  SerializedBy(K)
-```
-
-provided the lock key is established to carry the same logical value as the serialization-requirement key (§9). The declaration asserts the abstract exclusion guarantee, never its mechanism: advisory database locks, distributed mutexes, and fenced lock services are Confluence realization concerns. It is not a program step, and it is not a §21 transaction `Lock`: a transaction lock protects the object instances its selector selects for a transaction's span, while this guards the whole invocation under a semantic key that needs no instance to exist.
-
-Three non-implications are normative. The lock establishes **no invocation ordering** — acquisition makes no FIFO guarantee. It is **not a concurrency bound** — it excludes equal keys only, and distinct keys proceed concurrently. And async effects permitted to outlive the operation terminal (§16) are **not implicitly kept under the lock after terminal**: the lock spans the program, not the effect lifetimes that escape it.
-
-The key is evaluated at operation entry, before any step, and only an input payload exists there. Validation therefore requires the key's source to be an input of the operation, and its **only** input — every invocation acquires the lock, and an invocation triggered by another input carries no value for the key (`InvocationLockKeyNotFromInput`, `InvocationLockKeyNotEvaluable`). The path must resolve in every schema the input admits, like a requirement key's.
-
-This is deliberately an operation-level declaration and still not an execution-concurrency fact: member concurrency describes the runtime capacity of an execution resource (§10.5), while the lock is an L0 synchronization **guarantee** the application machine asserts — the same layering that keeps serializable isolation and transaction locks L0 however much infrastructure implements them (§1). It is the one serialization proof route that survives any change of runtime topology (§9).
+An operation declares no serialization, ordering, or entry-exclusion fact of its own. What the architecture must get right is the **committed state history** of the transactions its invocations run, and that is what a transaction's own requirements state — `SerializableBy(K)` and `OrderedBy(K, P)` (§17) — and what its isolation, its locks, the object version protocol, and its cursors prove. Two invocations of one operation may run concurrently and still commit a serializable history; one invocation running alone, on a stale worker after a redelivery, may still commit a stale one. The runtime topology (§10) says where invocations execute and never whether the transactions they commit are consistent, which is why no operation-level or topology-level declaration can stand in for the transaction's own.
 
 ### Multiple inputs
 
@@ -574,12 +564,14 @@ A request input declares the `Result<Ok, Err>` contract a request through it ret
 ```yaml
 result:
   ok: schema.CreateOrderResponse
-  err:
-    schema: schema.RequestRejected
-    disposition: unspecified
+  errors:
+    rejected:
+      schema: schema.RequestRejected
+      disposition: unspecified
+    not_pending: schema.OrderNotPending
 ```
 
-`ResultType { ok, err }` names the `Ok` schema and the `Err` contract — `ErrorResultType { schema, disposition }`. The result is a tagged sum holding exactly one of `Ok(ok_payload)` or `Err(err_payload)`; mutual exclusivity is structural. Conseqa models the algebraic outcome, not any language's API around it. A bare schema id is accepted as shorthand for the `Err` contract and means `disposition: unspecified`; because `unspecified` is epistemic, no shorthand or default may silently declare `terminal` or `retryable`, and canonical serialization always emits the disposition.
+`ResultType { ok, errors }` names the `Ok` schema and one `ErrorResultType { schema, disposition }` per **error class**, keyed by a class id local to the contract. The result is a tagged sum holding exactly one of `Ok(ok_payload)` or `Err(class, err_payload)`; mutual exclusivity is structural, and the classes are exhaustive — a program matching the result declares one arm per class (§16), and a `return` constructing an error names its class (§15). A contract may declare no error class at all. Conseqa models the algebraic outcome, not any language's API around it. A bare schema id is accepted as shorthand for a class's contract and means `disposition: unspecified`; because `unspecified` is epistemic, no shorthand or default may silently declare `terminal` or `retryable`, and canonical serialization always emits the disposition.
 
 The contract belongs to the input rather than to the operation. An operation may expose several request inputs, and a `RequestEffect` already targets one specific `operation + input`, from which it inherits this contract (§13.2). Subscription inputs have no synchronous result.
 
@@ -595,7 +587,7 @@ The disposition declares whether observing the contract's `Err` terminally resol
 
 `Ok` is terminal by definition; no `Ok` disposition exists. A retryable `Err` remains a *logical, conclusive* outcome of its attempt — the distinction from crashes and timeouts above is untouched.
 
-The disposition belongs to the **result contract**, not to the schema: the same error schema may be terminal in one contract and retryable in another. One disposition covers the whole declared `Err` variant; heterogeneous per-error-class dispositions inside one contract are out of scope in V1.
+The disposition belongs to the **result contract**, not to the schema: the same error schema may be terminal in one contract and retryable in another. Each error class declares its own disposition, so one contract may declare a terminal `declined` beside a retryable `throttled`; a decision on the result is judged per observed class (§16, §18).
 
 For a request contract, the disposition describes whether an error returned by the target semantically admits another logical request attempt. It is orthogonal to `RequestEffect.retry` (§13.2): `retry` describes whether the requesting boundary may issue repeated attempts, the disposition whether another attempt is admitted after this error — `Err retryable` with `retry: never`, and `Err terminal` with `retry: may_repeat`, are both coherent, and no automatic coupling exists. For an external contract, the disposition feeds the `result_replay: replay_stable` terminal-result rule (§13.3).
 
@@ -696,96 +688,7 @@ Operation requirements are **proof obligations**.
 
 Declaring one does not assert that the operation already satisfies it.
 
-### `SerializationRequirement`
-
-A serialization requirement keyed by a `ValueRef` means:
-
-> Invocations with the same logical key must not execute concurrently.
-
-Different keys may execute concurrently unless constrained elsewhere.
-
-Serialization establishes mutual exclusion/non-overlap. It does **not** establish which same-key invocation should come first.
-
-Thus a keyed routing domain on a serial pool member, a lock, or another mechanism may prove serialization without proving ordering.
-
-The requirement is L0: it constrains the application machine. Two independent positive proof routes discharge it.
-
-**Route A — explicit synchronization** is L0-only: the operation declares an `invocation_lock` (§7) whose key is established to carry the same logical value as the requirement key for the key's input — the same path, or the same canonical value through fragment aliasing (§4), for every admitted schema. Same-key invocations then contend on one exclusive lock held from operation entry to the invocation's terminal, so their programs never overlap:
-
-```
-InvocationLock(K)  =>  SerializedBy(K)
-```
-
-No routing, pool, member-lifecycle, or handoff fact participates, so the proof survives any change of runtime topology. The lock makes no FIFO guarantee, so route A is never an ordering argument.
-
-**Route B — runtime topology** is runtime-dependent, and always one four-legged shape:
-
-```
-semantic key equivalence
-    -> routing-domain equivalence
-    -> stable-epoch member affinity
-    -> exclusive execution handoff
-    -> member concurrency
-```
-
-All four facts are required, and each carries one narrow responsibility: the boundary's routing key is equivalent to the requirement key, so same-key invocations share one routing domain; `member_assignment: consistent_hash` assigns that domain to one member per stable ownership epoch (§10.6); `execution_handoff: exclusive_ownership` preserves exclusive execution ownership across ownership and member transitions (§10.5), so a stale owner cannot overlap its successor; and `member_concurrency = bounded(1)` stops the owning member itself from overlapping invocations.
-
-Why the handoff leg cannot be omitted: `bounded(1)` means only that one member executes at most one invocation at a time, and consistent-hash affinity holds within a stable epoch. Neither says a stale invocation belonging to a former member or member incarnation cannot coexist with work running on its replacement:
-
-```
-member A:        M ----------------------------->
-A becomes unreachable
-replacement B:              M ------------------>
-A may actually still be executing
-```
-
-Each of A and B individually satisfies `member_concurrency = bounded(1)`, and the same-key invocations overlap. Only the declared handoff fact bridges the transition.
-
-V1 accepts route B in three per-ingress forms, plus the vacuous route. **Vacuous population**: the key's message-driven input admits no message schemas, so the constrained population is empty by declaration — L0-only like route A, and needing no fact at all. **Request-routed**: a `Router` serves the key's request boundary, every component of its semantic routing key carries the same logical value as the requirement key (§4), and the four legs hold over its pool. **Subscription-routed**: the same argument on the delivery side, with `key: grouping_key` naming the effective grouping domain (§10.2) and the requirement key established to carry the grouping key for every admitted schema. **Outbox-routed**: the same argument over an outbox input's keyed partitioning (§10.3.2) — the dispatch declares `routing` with `key: partition_key`, every partition-key component carries the requirement key for every admitted schema, the four legs hold, **and the dispatch declares no batching stage**. A declared batching stage stops the route whatever its ordering preservation: batch-internal overlap is intentionally unmodeled, and `member_concurrency` must not be silently read as a fact about it. `partitioning: none` also proves nothing here — it declares one undivided consumption domain, and V1 consumes keyed partition affinity only.
-
-**No ordering fact participates in any of them.** Serialization is about non-overlap; a grouping domain is the whole of what a transport has to supply for it. That is the main reason grouping is declared independently of ordering — an unordered transport that still groups by key serializes, and the model can say so without claiming an order it does not provide.
-
-Six things are deliberately not credited. A **shared pool** is a shared execution population, not a shared routing domain: two boundaries assigned to one pool, even under equal-looking keys, borrow nothing from each other. **Routing absence** yields the target population and no member-affinity fact at all. A **routing key wider than the requirement key** partitions same-key invocations across domains, so equality of the requirement key implies nothing. **Affinity plus a serial member, without the handoff fact** admits the overlap diagram above; neither `consistent_hash` nor `bounded(1)` bridges a member transition. An **ordinary message lease** is not invocation fencing: expiry may permit redelivery without the old attempt having terminated, so a lease alone never satisfies the handoff leg. And `bounded(n)` with `n > 1` permits overlap wherever it appears.
-
-### `OrderingRequirement`
-
-An ordering requirement keyed by a `ValueRef` means:
-
-> Same-key invocations for which a meaningful logical precedence exists must preserve that precedence through the operation's semantically relevant execution.
-
-Ordering is stronger than merely choosing *some* serial order.
-
-A proof must therefore establish both:
-
-1. where the relevant precedence comes from, and
-2. that the execution mechanism preserves it.
-
-Arbitrarily serializing concurrent inputs can satisfy a serialization requirement but cannot invent a semantic precedence required by an ordering proof.
-
-Where preserving the required order entails preventing later invocations from overtaking earlier ones, the proof must also establish the necessary execution serialization.
-
-V1 recognizes two precedence sources: the effective transport ordering (§10.2–§10.3) — `within_group`, or `global` — for a subscription-triggered key, and the outbox runtime's declared ordering (§10.3.2) — `partition`, or `global` — for an outbox-triggered one. A request input has no precedence source at all, and a key not sourced from an input selects no population; both are unproven.
-
-That request inputs have none is worth stating plainly: a router keyed exactly like the requirement, on a pool whose members are serial, does establish serialization — and still no ordering, because arrival order of unmodeled callers is not a logical precedence. There is nothing for the mechanism to preserve. A separate precedence source would be required.
-
-The mechanism is the §10 composition, and it is the serialization argument plus a precedence: the requirement key is established to be the effective grouping key for every admitted schema, `key: grouping_key` routes by that same domain, `MemberAssignment` assigns it to one member per stable ownership epoch, `execution_handoff = exclusive_ownership` keeps a stale owner's earlier invocation from overlapping its successor's later one across a transition — precedence of effect is lost in such an overlap — and `member_concurrency = bounded(1)` stops a later invocation overtaking an earlier one on the member itself. Ordering is strictly stronger than serialization, so no leg of the serialization argument may be missing here. Route A contributes nothing: an `invocation_lock` serializes with no FIFO acquisition guarantee, so it preserves no precedence.
-
-Every leg is interrogated, not merely cited. The routing key is matched exhaustively, the member assignment is checked for stable-epoch domain affinity, the pool's execution handoff for exclusive ownership across transitions, and its concurrency for `bounded(1)` — so a future routing key, assignment, or handoff variant with weaker guarantees cannot be carried into a proof as though it were the one this rule was written for. Where a boundary is routed two ways, or a topic and its subscription both declare transport semantics, there is no single set of facts to reason from and the verifier refuses rather than reading whichever half it finds first.
-
-Both precedence sources require that same grouping identity, and for the same reason: a precedence only reaches execution if same-key deliveries stay together. `within_group` needs it because its guarantee is *about* the group. `global` needs it because an order over everything is still lost the moment two same-key deliveries land on different members. So the grouping evidence is established once and cited by either — serialization proves on the grouping alone, and ordering is that argument with a precedence added.
-
-This is why an ordering proof is strictly stronger than a serialization one over the same key, and why dispatch alone can never supply it: dispatch preserves precedence, it does not create any (§10.3.1). Dispatch additionally carries the order-preservation obligation of §10.3, so redelivery cannot invert the precedence: a failure-driven redelivery cannot be overtaken by a later message of its domain, and a duplicate of an already completed message is a repeated attempt at a logical invocation that took effect in order. That obligation concerns admission order and composes with the handoff fact rather than substituting for it — exclusive handoff stops a stale owner overlapping its successor, order-preserving admission stops the successor running the later message before the redelivered earlier one — what that attempt does is the idempotency requirement's obligation, not ordering's, and the proof records which requirement answers for it or that none does. Vacuously discharged: a message-driven input admitting no message schemas.
-
-The outbox route is the same composition in the outbox's own vocabulary: the runtime declares `ordering: partition` (or `global`), every partition-key component carries the requirement key for every admitted schema — same-key deliveries then share one partition, which both precedence reaches need — the dispatch declares `routing` with `key: partition_key` whose `MemberAssignment` assigns that partition to one member per stable epoch, the pool declares `execution_handoff = exclusive_ownership`, and the pool is serial. One leg is new: a declared **batching stage** is judged explicitly. Absent, there is no batch obstacle; `ordering: preserved` lets the established precedence pass through the stage — the opaque batch processing does not let a later message overtake an earlier one against it; `ordering: unspecified` stops the proof, because the stage then provides no evidence the order survives execution. Order preservation is an ordering fact only: it is never read as a no-overlap guarantee, which is why the serialization route above refuses batching outright while this route accepts `preserved` (§10.3.2).
-
-### Serialization versus ordering
-
-These terms are deliberately separate:
-
-- **serialization**: same-key invocations do not overlap;
-- **ordering**: the correct same-key precedence is preserved.
-
-A FIFO mutex may provide both if its acquisition order is proven to correspond to the required input order. A non-FIFO mutex may provide serialization without providing the required ordering — and the `invocation_lock` is exactly that: it declares no acquisition-order fact, so it proves serialization and never ordering. Likewise a routing domain on a serial pool member with exclusive handoff provides serialization; it provides ordering only when a transport precedence exists for the mechanism to preserve.
+An operation declares two families: idempotency and recoverability. Serializability and ordering are **not** operation requirements. They are properties of committed transaction histories, declared on the transaction they constrain (`Transaction.requirements`, §17) and proven from transactions alone — never from an entry lock, a routing key, a member assignment, a member concurrency bound, or a transport fact, none of which says what a transaction commits. The two operation families are unchanged by that placement, and neither implies a transaction property: collapsing the work of duplicate attempts does not order the commits of concurrent ones, and a serializable history does not collapse duplicate work.
 
 ### `IdempotencyRequirement`
 
@@ -925,6 +828,12 @@ Neither implies exactly-once external execution. Driving the program to a termin
 
 L1 describes selected facts about how the L0 machine is realized. It hangs off `Model.runtime` and is entirely optional; absence of any L1 declaration is epistemic — no fact — never an assertion that the realization lacks the property.
 
+The governing rule of the layer:
+
+> **L1 describes placement, transport, grouping, precedence, and runtime capacity. It provides no serializability or ordering guarantee: no L1 fact is commit-order evidence.**
+
+No serializability or ordering proof consumes an L1 fact. A routing key, a member assignment, and a serial pool member say where same-key invocations ordinarily execute; they never say that the transactions those invocations commit are serializable, because a stale worker, a redelivery, or a member replacement can put two of them side by side whatever the topology declares, and the committed history is decided by the database under the transactions' own isolation, locks, and version protocol (§17). What L1 still discharges is a progress fact: `delivery: at_least_once` is a retry driver for `completion: guaranteed` (§9). Everything else it declares serves the reader and the external analysis (§10.9).
+
 ```
 runtime:
   topics:            <topic id>       -> TopicRuntime      { grouping?, ordering? }
@@ -1017,13 +926,13 @@ Neither implies globally ordered *execution*. A transport precedence reaches exe
 
 Bundling a grouping key inside a keyed-ordering variant overconstrains the model and forces unrelated consumers to depend on an ordering declaration merely to recover a domain. A realization may provide grouping without ordering, ordering without grouping, or both, and the model must be able to say which.
 
-The serialization verifier is the sharp case: it needs only
+Grouping without ordering is the sharp case: a transport that establishes
 
 ```
 same K  ->  same runtime group
 ```
 
-and no transport precedence whatever. An unordered queue with consistent-hash workers is an ordinary architecture, and with the two facts separate it is stated as it is — `grouping: keyed`, `ordering: none` — instead of claiming an order the transport does not provide in order to reach the key.
+and no transport precedence whatever. An unordered queue with consistent-hash workers is an ordinary architecture, and with the two facts separate it is stated as it is — `grouping: keyed`, `ordering: none` — instead of claiming an order the transport does not provide in order to reach the key. Neither fact is commit-order evidence: same-key deliveries landing in one group says where they go, not what their transactions commit (§17).
 
 #### One scope, exclusively
 
@@ -1060,7 +969,7 @@ else:
     EffectiveOrdering(S) = S.ordering
 ```
 
-Every proof records which scope it read, so a reader tracing a verdict knows which declaration to look at and which one changing would invalidate it.
+The analyzer records which scope it read, so a reader tracing a fact knows which declaration to look at.
 
 ### 10.3.1 `SubscriptionRuntime`
 
@@ -1114,7 +1023,7 @@ Where a precedence exists, dispatch must preserve it when admitting invocations 
 2. leave A semantically incomplete;
 3. admit B in a manner that permits B to overtake A contrary to the declared guarantee.
 
-This order-preservation responsibility is what replaces the logical-lane semantics of the previous model. It is a preservation obligation only: dispatch contributes no precedence of its own, so a routing declaration alone proves no ordering.
+This order-preservation responsibility is what replaces the logical-lane semantics of the previous model. It is a preservation obligation only: dispatch contributes no precedence of its own, and a preserved delivery precedence is not a transaction ordering proof — that is proven by a cursor or fence on the keyed object (§17), which refuses an earlier message applied late by a stale worker however faithfully dispatch preserved the order.
 
 ### 10.3.2 `OutboxRuntime`
 
@@ -1180,7 +1089,7 @@ logical OutboxInput invocation
 
 #### `routing`
 
-An optional `OutboxRouting` block that intentionally mirrors `SubscriptionRouting` — `{ key, member_assignment }` — rather than burying the routing domain implicitly inside a bare member assignment. The declaration states two independent facts: `key` names **which established semantic domain is routed**, and `member_assignment` **how that domain is assigned to pool members**, with the §10.6 semantics unchanged — assignment and affinity only; continuity of exclusive execution authority across transitions is `ExecutionPool.execution_handoff`'s separate fact (§10.5).
+An optional `OutboxRouting` block that intentionally mirrors `SubscriptionRouting` — `{ key, member_assignment }` — rather than burying the routing domain implicitly inside a bare member assignment. The declaration states two independent facts: `key` names **which established semantic domain is routed**, and `member_assignment` **how that domain is assigned to pool members**, with the §10.6 semantics unchanged — placement and affinity only.
 
 With `routing` absent, Conseqa establishes only that consumption attempts execute on some member of the referenced pool — no stable partition-to-member affinity is known. With
 
@@ -1192,13 +1101,13 @@ routing:
 
 the logical partition domain established by `partitioning` is routed to pool members according to the assignment. For V1 the only routing key is `partition_key`, because `OutboxPartitioning` is the outbox's one established semantic consumption domain; validation requires keyed partitioning with it, since `partitioning: none` leaves no partition-key domain to route — routing consumes an already-declared semantic key rather than inventing one, exactly as `grouping_key` routing does on the subscription side.
 
-Routing does not imply attempt exclusivity. After redelivery or ownership uncertainty, `attempt A(M) -> member X` and `attempt B(M) -> member Y` may overlap unless the pool's `execution_handoff = exclusive_ownership` (§10.5) establishes otherwise. An ordinary polling message lease is not that fact: expiry may permit redelivery without the old attempt having terminated, so a lease alone is never invocation fencing.
+Routing does not imply attempt exclusivity. After redelivery or ownership uncertainty, `attempt A(M) -> member X` and `attempt B(M) -> member Y` may overlap, and no L1 fact excludes it: a consumer whose transactions must not interleave says so on the transactions (§17), where the database enforces it.
 
 #### `batching`
 
 The declared fact that this consumer may retrieve or dispatch several logical source items together — how several logical source-item invocations cross the source-to-execution boundary, **not** whether the underlying database or transport happened to fetch several rows or records together. L0 is untouched: each item remains one logical per-message invocation (§8.3), batching changes no message, partition, or input identity, creates no new idempotency identity, and each item's intrinsic consumption is still judged on its own invocation's completion. The batch's internals — sequential iteration, parallel futures, vectorized APIs, sizes, wait durations — are deliberately opaque and partly external scenario inputs.
 
-The one semantic the declaration carries is `ordering`, explicit with no default: `preserved` guarantees the opaque batch processing does not let a later message overtake an earlier one against an already-established ordering relation — without requiring literal serial execution, if an implementation is observationally consistent with the guarantee; `unspecified` provides no usable fact, and a verifier must not propagate a source ordering guarantee through the stage. Preservation is **not** a serialization guarantee: opaque batch processing may still overlap logical item evaluations, and `member_concurrency` must not be silently read as a fact about batch-internal parallelism — which is why a declared batching stage stops a serialization proof outright while an ordering proof accepts `preserved` (§9). Absent `batching` declares no batching fact, and no default silently states preservation.
+The one semantic the declaration carries is `ordering`, explicit with no default: `preserved` guarantees the opaque batch processing does not let a later message overtake an earlier one against an already-established ordering relation — without requiring literal serial execution, if an implementation is observationally consistent with the guarantee; `unspecified` provides no usable fact, and a verifier must not propagate a source ordering guarantee through the stage. Preservation is **not** a no-overlap guarantee: opaque batch processing may still overlap logical item evaluations, and `member_concurrency` must not be silently read as a fact about batch-internal parallelism. No correctness proof consumes the declaration; it is a capacity fact for the external analysis (§10.9), and serializability and ordering are proven elsewhere (§17). Absent `batching` declares no batching fact, and no default silently states preservation.
 
 ### 10.4 `Router`
 
@@ -1235,10 +1144,9 @@ means "requests through this boundary execute within `pool.web`", and provides n
 ```
 runtime.execution_pools[<pool>]:
   member_concurrency: unspecified | unbounded | bounded{ value }
-  execution_handoff: exclusive_ownership        # optional
 ```
 
-A pool identifies **a logical population of interchangeable runtime members capable of executing the operation invocations assigned to that pool**. It establishes up to three things: runtime population identity, the qualitative execution concurrency of each member, and — when declared — the continuity of exclusive execution authority across ownership and member transitions.
+A pool identifies **a logical population of interchangeable runtime members capable of executing the operation invocations assigned to that pool**. It establishes two things: runtime population identity, and the qualitative execution concurrency of each member.
 
 #### Pool identity
 
@@ -1250,35 +1158,13 @@ If they target different pools, they target distinct logical populations. That i
 
 **`bounded(n)`** — at most `n` operation invocations assigned to one member of the pool may simultaneously be active. The bound applies across *all* invocations assigned to that member, irrespective of operation or ingress mechanism.
 
-**`bounded(1)`** is the important serialization case: one pool member executes at most one invocation at a time.
+**`bounded(1)`** — one pool member executes at most one invocation at a time. A capacity fact: it bounds how much work one member does at once and proves no transaction property, since same-key invocations still land on two members across a replacement or a redelivery, and what they commit is decided by their transactions (§17).
 
 **`unbounded`** — no finite member-level execution bound may be assumed.
 
 **`unspecified`** — no usable fact about simultaneous execution on one member.
 
 Unlike routing, member concurrency has genuine semantic value in distinguishing an unknown resource from an explicitly unconstrained one, so it keeps both negative states.
-
-#### `execution_handoff`
-
-An optional declaration of execution-ownership continuity, with one value:
-
-> **`exclusive_ownership`** — when execution authority for a routing domain transfers from one pool member or member incarnation to another, the runtime preserves exclusive execution ownership of that domain across the transition.
-
-If `owner(K, E) = A` and `owner(K, E+1) = B`, a conforming runtime cannot allow an invocation for `K` executing under A's old authority to overlap an invocation for `K` executing under B's successor authority. This covers domain reassignment (`A -> B`) and member replacement (`A -> A'`, a new incarnation) alike.
-
-The guarantee concerns **execution authority**, not control-plane membership or agreement. None of the following alone establishes it:
-
-```
-membership lease expiry
-worker declared unhealthy
-new member started
-consistent-hash ring recomputed
-consensus agrees on new owner
-```
-
-A conforming realization must actually prevent the stale owner's execution from overlapping the successor's — draining, generation fencing, and coordinated handoff are conforming mechanisms, and Conseqa models the resulting guarantee, never the mechanism. An ordinary polling message lease is not conforming by itself: expiry permits redelivery without terminating the old attempt.
-
-Absence is epistemic — no usable fact about execution overlap across such transitions — never an assertion that overlap occurs. And the declaration is independent of `member_concurrency` in both directions: exclusive handoff does not bound how many invocations one member runs, and `bounded(1)` binds each member separately without bridging a transition between members. The §9 topology proofs need both, plus the assignment's affinity, because each fact answers one question.
 
 #### Cardinality is external
 
@@ -1290,42 +1176,31 @@ A pool carries no member count, replica count, CPU, memory, autoscaling rule, ho
 member_assignment: { kind: consistent_hash }
 ```
 
-A member assignment describes how a routing domain is assigned to a member of an execution pool — **assignment and affinity only**. It asserts nothing about execution overlap between a previous owner and its successor across worker replacement, failure recovery, scaling, membership change, partition reassignment, or ownership rebalance: that continuity is a separate declared fact, `ExecutionPool.execution_handoff` (§10.5). The split keeps `consistent_hash` from silently carrying a much stronger distributed-systems guarantee than its declaration visibly states.
+A member assignment describes how a routing domain is assigned to a member of an execution pool — **placement and affinity only**. It asserts nothing about execution overlap between a previous owner and its successor across worker replacement, failure recovery, scaling, membership change, partition reassignment, or ownership rebalance, and nothing about the transactions the assigned invocations commit. No correctness proof consumes any member assignment; the declaration serves the reader and the external analysis (§10.9), and keeps `consistent_hash` from silently carrying a distributed-systems guarantee its declaration does not state.
 
 #### `consistent_hash`
 
 > During a stable ownership epoch, equal routing domains are assigned to the same execution-pool member.
 
-Different routing domains may be assigned to the same member. Conseqa prescribes no hash function, virtual-node count, membership-discovery mechanism, or choice between Ketama and rendezvous hashing. The declaration specifies semantic assignment behaviour, not implementation mechanics — and it says nothing about what happens **between** epochs: a stale owner overlapping its successor is consistent with this declaration alone (§10.5).
+Different routing domains may be assigned to the same member. Conseqa prescribes no hash function, virtual-node count, membership-discovery mechanism, or choice between Ketama and rendezvous hashing. The declaration specifies semantic assignment behaviour, not implementation mechanics — and it says nothing about what happens **between** epochs: a stale owner overlapping its successor is consistent with this declaration alone, which is one reason no proof reads affinity as consistency.
 
 #### `round_robin`
 
 > Each invocation goes to the next member in rotation, irrespective of routing domain.
 
-No correctness proof consumes it. It earns its place anyway, for two reasons.
+Like every assignment, no correctness proof consumes it. It earns its place for two reasons.
 
 The first is that it is a **primary input to the external analysis** L1 exists to feed (§10.9). Consistent-hash and round-robin over one pool, at one cardinality, under one workload, behave completely differently: hashing a skewed key distribution concentrates load on the members owning the hot domains, while rotation spreads load evenly and destroys locality. Hot members and routing skew are exactly what a simulator is asked to find, and it cannot find them without knowing which assignment is in force. A model that could not distinguish the two would be handing that analysis a coin flip.
 
-The second is diagnostic. Omitting the routing block says *nothing is known* about member affinity; `round_robin` says *affinity is known not to exist*. A serialization or ordering requirement over such a boundary is then refused with a reason — "rotation puts same-key invocations on different members" — rather than for want of a declaration nobody has made. An author reading the first is told to go and find out; reading the second, to change the architecture.
+The second is diagnostic. Omitting the routing block says *nothing is known* about member affinity; `round_robin` says *affinity is known not to exist* — same-key invocations land on different members by design. An author reading the first is told to go and find out; reading the second, that locality was never intended.
 
 A routing key declared alongside it still names domains, and those domains keep their own identity. This assignment simply does not respect them.
 
 This is the "explicit negative routing guarantee" the initial model deferred (§27), admitted now that there is a use for the distinction. It is emphatically *not* the `unconstrained` routing variant that model declined: routing keys still have exactly two components, and absence still means absence. What changed is that the *assignment* dimension gained a second ordinary value.
 
-#### Assignment is not ownership continuity
+#### Assignment is placement
 
-The previous contract read a normative safe-ownership-transfer rule into any assignment a serialization proof consumed. That rule is removed. Two explicit facts replace it:
-
-```
-MemberAssignment
-    -> describes assignment/affinity
-
-ExecutionPool.execution_handoff
-    -> describes continuity of exclusive execution authority
-       across assignment/member transitions
-```
-
-A topology proof cites both by name (§9), so nothing about failover ever again rides implicitly on `consistent_hash` — and a runtime that provides affinity without fencing can now say exactly that, by declaring the first fact and not the second.
+Earlier contracts read a safe-ownership-transfer rule, and then a serialization proof, into `consistent_hash`. Both are gone. An assignment says where a domain's invocations ordinarily execute, and a runtime that provides affinity without fencing, or fencing without affinity, is described exactly by declaring the placement it has — no serializability or ordering claim is at stake in the declaration, because the transactions carry both (§17).
 
 ### 10.7 `StorageLayout`
 
@@ -1386,7 +1261,7 @@ StorageLayout Message:       partition_key = (channel_id, bucket)
 
 can be run against `MessageReads.members = 16` or `= 128`, against a uniform `channel_id` or a Zipf one, without a word of it changing. And when the scenario moves `channel_id` domain X from member 17 to member 31, the routing domain keeps its identity — that is §10.1's point, and it is what lets the same declarations serve both consumers.
 
-This is also why L1 carries facts no proof reads. A member assignment is inert to the verifier and decisive to the simulator: under a skewed key distribution, consistent-hash concentrates load on the members owning the hot domains while round-robin spreads it and gives up locality. Same pool, same cardinality, different answer.
+This is also why L1 carries facts no proof reads. Every routing and assignment fact is inert to the verifier and decisive to the simulator: under a skewed key distribution, consistent-hash concentrates load on the members owning the hot domains while round-robin spreads it and gives up locality. Same pool, same cardinality, different answer.
 
 ---
 
@@ -1462,9 +1337,9 @@ Availability is a matter of control flow. The reference is valid only at a progr
 
 ### `ValueSource::effect_result_ok` and `ValueSource::effect_result_err`
 
-Reference a field of the `Ok` or `Err` payload of a bound effect result (§13), where the id names the `bind` of an `execute_effect` or `execute_effect_intent` step. The path resolves against the effect contract's `ok` or `err` schema respectively.
+Reference a field of the `Ok` payload, or of the observed error class's payload, of a bound effect result (§13), where the id names the `bind` of an `execute_effect` or `execute_effect_intent` step. The path resolves against the contract's `ok` schema, or against the schema of the error class whose arm encloses the reference.
 
-These are **operation-local observations** of the current attempt. They are not transaction artifacts, and they are not inherently durable. Each is available only inside the arm of a `match_result` on that binding that selects its variant: `effect_result_ok` in the `ok` arm, `effect_result_err` in the `err` arm. Neither survives the join after the match (§16).
+These are **operation-local observations** of the current attempt. They are not transaction artifacts, and they are not inherently durable. Each is available only inside the arm of a `match_result` on that binding that selects its variant: `effect_result_ok` in the `ok` arm, `effect_result_err` in an error-class arm, where it is typed by that class. Neither survives the join after the match (§16).
 
 ### `ValueSource::state_machine_subject`
 
@@ -1682,14 +1557,15 @@ Because Conseqa cannot inspect beyond the boundary, an external effect may decla
 ```yaml
 result:
   ok: schema.ChargeAccepted
-  err:
-    schema: schema.ChargeDeclined
-    disposition: terminal
+  errors:
+    declined:
+      schema: schema.ChargeDeclined
+      disposition: terminal
 ```
 
 Absent (`result: null`), no synchronous result is modeled and an execution site may not bind one.
 
-Relative to a governing key, a bound external result is replay-stable — per observed variant — when the effect declares `result_replay: replay_stable`, every component of its identity key is replay-stable, and the observed variant is terminal: `Ok` by definition, `Err` under a declared `terminal` disposition (§16, §18). A retryable or unspecified `Err`, a boundary declaring `unstable` or nothing, or an unstable identity key leaves the observation unusable as a replay-stable root, and a decision resting on it is not established to replay — an honest gap the checker reports rather than a fact it assumes.
+Relative to a governing key, a bound external result is replay-stable — per observed variant — when the effect declares `result_replay: replay_stable`, every component of its identity key is replay-stable, and the observed variant is terminal: `Ok` by definition, an error class under a declared `terminal` disposition (§16, §18). A retryable or unspecified error class, a boundary declaring `unstable` or nothing, or an unstable identity key leaves the observation unusable as a replay-stable root, and a decision resting on it is not established to replay — an honest gap the checker reports rather than a fact it assumes.
 
 ## 13.4 Outbox write effect
 
@@ -1897,7 +1773,7 @@ There is no response declaration. A request invocation terminates directly with 
           path: order_id
 ```
 
-`return` names an operation-owned request input `R` with `R.result = Result<OkSchema, ErrSchema>`; `outcome: { kind: ok, values }` constructs an `OkSchema` payload from `values`, and `outcome: { kind: err, values }` an `ErrSchema` payload. A subscription input cannot be a `return` target. Unknown provenance is declared as `values: { kind: unspecified }`, never omitted.
+`return` names an operation-owned request input `R` with `R.result = Result<OkSchema, {class: ErrSchema}>`; `outcome: { kind: ok, values }` constructs an `OkSchema` payload from `values`, and `outcome: { kind: err, error: <class>, values }` the payload of the named error class, which must be one the input declares (`UnknownResultErrorClass`). A subscription input cannot be a `return` target. Unknown provenance is declared as `values: { kind: unspecified }`, never omitted.
 
 `complete` terminates an execution that returns nothing, as is natural for a subscription-driven operation.
 
@@ -1927,11 +1803,32 @@ No explicit recovery step exists for a transaction output or an effect intent; r
 
 ### `transaction`
 
-Declares and executes one atomic transaction at that point in the operation program, or resolves its prior keyed commit. The step **is** the transaction: it carries the stable logical `id` together with the data-model boundary, isolation guarantee, idempotency guarantee, and ordered body (§17). The ID identifies the inline transaction for keyed commit recovery, conformance, proof evidence, and diagnostics; it is not a reference to another declaration.
+```yaml
+- kind: transaction
+  transaction:
+    id: tx.apply_payment
+    data_model: data.checkout
+    isolation: read_committed
+    idempotency: { kind: deduplicated_by, key: ... }
+    requirements:
+      serializability: [ { key: ... } ]
+      ordering: [ { key: ..., position: ... } ]
+    steps: [ ... ]
+  rejected:
+    steps: [ ... ]
+```
 
-For an ordinary transaction, reaching the step means executing the transaction body.
+Declares and executes one atomic transaction at that point in the operation program, or resolves its prior keyed commit. The step carries the whole transaction under `transaction` — its stable logical `id` together with the data-model boundary, isolation guarantee, idempotency guarantee, serializability and ordering requirements, and ordered body (§17) — and, when the body can reject, the `rejected` block the invocation continues in when it does. The ID identifies the inline transaction for keyed commit recovery, conformance, proof evidence, and diagnostics; it is not a reference to another declaration.
 
-For a transaction explicitly `DeduplicatedBy { key }`, if the same logical commit already exists, the step resolves that prior commit instead of committing the body again and restores the artifacts retained by that commit. The durable identity is conceptually `Commit(operation, id, K)` — which is why the ID, not the step's location, carries it: moving the step must not silently change durable commit identity.
+A transaction execution has exactly one of three outcomes:
+
+- **committed** — the body applied atomically. The program continues with the step after this one, and the transaction's artifacts are available there.
+- **rejected** — a rejecting step of the body refused the transaction under its declared semantics: a `transition` whose subject is not in one of its `from` states (§22), a `validate_version` whose expected version is stale, an `advance_cursor` whose incoming position is out of order, or a `fence` whose token is stale (§20). Nothing committed and no artifact of the transaction exists; the invocation continues in the `rejected` block, which either reaches a terminal or falls through to the join after the step like any other arm.
+- **interrupted** — crash, timeout, connectivity loss, an aborted commit, or an indeterminate one. Not a program outcome: nothing continues, and what a later attempt finds is the idempotency and recoverability question of §9. An engine-level serialization failure or deadlock abort is interrupted, never rejected.
+
+The `rejected` arm is required exactly when the body contains a rejecting step and forbidden otherwise (`MissingTransactionRejectedArm`, `UnexpectedTransactionRejectedArm`): a transaction that cannot reject has no rejected outcome to handle. The arm is generic — the rejection cause is not exposed as a value — and a rejection is not an `Err` result: it is a fact about state the transaction observed, and the program decides in the arm what the boundary reports, if anything.
+
+For an ordinary transaction, reaching the step means executing the transaction body. For a transaction explicitly `DeduplicatedBy { key }`, if the same logical commit already exists, the step resolves that prior commit instead of committing the body again and restores the artifacts retained by that commit — the committed outcome, taken again. The durable identity is conceptually `Commit(operation, id, K)` — which is why the ID, not the step's location, carries it: moving the step must not silently change durable commit identity.
 
 ### `execute_effect`
 
@@ -2057,24 +1954,25 @@ For a request operation, `race(A,B) -> R; return R` makes the request result cau
 
 Program reachability remains defined over synchronous control: no program step executes after a terminal, so `async A; complete; B` still makes B unreachable — a continuing asynchronous A does not make B reachable. Outstanding handles do not make an otherwise terminating path unterminated: they are launched side-effect executions, not additional control paths requiring terminals.
 
-Async overlap may invalidate a serialization argument that depended on sequential execution within one invocation — two asynchronously launched effects cannot be assumed not to overlap. Operation-level `SerializedBy(K)` requirements, however, continue to concern separate logical operation invocations under their existing definition (§9): async effects within one invocation are not additional operation invocations, and the two domains remain distinct.
+Async overlap may invalidate an argument that depended on sequential execution within one invocation — two asynchronously launched effects cannot be assumed not to overlap. Transaction serializability and ordering are untouched by it: asynchronous execution is never permitted for transactions, so a transaction's committed history, and the `SerializableBy` and `OrderedBy` requirements over it (§17), concern the same committed executions whether the invocation's effects overlap or not. The two domains remain distinct.
 
 ### `match_result`
 
-Destructures a bound result into two arms:
+Destructures a bound result into one arm per outcome class:
 
 ```yaml
 - kind: match_result
   result: result.charge_payment.card
   ok:
     steps: [...]
-  err:
-    steps: [...]
+  errors:
+    declined:
+      steps: [...]
 ```
 
-`result = Ok(v)` executes the `ok` block, `result = Err(e)` the `err` block. The match is exhaustive and mutually exclusive by construction; both arms are declared, though either may be empty.
+`result = Ok(v)` executes the `ok` block, `result = Err(class, e)` the block declared for that class. The match is exhaustive and mutually exclusive by construction: the `ok` arm and exactly one arm per error class of the result's contract are declared (`MissingResultErrorArm`, `UnexpectedResultErrorArm`), though any of them may be empty.
 
-Inside `ok`, `effect_result_ok:<result>` is available and the `err` payload is not; inside `err`, the reverse. **Variant payloads are arm-local**: neither survives the join after the match, even when the other arm terminates. Data that must be generally available after a match is exported through a transaction artifact instead — a transaction inside the arm establishing a transaction output — or the control is structured so the consumer sits inside the arm.
+Inside `ok`, `effect_result_ok:<result>` is available and no error payload is; inside an error arm, `effect_result_err:<result>` resolves against that class's schema and the `ok` payload is not available. **Variant payloads are arm-local**: neither survives the join after the match, even when the other arm terminates. Data that must be generally available after a match is exported through a transaction artifact instead — a transaction inside the arm establishing a transaction output — or the control is structured so the consumer sits inside the arm.
 
 Success and failure of a synchronous interaction are expressed by `match_result` over a `Result`, not by a `branch` comparing a conventional status field. The two primitives are not overloaded to do each other's job.
 
@@ -2128,12 +2026,16 @@ Validation establishes that the program is structurally coherent. It performs no
 2. **Reachability.** No step follows a terminal — or a decision whose every arm terminates — in its block (`UnreachableProgramStep`, reported for the first dead step of a block).
 3. **Definite artifact availability.** A transaction artifact — transaction output or effect intent — may be consumed only at a program point where a transaction on **every** path reaching that point establishes or recovers it (`TransactionArtifactNotAvailable`). Consumers are: an `execute_effect_intent` of the intent; a `transaction_output` reference in an effect derivation, a branch condition, a `return` outcome, another transaction's commit key or body, or an effect contract's own roots at the site where they are evaluated (§13) — an external deduplication key, propagation components. Inside one transaction, a reference to an output that transaction establishes is satisfied by step order.
 4. **Definite result assignment.** A result binding may be matched or referenced only where a step on every path reaching the point has bound it (`EffectResultNotBound`). The binding steps are the synchronous effect executions and the synchronization barriers: an asynchronous launch binds no result, so a result from an asynchronously executed effect is **not** considered bound merely because its launch occurred — it becomes available only where a `join_all` or `race` produces it. This is fundamental to async soundness.
-5. **Variant scope.** `effect_result_ok:<r>` is legal only inside the `ok` arm of a `match_result` on `r`, `effect_result_err:<r>` only inside its `err` arm (`EffectResultVariantOutOfScope`). Field paths resolve against the variant's schema.
+5. **Variant scope.** `effect_result_ok:<r>` is legal only inside the `ok` arm of a `match_result` on `r`, `effect_result_err:<r>` only inside one of its error-class arms (`EffectResultVariantOutOfScope`). Field paths resolve against the `ok` schema or the enclosing arm's class schema.
 6. **Result-binding contracts.** A binding is declared only by a site observing a result-bearing effect (`EffectHasNoResult`): a request, whose contract resolves through its target input; an external effect declaring `result`; never a publication. For a `join_all` entry, the underlying effect is the joined handle's; for a `race`, every candidate must be result-bearing and all candidates must expose the same logical result contract (`RaceResultContractMismatch`) — absent `bind`, no compatibility requirement is imposed.
-7. **Return target.** `return.request` names an operation-owned **request** input (`InvalidInputKind` for a subscription). The outcome's derivation roots must be definitely available under rules 3–5.
+7. **Return target.** `return.request` names an operation-owned **request** input (`InvalidInputKind` for a subscription), and an `err` outcome names an error class the input's contract declares (`UnknownResultErrorClass`). The outcome's derivation roots must be definitely available under rules 3–5.
 8. **Identity.** Every inline `Transaction.id`, inline `effect_id`, binding ID, and async handle ID is unique (`DuplicateId`, §7); an `execute_effect_intent` or `execute_effect_intent_async` names an intent binding produced by this operation's program; every value reference respects §11 scope.
 9. **Definite handle availability.** A synchronization step waits only on handles bound by an async launch on every path reaching it (`AsyncHandleNotAvailable`); a handle is consumed by nothing else.
 10. **`join_all` shape.** The handle list is non-empty (`EmptyJoinAll`); every referenced handle exists and is operation-owned; no handle appears twice in one `join_all` (`DuplicateSynchronizationHandle`); every declared result binding is unique; a binding is declared only for a result-bearing underlying effect, its type inferred from the contract and never restated.
+12. **Match arms.** A `match_result` declares the `ok` arm and exactly one arm per error class of the matched result's contract (`MissingResultErrorArm`, `UnexpectedResultErrorArm`).
+13. **Rejected arm.** A `transaction` step declares a `rejected` block iff its body contains a rejecting step — `transition`, `validate_version`, `advance_cursor`, or `fence` (`MissingTransactionRejectedArm`, `UnexpectedTransactionRejectedArm`). The block is a decision arm under rules 1–5: it terminates or falls through to the join after the step, and no artifact of the rejected transaction is available inside it.
+14. **Version protocol and managed fields.** A `Write` never names a version or managed field (`DirectWriteToVersionField`, `DirectWriteToManagedField`); every `Write` or `Transition` of a versioned instance is matched by exactly one `bump_version` of the same selected instance in its transaction (`MissingVersionBump`, `DuplicateVersionBump`); `validate_version` names a version the transaction observed (`VersionValidationWithoutObservedVersion`); version steps target versioned objects only (`VersionProtocolOnUnversionedObject`).
+15. **Transaction requirement roots.** Every requirement key and ordering position is available at transaction entry (`TransactionRequirementKeyUnavailable`, `TransactionOrderingPositionUnavailable`), and a position is a non-optional `int`, `decimal`, or `timestamp` (`TransactionOrderingPositionNotOrderedScalar`).
 11. **`race` shape.** At least two handles (`RaceRequiresTwoHandles`); every referenced handle exists and is operation-owned; no handle occurs twice in one race (`DuplicateSynchronizationHandle`); the result binding, when present, is unique and subject to rule 6's compatibility requirement.
 
 An `execute_effect_async` additionally applies every structural rule already applicable to synchronous `execute_effect` — effect target resolution, schema compatibility, derivation validity, value-reference scope, idempotency-key reference validity, `effect_id` uniqueness, result-contract resolution — plus handle uniqueness and the requirement that the effect kind permits direct async execution. An `execute_effect_intent_async` requires an existing, definitely available intent binding and a unique handle, and resolves the underlying effect contract to determine result compatibility for later synchronization.
@@ -2162,11 +2064,13 @@ Bindings exist only after their producer — there are **no forward references**
 
 A binding has one syntactic producer and is never merged with a differently produced value from another arm: this model has no phi or merge construct. If two falling-through arms must produce different values for a later common consumer, keep the consumer inside each arm or restructure the program.
 
-Operation requirements live outside the causal execution body, so program-produced bindings are not in scope inside `Operation.requirements`: idempotency and recoverability governing keys define the invocation equivalence class from the triggering boundary, never from values the invocation later produces (§12).
+Operation requirements live outside the causal execution body, so program-produced bindings are not in scope inside `Operation.requirements` (a transaction's own requirements are the exception, and see what is available at its entry — §17): idempotency and recoverability governing keys define the invocation equivalence class from the triggering boundary, never from values the invocation later produces (§12).
 
 ### Paths and path admission
 
 An invocation traverses one **synchronous control path** through the program: the linear sequence of its steps, the arm taken at each decision, and the terminal reached. Asynchronous effect steps on the path initiate executions whose lifetimes overlap later control, and synchronization steps add explicit completion dependencies; the path remains the acyclic control skeleton those lifetimes hang off. Verification analyzes the program path by path — a path is a linear sequence of steps plus the decisions that selected it — so the forward replay pass of §18 applies to each path unchanged, and what a decision rests on is judged where it is taken. For simulation, a path with async steps lowers to a partial-order graph: each launch is an effect-start event with no immediate completion dependency on the next step, `join_all` a barrier requiring every corresponding completion event, `race` a barrier enabled by the first; Conseqa supplies the causal structure, the simulator the quantitative facts.
+
+A rejectable `transaction` step is a decision too: its committed path continues after the step, its rejected path continues in the `rejected` block, and the path records which outcome it took (§16, "Decision replay").
 
 A path is **admitted for input `i`** iff its terminal is `complete`, or `return` for `i`. A path returning another request input's result is not one an invocation of `i` completes. Admission is terminal-based; the DSL adds no explicit entry or path-admission concept associating a triggering input with a control entry. That association is open question 10 (§27) and is deliberately not resolved by inventing one: an operation with several request inputs distinguishes their paths by the `return` each takes, and a subscription-triggered invocation is admitted to every path ending at `complete`.
 
@@ -2200,13 +2104,14 @@ Transaction-read results are excluded: they remain local to the transaction exec
 A retry traverses declared control. Whether it takes the same arm at a decision is a fact the checker establishes or records as a gap. Relative to a governing key (§12), a decision **replays** — every attempt in a class takes the same arm — when:
 
 - for a `branch`: the condition is deterministic (not `unspecified` anywhere) **and** every root it observes is replay-stable under §18. The same roots then yield the same predicate value; or
-- for a `match_result`: the matched result is replay-stable under §18, so the variant is fixed across the class.
+- for a `match_result`: the matched result is replay-stable under §18, so the variant — the class, for an error — is fixed across the class;
+- for a rejectable `transaction`: the transaction is `DeduplicatedBy` a key the §18 rules make stable, so a later attempt resolves the prior commit and takes the committed outcome again. Without keyed recovery the outcome is not established: a retry may observe state the first attempt itself changed and reject where it committed.
 
-Otherwise the checker reports the decision as **not established to replay**, naming the gap: the condition is `unspecified`; a condition root is unstable; the result is not bound before the decision on this path; or the result is unstable in the taken arm's variant — its instance not class-fixed, its request's schema not the target's, its target declaring no replay-consistent requirement for the input or one that is unproven, an external boundary declaring `result_replay: unstable` or no replay fact at all, one whose identity key is unstable, or one whose observed `Err` is retryable or of unspecified disposition (§13.3), or a result bound by `race`, whose winner is scheduling nondeterminism (§16). Instability is not proven; a different arm on retry may be legitimate. What that means for each obligation is stated in §9: an obstacle for idempotency and result replay, never for recoverability.
+Otherwise the checker reports the decision as **not established to replay**, naming the gap: the condition is `unspecified`; a condition root is unstable; the result is not bound before the decision on this path; the transaction outcome is unstable; or the result is unstable in the taken arm's variant — its instance not class-fixed, its request's schema not the target's, its target declaring no replay-consistent requirement for the input or one that is unproven, an external boundary declaring `result_replay: unstable` or no replay fact at all, one whose identity key is unstable, or one whose observed `Err` is retryable or of unspecified disposition (§13.3), or a result bound by `race`, whose winner is scheduling nondeterminism (§16). Instability is not proven; a different arm on retry may be legitimate. What that means for each obligation is stated in §9: an obstacle for idempotency and result replay, never for recoverability — with one further admission for idempotency alone. A transaction outcome not established to replay is admitted there (`OutcomeDivergenceAddsNoWork`): a rejected attempt commits nothing and does only its block's work, a committed one only its continuation's, and each path's work is judged duplicate-safe on its own, so the divergence itself cannot duplicate work. Result replay grants no such admission — a rejected attempt may construct a different result.
 
 ### Step locations
 
-Program steps carry no ids. Diagnostics, proofs, and obstacles name a step by its **location**: one hop per nesting level, each the one-based position in its block and, for every level but the last, the arm entered beneath it. `3.ok.1` is the first step of the `ok` arm of the third top-level step; `2` is the second top-level step. A path is named by the arms it takes, as `ok(result.charge_payment.card) › then(step 3)`, or as "the program" when it has no decisions. An obstacle at a step is reported once per site however many paths share the prefix reaching it, since those paths reach the step with the same context.
+Program steps carry no ids. Diagnostics, proofs, and obstacles name a step by its **location**: one hop per nesting level, each the one-based position in its block and, for every level but the last, the arm entered beneath it. `3.ok.1` is the first step of the `ok` arm of the third top-level step; `2.err:declined.1` the first step of the `declined` arm of the second; `1.rejected.1` the first step of the first step's rejected arm; `2` is the second top-level step. A path is named by the arms it takes, as `ok(result.charge_payment.card) › then(step 3)` or `committed(tx.apply_payment)`, or as "the program" when it has no decisions. An obstacle at a step is reported once per site however many paths share the prefix reaching it, since those paths reach the step with the same context.
 
 ---
 
@@ -2218,7 +2123,7 @@ A transaction is one atomic commit/abort unit, declared inline at the program st
 
 `id` is the transaction's stable logical identity: unique within the operation, carried by the inline declaration itself, and the identity under which a keyed commit is durably recognized. Its object accesses are interpreted against its declared `data_model`. Its steps are logically ordered as written.
 
-Atomicity does not imply serializability, and serializability is a statement about committed transactions only — it is not to be read as any stronger object-history property (§5).
+Atomicity does not imply serializability, and serializability is a statement about committed transactions only — it is not to be read as any stronger object-history property (§5). A transaction's execution ends committed, rejected, or interrupted (§16); only committed executions appear in the history the requirements below speak of.
 
 Framework transaction artifacts established by the transaction — transaction outputs and effect intents (§23) — participate in the same logical atomic boundary as application-state mutations.
 
@@ -2320,7 +2225,7 @@ No isolation fact may be assumed.
 
 Reads do not observe uncommitted writes from other transactions.
 
-The verifier must still consider anomalies permitted by read-committed execution, including non-repeatable reads and concurrent read/modify/write races unless prevented by stronger facts such as locks, atomic mutation semantics, uniqueness, or serialization.
+The verifier must still consider anomalies permitted by read-committed execution, including non-repeatable reads and concurrent read/modify/write races — the write-skew shape — unless prevented by stronger facts: a strict lock covering the access, or a version validated at commit (below).
 
 Read committed is not serializable.
 
@@ -2336,13 +2241,74 @@ Committed transactions admit an equivalent serial execution order.
 
 Serializable does **not** by itself imply real-time precedence. It is a transaction-level fact and must not be promoted into an object-history guarantee (§5); no V1 verifier draws such an inference.
 
+A serializable transaction is serializable only **with respect to other serializable transactions**: one serializable transaction beside a weaker conflicting one is ordered by nothing, which is why the isolation route below asks the whole conflict closure to declare it.
+
 Serializable execution also does not imply that a transaction is replayable across separate invocation attempts.
 
 ### Transaction step order
 
 The declared step sequence represents logical program order inside the transaction.
 
-This is especially important for lock-order/deadlock analysis, transaction-read provenance, state transitions, and reasoning about when transaction artifacts are established relative to application state.
+This is especially important for lock-order/deadlock analysis, lock coverage (a lock protects only accesses after it), transaction-read provenance, state transitions, and reasoning about when transaction artifacts are established relative to application state.
+
+### Transaction requirements
+
+A transaction may declare what it requires of its own committed history:
+
+```yaml
+requirements:
+  serializability:
+    - key: { source: input:input.apply_payment.captured, path: order_id }
+  ordering:
+    - key: { source: input:input.apply_payment.captured, path: order_id }
+      position: { source: input:input.apply_payment.captured, path: sequence }
+```
+
+Both are proof obligations in the sense of §9, and both are properties of **transactions** — never of operations, invocations, or the runtime topology (§10).
+
+#### `SerializableBy(K)`
+
+> Within each value of `K`, the committed executions of this transaction, together with every transaction that may conflict with it, admit an equivalent serial order.
+
+The population is the transaction's **conflict closure**: every transaction of the model, in any operation, that may read or write an object instance and field this one writes, or write one it reads — transitively, since a serialization cycle may pass through a third transaction. Aborted, rejected, and interrupted attempts are not committed executions and do not appear in the history. Serializability says nothing about *which* serial order; that is ordering's question.
+
+#### `OrderedBy(K, P)`
+
+> Within each value of `K`, the committed executions of this transaction take effect in the order of their `P` values.
+
+Strictly stronger than serializability over the same key, which it presupposes: an ordered history is one particular serial order. `P` must be a non-optional `int`, `decimal`, or `timestamp` (`TransactionOrderingPositionNotOrderedScalar`).
+
+#### Entry availability
+
+Keys and positions are evaluated when the transaction is entered, so each must be available there: an input payload, or a transaction output or effect result bound on every path before the step — never a `transaction_read` of this transaction (`TransactionRequirementKeyUnavailable`, `TransactionOrderingPositionUnavailable`). A key knowable only inside the transaction would name a domain the history cannot be partitioned by.
+
+### Proving serializability
+
+The checker builds, model-wide, an index of every transaction's accesses — reads with their field selections; writes; inserts and deletes, which touch every field; transitions, which read and write the state field; version validations and bumps; cursor advances and fences, which read and write their managed field — and judges every pair of accesses for conflict. Two accesses conflict when they may select overlapping instances and touch overlapping fields, and at least one writes. **Unknown overlap is never disjoint**: two selectors over one object are proven disjoint only by distinct literals or by identities pinned to different canonical values; anything else may overlap, and `fields: all` overlaps everything. Transition-scoped outbox admissions (§22) create no conflict edge.
+
+The obligation's population is the closure of transactions reachable from the requiring one through conflicts. Two routes discharge it, and both are `l0_only`:
+
+**Serializable-isolation closure.** Every transaction in the closure declares `isolation: serializable`. The database then orders the whole closure itself, and nothing more is asked. One serializable transaction beside a weaker conflicting one is insufficient (`IsolationUnspecified`, or the weaker levels named), since serializability holds only among serializable transactions.
+
+**Serialization graph.** Otherwise the checker constructs the potential dependency graph over the closure — `wr` (a read that may observe a write), `rw` (a read a later write may invalidate: the anti-dependency behind write skew), and `ww` — and asks of every edge whether a declared fact fixes the commit order across it:
+
+- a **strict lock** covering the access on each side, acquired before the access and held to transaction end (§21): the reader under a `shared` or `exclusive` lock, the writer under an `exclusive` one — the two-phase-locking argument (`LockCoverageMissing`, `LockAcquiredAfterProtectedAccess`);
+- **version validation**: the reader observed the version of the instance through a read that selected the version field and validates it at commit, and the writer bumps it — or inserts or deletes the instance — so a stale observation cannot commit: the optimistic-concurrency argument (`VersionValidationMissing`, `VersionBumpMissing`);
+- an **ordered cursor** on the accessed field (§20), whose accepted positions fix the order of the commits that advanced it;
+- for a `wr` edge, the intrinsic order of a committed read behind the write it observes, and for a `ww` edge, atomic write order.
+
+A fence is recorded but is not commit-order evidence on its own: equal tokens do not order same-generation transactions.
+
+The graph's strongly connected components are then computed. A cycle every edge of which is constrained cannot produce a non-serializable committed history; a cycle containing an unconstrained edge can, and the obligation is unproven — citing the cycle, the dependency, and the gap on the edge. Nothing here consumes a routing key, a member assignment, a member concurrency bound, a transport fact, or an operation boundary.
+
+### Proving ordering
+
+`OrderedBy(K, P)` is proven when serializability over `K` is proven for the same closure (`OrderingMissingSerializability`) and the transaction carries a step that makes commit order follow `P` within the key's domain (`OrderingMissingCursorOrFence`):
+
+- an `advance_cursor` on a managed field of an object whose identity the selector pins to `K` — equal keys select one guarded instance and different keys never share one (`OrderingKeyDomainMismatch`) — whose `incoming` carries `P` (`OrderingPositionMismatch`): under `successor` every committed execution applies exactly the next position, under `monotonic_after` any greater one, and a stale, duplicate, or out-of-order position rejects; or
+- a `fence` on such an object whose `token` carries `P`: a stale token rejects, which excludes stale-generation histories.
+
+The managed field must be advanced through that protocol alone — no ordinary write, and no cursor advance under another rule, anywhere in the model (`OrderingUncontrolledManagedFieldWriter`) — since otherwise the accepted positions do not order every commit. Transport precedence, dispatch, batching, and pool facts play no part: ordered delivery still leaves a stale worker or a redelivery free to apply an earlier position later, and it is the cursor in the committed state that refuses it.
 
 ---
 
@@ -2616,7 +2582,7 @@ Reads only the listed field paths for the modeled semantics.
 
 ### `Write`
 
-Mutates the listed fields of the selected object instances.
+Mutates the listed fields of the selected object instances. It may not name the object's version field or a managed cursor or fence field (§5); those move only through their protocol steps below.
 
 The step declares the provenance of the values written through `Derivation` (§18).
 
@@ -2639,6 +2605,49 @@ Whether retrying a conflicting insert can participate in a natural replayability
 Deletes the instances selected by the object selector.
 
 Deletion replay behavior depends on what the model guarantees when the selected instance is already absent. Unless sufficient semantics establish a reproducible outcome, the verifier must not silently treat deletion as naturally replayable merely because applying deletion twice leaves no object.
+
+### Version protocol steps
+
+Two steps use a versioned object's token, and they make different promises. Neither is evaluated where it is written: both take effect at **commit arbitration**, atomically with the commit.
+
+**`bump_version { target }` publishes a change.** At commit, the selected instance's version becomes one higher than it is at that moment — unconditionally. The step compares nothing and never rejects. Its purpose is other transactions: a version that moved is what their guards detect.
+
+**`validate_version { target, expected }` guards an observation.** The transaction commits only if the selected instance's version at commit still **equals** `expected`; otherwise the transaction **rejects** (§16). `expected` must be a version this transaction itself observed: a `transaction_read` binding of the same selected instance whose field selection included the version field (`VersionValidationWithoutObservedVersion`). The guard checks equality, not an increment — a version moved by one or by fifty rejects alike — and it performs no increment of its own.
+
+When each is required:
+
+- Every `Write` or `Transition` of a live versioned instance must be accompanied by exactly one `bump_version` of the same selected instance in the same transaction (`MissingVersionBump`, `DuplicateVersionBump`). `Insert` creates the initial version and `Delete` removes the instance, so neither bumps. This is a validation rule: a mutation nobody can detect is not a versioned mutation.
+- `validate_version` is never required by validation. It is declared where the transaction relies on an observation staying true until commit, and a serializability proof over a read-then-write needs it on the reader's side (below).
+- Both steps require the object to declare a version (`VersionProtocolOnUnversionedObject`).
+
+**Neither step implies the other.** A transaction may validate an instance it only reads — the revision's own example validates a global limit it never writes while it writes and bumps an account — which is a pure compare. A transaction may bump an instance it never read — a blind write still publishes — which is a pure increment. When one transaction validates and bumps the same instance, the two compose into the familiar compare-and-swap: commit only if the version is still `expected`, and in that same commit set it to `expected + 1`. That composition is the common shape, not the definition of either half.
+
+**Why a proof needs both halves.** Take two executions of one transaction that reads a row's `balance` and `version`, computes a new balance, writes it, and bumps:
+
+```text
+A reads  version 7, balance 100          B reads  version 7, balance 100
+A commits: balance 100 + a, version 8
+                                         B at commit: validate(7) finds 8 → rejects
+```
+
+Without B's validation, B commits `100 + b` and bumps 8 to 9: A's amount is lost, and nothing objected. Without A's bump, B's validation finds 7 = 7 and commits the same stale balance. So the serialization-graph route (§17) cites version validation on a read-write dependency only when the reader validates the version it observed **and** the writer bumps it; missing either is a named gap (`VersionValidationMissing`, `VersionBumpMissing`). Note what the cursor of the next section does not do here: an `advance_cursor` compares the incoming position against the *stored* one at commit, so B's cursor can pass while B's balance is stale. The cursor orders positions; the version guards observations.
+
+**Realization.** A conforming implementation makes the check and the advance atomic with the commit. On a relational store that is one conditional statement, with the transaction rejecting when it affects no row:
+
+```sql
+UPDATE ledger SET balance = ?, version = version + 1
+WHERE id = ? AND version = ?;
+```
+
+A conditional put, an ETag or `If-Match` precondition, or a compare-and-swap column realize the same guarantee. The DSL names the guarantee and none of the mechanisms; in particular the guard holds no lock across the read-to-commit window, which is what makes the route optimistic and distinguishes it from a `lock` step (§21).
+
+**Placement.** `validate_version` carries no timing meaning; it is evaluated at commit wherever it sits. It must follow the read whose binding it names, and it reads best beside that read, before the work that depends on the observation.
+
+A bump depends on the state it advances, so it is not naturally replayable; a transaction containing one recovers its artifacts only through a keyed commit.
+
+### Cursor and fence steps
+
+`advance_cursor { target, field, incoming, rule }` is the only mechanism that writes a cursor field. Under `successor` the transaction commits only if `incoming` is exactly the next position after the stored one; under `monotonic_after` only if it is greater. A stale or duplicate position, or a gap under `successor`, **rejects** the transaction. `fence { target, field, token }` commits only if `token` is not older than the stored fencing token, and stores it; a stale token rejects. Each step reads and writes its managed field, each is the ordering evidence of §17, and, like a bump, neither is naturally replayable.
 
 ---
 
@@ -2684,9 +2693,11 @@ Program order between separate `Lock` steps is itself relevant to the lock-order
 
 A `by` order within one selector does not automatically reconcile contradictory order between two separately declared lock steps.
 
-The current DSL therefore cannot declare a deadlock-safe acquisition of several specific instances of one object: a selector admits no disjunction, so one lock step cannot name them, and no fact orders separate steps. The locking facts the DSL lacks are open question 8 (§27), and the model-wide deadlock checker that would consume them is question 9; no V1 verifier reasons about transaction locks.
+The current DSL therefore cannot declare a deadlock-safe acquisition of several specific instances of one object: a selector admits no disjunction, so one lock step cannot name them, and no fact orders separate steps. The locking facts the DSL lacks are open question 8 (§27), and the model-wide deadlock checker that would consume them is question 9.
 
-The operation-entry `invocation_lock` (§7) is deliberately not a `Lock`. A transaction lock protects the object instances its selector selects, for the span from acquisition to transaction end; whether two same-key invocations conflict on a common instance depends on such an instance existing at lock time, which is runtime state the model cannot declare. The invocation lock differs on exactly those two points — a semantic key needing no instance, held over the whole program — which is why the §9 serialization verifier credits it while declining every transaction-lock route.
+### Locks as commit-order evidence
+
+What a lock does prove is commit order. A strict lock — acquired before the access it protects and held to transaction end — covering an access on each side of a conflict fixes which of the two transactions commits first, and is cited as such by the serialization-graph route of §17: the reader under `shared` or `exclusive`, the writer under `exclusive`. A lock acquired after the access it should protect covers nothing (`LockAcquiredAfterProtectedAccess`). There are two modes and no update mode: a `shared` lock followed by an `exclusive` one on the same target is the classic upgrade deadlock, written without semantics until question 8 settles it.
 
 ---
 
@@ -2726,7 +2737,9 @@ Selects a concrete persistent machine instance and applies the named transition.
 
 The transition's `from` condition and update to `to` are interpreted as one logical state transition within the surrounding transaction.
 
-The state machine declares legality, not concurrency safety. Two individually legal transitions can still race. The verifier must use isolation, locks, serialization, ordering, or other facts to prove that concurrent execution cannot produce an illegal history.
+A transition is **fallible**: when the selected instance is not in one of the transition's `from` states, the transition rejects, and with it the containing transaction (§16) — the transaction step's `rejected` arm is where the program says what happens then.
+
+The state machine declares legality, not concurrency safety. Two individually legal transitions can still race — two attempts observing `pending` and each moving it to `paid` — unless the transactions carry the facts that order them: serializable isolation across the closure, a strict lock on the subject, or the version protocol, under which a transition of a versioned instance bumps its version and a stale observer rejects. That is what a `SerializableBy` requirement on the transaction asks the checker to establish (§17).
 
 ### Transition transaction replay
 
@@ -2764,6 +2777,25 @@ ExecuteEffectIntent E
 If the invocation crashes after `T` commits but before `ExecuteEffectIntent E`, natural replay cannot be relied on to reproduce `E`, because V1 will not replay the transition transaction naturally. `DeduplicatedBy { key }` ensures that retrying `T` resolves the prior commit and restores `E`, allowing the program to continue along the same path. Without it no declared fact makes `E` available to the resumption, and an obligation that needs `E` there stays unproven.
 
 This still does not imply exactly-once external execution. Effect-level idempotency/retry analysis remains necessary.
+
+### Transition-scoped outbox effects
+
+Besides side effects, a transition may declare **effects**: outbox admissions that commit exactly when the transition applies.
+
+```yaml
+transition.order.mark_paid:
+  from: [state.order.pending]
+  to: state.order.paid
+  side_effects: {}
+  effects:
+    effect.order.paid_admitted:
+      kind: outbox_write
+      outbox: outbox.order_events
+      schema: schema.OrderPaid
+      idempotency_key_propagation: []
+```
+
+The outbox must exist, admit the schema, and belong to the data model of every transaction applying the transition (`UnknownTransitionOutbox`, `InvalidTransitionOutboxSchema`, `TransitionOutboxOutsideDataModel`). The applying `transition` step supplies one derivation per declared effect under `effects` — `effect.order.paid_admitted: { values: ... }` — keyed exactly by the transition's effect ids (`InvalidTransitionOutboxDerivation`). The effects are keyed, not listed, for the same reasons side effects are: the id is the admission's stable identity — a propagation target names it as `effect:<id>` — and the derivation belongs at the applying site, which can refer to the declared effect only by name (§15.1 of the DSL v4 revision). The admission is part of the transition's atomic application: it exists on the committed path only, a rejected transition admits nothing, and the message reaches the outbox's consumer as any admitted message does (§13.4). It is not a side effect — no intent is established and no program step executes it — and it is not a database conflict edge for serializability analysis; whether a duplicate admission is the same logical message is the effect leg's question (§9).
 
 ### Transition effect intents
 
@@ -2847,18 +2879,22 @@ The solver must preserve these distinctions:
 | **Unspecified vs negative guarantee** | Unknown is not the same as explicitly unordered/unbounded/non-deduplicated. |
 | **Semantic layer vs semantic category** | L0 versus L1 says which layer a fact belongs to; structural/guarantee/requirement says what kind of claim it makes. Correctness relevance decides neither. |
 | **Transport ordering vs execution ordering** | Ordered delivery can still lead to concurrent/overtaking execution. |
-| **Ordering vs serialization** | Serialization prevents overlap; ordering preserves the correct precedence. |
+| **Ordering vs serializability** | Serializability admits *some* serial order of the committed history; ordering fixes *which* — the order of the declared positions. |
+| **Placement vs commit order** | Routing, member assignment, and member concurrency say where invocations execute; what their transactions commit is decided by isolation, locks, the version protocol, and cursors. No L1 fact is commit-order evidence. |
+| **Operation vs transaction as the subject** | Invocations may overlap or not; only committed transactions have a history, so serializability and ordering are declared and proven on transactions. |
 | **Transport order vs semantic order** | A broker can serialize concurrent producers without establishing a business-level happens-before relation. |
 | **Routing domain vs pool member** | A routing key names a semantic domain; `MemberAssignment` maps it onto a member. The domain keeps its identity across rebalances. |
-| **Stable-epoch affinity vs execution handoff** | `consistent_hash` assigns a domain to one member while an ownership epoch is stable; only `execution_handoff = exclusive_ownership` says a stale owner cannot overlap its successor across a transition. `bounded(1)` binds each member separately and bridges nothing. |
-| **Message lease vs invocation fencing** | Lease expiry may permit redelivery without the old attempt having terminated; a lease alone never establishes exclusive handoff. |
-| **Invocation lock vs transaction lock** | An `invocation_lock` guards the whole invocation under a semantic key evaluated at entry; a `Lock` step protects selected object instances for a transaction's span, and no V1 proof credits it. |
-| **Invocation lock vs ordering** | The lock excludes concurrent same-key execution with no FIFO acquisition guarantee, so it proves serialization and never ordering. |
-| **Idempotency vs serialization** | Collapsing the work of duplicate attempts does not prevent same-key invocations overlapping, and mutual exclusion does not collapse duplicate work; neither implies the other. |
+| **Serializable vs serializable closure** | A serializable transaction is serializable only with respect to other serializable ones; one beside a weaker conflicting transaction is ordered by nothing. |
+| **Version validation vs version bump** | Validation guards the reader's commit against a stale observation; the bump is what makes the writer's commit observable to it. The OCC argument needs both sides. |
+| **Cursor vs fence** | A cursor orders commits along accepted positions; a fence only excludes stale generations — equal tokens order nothing. |
+| **Rejected vs interrupted** | A rejection is a program outcome the `rejected` arm handles, with nothing committed; an interruption is no outcome at all and is judged by idempotency and recoverability. |
+| **Rejection vs `Err` result** | A rejected transaction is a fact about observed state; an `Err` is a logical result a boundary returned. The program decides in the rejected arm which, if any, error class the boundary reports. |
+| **Unknown overlap vs disjointness** | Two selectors are disjoint only when proven so; unknown overlap is a conflict, never an absence of one. |
+| **Idempotency vs serializability** | Collapsing the work of duplicate attempts does not order the commits of concurrent ones, and a serializable history does not collapse duplicate work; neither implies the other. |
 | **Routing domain vs storage partition** | Equal key expressions do not make execution affinity and physical partitioning the same concept. |
 | **Shared pool vs shared routing domain** | One execution population is not one ownership domain; two boundaries in one pool borrow no affinity from each other. |
 | **Routing absence vs unconstrained routing** | No routing block is no fact — not a declaration that routing is arbitrary. |
-| **Grouping vs ordering** | A transport may group without ordering, order without grouping, or both. Serialization needs only the first. |
+| **Grouping vs ordering** | A transport may group without ordering, order without grouping, or both. Neither is commit-order evidence. |
 | **Grouping vs dispatch** | Grouping is a transport equivalence domain; dispatch maps it onto execution topology. Dispatch preserves precedence and never creates it. |
 | **Topic scope vs subscription scope** | Exclusive declaration modes, not a default and an override. Neither inherits from the other. |
 | **Serializability vs linearizability** | Serializable histories need not respect real-time precedence. The DSL currently declares no object-history requirement (§5); the distinction is kept so that `serializable` is never promoted into one. |
@@ -2895,11 +2931,11 @@ The solver must preserve these distinctions:
 | **Outbox vs topic** | Same typed messages, same identity vocabulary; only an outbox's producer is transaction-exclusive, its admission atomic with the commit (§5, §13.4). |
 | **Commit deduplication vs outbox message identity** | `DeduplicatedBy` may prevent a second committed admission; `message_identity` says when two admissions are one logical message. Different questions, different discharge routes (§13.4). |
 | **Outbox message vs transaction artifact** | An outbox message is durable application data for independent consumers; an output or intent is a framework artifact for this program's continuation (§23). |
-| **Batch order preservation vs serialization** | `preserved` stops a later message overtaking an earlier one against an established order; batch-internal overlap stays unmodeled, so it is never a no-overlap fact (§10.3.2). |
+| **Batch order preservation vs no-overlap** | `preserved` stops a later message overtaking an earlier one against an established order; batch-internal overlap stays unmodeled, so it is never a no-overlap fact, and no proof consumes it (§10.3.2). |
 | **`execute_effect` vs `execute_effect_async`** | Synchronous completion dependency versus asynchronous initiation: only the first establishes `complete(A) < start(next)`. |
 | **Effect ID vs async handle** | Stable effect-site identity versus invocation-local synchronization artifact. |
 | **Launch vs completion** | Starting an effect does not imply it has completed; only synchronization establishes completion edges. |
-| **`join_all` vs serialization** | A barrier after all completions establishes no order and no non-overlap among the joined candidates. |
+| **`join_all` vs ordering** | A barrier after all completions establishes no order and no non-overlap among the joined candidates. |
 | **`race` vs cancellation** | First-completion synchronization says nothing about stopping, preventing, or undoing the losers. |
 | **`race` vs first-success** | The first completion may be an `Err`; a result-binding race observes it. |
 | **Async result vs handle** | The application result is unavailable until synchronization; the handle is never application data. |
@@ -2931,34 +2967,48 @@ Every successful proof records the semantic layers its argument consumed:
 | `l0_only` | No explicit L1 fact was required. |
 | `runtime_dependent` | At least one L1 fact was necessary. |
 
-The scope records a **dependency**, nothing more. A `runtime_dependent` proof is not weaker in kind; it is conditional on the runtime realization the model declares, and must be re-examined when that realization changes — which is exactly what makes the record useful. Changing a pool's member concurrency, or dropping a router's routing block, invalidates the proofs that cited them, and the scope is how a reader finds them.
+The scope records a **dependency**, nothing more. A `runtime_dependent` proof is not weaker in kind; it is conditional on the runtime realization the model declares, and must be re-examined when that realization changes — which is exactly what makes the record useful. Changing a subscription's delivery semantics invalidates the completion proofs that cited it, and the scope is how a reader finds them. Transaction serializability and ordering proofs are always `l0_only`: no L1 fact participates (§10, §17).
 
 `l0_only` does **not** mean implementation-free. A proof resting on `isolation: serializable` is L0-only, and still assumes the concrete database implements serializable execution. Scope identifies dependency on semantic layers, not the absence of conformance assumptions.
 
 Alongside the scope, a proof carries the declarations it consumed, so a report can say precisely why a verdict holds:
 
 ```
-Requirement:  SerializedBy(account_id)
-Verdict:      Proven
-Scope:        runtime_dependent
-Evidence:
-    Router update_account_router
-        semantic routing key = account_id
-        member_assignment    = consistent_hash
-    ExecutionPool account_workers
-        execution_handoff    = exclusive_ownership
-        member_concurrency   = bounded(1)
-```
-
-An invocation-lock proof cites less and survives more:
-
-```
-Requirement:  SerializedBy(account_id)
+Requirement:  SerializableBy(order_id) on tx.apply_payment
 Verdict:      Proven
 Scope:        l0_only
 Evidence:
-    InvocationLock
-        key = account_id
+    conflict closure over object.order:
+        tx.apply_payment, tx.cancel_order, tx.create_order.new
+    rw  tx.apply_payment -> tx.cancel_order
+        version validation: read.apply_payment.order selects version,
+        validate_version at step 2; tx.cancel_order bumps at step 4
+    rw  tx.cancel_order -> tx.apply_payment
+        version validation: the symmetric argument
+    ww  tx.create_order.new -> tx.apply_payment
+        atomic write order; the insert creates the version
+```
+
+A serializable closure cites less:
+
+```
+Requirement:  SerializableBy(video_id) on tx.publish_video.ready
+Verdict:      Proven
+Scope:        l0_only
+Evidence:
+    every transaction of the conflict closure declares
+    isolation: serializable
+```
+
+A progress proof may cite the runtime, and says so:
+
+```
+Requirement:  Recoverability(event_id), completion: guaranteed
+Verdict:      Proven
+Scope:        runtime_dependent
+Evidence:
+    SubscriptionRuntime input.apply_payment.captured
+        delivery = at_least_once
 ```
 
 ### 25.2 Removing L1
@@ -2989,7 +3039,7 @@ Serializable isolation, explicit locks, message identity, and `retry: may_repeat
 
 When declaring transport semantics, ask which of the two facts you actually have. Grouping and ordering are separate on purpose: a transport that groups by a key without ordering within it is an ordinary thing, and saying so earns a serialization proof without claiming an order that does not exist. Declaring `within_group` to reach a grouping key would be exactly the false statement §26 warns against.
 
-When declaring runtime topology, declare only what the architecture genuinely provides. Inventing a pool or a member assignment to make a proof pass is the same error as declaring a guarantee the implementation does not offer — and here the temptation is sharper, because `member_concurrency = bounded(1)` discharges obligations so readily. Sharper still with `execution_handoff: exclusive_ownership`, which no topology proof can do without and which most runtimes do not actually provide: declare it only where the runtime genuinely fences or drains a stale owner, and never on the strength of a message lease. If the architecture does not constrain execution that way, leave the requirement unproven — or, where entry exclusion is the honest architecture, declare the L0 `invocation_lock` (§7) instead of inventing topology.
+When declaring runtime topology, declare only what the architecture genuinely provides — and know that no topology fact makes a serializability or ordering proof pass. A serial pool member, a consistent-hash assignment, and an ordered transport describe where invocations land; the transactions carry the proof. When a `SerializableBy` or `OrderedBy` obligation is unproven, the honest fixes are on the transaction: serializable isolation the database genuinely provides across the whole closure, a strict lock the transaction genuinely takes before the access, a version the object genuinely carries and the transaction validates, or a cursor the keyed object genuinely advances. Declaring `isolation: serializable` on a transaction the database runs at read committed is the same error as declaring a guarantee the implementation does not offer. If the architecture does not constrain the history that way, leave the requirement unproven.
 
 ---
 
@@ -3022,21 +3072,23 @@ What the DSL deliberately does not yet decide. Every entry is scoped so that res
    - *Predicate versus instance locks.* Whether a lock on `all` or on a partial identity covers instances inserted later (a predicate lock) or only current ones is unspecified; serialization and deadlock reasoning both depend on it.
    - *Wait policy.* No lock-wait timeout, `nowait`, or `skip locked` fact; these decide whether a circular wait deadlocks or aborts. Absent one, a checker must treat every cycle as a deadlock.
 
-   No V1 proof credits a transaction lock — the serialization checker deliberately declines every transaction-lock route; the operation-entry `invocation_lock` (§7) is a different primitive with its own §9 route — so each of these can only add what can be stated and proven, never invalidate a verdict.
+   A strict lock is credited as commit-order evidence by the serialization-graph route (§17, §21), which reads only its coverage of the conflicting accesses; each of the gaps above concerns deadlock freedom, so settling them can only add what can be stated and proven, never invalidate a verdict.
 
 9. **Model-wide deadlock checker** — *Open; earmarked for implementation; depends on 8 to be useful.* A model-wide analysis, not a per-operation requirement: locks live in transactions, and a deadlock is a property of every transaction the model admits concurrently on one data model. The analysis, per data model:
 
    1. *Collect* every explicit lock step of every transaction in every operation — object, selector, mode, declared order, program position — and, once question 8 settles it, the implicit locks its isolation level implies.
    2. *Abstract* each lock to a class: the object and the shape of its selector (full identity, partial identity, `all`), with selector values carried as canonical paths, so that two classes are *disjoint* only when provably so (distinct literals, or identities pinned to different canonical values) and otherwise *may overlap*. Two classes *conflict* when they may overlap and are not both `shared`.
    3. *Order* the classes: within a transaction, program order between steps and the `by` order within a step give a per-transaction acquisition order over conflicting classes; a multi-instance step with `order: unspecified` contributes no order among its own instances.
-   4. *Admit* concurrency: two transactions can overlap unless a declared fact says otherwise — a proven serialization requirement for same-key invocations, or `member_concurrency = bounded(1)` on a pool both boundaries are assigned to. The serialization verdicts already compute most of this.
+   4. *Admit* concurrency: no declared fact bounds which transactions the model admits concurrently — serializability constrains committed order, not overlap, and no L1 fact is read as a no-overlap guarantee — so every pair of transactions on one data model is admitted. The conflict index of §17 already computes the classes and their overlap.
    5. *Decide.* The union of the admitted transactions' acquisition orders over conflicting classes is acyclic: **proven**, citing the global order it found. A cycle whose every edge is a declared fact, whose transactions are admitted concurrently, and whose classes may overlap: **disproven**, with a counterexample trace — "T1 holds A, requests B; T2 holds B, requests A" — the checker's first disproven verdict, consistent with §1.2 because it is built from declarations, not from their absence. Anything else — an `unspecified` order on a multi-instance class, an unspecified concurrency bound, overlap that cannot be decided — is **unknown**, with the lock steps it hinges on as evidence.
 
    To settle alongside: whether deadlock freedom is declared (a data-model requirement, keeping the rule that requirements are obligations) or standing; a `data_model` subject kind for the report; the rendering of a disproven obligation with its trace; and the wait-policy assumption of question 8. Until question 8 lands, the analysis is implementable but would return unknown for nearly every real model, the transfer pattern included — which is still the honest answer.
 
 10. **Input-specific path admission** — *Open; V1 stance adopted.* An operation may declare several inputs, and its one program does not say which input an invocation entered through. V1 relates a path to an input only through its terminal (§16): a path is admitted for triggering input `i` iff it ends at `complete` or at `return` for `i`. This is sufficient but weaker than the model knows: a `complete`-terminated path is admitted for every input, including a request input whose invocations then return nothing; a program with two request inputs cannot state that a step is reachable only through one of them, so both populations are analyzed over it; and a `return` for another input excludes a path without saying what an `i`-invocation does instead. An explicit entry concept — a per-input entry block, an `entry` step naming the inputs that may reach the steps it dominates, or a validation rule that every request input has at least one `return` — would let validation reject a program that returns nothing for a request input, let each population analyze only the steps it can reach, and give path admission a declared rather than inferred basis. Any resolution refines admission and so can only remove paths from an analysis, never add work to a proven one.
 
-11. **External effect result replay** — *Resolved.* For a result-bearing external effect, `result_replay: replay_stable` over a keyed identity fixes the interaction's terminal result (§13.3), and `ResultType.err` declares an `ErrorDisposition` (§8.1); a terminal external result over a class-fixed identity is a replay-stable root (§18 rule 6). Still open from that resolution: heterogeneous per-error-class dispositions inside one result contract, and any retry-execution vocabulary that would consume `retryable`.
+11. **External effect result replay** — *Resolved.* For a result-bearing external effect, `result_replay: replay_stable` over a keyed identity fixes the interaction's terminal result (§13.3), and each error class of `ResultType.errors` declares its own `ErrorDisposition` (§8.1), so heterogeneous dispositions inside one contract are expressible; a terminal external result over a class-fixed identity is a replay-stable root (§18 rule 6). Still open: any retry-execution vocabulary that would consume `retryable`.
+
+12. **Transaction requirements: deferred surfaces** — *Open; V1 stance adopted.* The serializability and ordering proofs of §17 are deliberately conservative where the model cannot yet say more: unknown selector overlap is a conflict, so a proof over a partially pinned selector needs a lock or version covering the widest instance set it may touch; predicate and phantom conflicts are read as instance conflicts over the selector's object, with no gap-lock vocabulary; there is no update lock mode; a rejection exposes no cause; and the `rejected` arm is one generic block. Each of these can gain precision — typed rejection causes, a disjointness precondition on inputs, predicate-lock facts, an upgrade mode — by adding what can be stated, and no V1 verdict rests on their absence being read as anything but unknown.
 
 ### Deferred surfaces
 
@@ -3046,5 +3098,5 @@ What the DSL deliberately does not yet decide. Every entry is scoped so that res
 - **Retry execution.** `ErrorDisposition::retryable` states that another attempt is semantically admitted (§8.1); nothing models the mechanism that performs one — no retry policy, loop, attempt count, backoff, or timeout. A retry-execution revision may consume the disposition.
 - **Performance overlay.** The correctness vocabulary deliberately exposes distinctions a future probabilistic layer could consume — terminal versus retryable outcomes, attempt populations, member concurrency, member assignment, routing and partition keys — but no performance semantics exist in the model. L1 is qualitative by design: pool cardinality, traffic rates, key-frequency distributions, service-time distributions, storage-node counts, replication factors, capacity, queueing, and latency belong to an external simulation scenario evaluated *against* a Conseqa architecture, never inside it.
 - **Explicit negative routing** — *partly resolved.* There is still no `unconstrained` routing variant: absence of a routing block expresses that no member-affinity fact exists, and routing keeps exactly two components. The distinction between *unknown* and *known arbitrary* member behaviour is now carried where it belongs, on the assignment: `member_assignment: round_robin` (§10.6), admitted for the external analysis that needs it rather than for any proof. Still open is whether a routing *key* ever needs a comparable negative.
-- **Global execution gates** — *partly resolved.* Keyed operation-entry exclusion is now the explicit `invocation_lock` (§7): an L0 synchronization guarantee the application machine asserts, not a concurrency bound hidden in `Operation` — the same §1 layering that keeps serializable isolation L0. A keyless global gate ("no two invocations of X overlap, whatever their keys") still has no declaration: a lock key sources an input path, so a constant key cannot be written. If that need appears, it should still be its own primitive.
+- **Global execution gates** — *withdrawn.* The v3 operation-entry `invocation_lock` is removed with the operation-level serialization it served: whether two invocations overlap is not the property the architecture must get right, and no execution gate — keyed or global — says what the transactions commit. If a genuine need for an invocation-level exclusion primitive appears, it must be stated in terms of what it proves about committed histories, and it will not be commit-order evidence.
 - **Beyond the pool.** L1's execution abstraction stops at a population of interchangeable members. Physical database nodes, replica topology, consensus protocols, database lock-manager internals, hosts, containers, process ids, CPU, memory, availability zones, network links, queue capacities, and autoscaling policies are all outside it.

@@ -5,9 +5,10 @@ import { Input } from "@cloudflare/kumo/components/input";
 import { Switch } from "@cloudflare/kumo/components/switch";
 import { Tooltip } from "@cloudflare/kumo/components/tooltip";
 import { ListChecksIcon, MoonIcon, SunIcon } from "@phosphor-icons/react";
+import { Fragment } from "react";
 
+import { ancestry } from "../lib/navigation";
 import { STATUS_GLYPH, statusCounts } from "../lib/obligations";
-import { hashes } from "../lib/route";
 import { useApp } from "../state/AppState";
 
 /** The top bar sits in the content column and uses the pages' container,
@@ -21,9 +22,14 @@ import { useApp } from "../state/AppState";
 export function TopBar() {
   const app = useApp();
   const {
-    data, model, report, reportIssue, route, search, obligationsOpen, runtime, showRuntime,
-    theme, themeControllable,
+    data, model, index, report, reportIssue, route, search, obligationsOpen, runtime, showRuntime,
+    transactionProofs, showConflicts, theme, themeControllable,
   } = app;
+  const hasTransactionProofs = transactionProofs.serializability.length > 0;
+  // The path down the model's hierarchy to the page in view: system,
+  // then the service, then the operation, then its transaction — every
+  // step a link back up.
+  const crumbs = ancestry(route, model, index);
   const counts = report ? statusCounts(report.obligations) : null;
   const tally = counts
     ? (["disproven", "unknown", "proven"] as const)
@@ -67,16 +73,15 @@ export function TopBar() {
 
         <div className="hidden min-w-0 flex-1 items-center gap-3 overflow-hidden @3xl:flex">
           <Breadcrumbs size="sm">
-            {route.view === "system" ? (
-              <Breadcrumbs.Current>system</Breadcrumbs.Current>
-            ) : (
-              <>
-                <Breadcrumbs.Link href={hashes.system()}>system</Breadcrumbs.Link>
-                <Breadcrumbs.Separator />
-                <Breadcrumbs.Current>{route.view === "op" ? "operation" : "machine"}</Breadcrumbs.Current>
-                <Breadcrumbs.Separator />
-                <Breadcrumbs.Current>{route.id}</Breadcrumbs.Current>
-              </>
+            {crumbs.map((c, i) =>
+              i < crumbs.length - 1 ? (
+                <Fragment key={c.hash}>
+                  <Breadcrumbs.Link href={c.hash}>{c.label}</Breadcrumbs.Link>
+                  <Breadcrumbs.Separator />
+                </Fragment>
+              ) : (
+                <Breadcrumbs.Current key={c.hash}>{c.label}</Breadcrumbs.Current>
+              ),
             )}
           </Breadcrumbs>
         </div>
@@ -128,6 +133,27 @@ export function TopBar() {
                   </span>
                 }
               />
+              {/* The conflict overlay: an L0 reading of the transactions'
+                  serializability arguments. Offered only when the model
+                  declares one; hiding it hides the drawing, never the
+                  argument. */}
+              {hasTransactionProofs && (
+                <Tooltip
+                  content="Conflict arcs between operations whose transactions may conflict: green when every dependency between them is commit-ordered by a declared fact, amber dashed when one is not. Read off the transactions alone — never from runtime topology."
+                  render={
+                    <span className="inline-flex">
+                      <Switch
+                        size="sm"
+                        label="conflicts"
+                        controlFirst={false}
+                        checked={showConflicts}
+                        onCheckedChange={app.setShowConflicts}
+                        aria-label="Draw the transaction conflict overlay"
+                      />
+                    </span>
+                  }
+                />
+              )}
             </span>
           )}
           {report && (

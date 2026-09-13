@@ -2,17 +2,28 @@
 # card, apply the payment — every hand-off an identified event on one
 # keyed topic.
 #
-# Serialization and ordering are discharged from the runtime topology
-# at the foot of this file, so those proofs are runtime-dependent.
+# Serializability and ordering are properties of transactions here,
+# proven from the transactions themselves. The order object is versioned: applying a
+# payment and cancelling an order both observe the order's version,
+# validate it at commit, apply their transition, and bump it, so a
+# stale observation rejects rather than commits — the OCC route that
+# constrains every read-write anti-dependency between them, with
+# create_order's insert in the same closure. apply_payment additionally
+# persists the captured sequence through a successor cursor, which is
+# what proves that payments apply to an order in sequence order. The
+# runtime topology at the foot of the file describes placement and
+# transport only; no proof here consumes it.
 #
-# The model keeps four deliberate gaps, and the checker reports each:
-# tx.reserve_inventory is not deduplicated and its write depends on a
-# read, so reserve_inventory is neither idempotent nor recoverable;
-# the card charge is explicitly not deduplicated, so no same-key
-# terminal result is fixed and charge_payment's branch on it is not
-# established to replay; and create_order's idempotency is unknown
-# through the cascade those consumers start.
-dsl: 3
+# The model keeps its deliberate gaps, and the checker reports each:
+# tx.reserve_inventory reads stock and writes it back under read
+# committed with neither a lock nor a version — the write-skew shape —
+# so its serializability is unproven and its idempotency and
+# recoverability with it; the card charge is explicitly not
+# deduplicated, so no same-key terminal result is fixed and
+# charge_payment's match on it is not established to replay; and
+# create_order's idempotency is unknown through the cascade those
+# consumers start.
+dsl: 4
 revision: 1
 services:
   service.checkout:
@@ -106,6 +117,7 @@ schemas:
     fields:
       event_id: string
       order_id: uuid
+      sequence: int
       amount: decimal
   schema.PaymentFailed:
     kind: canonical
@@ -133,6 +145,8 @@ schemas:
       order_id: uuid
       status: string
       amount: decimal
+      version: int
+      last_applied_sequence: int
   schema.StockRecord:
     kind: canonical
     completeness: complete
@@ -148,6 +162,11 @@ data_models:
         schema: schema.OrderRecord
         identity:
         - order_id
+        # The order's application concurrency token: every mutation of
+        # a live order bumps it, and a transaction that observed it
+        # validates it at commit.
+        version:
+          field: version
   data.inventory:
     objects:
       object.stock:
@@ -220,70 +239,72 @@ operations:
           - idempotency_key
         result:
           ok: schema.CreateOrderResponse
-          err: schema.RequestRejected
+          errors:
+            rejected: schema.RequestRejected
     program:
       steps:
       - kind: transaction
-        id: tx.create_order.new
-        data_model: data.checkout
-        isolation: read_committed
-        idempotency:
-          kind: deduplicated_by
-          key:
-            components:
-            - source: input:input.create_order.request
-              path: idempotency_key
-        steps:
-        - kind: insert
-          object: object.order
-          values:
-            kind: deterministic
-            from:
-            - source: input:input.create_order.request
-              path: order_id
-            - source: input:input.create_order.request
-              path: amount
-        - kind: establish_effect_intent
-          bind: intent.create_order.publish_created
-          effect_id: effect.create_order.publish_created
-          effect:
-            kind: publication
-            topic: topic.order_events
-            schema: schema.OrderCreated
-            idempotency_key_propagation:
-            - source:
-                components:
-                - source: input:input.create_order.request
-                  path: idempotency_key
-              target:
-                components:
-                - source: effect:effect.create_order.publish_created
-                  path: event_id
-          values:
-            kind: deterministic
-            from:
-            - source: input:input.create_order.request
-              path: order_id
-            - source: input:input.create_order.request
-              path: idempotency_key
-            - source: input:input.create_order.request
-              path: warehouse_id
-            - source: input:input.create_order.request
-              path: sku
-            - source: input:input.create_order.request
-              path: quantity
-            - source: input:input.create_order.request
-              path: amount
-        # status is the constant initial state, so the only provenance
-        # root is the order id.
-        - kind: establish_transaction_output
-          bind: output.create_order
-          schema: schema.CreateOrderResponse
-          values:
-            kind: deterministic
-            from:
-            - source: input:input.create_order.request
-              path: order_id
+        transaction:
+          id: tx.create_order.new
+          data_model: data.checkout
+          isolation: read_committed
+          idempotency:
+            kind: deduplicated_by
+            key:
+              components:
+              - source: input:input.create_order.request
+                path: idempotency_key
+          steps:
+          - kind: insert
+            object: object.order
+            values:
+              kind: deterministic
+              from:
+              - source: input:input.create_order.request
+                path: order_id
+              - source: input:input.create_order.request
+                path: amount
+          - kind: establish_effect_intent
+            bind: intent.create_order.publish_created
+            effect_id: effect.create_order.publish_created
+            effect:
+              kind: publication
+              topic: topic.order_events
+              schema: schema.OrderCreated
+              idempotency_key_propagation:
+              - source:
+                  components:
+                  - source: input:input.create_order.request
+                    path: idempotency_key
+                target:
+                  components:
+                  - source: effect:effect.create_order.publish_created
+                    path: event_id
+            values:
+              kind: deterministic
+              from:
+              - source: input:input.create_order.request
+                path: order_id
+              - source: input:input.create_order.request
+                path: idempotency_key
+              - source: input:input.create_order.request
+                path: warehouse_id
+              - source: input:input.create_order.request
+                path: sku
+              - source: input:input.create_order.request
+                path: quantity
+              - source: input:input.create_order.request
+                path: amount
+          # status is the constant initial state, so the only provenance
+          # root is the order id.
+          - kind: establish_transaction_output
+            bind: output.create_order
+            schema: schema.CreateOrderResponse
+            values:
+              kind: deterministic
+              from:
+              - source: input:input.create_order.request
+                path: order_id
       - kind: execute_effect_intent
         intent: intent.create_order.publish_created
       - kind: return
@@ -298,8 +319,6 @@ operations:
             - source: transaction_output:output.create_order
               path: status
     requirements:
-      serialization: []
-      ordering: []
       idempotency:
       - key:
           components:
@@ -326,102 +345,105 @@ operations:
     program:
       steps:
       - kind: transaction
-        id: tx.reserve_inventory
-        data_model: data.inventory
-        isolation: read_committed
-        idempotency:
-          kind: not_deduplicated
-        steps:
-        - kind: read
-          bind: read.reserve_inventory.stock
-          target:
-            object: object.stock
-            predicate:
-              kind: and
-              predicates:
-              - kind: eq
-                field: warehouse_id
-                value:
-                  source: input:input.reserve_inventory.created
-                  path: warehouse_id
-              - kind: eq
-                field: sku
-                value:
-                  source: input:input.reserve_inventory.created
-                  path: sku
-          fields:
-            kind: only
+        transaction:
+          id: tx.reserve_inventory
+          data_model: data.inventory
+          isolation: read_committed
+          idempotency:
+            kind: not_deduplicated
+          # The read-then-write of the stock row under read committed,
+          # with neither a lock nor a version protocol: the write-skew
+          # shape. The serializability obligation is deliberately left
+          # unproven, and the checker names the unprotected
+          # anti-dependency.
+          requirements:
+            serializability:
+            - key:
+                source: input:input.reserve_inventory.created
+                path: order_id
+          steps:
+          - kind: read
+            bind: read.reserve_inventory.stock
+            target:
+              object: object.stock
+              predicate:
+                kind: and
+                predicates:
+                - kind: eq
+                  field: warehouse_id
+                  value:
+                    source: input:input.reserve_inventory.created
+                    path: warehouse_id
+                - kind: eq
+                  field: sku
+                  value:
+                    source: input:input.reserve_inventory.created
+                    path: sku
             fields:
-            - on_hand
+              kind: only
+              fields:
+              - on_hand
+              - reserved
+          - kind: write
+            target:
+              object: object.stock
+              predicate:
+                kind: and
+                predicates:
+                - kind: eq
+                  field: warehouse_id
+                  value:
+                    source: input:input.reserve_inventory.created
+                    path: warehouse_id
+                - kind: eq
+                  field: sku
+                  value:
+                    source: input:input.reserve_inventory.created
+                    path: sku
+            fields:
             - reserved
-        - kind: write
-          target:
-            object: object.stock
-            predicate:
-              kind: and
-              predicates:
-              - kind: eq
-                field: warehouse_id
-                value:
-                  source: input:input.reserve_inventory.created
-                  path: warehouse_id
-              - kind: eq
-                field: sku
-                value:
-                  source: input:input.reserve_inventory.created
-                  path: sku
-          fields:
-          - reserved
-          values:
-            kind: deterministic
-            from:
-            - source: transaction_read:read.reserve_inventory.stock
-              path: reserved
-            - source: input:input.reserve_inventory.created
-              path: quantity
-        - kind: establish_effect_intent
-          bind: intent.reserve_inventory.publish_reserved
-          effect_id: effect.reserve_inventory.publish_reserved
-          effect:
-            kind: publication
-            topic: topic.order_events
-            schema: schema.InventoryReserved
-            idempotency_key_propagation:
-            - source:
-                components:
-                - source: input:input.reserve_inventory.created
-                  path: event_id
-              target:
-                components:
-                - source: effect:effect.reserve_inventory.publish_reserved
-                  path: event_id
-          values:
-            kind: deterministic
-            from:
-            - source: input:input.reserve_inventory.created
-              path: order_id
-            - source: input:input.reserve_inventory.created
-              path: event_id
-            - source: input:input.reserve_inventory.created
-              path: warehouse_id
-            - source: input:input.reserve_inventory.created
-              path: sku
-            - source: input:input.reserve_inventory.created
-              path: quantity
-            - source: input:input.reserve_inventory.created
-              path: amount
+            values:
+              kind: deterministic
+              from:
+              - source: transaction_read:read.reserve_inventory.stock
+                path: reserved
+              - source: input:input.reserve_inventory.created
+                path: quantity
+          - kind: establish_effect_intent
+            bind: intent.reserve_inventory.publish_reserved
+            effect_id: effect.reserve_inventory.publish_reserved
+            effect:
+              kind: publication
+              topic: topic.order_events
+              schema: schema.InventoryReserved
+              idempotency_key_propagation:
+              - source:
+                  components:
+                  - source: input:input.reserve_inventory.created
+                    path: event_id
+                target:
+                  components:
+                  - source: effect:effect.reserve_inventory.publish_reserved
+                    path: event_id
+            values:
+              kind: deterministic
+              from:
+              - source: input:input.reserve_inventory.created
+                path: order_id
+              - source: input:input.reserve_inventory.created
+                path: event_id
+              - source: input:input.reserve_inventory.created
+                path: warehouse_id
+              - source: input:input.reserve_inventory.created
+                path: sku
+              - source: input:input.reserve_inventory.created
+                path: quantity
+              - source: input:input.reserve_inventory.created
+                path: amount
       - kind: execute_effect_intent
         intent: intent.reserve_inventory.publish_reserved
       - kind: complete
     requirements:
-      serialization:
-      - key:
-          source: input:input.reserve_inventory.created
-          path: order_id
-      ordering:
-      - key:
-          source: input:input.reserve_inventory.created
-          path: order_id
       idempotency:
       - key:
           components:
@@ -458,7 +480,8 @@ operations:
           result_replay: unspecified
           result:
             ok: schema.ChargeAccepted
-            err: schema.ChargeDeclined
+            errors:
+              declined: schema.ChargeDeclined
         values:
           kind: unspecified
         bind: result.charge_payment.card
@@ -491,44 +514,37 @@ operations:
               - source: input:input.charge_payment.reserved
                 path: amount
           - kind: complete
-        err:
-          steps:
-          # No modeled operation consumes PaymentFailed; the err arm
-          # exists to observe the provider's declined outcome.
-          - kind: execute_effect
-            effect_id: effect.charge_payment.publish_failed
-            effect:
-              kind: publication
-              topic: topic.order_events
-              schema: schema.PaymentFailed
-              idempotency_key_propagation:
-              - source:
-                  components:
-                  - source: input:input.charge_payment.reserved
-                    path: event_id
-                target:
-                  components:
-                  - source: effect:effect.charge_payment.publish_failed
-                    path: event_id
-            values:
-              kind: deterministic
-              from:
-              - source: input:input.charge_payment.reserved
-                path: event_id
-              - source: input:input.charge_payment.reserved
-                path: order_id
-              - source: effect_result_err:result.charge_payment.card
-                path: reason
-          - kind: complete
+        errors:
+          declined:
+            steps:
+            # No modeled operation consumes PaymentFailed; the declined
+            # arm exists to observe the provider's outcome.
+            - kind: execute_effect
+              effect_id: effect.charge_payment.publish_failed
+              effect:
+                kind: publication
+                topic: topic.order_events
+                schema: schema.PaymentFailed
+                idempotency_key_propagation:
+                - source:
+                    components:
+                    - source: input:input.charge_payment.reserved
+                      path: event_id
+                  target:
+                    components:
+                    - source: effect:effect.charge_payment.publish_failed
+                      path: event_id
+              values:
+                kind: deterministic
+                from:
+                - source: input:input.charge_payment.reserved
+                  path: event_id
+                - source: input:input.charge_payment.reserved
+                  path: order_id
+                - source: effect_result_err:result.charge_payment.card
+                  path: reason
+            - kind: complete
     requirements:
-      serialization:
-      - key:
-          source: input:input.charge_payment.reserved
-          path: order_id
-      ordering:
-      - key:
-          source: input:input.charge_payment.reserved
-          path: order_id
       idempotency:
       - key:
           components:
@@ -538,7 +554,7 @@ operations:
       recoverability: []
   operation.cancel_order:
     service: service.checkout
-    description: Cancel a pending order and publish OrderCancelled.
+    description: Cancel a pending order and publish OrderCancelled; an order that is no longer pending rejects the transaction.
     inputs:
       input.cancel_order.request:
         kind: request
@@ -547,45 +563,99 @@ operations:
           kind: unspecified
         result:
           ok: schema.CancelOrderResponse
-          err: schema.RequestRejected
+          errors:
+            not_pending:
+              schema: schema.RequestRejected
+              disposition: terminal
     program:
       steps:
       - kind: transaction
-        id: tx.cancel_order
-        data_model: data.checkout
-        isolation: read_committed
-        # A transition transaction needs no keyed commit when nothing
-        # declares a retry obligation over it: cancel_order carries no
-        # idempotency or recoverability requirement, so the blocked
-        # natural-replay route costs no proof (Amendment A).
-        idempotency:
-          kind: unspecified
-        steps:
-        - kind: transition
-          machine: machine.order_lifecycle
-          transition: transition.order.cancel
-          subject:
-            object: object.order
-            predicate:
-              kind: eq
-              field: order_id
-              value:
-                source: input:input.cancel_order.request
+        transaction:
+          id: tx.cancel_order
+          data_model: data.checkout
+          isolation: read_committed
+          # A transition transaction needs no keyed commit when nothing
+          # declares a retry obligation over it: cancel_order carries no
+          # idempotency or recoverability requirement, so the blocked
+          # natural-replay route costs no proof.
+          idempotency:
+            kind: unspecified
+          steps:
+          - kind: read
+            bind: read.cancel_order.order
+            target:
+              object: object.order
+              predicate:
+                kind: eq
+                field: order_id
+                value:
+                  source: input:input.cancel_order.request
+                  path: order_id
+            fields:
+              kind: only
+              fields:
+              - order_id
+              - version
+          - kind: validate_version
+            target:
+              object: object.order
+              predicate:
+                kind: eq
+                field: order_id
+                value:
+                  source: input:input.cancel_order.request
+                  path: order_id
+            expected:
+              source: transaction_read:read.cancel_order.order
+              path: version
+          - kind: transition
+            machine: machine.order_lifecycle
+            transition: transition.order.cancel
+            subject:
+              object: object.order
+              predicate:
+                kind: eq
+                field: order_id
+                value:
+                  source: input:input.cancel_order.request
+                  path: order_id
+            effect_intents: {}
+          - kind: bump_version
+            target:
+              object: object.order
+              predicate:
+                kind: eq
+                field: order_id
+                value:
+                  source: input:input.cancel_order.request
+                  path: order_id
+          - kind: establish_effect_intent
+            bind: intent.cancel_order.publish_cancelled
+            effect_id: effect.cancel_order.publish_cancelled
+            effect:
+              kind: publication
+              topic: topic.order_events
+              schema: schema.OrderCancelled
+              idempotency_key_propagation: []
+            values:
+              kind: deterministic
+              from:
+              - source: input:input.cancel_order.request
                 path: order_id
-          effect_intents: {}
-        - kind: establish_effect_intent
-          bind: intent.cancel_order.publish_cancelled
-          effect_id: effect.cancel_order.publish_cancelled
-          effect:
-            kind: publication
-            topic: topic.order_events
-            schema: schema.OrderCancelled
-            idempotency_key_propagation: []
-          values:
-            kind: deterministic
-            from:
-            - source: input:input.cancel_order.request
-              path: order_id
+        # The order was not pending, or its version moved under the
+        # request: nothing committed, and the boundary says so.
+        rejected:
+          steps:
+          - kind: return
+            request: input.cancel_order.request
+            outcome:
+              kind: err
+              error: not_pending
+              values:
+                kind: deterministic
+                from:
+                - source: input:input.cancel_order.request
+                  path: order_id
       - kind: execute_effect_intent
         intent: intent.cancel_order.publish_cancelled
       - kind: return
@@ -598,13 +668,11 @@ operations:
             - source: input:input.cancel_order.request
               path: order_id
     requirements:
-      serialization: []
-      ordering: []
       idempotency: []
       recoverability: []
   operation.apply_payment:
     service: service.checkout
-    description: Advance a pending order to paid on PaymentCaptured.
+    description: Advance a pending order to paid on PaymentCaptured, in capture sequence.
     inputs:
       input.apply_payment.captured:
         kind: subscription
@@ -616,63 +684,114 @@ operations:
     program:
       steps:
       - kind: transaction
-        id: tx.apply_payment
-        data_model: data.checkout
-        isolation: read_committed
-        idempotency:
-          kind: deduplicated_by
-          key:
-            components:
-            - source: input:input.apply_payment.captured
-              path: event_id
-        steps:
-        - kind: read
-          bind: read.apply_payment.order
-          target:
-            object: object.order
-            predicate:
-              kind: eq
-              field: order_id
-              value:
+        transaction:
+          id: tx.apply_payment
+          data_model: data.checkout
+          isolation: read_committed
+          idempotency:
+            kind: deduplicated_by
+            key:
+              components:
+              - source: input:input.apply_payment.captured
+                path: event_id
+          # Serializable by order through the version protocol below,
+          # and ordered by the captured sequence through the successor
+          # cursor on the order.
+          requirements:
+            serializability:
+            - key:
                 source: input:input.apply_payment.captured
                 path: order_id
-          fields:
-            kind: only
-            fields:
-            - order_id
-        - kind: transition
-          machine: machine.order_lifecycle
-          transition: transition.order.mark_paid
-          subject:
-            object: object.order
-            predicate:
-              kind: eq
-              field: order_id
-              value:
+            ordering:
+            - key:
                 source: input:input.apply_payment.captured
                 path: order_id
-          effect_intents:
-            effect.order.paid:
-              bind: intent.apply_payment.order_paid
-              values:
-                kind: deterministic
-                from:
-                - source: transaction_read:read.apply_payment.order
+              position:
+                source: input:input.apply_payment.captured
+                path: sequence
+          steps:
+          - kind: read
+            bind: read.apply_payment.order
+            target:
+              object: object.order
+              predicate:
+                kind: eq
+                field: order_id
+                value:
+                  source: input:input.apply_payment.captured
                   path: order_id
-                - source: input:input.apply_payment.captured
-                  path: event_id
+            fields:
+              kind: only
+              fields:
+              - order_id
+              - version
+              - last_applied_sequence
+          - kind: validate_version
+            target:
+              object: object.order
+              predicate:
+                kind: eq
+                field: order_id
+                value:
+                  source: input:input.apply_payment.captured
+                  path: order_id
+            expected:
+              source: transaction_read:read.apply_payment.order
+              path: version
+          - kind: advance_cursor
+            target:
+              object: object.order
+              predicate:
+                kind: eq
+                field: order_id
+                value:
+                  source: input:input.apply_payment.captured
+                  path: order_id
+            field: last_applied_sequence
+            incoming:
+              source: input:input.apply_payment.captured
+              path: sequence
+            rule: successor
+          - kind: transition
+            machine: machine.order_lifecycle
+            transition: transition.order.mark_paid
+            subject:
+              object: object.order
+              predicate:
+                kind: eq
+                field: order_id
+                value:
+                  source: input:input.apply_payment.captured
+                  path: order_id
+            effect_intents:
+              effect.order.paid:
+                bind: intent.apply_payment.order_paid
+                values:
+                  kind: deterministic
+                  from:
+                  - source: transaction_read:read.apply_payment.order
+                    path: order_id
+                  - source: input:input.apply_payment.captured
+                    path: event_id
+          - kind: bump_version
+            target:
+              object: object.order
+              predicate:
+                kind: eq
+                field: order_id
+                value:
+                  source: input:input.apply_payment.captured
+                  path: order_id
+        # A stale or out-of-sequence capture, or an order no longer
+        # pending, rejects: nothing is applied, and the delivery
+        # completes without announcing anything.
+        rejected:
+          steps:
+          - kind: complete
       - kind: execute_effect_intent
         intent: intent.apply_payment.order_paid
       - kind: complete
     requirements:
-      serialization:
-      - key:
-          source: input:input.apply_payment.captured
-          path: order_id
-      ordering:
-      - key:
-          source: input:input.apply_payment.captured
-          path: order_id
       idempotency:
       - key:
           components:
@@ -696,126 +815,128 @@ operations:
           kind: unspecified
         result:
           ok: schema.TransferStockResponse
-          err: schema.RequestRejected
+          errors:
+            rejected: schema.RequestRejected
     program:
       steps:
       - kind: transaction
-        id: tx.transfer_stock
-        data_model: data.inventory
-        isolation: read_committed
-        idempotency:
-          kind: unspecified
-        steps:
-        # The two exclusive locks below take the source and destination
-        # rows as separate steps in program order with no acquisition
-        # order between them, so a concurrent transfer in the opposite
-        # direction may deadlock. The DSL cannot yet say otherwise and
-        # no checker yet looks (CONSEQA_DSL_SEMANTICS.md §27,
-        # questions 8 and 9).
-        - kind: lock
-          target:
-            object: object.stock
-            predicate:
-              kind: and
-              predicates:
-              - kind: eq
-                field: warehouse_id
-                value:
-                  source: input:input.transfer_stock.request
-                  path: source_warehouse_id
-              - kind: eq
-                field: sku
-                value:
-                  source: input:input.transfer_stock.request
-                  path: sku
-          mode: exclusive
-          order:
+        transaction:
+          id: tx.transfer_stock
+          data_model: data.inventory
+          isolation: read_committed
+          idempotency:
             kind: unspecified
-        - kind: lock
-          target:
-            object: object.stock
-            predicate:
-              kind: and
-              predicates:
-              - kind: eq
-                field: warehouse_id
-                value:
-                  source: input:input.transfer_stock.request
-                  path: destination_warehouse_id
-              - kind: eq
-                field: sku
-                value:
-                  source: input:input.transfer_stock.request
-                  path: sku
-          mode: exclusive
-          order:
-            kind: unspecified
-        - kind: read
-          bind: read.transfer_stock.source_stock
-          target:
-            object: object.stock
-            predicate:
-              kind: and
-              predicates:
-              - kind: eq
-                field: warehouse_id
-                value:
-                  source: input:input.transfer_stock.request
-                  path: source_warehouse_id
-              - kind: eq
-                field: sku
-                value:
-                  source: input:input.transfer_stock.request
-                  path: sku
-          fields:
-            kind: only
+          steps:
+          # The two exclusive locks below take the source and destination
+          # rows as separate steps in program order with no acquisition
+          # order between them, so a concurrent transfer in the opposite
+          # direction may deadlock. The DSL cannot yet say otherwise and
+          # no checker yet looks: serializability and deadlock freedom
+          # are separate properties.
+          - kind: lock
+            target:
+              object: object.stock
+              predicate:
+                kind: and
+                predicates:
+                - kind: eq
+                  field: warehouse_id
+                  value:
+                    source: input:input.transfer_stock.request
+                    path: source_warehouse_id
+                - kind: eq
+                  field: sku
+                  value:
+                    source: input:input.transfer_stock.request
+                    path: sku
+            mode: exclusive
+            order:
+              kind: unspecified
+          - kind: lock
+            target:
+              object: object.stock
+              predicate:
+                kind: and
+                predicates:
+                - kind: eq
+                  field: warehouse_id
+                  value:
+                    source: input:input.transfer_stock.request
+                    path: destination_warehouse_id
+                - kind: eq
+                  field: sku
+                  value:
+                    source: input:input.transfer_stock.request
+                    path: sku
+            mode: exclusive
+            order:
+              kind: unspecified
+          - kind: read
+            bind: read.transfer_stock.source_stock
+            target:
+              object: object.stock
+              predicate:
+                kind: and
+                predicates:
+                - kind: eq
+                  field: warehouse_id
+                  value:
+                    source: input:input.transfer_stock.request
+                    path: source_warehouse_id
+                - kind: eq
+                  field: sku
+                  value:
+                    source: input:input.transfer_stock.request
+                    path: sku
+            fields:
+              kind: only
+              fields:
+              - on_hand
+          - kind: write
+            target:
+              object: object.stock
+              predicate:
+                kind: and
+                predicates:
+                - kind: eq
+                  field: warehouse_id
+                  value:
+                    source: input:input.transfer_stock.request
+                    path: source_warehouse_id
+                - kind: eq
+                  field: sku
+                  value:
+                    source: input:input.transfer_stock.request
+                    path: sku
             fields:
             - on_hand
-        - kind: write
-          target:
-            object: object.stock
-            predicate:
-              kind: and
-              predicates:
-              - kind: eq
-                field: warehouse_id
-                value:
-                  source: input:input.transfer_stock.request
-                  path: source_warehouse_id
-              - kind: eq
-                field: sku
-                value:
-                  source: input:input.transfer_stock.request
-                  path: sku
-          fields:
-          - on_hand
-          values:
-            kind: deterministic
-            from:
-            - source: transaction_read:read.transfer_stock.source_stock
-              path: on_hand
-            - source: input:input.transfer_stock.request
-              path: quantity
-        - kind: write
-          target:
-            object: object.stock
-            predicate:
-              kind: and
-              predicates:
-              - kind: eq
-                field: warehouse_id
-                value:
-                  source: input:input.transfer_stock.request
-                  path: destination_warehouse_id
-              - kind: eq
-                field: sku
-                value:
-                  source: input:input.transfer_stock.request
-                  path: sku
-          fields:
-          - on_hand
-          values:
-            kind: unspecified
+            values:
+              kind: deterministic
+              from:
+              - source: transaction_read:read.transfer_stock.source_stock
+                path: on_hand
+              - source: input:input.transfer_stock.request
+                path: quantity
+          - kind: write
+            target:
+              object: object.stock
+              predicate:
+                kind: and
+                predicates:
+                - kind: eq
+                  field: warehouse_id
+                  value:
+                    source: input:input.transfer_stock.request
+                    path: destination_warehouse_id
+                - kind: eq
+                  field: sku
+                  value:
+                    source: input:input.transfer_stock.request
+                    path: sku
+            fields:
+            - on_hand
+            values:
+              kind: unspecified
       - kind: return
         request: input.transfer_stock.request
         outcome:
@@ -823,15 +944,14 @@ operations:
           values:
             kind: unspecified
     requirements:
-      serialization: []
-      ordering: []
       idempotency: []
       recoverability: []
 
 # ---------------------------------------------------------------------
 # L1 — one runtime realization of the machine above.
 #
-# Two facts this topology is chosen to make visible:
+# Placement, transport, and capacity facts only. Three things this
+# topology is chosen to make visible:
 #
 #   * reserve_inventory (service.inventory) and apply_payment
 #     (service.checkout) share pool.order_workers. Services carry no
@@ -842,14 +962,14 @@ operations:
 #   * A shared pool is a shared execution population, not a shared
 #     routing domain. Both subscriptions route by the same order_id
 #     topic key, and nothing infers that their domains have a common
-#     owner. Each proof stands on its own routing declaration.
+#     owner.
 #
-#   * The serial worker pools declare execution_handoff:
-#     exclusive_ownership — the fourth leg of every topology
-#     serialization proof. consistent_hash gives one owner per stable
-#     ownership epoch and bounded(1) binds each member separately;
-#     only the declared handoff fact says a stale owner cannot still
-#     be executing while its replacement begins.
+#   * None of it proves a transaction property. The serial worker pools
+#     and the consistent-hash routing describe where same-order work
+#     ordinarily lands; the version protocol and the sequence cursor on
+#     the order are what make apply_payment serializable and ordered,
+#     and they hold under redelivery, worker replacement, and a stale
+#     worker that the topology cannot see.
 # ---------------------------------------------------------------------
 runtime:
 
@@ -873,13 +993,11 @@ runtime:
       member_concurrency:
         kind: bounded
         value: 1
-      execution_handoff: exclusive_ownership
 
     pool.payment_workers:
       member_concurrency:
         kind: bounded
         value: 1
-      execution_handoff: exclusive_ownership
 
     pool.checkout_api:
       member_concurrency:

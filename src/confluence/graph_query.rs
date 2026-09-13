@@ -247,10 +247,12 @@ pub fn run(workspace: &WorkspaceState, graph: &SymbolGraph, query: &GraphQuery) 
             })
             .unwrap_or_default(),
 
-        GraphQuery::ImpactedBy { symbol, depth } => traverse(graph, symbol, *depth, Direction::Incoming)
-            .into_iter()
-            .map(|(symbol, distance)| QueryRow::Impacted { symbol, distance })
-            .collect(),
+        GraphQuery::ImpactedBy { symbol, depth } => {
+            traverse(graph, symbol, *depth, Direction::Incoming)
+                .into_iter()
+                .map(|(symbol, distance)| QueryRow::Impacted { symbol, distance })
+                .collect()
+        }
 
         GraphQuery::OperationNeighborhood { operation, depth } => traverse(
             graph,
@@ -415,7 +417,9 @@ struct EffectValues<'a> {
     transaction: Option<&'a Transaction>,
 }
 
-fn index_program(program: &crate::spec::OperationBlock) -> (ProgramIndex<'_>, FxHashMap<&Id, EffectValues<'_>>) {
+fn index_program(
+    program: &crate::spec::OperationBlock,
+) -> (ProgramIndex<'_>, FxHashMap<&Id, EffectValues<'_>>) {
     let mut bindings = FxHashMap::default();
     let mut effects: FxHashMap<&Id, EffectValues<'_>> = FxHashMap::default();
 
@@ -426,15 +430,21 @@ fn index_program(program: &crate::spec::OperationBlock) -> (ProgramIndex<'_>, Fx
     for (_, step) in program.steps_with_locations() {
         match step {
             OperationStep::ExecuteEffectAsync(execute) => {
-                handles.insert(&execute.handle, AsyncHandleSite::Direct {
-                    effect: &execute.effect_id,
-                });
+                handles.insert(
+                    &execute.handle,
+                    AsyncHandleSite::Direct {
+                        effect: &execute.effect_id,
+                    },
+                );
             }
 
             OperationStep::ExecuteEffectIntentAsync(execute) => {
-                handles.insert(&execute.handle, AsyncHandleSite::Intent {
-                    intent: &execute.intent,
-                });
+                handles.insert(
+                    &execute.handle,
+                    AsyncHandleSite::Intent {
+                        intent: &execute.intent,
+                    },
+                );
             }
 
             _ => {}
@@ -443,7 +453,9 @@ fn index_program(program: &crate::spec::OperationBlock) -> (ProgramIndex<'_>, Fx
 
     for (_, step) in program.steps_with_locations() {
         match step {
-            OperationStep::Transaction(transaction) => {
+            OperationStep::Transaction(execute) => {
+                let transaction = &execute.transaction;
+
                 for inner in &transaction.steps {
                     match inner {
                         TransactionStep::EstablishEffectIntent(establish) => {
@@ -535,8 +547,7 @@ fn index_program(program: &crate::spec::OperationBlock) -> (ProgramIndex<'_>, Fx
 
             OperationStep::JoinAll(join) => {
                 for entry in &join.handles {
-                    let (Some(bind), Some(site)) = (&entry.bind, handles.get(&entry.handle))
-                    else {
+                    let (Some(bind), Some(site)) = (&entry.bind, handles.get(&entry.handle)) else {
                         continue;
                     };
 
@@ -582,7 +593,11 @@ impl<'a> AsyncHandleSite<'a> {
     }
 }
 
-fn provenance_roots(workspace: &WorkspaceState, operation: &Id, binding: &Id) -> Vec<ProvenanceRoot> {
+fn provenance_roots(
+    workspace: &WorkspaceState,
+    operation: &Id,
+    binding: &Id,
+) -> Vec<ProvenanceRoot> {
     let Some(program) = workspace
         .operations
         .get(operation)
@@ -692,9 +707,9 @@ impl ProvenanceWalker<'_, '_> {
 
     fn derivation(&mut self, values: &Derivation, transaction: Option<&Transaction>, at: &str) {
         match values {
-            Derivation::Unspecified => self.roots.push(ProvenanceRoot::Unspecified {
-                at: at.to_string(),
-            }),
+            Derivation::Unspecified => self
+                .roots
+                .push(ProvenanceRoot::Unspecified { at: at.to_string() }),
 
             Derivation::Deterministic { from } => {
                 for root in from {
@@ -721,10 +736,9 @@ impl ProvenanceWalker<'_, '_> {
             ValueSource::TransactionRead(bind) => {
                 let resolved = transaction.and_then(|transaction| {
                     transaction.steps.iter().find_map(|step| match step {
-                        TransactionStep::Read(read) if &read.bind == bind => Some((
-                            transaction.id.clone(),
-                            read.target.object.clone(),
-                        )),
+                        TransactionStep::Read(read) if &read.bind == bind => {
+                            Some((transaction.id.clone(), read.target.object.clone()))
+                        }
                         _ => None,
                     })
                 });
@@ -764,7 +778,9 @@ impl ProvenanceWalker<'_, '_> {
                 }
             }
 
-            ValueSource::EffectResultOk(binding) => self.result_root(binding, reference, ResultVariant::Ok),
+            ValueSource::EffectResultOk(binding) => {
+                self.result_root(binding, reference, ResultVariant::Ok)
+            }
 
             ValueSource::EffectResultErr(binding) => {
                 self.result_root(binding, reference, ResultVariant::Err)

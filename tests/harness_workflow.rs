@@ -21,7 +21,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use conseqa::confluence::{
     AgentBackendMetadata, CommitRequest, ConfluenceEngine, Mutation, OperationInterfaceDraft,
-    PatchId, ProposedRequirement, PromptObligation, PromptObligationId, PromptObligationStatus,
+    PatchId, PromptObligation, PromptObligationId, PromptObligationStatus, ProposedRequirement,
     RequirementOrigin, RequirementSubmission, RunId, RunMetadata, RunPolicy, SpecPatch,
     WorkspaceState,
 };
@@ -33,10 +33,9 @@ use conseqa::harness::{
     RunStatus, Scheduler, SchedulerPolicy, Supervisor, Workflow, WorkflowConfig,
 };
 use conseqa::spec::{
-    CanonicalSchema, Derivation, ErrorDisposition, ErrorResultType, Field,
-    Id, IdempotencyKey, Input, OperationBlock, OperationStep,
-    RequestIdentity, RequestInput, ResultOutcome, ResultType, Return, ScalarType, Schema,
-    SchemaCompleteness, SerializationRequirement, Service, ServiceKind, TypeRef, ValueRef,
+    CanonicalSchema, Derivation, ErrorDisposition, ErrorResultType, Field, Id, IdempotencyKey,
+    Input, OperationBlock, OperationStep, RequestIdentity, RequestInput, ResultOutcome, ResultType,
+    Return, ScalarType, Schema, SchemaCompleteness, Service, ServiceKind, TypeRef, ValueRef,
     ValueSource,
 };
 use uuid::Uuid;
@@ -158,14 +157,16 @@ fn ping_interface() -> OperationInterfaceDraft {
                 }),
                 result: ResultType {
                     ok: id("schema.PingResponse"),
-                    err: ErrorResultType {
-                        schema: id("schema.Rejected"),
-                        disposition: ErrorDisposition::Terminal,
-                    },
+                    errors: BTreeMap::from([(
+                        id("rejected"),
+                        ErrorResultType {
+                            schema: id("schema.Rejected"),
+                            disposition: ErrorDisposition::Terminal,
+                        },
+                    )]),
                 },
             }),
         )]),
-        invocation_lock: None,
     }
 }
 
@@ -185,10 +186,10 @@ fn ping_program() -> OperationBlock {
     }
 }
 
-const OBLIGATION: &str = "obl.serialize-ping";
+const OBLIGATION: &str = "obl.ping-once";
 
 /// The scripted plan that reaches success: decompose the skeleton,
-/// synthesize the program, and propose the serialization requirement
+/// synthesize the program, and propose the idempotency requirement
 /// mapped to the explicit prompt obligation.
 fn success_script() -> ScriptFn {
     Arc::new(|engine, invocation| {
@@ -228,10 +229,8 @@ fn success_script() -> ScriptFn {
                             Mutation::PutPromptObligation {
                                 id: PromptObligationId(OBLIGATION.to_string()),
                                 value: PromptObligation {
-                                    source_span: Some(
-                                        "pings for the same id must never overlap".to_string(),
-                                    ),
-                                    normalized_intent: "serialize ping by id".to_string(),
+                                    source_span: Some("duplicate pings must collapse".to_string()),
+                                    normalized_intent: "ping is idempotent by id".to_string(),
                                     targets: vec![id("operation.ping")],
                                     status: PromptObligationStatus::Unmapped,
                                 },
@@ -255,9 +254,6 @@ fn success_script() -> ScriptFn {
                                 value: conseqa::spec::ExecutionPool {
                                     member_concurrency: conseqa::spec::MemberConcurrency::Bounded(
                                         std::num::NonZeroU32::new(1).expect("non-zero"),
-                                    ),
-                                    execution_handoff: Some(
-                                        conseqa::spec::ExecutionHandoff::ExclusiveOwnership,
                                     ),
                                 },
                             },
@@ -290,12 +286,10 @@ fn success_script() -> ScriptFn {
                     commit(
                         &engine,
                         &invocation,
-                        vec![
-                            Mutation::ReplaceOperationProgram {
-                                operation: id("operation.ping"),
-                                program: ping_program(),
-                            },
-                        ],
+                        vec![Mutation::ReplaceOperationProgram {
+                            operation: id("operation.ping"),
+                            program: ping_program(),
+                        }],
                     )
                     .await;
                 }
@@ -307,12 +301,18 @@ fn success_script() -> ScriptFn {
                         vec![Mutation::ProposeRequirements {
                             operation: id("operation.ping"),
                             proposals: vec![RequirementSubmission {
-                                requirement: ProposedRequirement::Serialization(
-                                    SerializationRequirement {
-                                        key: ValueRef {
-                                            source: ValueSource::Input(id("input.ping.request")),
-                                            path: path("id"),
+                                requirement: ProposedRequirement::Idempotency(
+                                    conseqa::spec::IdempotencyRequirement {
+                                        key: IdempotencyKey {
+                                            components: vec![ValueRef {
+                                                source: ValueSource::Input(id(
+                                                    "input.ping.request",
+                                                )),
+                                                path: path("id"),
+                                            }],
                                         },
+                                        result:
+                                            conseqa::spec::ResultReplayRequirement::ReplayConsistent,
                                     },
                                 ),
                                 origin: RequirementOrigin::ExplicitPrompt {
@@ -324,8 +324,9 @@ fn success_script() -> ScriptFn {
                     .await;
                 }
 
-                // No repair is needed: the requirement proves from the
-                // router's semantic key and the pool's serial members.
+                // No repair is needed: the echo program does no work a
+                // duplicate could repeat, and its result is fixed by the
+                // request's own identified payload.
                 _ => {}
             }
         })
@@ -370,9 +371,7 @@ fn incomplete_script() -> ScriptFn {
                             Mutation::PutPromptObligation {
                                 id: PromptObligationId(OBLIGATION.to_string()),
                                 value: PromptObligation {
-                                    source_span: Some(
-                                        "duplicate pings must collapse".to_string(),
-                                    ),
+                                    source_span: Some("duplicate pings must collapse".to_string()),
                                     normalized_intent: "ping is idempotent by id".to_string(),
                                     targets: vec![id("operation.ping")],
                                     status: PromptObligationStatus::Unmapped,
@@ -397,9 +396,6 @@ fn incomplete_script() -> ScriptFn {
                                 value: conseqa::spec::ExecutionPool {
                                     member_concurrency: conseqa::spec::MemberConcurrency::Bounded(
                                         std::num::NonZeroU32::new(1).expect("non-zero"),
-                                    ),
-                                    execution_handoff: Some(
-                                        conseqa::spec::ExecutionHandoff::ExclusiveOwnership,
                                     ),
                                 },
                             },
@@ -427,12 +423,10 @@ fn incomplete_script() -> ScriptFn {
                     commit(
                         &engine,
                         &invocation,
-                        vec![
-                            Mutation::ReplaceOperationProgram {
-                                operation: id("operation.ping"),
-                                program: ping_program(),
-                            },
-                        ],
+                        vec![Mutation::ReplaceOperationProgram {
+                            operation: id("operation.ping"),
+                            program: ping_program(),
+                        }],
                     )
                     .await;
                 }
@@ -524,12 +518,10 @@ fn no_requirements_script() -> ScriptFn {
                     commit(
                         &engine,
                         &invocation,
-                        vec![
-                            Mutation::ReplaceOperationProgram {
-                                operation: id("operation.ping"),
-                                program: ping_program(),
-                            },
-                        ],
+                        vec![Mutation::ReplaceOperationProgram {
+                            operation: id("operation.ping"),
+                            program: ping_program(),
+                        }],
                     )
                     .await;
                 }
@@ -632,7 +624,8 @@ async fn prompt_to_validated_model_with_all_requirements_proven() {
 
     // The prompt obligation ended mapped (§71).
     let head = engine.head_snapshot();
-    let obligation = &head.workspace.prompt_obligations[&PromptObligationId(OBLIGATION.to_string())];
+    let obligation =
+        &head.workspace.prompt_obligations[&PromptObligationId(OBLIGATION.to_string())];
 
     assert!(matches!(
         obligation.status,
@@ -941,10 +934,7 @@ async fn workers_that_build_nothing_yield_incomplete_not_false_success() {
 /// one shared topic — the setup an operation-synthesis fanout starts
 /// from.
 fn planned_workspace(count: usize) -> WorkspaceState {
-    use conseqa::spec::{
-        MessageSelector,
-        SubscriptionInput, Topic,
-    };
+    use conseqa::spec::{MessageSelector, SubscriptionInput, Topic};
 
     let mut workspace = WorkspaceState::empty(RunMetadata::new(RunId("fanout".to_string())));
 
@@ -980,13 +970,10 @@ fn planned_workspace(count: usize) -> WorkspaceState {
                     input,
                     Input::Subscription(SubscriptionInput {
                         topic: id("topic.events"),
-                        messages: MessageSelector::Only(
-                            [id("schema.Event")].into_iter().collect(),
-                        ),
+                        messages: MessageSelector::Only([id("schema.Event")].into_iter().collect()),
                         acknowledge_on_success: None,
                     }),
                 )]),
-                invocation_lock: None,
             }),
         );
     }
@@ -1002,10 +989,14 @@ fn scoped_operation(engine: &ConfluenceEngine, invocation: &AgentInvocation) -> 
     let task = engine.resolve_token(&invocation.task_token)?;
     let context = engine.task_context(task).ok()?;
 
-    context.write_scope.grants.iter().find_map(|grant| match grant {
-        WriteGrant::OperationProgram(operation) => Some(operation.clone()),
-        _ => None,
-    })
+    context
+        .write_scope
+        .grants
+        .iter()
+        .find_map(|grant| match grant {
+            WriteGrant::OperationProgram(operation) => Some(operation.clone()),
+            _ => None,
+        })
 }
 
 #[tokio::test]
@@ -1014,8 +1005,7 @@ async fn operation_fanout_runs_agents_concurrently() {
 
     const OPERATIONS: usize = 4;
 
-    let engine =
-        ConfluenceEngine::in_memory(planned_workspace(OPERATIONS)).expect("engine starts");
+    let engine = ConfluenceEngine::in_memory(planned_workspace(OPERATIONS)).expect("engine starts");
 
     // Each session records the concurrent-session high-water mark, then
     // holds itself open long enough for the others to overlap before
@@ -1041,20 +1031,17 @@ async fn operation_fanout_runs_agents_concurrently() {
 
                 active.fetch_sub(1, Ordering::SeqCst);
 
-                let operation =
-                    scoped_operation(&engine, &invocation).expect("a program scope");
+                let operation = scoped_operation(&engine, &invocation).expect("a program scope");
 
                 commit(
                     &engine,
                     &invocation,
-                    vec![
-                        Mutation::ReplaceOperationProgram {
-                            operation,
-                            program: OperationBlock {
-                                steps: vec![OperationStep::Complete],
-                            },
+                    vec![Mutation::ReplaceOperationProgram {
+                        operation,
+                        program: OperationBlock {
+                            steps: vec![OperationStep::Complete],
                         },
-                    ],
+                    }],
                 )
                 .await;
             })
@@ -1202,7 +1189,9 @@ async fn a_run_objective_reaches_every_worker_prompt() {
         "every worker prompt carries the run objective: {prompts:#?}"
     );
     assert!(
-        prompts.iter().all(|prompt| prompt.contains("A ping service.")),
+        prompts
+            .iter()
+            .all(|prompt| prompt.contains("A ping service.")),
         "the project prompt is still carried too: {prompts:#?}"
     );
 
@@ -1224,12 +1213,16 @@ async fn an_invalidated_attempt_hands_its_patch_to_the_replacement() {
     fn worker_program(marker: u32) -> OperationBlock {
         OperationBlock {
             steps: vec![
-                OperationStep::Transaction(conseqa::spec::Transaction {
-                    id: id(&format!("tx.worker0.probe{marker}")),
-                    data_model: None,
-                    isolation: conseqa::spec::TransactionIsolation::ReadCommitted,
-                    idempotency: conseqa::spec::IdempotencyGuarantee::NotDeduplicated,
-                    steps: Vec::new(),
+                OperationStep::Transaction(conseqa::spec::ExecuteTransaction {
+                    transaction: conseqa::spec::Transaction {
+                        id: id(&format!("tx.worker0.probe{marker}")),
+                        data_model: None,
+                        isolation: conseqa::spec::TransactionIsolation::ReadCommitted,
+                        idempotency: conseqa::spec::IdempotencyGuarantee::NotDeduplicated,
+                        requirements: Default::default(),
+                        steps: Vec::new(),
+                    },
+                    rejected: None,
                 }),
                 OperationStep::Complete,
             ],
@@ -1265,8 +1258,7 @@ async fn an_invalidated_attempt_hands_its_patch_to_the_replacement() {
             Box::pin(async move {
                 prompts.lock().unwrap().push(invocation.prompt.clone());
 
-                let attempt =
-                    attempt_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let attempt = attempt_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
                 let task = engine
                     .resolve_token(&invocation.task_token)
@@ -1277,11 +1269,10 @@ async fn an_invalidated_attempt_hands_its_patch_to_the_replacement() {
                     .expect("context")
                     .snapshot_revision;
 
-                let patch =
-                    vec![Mutation::ReplaceOperationProgram {
-                        operation: id("operation.worker0"),
-                        program: worker_program(attempt as u32),
-                    }];
+                let patch = vec![Mutation::ReplaceOperationProgram {
+                    operation: id("operation.worker0"),
+                    program: worker_program(attempt as u32),
+                }];
 
                 if attempt == 0 {
                     // An interloper rewrites the same program first, so
@@ -1366,7 +1357,11 @@ async fn an_invalidated_attempt_hands_its_patch_to_the_replacement() {
 
     assert!(run.committed(), "{run:?}");
     assert!(!run.exhausted);
-    assert_eq!(run.attempts.len(), 2, "one invalidated attempt, one warm retry");
+    assert_eq!(
+        run.attempts.len(),
+        2,
+        "one invalidated attempt, one warm retry"
+    );
 
     let prompts = prompts.lock().unwrap();
 
@@ -1506,17 +1501,22 @@ async fn attempt_exhaustion_is_reported_without_discarding_siblings() {
 
     assert!(runs[0].exhausted, "{:?}", runs[0]);
     assert!(!runs[0].committed());
-    assert_eq!(runs[0].attempts.len(), 2, "the crashing session was retried");
+    assert_eq!(
+        runs[0].attempts.len(),
+        2,
+        "the crashing session was retried"
+    );
 
-    assert!(runs[1].committed(), "the sibling's work survives: {:?}", runs[1]);
+    assert!(
+        runs[1].committed(),
+        "the sibling's work survives: {:?}",
+        runs[1]
+    );
     assert!(!runs[1].exhausted);
 
     // The sibling's commit is in the model.
     assert!(
-        engine
-            .head_snapshot()
-            .workspace
-            .operations[&id("operation.worker1")]
+        engine.head_snapshot().workspace.operations[&id("operation.worker1")]
             .program
             .is_some()
     );

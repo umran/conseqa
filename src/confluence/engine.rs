@@ -21,13 +21,11 @@ use crate::spec::{Id, Input, Revision};
 
 use super::analysis::{AnalysisHub, AnalysisPin, AnalysisState};
 use super::auth::{TaskToken, TokenMap};
-use super::commit::{
-    CommitReceipt, CommitRecord, CommitRejection, CommitRequest, apply_patch,
-};
-use super::patch::SpecPatch;
+use super::commit::{CommitReceipt, CommitRecord, CommitRejection, CommitRequest, apply_patch};
 use super::events::{EngineEvent, EventBus, InvalidationCause};
 use super::graph_query::{self, GraphQuery, QueryResult};
 use super::invalidation::stale_causes;
+use super::patch::SpecPatch;
 use super::persistence::{Persistence, PersistenceError, TaskRecord};
 use super::read_set::{
     QueryObservation, SearchSpec, SummaryObservation, SymbolObservation, TaskReadSet, run_search,
@@ -38,8 +36,7 @@ use super::summary::OperationSummary;
 use super::symbol::{SymbolKey, SymbolKind, SymbolOwner, SymbolVersion};
 use super::task::{
     DependencyRequest, DependencyRequestId, DependencyResolution, PromptEvidence, TaskBudget,
-    TaskCompletionGate,
-    TaskId, TaskKind, TaskSpec, TaskState, WriteScope,
+    TaskCompletionGate, TaskId, TaskKind, TaskSpec, TaskState, WriteScope,
 };
 use super::workspace::{EvidenceRef, WorkspaceState};
 
@@ -141,11 +138,12 @@ pub struct BundleSpec {
     /// the bundle and its shared dependencies are sliced in (§94).
     pub operation: Option<Id>,
 
-    /// The requirements under repair; each one's analyzer obligation
-    /// becomes bundle evidence. Several, because one repair task
-    /// carries every unproven obligation of its operation — they are
-    /// discharged by one program and often by one revision.
-    pub requirements: Vec<(super::symbol::RequirementFamily, usize)>,
+    /// The requirements under repair — family, the inline transaction
+    /// for a transaction family, and index — each one's analyzer
+    /// obligation becomes bundle evidence. Several, because one repair
+    /// task carries every unproven obligation of its operation — they
+    /// are discharged by one program and often by one revision.
+    pub requirements: Vec<(super::symbol::RequirementFamily, Option<Id>, usize)>,
 
     /// Extra shared symbols the scheduler wants included.
     pub include: Vec<SymbolKey>,
@@ -477,8 +475,7 @@ impl ConfluenceEngine {
         if let SymbolKey::OperationSummary(operation) = key {
             let revision = self.active_entry(task)?.snapshot.revision;
 
-            let view =
-                self.read_operation(task, operation, OperationReadMode::ProofSummary)?;
+            let view = self.read_operation(task, operation, OperationReadMode::ProofSummary)?;
 
             return Ok(SymbolView {
                 key: key.clone(),
@@ -613,7 +610,11 @@ impl ConfluenceEngine {
     /// Runs one canonical graph query against the task's pinned
     /// snapshot, recording the result fingerprint for phantom
     /// revalidation (§49).
-    pub fn graph_query(&self, task: TaskId, query: &GraphQuery) -> Result<QueryResult, EngineError> {
+    pub fn graph_query(
+        &self,
+        task: TaskId,
+        query: &GraphQuery,
+    ) -> Result<QueryResult, EngineError> {
         let entry = self.active_entry(task)?;
 
         let result = graph_query::run(&entry.snapshot.workspace, &entry.snapshot.graph, query);
@@ -637,13 +638,10 @@ impl ConfluenceEngine {
 
         let rows = run_search(&entry.snapshot.workspace, &entry.snapshot.graph, spec);
 
-        entry
-            .read_set
-            .lock()
-            .record_query(QueryObservation::search(
-                spec.clone(),
-                search_fingerprint(&rows),
-            ));
+        entry.read_set.lock().record_query(QueryObservation::search(
+            spec.clone(),
+            search_fingerprint(&rows),
+        ));
 
         Ok(rows)
     }
@@ -689,12 +687,7 @@ impl ConfluenceEngine {
 
             AnalysisState::Ready(analysis) => {
                 if let Some(operation) = &operation {
-                    if !entry
-                        .snapshot
-                        .workspace
-                        .operations
-                        .contains_key(operation)
-                    {
+                    if !entry.snapshot.workspace.operations.contains_key(operation) {
                         return Err(EngineError::UnknownOperation(operation.clone()));
                     }
 
@@ -716,9 +709,15 @@ impl ConfluenceEngine {
                     .iter()
                     .filter(|obligation| match (&operation, &obligation.subject) {
                         (None, _) => true,
-                        (Some(operation), Subject::Operation { operation: subject, .. }) => {
-                            operation == subject
-                        }
+                        (
+                            Some(operation),
+                            Subject::Operation {
+                                operation: subject, ..
+                            }
+                            | Subject::Transaction {
+                                operation: subject, ..
+                            },
+                        ) => operation == subject,
                         (Some(_), _) => false,
                     })
                     .filter(|obligation| match family {
@@ -803,10 +802,7 @@ impl ConfluenceEngine {
     ) -> Result<(), EngineError> {
         let entry = self.active_entry(task)?;
 
-        entry
-            .read_set
-            .lock()
-            .record_summary(operation, observation);
+        entry.read_set.lock().record_summary(operation, observation);
 
         Ok(())
     }
@@ -867,11 +863,9 @@ impl ConfluenceEngine {
 
         self.inner.persistence.record_dependency_request(&request)?;
 
-        self.inner
-            .events
-            .emit(EngineEvent::DependencyRequested {
-                request: request.clone(),
-            });
+        self.inner.events.emit(EngineEvent::DependencyRequested {
+            request: request.clone(),
+        });
 
         Ok(request.id)
     }
@@ -924,7 +918,10 @@ impl ConfluenceEngine {
     /// symbol does not exist. Used to observe whether a dependency
     /// repair actually changed what it was asked to.
     pub fn symbol_version(&self, key: &SymbolKey) -> Option<SymbolVersion> {
-        self.head_snapshot().graph.node(key).map(|node| node.version)
+        self.head_snapshot()
+            .graph
+            .node(key)
+            .map(|node| node.version)
     }
 
     /// Cancels a task: its authority ends and its token is revoked.
@@ -1002,8 +999,7 @@ impl ConfluenceEngine {
                 .get(operation)
                 .ok_or_else(|| EngineError::UnknownOperation(operation.clone()))?;
 
-            operation_view =
-                Some(serde_json::to_value(draft).expect("draft serializes"));
+            operation_view = Some(serde_json::to_value(draft).expect("draft serializes"));
 
             self.record_operation_inputs(&entry, operation);
 
@@ -1047,11 +1043,14 @@ impl ConfluenceEngine {
                 }
             }
 
-            if let AnalysisState::Ready(analysis) =
-                self.inner.analysis.state(snapshot.revision)
-            {
-                for (family, index) in &spec.requirements {
-                    let id = format!("oblig.{operation}.{family}.{index}");
+            if let AnalysisState::Ready(analysis) = self.inner.analysis.state(snapshot.revision) {
+                for (family, transaction, index) in &spec.requirements {
+                    let id = match transaction {
+                        Some(transaction) => {
+                            format!("oblig.{operation}.{transaction}.{family}.{index}")
+                        }
+                        None => format!("oblig.{operation}.{family}.{index}"),
+                    };
 
                     if let Some(obligation) = analysis
                         .obligations
@@ -1059,9 +1058,8 @@ impl ConfluenceEngine {
                         .iter()
                         .find(|obligation| obligation.id == id)
                     {
-                        analyzer_evidence.push(
-                            serde_json::to_value(obligation).expect("obligation serializes"),
-                        );
+                        analyzer_evidence
+                            .push(serde_json::to_value(obligation).expect("obligation serializes"));
                     }
                 }
             }
@@ -1624,7 +1622,9 @@ fn invalidate_stale_tasks(
 
 fn rejection_causes(rejection: &CommitRejection) -> Vec<InvalidationCause> {
     match rejection {
-        CommitRejection::ReadConflict { symbol, current, .. } => match current {
+        CommitRejection::ReadConflict {
+            symbol, current, ..
+        } => match current {
             Some(_) => vec![InvalidationCause::ChangedSymbol {
                 symbol: symbol.clone(),
             }],
@@ -1655,9 +1655,13 @@ fn render_symbol(workspace: &WorkspaceState, key: &SymbolKey) -> Option<serde_js
             serde_json::to_value(workspace.data_models.get(data_model)?.objects.get(object)?)
         }
 
-        SymbolKey::Outbox { data_model, outbox } => {
-            serde_json::to_value(workspace.data_models.get(data_model)?.outboxes.get(outbox)?)
-        }
+        SymbolKey::Outbox { data_model, outbox } => serde_json::to_value(
+            workspace
+                .data_models
+                .get(data_model)?
+                .outboxes
+                .get(outbox)?,
+        ),
 
         SymbolKey::Topic(id) => serde_json::to_value(workspace.topics.get(id)?),
         SymbolKey::StateMachine(id) => serde_json::to_value(workspace.state_machines.get(id)?),
@@ -1689,13 +1693,13 @@ fn render_symbol(workspace: &WorkspaceState, key: &SymbolKey) -> Option<serde_js
 
         SymbolKey::TopicRuntime(id) => serde_json::to_value(workspace.runtime.topics.get(id)?),
 
-        SymbolKey::SubscriptionRuntime { operation, input } => serde_json::to_value(
-            workspace.runtime.subscriptions.get(operation)?.get(input)?,
-        ),
+        SymbolKey::SubscriptionRuntime { operation, input } => {
+            serde_json::to_value(workspace.runtime.subscriptions.get(operation)?.get(input)?)
+        }
 
-        SymbolKey::OutboxRuntime { operation, input } => serde_json::to_value(
-            workspace.runtime.outboxes.get(operation)?.get(input)?,
-        ),
+        SymbolKey::OutboxRuntime { operation, input } => {
+            serde_json::to_value(workspace.runtime.outboxes.get(operation)?.get(input)?)
+        }
 
         SymbolKey::ExecutionPool(id) => {
             serde_json::to_value(workspace.runtime.execution_pools.get(id)?)
@@ -1737,9 +1741,7 @@ fn render_symbol(workspace: &WorkspaceState, key: &SymbolKey) -> Option<serde_js
                     program
                         .outbox_write_declarations()
                         .into_iter()
-                        .find_map(|(_, write)| {
-                            (&write.effect_id == effect).then_some(write)
-                        })?
+                        .find_map(|(_, write)| (&write.effect_id == effect).then_some(write))?
                         .clone(),
                 ),
             }
@@ -1801,11 +1803,44 @@ fn requirement_content(
         None
     }
 
+    // A transaction family's occurrences run across every inline
+    // transaction of the program, in program order, exactly as the
+    // graph enumerates them.
     match family {
-        RequirementFamily::Serialization => {
-            pick(&draft.requirements.serialization, fingerprint, occurrence)
+        RequirementFamily::TransactionSerializability => {
+            let requirements: Vec<_> = draft
+                .program
+                .as_ref()
+                .map(|program| {
+                    program
+                        .transactions()
+                        .into_iter()
+                        .flat_map(|(_, transaction)| {
+                            transaction.requirements.serializability.iter().cloned()
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            pick(&requirements, fingerprint, occurrence)
         }
-        RequirementFamily::Ordering => pick(&draft.requirements.ordering, fingerprint, occurrence),
+        RequirementFamily::TransactionOrdering => {
+            let requirements: Vec<_> = draft
+                .program
+                .as_ref()
+                .map(|program| {
+                    program
+                        .transactions()
+                        .into_iter()
+                        .flat_map(|(_, transaction)| {
+                            transaction.requirements.ordering.iter().cloned()
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            pick(&requirements, fingerprint, occurrence)
+        }
         RequirementFamily::Idempotency | RequirementFamily::ResultReplay => {
             pick(&draft.requirements.idempotency, fingerprint, occurrence)
         }
@@ -1817,8 +1852,8 @@ fn requirement_content(
 
 fn property_matches(property: &Property, family: &str) -> bool {
     match property {
-        Property::Serialization => family == "serialization",
-        Property::Ordering => family == "ordering",
+        Property::TransactionSerializability => family == "transaction_serializability",
+        Property::TransactionOrdering => family == "transaction_ordering",
         Property::Idempotency => family == "idempotency",
         Property::ResultReplay => family == "result_replay",
         Property::Recoverability => family == "recoverability",
@@ -1844,7 +1879,10 @@ fn slice_shared_symbols(snapshot: &WorkspaceSnapshot, operation: &Id) -> Vec<Sym
             continue;
         }
 
-        for edge in snapshot.graph.outgoing_of(super::graph::NodeId(index as u32)) {
+        for edge in snapshot
+            .graph
+            .outgoing_of(super::graph::NodeId(index as u32))
+        {
             let target = &snapshot.graph.node_at(edge.to).key;
 
             match target {
@@ -1855,8 +1893,7 @@ fn slice_shared_symbols(snapshot: &WorkspaceSnapshot, operation: &Id) -> Vec<Sym
                     shared.insert(target.clone());
                 }
 
-                SymbolKey::DataObject { data_model, .. }
-                | SymbolKey::Outbox { data_model, .. } => {
+                SymbolKey::DataObject { data_model, .. } | SymbolKey::Outbox { data_model, .. } => {
                     shared.insert(target.clone());
                     shared.insert(SymbolKey::DataModel(data_model.clone()));
                 }
@@ -1939,10 +1976,7 @@ pub(crate) fn topology_symbols(workspace: &WorkspaceState) -> Vec<SymbolKey> {
     keys
 }
 
-pub(crate) fn runtime_inputs_of(
-    workspace: &WorkspaceState,
-    operation: &Id,
-) -> Vec<SymbolKey> {
+pub(crate) fn runtime_inputs_of(workspace: &WorkspaceState, operation: &Id) -> Vec<SymbolKey> {
     let Some(draft) = workspace.operations.get(operation) else {
         return Vec::new();
     };
@@ -1987,8 +2021,7 @@ pub(crate) fn runtime_inputs_of(
 
             Input::Request(_) => {
                 for (router_id, router) in &workspace.runtime.routers {
-                    if &router.boundary.operation == operation
-                        && &router.boundary.input == input_id
+                    if &router.boundary.operation == operation && &router.boundary.input == input_id
                     {
                         keys.push(SymbolKey::Router(router_id.clone()));
                         keys.push(SymbolKey::ExecutionPool(router.pool.clone()));

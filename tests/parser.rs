@@ -9,11 +9,11 @@ use conseqa::{
     spec::{
         CompletionRequirement, Condition, DeliverySemantics, Derivation, Effect, ErrorDisposition,
         ErrorResultType, ExternalIdempotency, ExternalIdentity, ExternalResultReplay, Field,
-        FieldPath, Id, IdempotencyGuarantee, Input, Literal,
-        MemberAssignment, MemberConcurrency, MessageIdentity, Model, OperationStep,
-        RequestIdentity, ResultOutcome, ResultVariant, ScalarType, Schema, SchemaCompleteness,
-        SelectorValue, ServiceKind, SubscriptionRoutingKey, OrderingSemantics, Transaction,
-        TransactionStep, TransitionSideEffect, TypeRef, ValueSource,
+        FieldPath, Id, IdempotencyGuarantee, Input, Literal, MemberAssignment, MemberConcurrency,
+        MessageIdentity, Model, OperationStep, OrderingSemantics, RequestIdentity, ResultArm,
+        ResultOutcome, ResultVariant, ScalarType, Schema, SchemaCompleteness, SelectorValue,
+        ServiceKind, SubscriptionRoutingKey, Transaction, TransactionStep, TransitionSideEffect,
+        TypeRef, ValueSource,
     },
 };
 
@@ -198,7 +198,10 @@ fn parses_keyed_topic_model() {
         .get(&Id("OrderEvent".into()))
         .expect("OrderEvent should define its grouping key");
 
-    assert_eq!(order_event_key, &vec![FieldPath(vec!["order_id".to_string()])]);
+    assert_eq!(
+        order_event_key,
+        &vec![FieldPath(vec!["order_id".to_string()])]
+    );
 
     // The grouping key and the message identity are separate
     // declarations: order_id groups events for an order, event_id
@@ -585,8 +588,8 @@ fn flash_checkout_parses_transition_side_effect_intent() {
     // a program step can execute it.
     let apply = transaction(&model, "operation.apply_payment", "tx.apply_payment");
 
-    let TransactionStep::Transition(applied) = &apply.steps[1] else {
-        panic!("second step should be the mark_paid transition");
+    let TransactionStep::Transition(applied) = &apply.steps[3] else {
+        panic!("the fourth step should be the mark_paid transition");
     };
 
     let intent = applied
@@ -735,7 +738,9 @@ fn flash_checkout_parses_execute_effect_values_and_result_bindings() {
     assert_eq!(from[0].path.0, vec!["event_id".to_string()]);
 
     // The err arm reads the provider's err payload.
-    let OperationStep::ExecuteEffect(failed) = &matched.err.steps[0] else {
+    let declined = &matched.errors[&Id("declined".into())];
+
+    let OperationStep::ExecuteEffect(failed) = &declined.steps[0] else {
         panic!("the err arm should publish the failure");
     };
 
@@ -751,7 +756,7 @@ fn flash_checkout_parses_execute_effect_values_and_result_bindings() {
     assert_eq!(from[2].path.0, vec!["reason".to_string()]);
 
     assert!(matches!(matched.ok.steps[1], OperationStep::Complete));
-    assert!(matches!(matched.err.steps[1], OperationStep::Complete));
+    assert!(matches!(declined.steps[1], OperationStep::Complete));
 }
 
 #[test]
@@ -773,19 +778,31 @@ fn flash_checkout_parses_request_results_and_return_terminals() {
     };
 
     assert_eq!(request.result.ok, Id("schema.CreateOrderResponse".into()));
-    assert_eq!(
-        request.result.err.schema,
-        Id("schema.RequestRejected".into())
-    );
+
+    let rejected = request
+        .result
+        .error(&Id("rejected".into()))
+        .expect("the request declares its rejected class");
+
+    assert_eq!(rejected.schema, Id("schema.RequestRejected".into()));
 
     // The bare-schema shorthand declares nothing about disposition.
+    assert_eq!(rejected.disposition, ErrorDisposition::Unspecified);
     assert_eq!(
-        request.result.err.disposition,
-        ErrorDisposition::Unspecified
+        request
+            .result
+            .schema_of(&ResultArm::err(&Id("rejected".into()))),
+        Some(&Id("schema.RequestRejected".into()))
     );
     assert_eq!(
-        request.result.schema(ResultVariant::Err),
-        &Id("schema.RequestRejected".into())
+        request.result.schema_of(&ResultArm::Ok),
+        Some(&request.result.ok)
+    );
+    assert_eq!(
+        request
+            .result
+            .schema_of(&ResultArm::err(&Id("unknown".into()))),
+        None
     );
 
     let OperationStep::Return(returned) = &create_order.program.steps[2] else {
@@ -836,8 +853,11 @@ fn external_effects_declare_their_result_contract() {
     let result = card.result.as_ref().expect("the provider returns a result");
 
     assert_eq!(result.ok, Id("schema.ChargeAccepted".into()));
-    assert_eq!(result.err.schema, Id("schema.ChargeDeclined".into()));
-    assert_eq!(result.err.disposition, ErrorDisposition::Unspecified);
+
+    let declined = &result.errors[&Id("declined".into())];
+
+    assert_eq!(declined.schema, Id("schema.ChargeDeclined".into()));
+    assert_eq!(declined.disposition, ErrorDisposition::Unspecified);
 
     // A boundary modeling no synchronous result says so.
     let source = read_fixture("video_streaming.yaml");
@@ -865,8 +885,10 @@ fn external_effects_declare_their_result_contract() {
 
     let result = engine.result.as_ref().expect("the engine returns a result");
 
-    assert_eq!(result.err.schema, Id("schema.RenderFailed".into()));
-    assert_eq!(result.err.disposition, ErrorDisposition::Terminal);
+    let failed = &result.errors[&Id("failed".into())];
+
+    assert_eq!(failed.schema, Id("schema.RenderFailed".into()));
+    assert_eq!(failed.disposition, ErrorDisposition::Terminal);
 }
 
 fn parse_error_contract(declaration: &str) -> ErrorResultType {
@@ -989,6 +1011,33 @@ intent: intent.x",
 fn an_inline_transaction_step_carries_its_whole_declaration() {
     let step: OperationStep = serde_yaml::from_str(
         "kind: transaction
+transaction:
+  id: tx.x
+  data_model: null
+  isolation: unspecified
+  idempotency:
+    kind: unspecified
+  steps: []",
+    )
+    .expect("an inline transaction should parse");
+
+    let OperationStep::Transaction(execute) = step else {
+        panic!("expected an inline transaction step");
+    };
+
+    assert_eq!(execute.transaction.id, Id("tx.x".into()));
+    assert_eq!(execute.transaction.data_model, None);
+    assert!(execute.transaction.steps.is_empty());
+
+    // Absent requirements and rejected arm are absent, not defaulted
+    // into existence.
+    assert!(execute.transaction.requirements.is_empty());
+    assert!(execute.rejected.is_none());
+
+    // The v3 flat form — the transaction's fields directly on the step
+    // — is gone, not aliased.
+    serde_yaml::from_str::<OperationStep>(
+        "kind: transaction
 id: tx.x
 data_model: null
 isolation: unspecified
@@ -996,17 +1045,9 @@ idempotency:
   kind: unspecified
 steps: []",
     )
-    .expect("an inline transaction should parse");
+    .expect_err("the flat transaction form should be rejected");
 
-    let OperationStep::Transaction(transaction) = step else {
-        panic!("expected an inline transaction step");
-    };
-
-    assert_eq!(transaction.id, Id("tx.x".into()));
-    assert_eq!(transaction.data_model, None);
-    assert!(transaction.steps.is_empty());
-
-    // The old reference form is gone: a step that names a transaction
+    // So is the older reference form: a step that names a transaction
     // without declaring it does not parse.
     serde_yaml::from_str::<OperationStep>(
         "kind: transaction
@@ -1019,7 +1060,7 @@ transaction: tx.x",
 /// level.
 fn operation_source(extra: &str) -> String {
     let mut source = String::from(
-        "dsl: 3
+        "dsl: 4
 revision: 1
 services:
   service.a:
@@ -1047,8 +1088,6 @@ operations:
       steps:
       - kind: complete
     requirements:
-      serialization: []
-      ordering: []
       idempotency: []
       recoverability: []
 ",
@@ -1137,8 +1176,8 @@ fn flash_checkout_parses_transition_effect_intents() {
 
     let apply = transaction(&model, "operation.apply_payment", "tx.apply_payment");
 
-    let TransactionStep::Transition(transition) = &apply.steps[1] else {
-        panic!("second step should be the mark_paid transition");
+    let TransactionStep::Transition(transition) = &apply.steps[3] else {
+        panic!("the fourth step should be the mark_paid transition");
     };
 
     assert_eq!(transition.effect_intents.len(), 1);
@@ -1167,8 +1206,8 @@ fn flash_checkout_parses_transition_effect_intents() {
     // A transition without side effects declares an explicit empty map.
     let cancel = transaction(&model, "operation.cancel_order", "tx.cancel_order");
 
-    let TransactionStep::Transition(transition) = &cancel.steps[0] else {
-        panic!("first step should be the cancel transition");
+    let TransactionStep::Transition(transition) = &cancel.steps[2] else {
+        panic!("the third step should be the cancel transition");
     };
 
     assert!(transition.effect_intents.is_empty());
@@ -1178,7 +1217,7 @@ fn flash_checkout_parses_transition_effect_intents() {
 /// surface syntax can be exercised without a fixture.
 fn field_source(fields: &str) -> String {
     let mut source = String::from(
-        "dsl: 3
+        "dsl: 4
 revision: 1
 services: {}
 schemas:
@@ -1753,7 +1792,7 @@ fn shorthand_selector_values_serialize_into_the_canonical_form() {
 #[test]
 fn an_l0_only_model_parses_with_no_runtime_block() {
     let source = "
-dsl: 3
+dsl: 4
 revision: 1
 
 topics:
@@ -1775,7 +1814,11 @@ topics:
 
     // With no runtime there are no transport facts at all, and the
     // topic is in neither declaration scope.
-    assert!(model.topic_runtime(&Id("topic.order_events".into())).is_none());
+    assert!(
+        model
+            .topic_runtime(&Id("topic.order_events".into()))
+            .is_none()
+    );
     assert!(!model.topic_scoped_transport(&Id("topic.order_events".into())));
 }
 
@@ -1785,7 +1828,7 @@ topics:
 #[test]
 fn the_canonical_runtime_block_parses_and_round_trips() {
     let source = "
-dsl: 3
+dsl: 4
 revision: 1
 
 runtime:
@@ -1854,7 +1897,11 @@ runtime:
 
     // Routing is optional, and absence is the whole statement: the
     // health boundary names a pool and no member affinity.
-    assert!(runtime.routers[&Id("router.health".into())].routing.is_none());
+    assert!(
+        runtime.routers[&Id("router.health".into())]
+            .routing
+            .is_none()
+    );
 
     let get_messages = runtime.routers[&Id("router.get_messages".into())]
         .routing
@@ -1862,7 +1909,10 @@ runtime:
         .expect("a routing declaration");
 
     assert_eq!(get_messages.key, vec![FieldPath(vec!["channel_id".into()])]);
-    assert_eq!(get_messages.member_assignment, MemberAssignment::ConsistentHash);
+    assert_eq!(
+        get_messages.member_assignment,
+        MemberAssignment::ConsistentHash
+    );
 
     // A routing key and a partition key may name the same field without
     // becoming the same concept.
@@ -1878,8 +1928,8 @@ runtime:
 
     // External tools read L1 from the serialized surface alone, so it
     // must round-trip.
-    let round_tripped = yaml::parse(&yaml::serialize(&model).expect("serializes"))
-        .expect("re-parses");
+    let round_tripped =
+        yaml::parse(&yaml::serialize(&model).expect("serializes")).expect("re-parses");
 
     assert_eq!(model, round_tripped);
 }
@@ -1890,7 +1940,7 @@ runtime:
 #[test]
 fn subscription_scoped_transport_semantics_parse() {
     let source = "
-dsl: 3
+dsl: 4
 revision: 1
 
 schemas:
@@ -1967,8 +2017,8 @@ runtime:
         "grouping without ordering is a complete declaration, not half a pair"
     );
 
-    let round_tripped = yaml::parse(&yaml::serialize(&model).expect("serializes"))
-        .expect("re-parses");
+    let round_tripped =
+        yaml::parse(&yaml::serialize(&model).expect("serializes")).expect("re-parses");
 
     assert_eq!(model, round_tripped);
 }
@@ -1983,7 +2033,7 @@ fn member_assignments_round_trip() {
     ] {
         let source = format!(
             "
-dsl: 3
+dsl: 4
 revision: 1
 
 runtime:
@@ -2020,7 +2070,7 @@ runtime:
 #[test]
 fn parses_asynchronous_effect_steps() {
     let source = r#"
-dsl: 3
+dsl: 4
 revision: 1
 services:
   service.read:
@@ -2059,7 +2109,8 @@ operations:
           kind: unspecified
         result:
           ok: schema.Row
-          err: schema.Miss
+          errors:
+            miss: schema.Miss
     program:
       steps:
       - kind: execute_effect_async
@@ -2074,7 +2125,8 @@ operations:
           result_replay: unspecified
           result:
             ok: schema.Row
-            err: schema.Miss
+            errors:
+              miss: schema.Miss
         values:
           kind: unspecified
       - kind: execute_effect_async
@@ -2089,7 +2141,8 @@ operations:
           result_replay: unspecified
           result:
             ok: schema.Row
-            err: schema.Miss
+            errors:
+              miss: schema.Miss
         values:
           kind: unspecified
       - kind: race
@@ -2115,17 +2168,17 @@ operations:
                 from:
                 - source: effect_result_ok:result.read
                   path: id
-        err:
-          steps:
-          - kind: return
-            request: input.hedged_read.request
-            outcome:
-              kind: err
-              values:
-                kind: unspecified
+        errors:
+          miss:
+            steps:
+            - kind: return
+              request: input.hedged_read.request
+              outcome:
+                kind: err
+                error: miss
+                values:
+                  kind: unspecified
     requirements:
-      serialization: []
-      ordering: []
       idempotency: []
       recoverability: []
 "#;
@@ -2210,7 +2263,10 @@ fn parses_transactional_outbox_model() {
         })
         .expect("the transaction should stage an outbox write");
 
-    assert_eq!(write.effect_id, Id("effect.create_order.outbox_created".into()));
+    assert_eq!(
+        write.effect_id,
+        Id("effect.create_order.outbox_created".into())
+    );
     assert_eq!(write.effect.outbox, Id("outbox.order_events".into()));
     assert_eq!(write.effect.schema, Id("schema.OrderCreated".into()));
     assert_eq!(write.effect.idempotency_key_propagation.len(), 1);
@@ -2270,7 +2326,11 @@ fn parses_transactional_outbox_model() {
     assert_eq!(routing.key, conseqa::spec::OutboxRoutingKey::PartitionKey);
     assert_eq!(routing.member_assignment, MemberAssignment::ConsistentHash);
     assert_eq!(
-        runtime.dispatch.batching.as_ref().map(|batching| batching.ordering),
+        runtime
+            .dispatch
+            .batching
+            .as_ref()
+            .map(|batching| batching.ordering),
         Some(conseqa::spec::BatchOrderingPreservation::Preserved)
     );
 }
@@ -2317,37 +2377,34 @@ fn absent_acknowledgement_and_outboxes_stay_absent() {
 
 #[test]
 fn a_declared_dsl_version_mismatch_is_refused_by_name() {
-    let error = yaml::parse("dsl: 4\nrevision: 1\n")
+    let error = yaml::parse("dsl: 5\nrevision: 1\n")
         .expect_err("a future contract version should be refused");
 
     assert!(
         matches!(
             &error,
-            yaml::ParseError::DslVersionMismatch { found } if found.0 == 4
+            yaml::ParseError::DslVersionMismatch { found } if found.0 == 5
         ),
         "{error:?}"
     );
 
     let message = error.to_string();
 
-    assert!(message.contains("declares dsl 4"), "{message}");
-    assert!(message.contains("this build reads dsl 3"), "{message}");
+    assert!(message.contains("declares dsl 5"), "{message}");
+    assert!(message.contains("this build reads dsl 4"), "{message}");
 }
 
 #[test]
 fn a_missing_dsl_version_is_refused_as_predating_versioning() {
-    let error = yaml::parse("revision: 1\n")
-        .expect_err("an unversioned specification should be refused");
+    let error =
+        yaml::parse("revision: 1\n").expect_err("an unversioned specification should be refused");
 
     assert!(
         matches!(&error, yaml::ParseError::DslVersionMissing),
         "{error:?}"
     );
 
-    assert!(
-        error.to_string().contains("predates versioning"),
-        "{error}"
-    );
+    assert!(error.to_string().contains("predates versioning"), "{error}");
 }
 
 #[test]
@@ -2355,7 +2412,7 @@ fn the_superseded_external_surface_fails_schema_validation() {
     // The clean break: the retired mechanism vocabulary is not
     // detected, canonicalized, or aliased — it fails ordinary shape
     // validation like any other unknown form.
-    let source = "dsl: 3
+    let source = "dsl: 4
 revision: 1
 operations:
   operation.x:
@@ -2377,8 +2434,6 @@ operations:
           kind: unspecified
       - kind: complete
     requirements:
-      serialization: []
-      ordering: []
       idempotency: []
       recoverability: []
 ";
@@ -2390,7 +2445,7 @@ operations:
 
 #[test]
 fn a_present_condition_parses_and_round_trips() {
-    let source = "dsl: 3
+    let source = "dsl: 4
 revision: 1
 schemas:
   schema.Event:
@@ -2432,8 +2487,6 @@ operations:
           - kind: complete
       - kind: complete
     requirements:
-      serialization: []
-      ordering: []
       idempotency: []
       recoverability: []
 services:
@@ -2464,10 +2517,16 @@ services:
 
     assert_eq!(model, reparsed);
 }
-
+/// The clean break of the v4 revision: the retired operation-level
+/// serialization and ordering surface is not aliased or migrated. An invocation lock,
+/// an execution handoff, and an operation-level serialization or
+/// ordering requirement each fail ordinary shape validation like any
+/// other unknown form, naming the retired field.
 #[test]
-fn an_invocation_lock_and_execution_handoff_parse_and_round_trip() {
-    let source = "dsl: 3
+fn retired_v3_serialization_declarations_are_refused_at_parse() {
+    let source = |operation_extra: &str, requirements_extra: &str, runtime: &str| {
+        format!(
+            "dsl: 4
 revision: 1
 schemas:
   schema.Transfer:
@@ -2475,7 +2534,6 @@ schemas:
     completeness: complete
     fields:
       account_id: uuid
-      amount: int
   schema.TransferAccepted:
     kind: canonical
     completeness: complete
@@ -2484,12 +2542,7 @@ schemas:
 operations:
   operation.transfer:
     service: service.x
-    invocation_lock:
-      key:
-        source: input:input.transfer.request
-        path:
-        - account_id
-    inputs:
+{operation_extra}    inputs:
       input.transfer.request:
         kind: request
         schema: schema.Transfer
@@ -2497,7 +2550,8 @@ operations:
           kind: unspecified
         result:
           ok: schema.TransferAccepted
-          err: schema.TransferAccepted
+          errors:
+            rejected: schema.TransferAccepted
     program:
       steps:
       - kind: return
@@ -2507,65 +2561,76 @@ operations:
           values:
             kind: unspecified
     requirements:
-      serialization:
-      - key:
-          source: input:input.transfer.request
-          path:
-          - account_id
-      ordering: []
-      idempotency: []
+{requirements_extra}      idempotency: []
       recoverability: []
 services:
   service.x:
     kind: backend
-runtime:
+{runtime}"
+        )
+    };
+
+    let model = yaml::parse(&source("", "", "")).expect("the v4 form parses");
+
+    assert!(validation::validate(&model).is_empty());
+
+    let cases = [
+        (
+            "invocation_lock",
+            source(
+                "    invocation_lock:
+      key:
+        source: input:input.transfer.request
+        path:
+        - account_id
+",
+                "",
+                "",
+            ),
+        ),
+        (
+            "serialization",
+            source(
+                "",
+                "      serialization:
+      - key:
+          source: input:input.transfer.request
+          path:
+          - account_id
+",
+                "",
+            ),
+        ),
+        ("ordering", source("", "      ordering: []\n", "")),
+        (
+            "execution_handoff",
+            source(
+                "",
+                "",
+                "runtime:
   execution_pools:
     pool.workers:
       member_concurrency:
         kind: bounded
         value: 1
       execution_handoff: exclusive_ownership
-";
+",
+            ),
+        ),
+    ];
 
-    let model = yaml::parse(source).expect("the lock and handoff should parse");
+    for (field, source) in cases {
+        let error = yaml::parse(&source).expect_err(&format!(
+            "a retired `{field}` declaration should be refused"
+        ));
 
-    let operation = model
-        .operations
-        .get(&Id("operation.transfer".into()))
-        .expect("operation exists");
+        assert!(
+            matches!(&error, yaml::ParseError::Yaml(_)),
+            "{field}: {error:?}"
+        );
 
-    let lock = operation
-        .invocation_lock
-        .as_ref()
-        .expect("the lock is declared");
+        let message = error.to_string();
 
-    assert_eq!(
-        lock.key.source,
-        ValueSource::Input(Id("input.transfer.request".into()))
-    );
-    assert_eq!(lock.key.path.0, vec!["account_id".to_string()]);
-
-    let pool = model
-        .runtime
-        .as_ref()
-        .expect("runtime declared")
-        .execution_pools
-        .get(&Id("pool.workers".into()))
-        .expect("pool declared");
-
-    assert_eq!(
-        pool.execution_handoff,
-        Some(conseqa::spec::ExecutionHandoff::ExclusiveOwnership)
-    );
-
-    // Absence stays absent: a pool without the declaration serializes
-    // without the field, and an operation without the lock without its
-    // key.
-    let serialized = yaml::serialize(&model).expect("model serializes");
-
-    let reparsed = yaml::parse(&serialized).expect("serialized model parses");
-
-    assert_eq!(model, reparsed);
-
-    assert!(validation::validate(&model).is_empty());
+        assert!(message.contains(field), "{field}: {message}");
+    }
 }

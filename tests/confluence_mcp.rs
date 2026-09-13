@@ -144,13 +144,16 @@ impl McpClient {
             panic!("no JSON-RPC response in SSE stream: {text}");
         }
 
-        serde_json::from_str(&text).unwrap_or_else(|error| {
-            panic!("response is not JSON ({error}): {content_type} {text}")
-        })
+        serde_json::from_str(&text)
+            .unwrap_or_else(|error| panic!("response is not JSON ({error}): {content_type} {text}"))
     }
 
     /// Calls one tool and returns (parsed JSON payload, is_error).
-    async fn call(&mut self, name: &str, arguments: serde_json::Value) -> (serde_json::Value, bool) {
+    async fn call(
+        &mut self,
+        name: &str,
+        arguments: serde_json::Value,
+    ) -> (serde_json::Value, bool) {
         let id = self.next_id;
 
         self.next_id += 1;
@@ -198,11 +201,13 @@ fn program_patch(operation: &str, marker: u32) -> serde_json::Value {
             "program": {"steps": [
                 {
                     "kind": "transaction",
-                    "id": format!("tx.{short}.probe{marker}"),
-                    "data_model": null,
-                    "isolation": "read_committed",
-                    "idempotency": {"kind": "not_deduplicated"},
-                    "steps": [],
+                    "transaction": {
+                        "id": format!("tx.{short}.probe{marker}"),
+                        "data_model": null,
+                        "isolation": "read_committed",
+                        "idempotency": {"kind": "not_deduplicated"},
+                        "steps": [],
+                    },
                 },
                 {"kind": "complete"},
             ]},
@@ -347,7 +352,10 @@ async fn a_multi_project_server_isolates_projects_behind_one_api_key() {
     assert_eq!(created["created"], true);
 
     let (context, _) = client.call("task_context", serde_json::json!({})).await;
-    assert_eq!(context["prompt_evidence"][0]["excerpt"], "A checkout system.");
+    assert_eq!(
+        context["prompt_evidence"][0]["excerpt"],
+        "A checkout system."
+    );
 
     let (committed, is_error) = client
         .call(
@@ -646,7 +654,10 @@ async fn a_malformed_patch_returns_actionable_feedback_not_a_protocol_error() {
         )
         .await;
 
-    assert!(!is_error, "a stringified patch was not accepted: {committed}");
+    assert!(
+        !is_error,
+        "a stringified patch was not accepted: {committed}"
+    );
     assert_eq!(committed["committed"], true);
 
     assert!(
@@ -911,8 +922,8 @@ async fn status_export_and_guide_serve_the_authoring_loop() {
 
     assert!(conseqa::analyzer::validate(&model).is_empty());
 
-    let report = std::fs::read_to_string(dir.join("verification-report.json"))
-        .expect("report written");
+    let report =
+        std::fs::read_to_string(dir.join("verification-report.json")).expect("report written");
 
     assert!(report.contains("obligations"), "{report}");
 
@@ -1188,7 +1199,7 @@ async fn the_server_and_its_artifacts_declare_the_dsl_contract_version() {
         .expect("the server declares instructions");
 
     assert!(
-        instructions.contains("DSL contract version 3"),
+        instructions.contains("DSL contract version 4"),
         "{instructions}"
     );
 
@@ -1205,7 +1216,7 @@ async fn the_server_and_its_artifacts_declare_the_dsl_contract_version() {
     assert!(!is_error);
     assert!(
         toc.as_str()
-            .is_some_and(|text| text.contains("DSL contract version 3")),
+            .is_some_and(|text| text.contains("DSL contract version 4")),
         "{toc}"
     );
 
@@ -1215,7 +1226,7 @@ async fn the_server_and_its_artifacts_declare_the_dsl_contract_version() {
     assert!(
         reference
             .as_str()
-            .is_some_and(|text| text.starts_with("DSL contract version 3.")),
+            .is_some_and(|text| text.starts_with("DSL contract version 4.")),
         "{reference}"
     );
 
@@ -1223,14 +1234,14 @@ async fn the_server_and_its_artifacts_declare_the_dsl_contract_version() {
     let (status, is_error) = client.call("spec_status", serde_json::json!({})).await;
 
     assert!(!is_error, "{status}");
-    assert_eq!(status["dsl"], 3, "{status}");
+    assert_eq!(status["dsl"], 4, "{status}");
 
     let (report, is_error) = client
         .call("requirement_report", serde_json::json!({}))
         .await;
 
     assert!(!is_error, "{report}");
-    assert_eq!(report["dsl"], 3, "{report}");
+    assert_eq!(report["dsl"], 4, "{report}");
 
     // The export leads with the stamp, and the stamped document
     // round-trips through the standalone two-phase parser.
@@ -1247,7 +1258,11 @@ async fn the_server_and_its_artifacts_declare_the_dsl_contract_version() {
 
     let yaml = std::fs::read_to_string(dir.join("conseqa.yaml")).expect("yaml written");
 
-    assert!(yaml.starts_with("dsl: 3\n"), "{}", &yaml[..40.min(yaml.len())]);
+    assert!(
+        yaml.starts_with("dsl: 4\n"),
+        "{}",
+        &yaml[..40.min(yaml.len())]
+    );
     assert!(conseqa::parser::yaml::parse(&yaml).is_ok());
 
     // The patch boundary refuses a stale authored claim by name,
@@ -1276,7 +1291,7 @@ async fn the_server_and_its_artifacts_declare_the_dsl_contract_version() {
         .call(
             "submit_patch",
             serde_json::json!({
-                "dsl": 3,
+                "dsl": 4,
                 "patch": program_patch("operation.create_order", 7),
             }),
         )

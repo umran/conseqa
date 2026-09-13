@@ -1,8 +1,9 @@
+use std::collections::BTreeMap;
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-use crate::spec::{Id, ResultVariant};
+use crate::spec::{Id, ResultArm, ResultVariant};
 
 use super::{Derivation, Effect, SelectorValue, Transaction, ValueRef, WriteOutboxEffect};
 
@@ -10,10 +11,11 @@ use super::{Derivation, Effect, SelectorValue, Transaction, ValueRef, WriteOutbo
 ///
 /// A program is a block of steps executed in order. Decisions —
 /// `MatchResult` over a synchronous effect result, `Branch` over an
-/// ordinary predicate — nest further blocks, and every reachable path
-/// ends at an explicit terminal: `Return` for a request-driven
-/// execution, `Complete` for one that returns nothing. The structure is
-/// acyclic by construction: loops are deliberately deferred.
+/// ordinary predicate, and the `rejected` block of a rejectable
+/// transaction — nest further blocks, and every reachable path ends at
+/// an explicit terminal: `Return` for a request-driven execution,
+/// `Complete` for one that returns nothing. The structure is acyclic
+/// by construction: loops are deliberately deferred.
 ///
 /// Control flow describes causality. It is not a durable workflow, a
 /// checkpoint, or a program counter; a retry traverses the same
@@ -29,8 +31,10 @@ pub struct OperationBlock {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum OperationStep {
     /// Declares and executes one atomic transaction at this point of
-    /// the program, or resolves its prior keyed commit.
-    Transaction(Transaction),
+    /// the program, or resolves its prior keyed commit — and, when the
+    /// transaction can reject, names the block control enters on
+    /// rejection.
+    Transaction(ExecuteTransaction),
 
     /// Declares one logical effect contract and one concrete execution
     /// site: reaching the step constructs the instance and executes it.
@@ -57,8 +61,8 @@ pub enum OperationStep {
     /// complete — first completion, not first success.
     Race(Race),
 
-    /// Destructures a bound effect result into its `ok` and `err`
-    /// arms.
+    /// Destructures a bound effect result into its `ok` arm and one
+    /// arm per declared error class.
     MatchResult(MatchResult),
 
     /// An ordinary control decision over modeled values.
@@ -71,6 +75,56 @@ pub enum OperationStep {
     /// Terminates an execution that returns nothing, as is natural for
     /// a subscription-driven operation.
     Complete,
+}
+
+/// One transaction execution site: the inline transaction and, when
+/// the body contains a logical commit guard, the block control enters
+/// on rejection.
+///
+/// A transaction attempt has three outcome classes. **Committed**: the
+/// mutations and artifacts commit atomically and control continues
+/// after the step. **Rejected**: a modeled commit guard — a transition
+/// whose `from` guard does not hold, a version validation mismatch, an
+/// inadmissible cursor position, a stale fencing token — conclusively
+/// fails; nothing commits, no artifact or outbox admission is
+/// established, and control enters `rejected`. If that block
+/// terminates, the operation terminates; if it falls through, control
+/// rejoins after the step, with the transaction's artifacts
+/// unavailable on that path. **Interrupted**: connection loss,
+/// deadlock victim abort, serialization failure, crash, unknown commit
+/// outcome — never `rejected`, never an application `Err`; these are
+/// the recoverability engine's phenomena.
+///
+/// `rejected` is required exactly when the body contains a rejecting
+/// step ([`Transaction::rejects`]), and forbidden otherwise. A generic
+/// rejection block is sufficient: the particular cause is not yet a
+/// first-class operation value.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExecuteTransaction {
+    pub transaction: Transaction,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rejected: Option<OperationBlock>,
+}
+
+/// The outcome class a path through a rejectable transaction assumes.
+/// Interruption is never a path: it is an execution phenomenon, not a
+/// modeled control decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TransactionOutcome {
+    Committed,
+    Rejected,
+}
+
+impl fmt::Display for TransactionOutcome {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Committed => "committed",
+            Self::Rejected => "rejected",
+        })
+    }
 }
 
 /// Declares one logical effect contract and one concrete execution
@@ -216,18 +270,26 @@ pub struct Race {
 }
 
 /// Explicit, exhaustive, mutually exclusive destructuring of a bound
-/// result.
+/// result: the `ok` arm and one arm per error class the result's
+/// contract declares.
 ///
-/// Inside `ok`, `effect_result_ok:<result>` is available and the `err`
-/// payload is not; inside `err`, the reverse. Neither payload survives
-/// the join after the match: data that must be generally available
-/// later is exported through a transaction artifact instead.
+/// Inside `ok`, `effect_result_ok:<result>` is available and no error
+/// payload is; inside the arm of error class `c`,
+/// `effect_result_err:<result>` resolves to `c`'s schema and the `ok`
+/// payload is unavailable. No payload survives the join after the
+/// match: data that must be generally available later is exported
+/// through a transaction artifact instead. The error arms must match
+/// the contract's error classes exactly — one arm per class, no arm
+/// for a class the contract does not declare — and each class keeps
+/// its own disposition.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MatchResult {
     pub result: Id,
     pub ok: OperationBlock,
-    pub err: OperationBlock,
+
+    #[serde(default)]
+    pub errors: BTreeMap<Id, OperationBlock>,
 }
 
 /// An ordinary control decision. `MatchResult` destructures a result;
@@ -335,13 +397,14 @@ pub struct Return {
 }
 
 /// Which variant a `Return` constructs, and the provenance of its
-/// payload: `Ok` builds the request's `ok` schema, `Err` its `err`
-/// schema.
+/// payload: `Ok` builds the request's `ok` schema, `Err` the schema of
+/// the named error class, which the request's result contract must
+/// declare.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ResultOutcome {
     Ok { values: Derivation },
-    Err { values: Derivation },
+    Err { error: Id, values: Derivation },
 }
 
 impl ResultOutcome {
@@ -352,40 +415,70 @@ impl ResultOutcome {
         }
     }
 
+    /// The arm of the request's result this outcome constructs.
+    pub fn arm(&self) -> ResultArm {
+        match self {
+            Self::Ok { .. } => ResultArm::Ok,
+            Self::Err { error, .. } => ResultArm::Err {
+                error: error.clone(),
+            },
+        }
+    }
+
+    /// The error class named by an `Err` outcome.
+    pub fn error(&self) -> Option<&Id> {
+        match self {
+            Self::Ok { .. } => None,
+            Self::Err { error, .. } => Some(error),
+        }
+    }
+
     pub fn values(&self) -> &Derivation {
         match self {
-            Self::Ok { values } | Self::Err { values } => values,
+            Self::Ok { values } | Self::Err { values, .. } => values,
         }
     }
 }
 
-/// The arm of a decision a nested block belongs to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+/// The arm of a decision a nested block belongs to: the `ok` arm or an
+/// error-class arm of a match, the `then` or `otherwise` arm of a
+/// branch, or the `rejected` block of a transaction step.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Arm {
     Ok,
-    Err,
+    Err { error: Id },
     Then,
     Otherwise,
+    Rejected,
 }
 
 impl Arm {
-    pub fn of(variant: ResultVariant) -> Self {
-        match variant {
-            ResultVariant::Ok => Self::Ok,
-            ResultVariant::Err => Self::Err,
+    pub fn of(arm: &ResultArm) -> Self {
+        match arm {
+            ResultArm::Ok => Self::Ok,
+            ResultArm::Err { error } => Self::Err {
+                error: error.clone(),
+            },
+        }
+    }
+
+    pub fn err(error: &Id) -> Self {
+        Self::Err {
+            error: error.clone(),
         }
     }
 }
 
 impl fmt::Display for Arm {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Self::Ok => "ok",
-            Self::Err => "err",
-            Self::Then => "then",
-            Self::Otherwise => "otherwise",
-        })
+        match self {
+            Self::Ok => f.write_str("ok"),
+            Self::Err { error } => write!(f, "err:{error}"),
+            Self::Then => f.write_str("then"),
+            Self::Otherwise => f.write_str("otherwise"),
+            Self::Rejected => f.write_str("rejected"),
+        }
     }
 }
 
@@ -395,7 +488,9 @@ impl fmt::Display for Arm {
 ///
 /// Steps carry no ids of their own, so this is how diagnostics and
 /// reports name them. It renders one-based, as `3.ok.1`: the first step
-/// of the `ok` arm of the third top-level step.
+/// of the `ok` arm of the third top-level step; an error arm renders
+/// with its class, `3.err:conflict.1`, and a rejection block as
+/// `3.rejected.1`.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct StepLocation(pub Vec<StepHop>);
@@ -436,7 +531,7 @@ impl fmt::Display for StepLocation {
 
             write!(f, "{}", hop.step + 1)?;
 
-            if let Some(arm) = hop.arm {
+            if let Some(arm) = &hop.arm {
                 write!(f, ".{arm}")?;
             }
         }
@@ -447,7 +542,8 @@ impl fmt::Display for StepLocation {
 
 impl OperationBlock {
     /// Every step of the program with its location, depth first in
-    /// program order.
+    /// program order — the arms of every decision and the rejection
+    /// block of every rejectable transaction included.
     pub fn steps_with_locations(&self) -> Vec<(StepLocation, &OperationStep)> {
         let mut out = Vec::new();
 
@@ -463,14 +559,23 @@ impl OperationBlock {
         out: &mut Vec<(StepLocation, &'a OperationStep)>,
     ) {
         for (index, step) in self.steps.iter().enumerate() {
-            let location = parent.descend(arm, index);
+            let location = parent.descend(arm.clone(), index);
 
             out.push((location.clone(), step));
 
             match step {
+                OperationStep::Transaction(execute) => {
+                    if let Some(rejected) = &execute.rejected {
+                        rejected.collect(&location, Some(Arm::Rejected), out);
+                    }
+                }
+
                 OperationStep::MatchResult(matched) => {
                     matched.ok.collect(&location, Some(Arm::Ok), out);
-                    matched.err.collect(&location, Some(Arm::Err), out);
+
+                    for (error, block) in &matched.errors {
+                        block.collect(&location, Some(Arm::err(error)), out);
+                    }
                 }
 
                 OperationStep::Branch(branch) => {
@@ -492,16 +597,26 @@ impl OperationBlock {
         parent.descend(arm, index)
     }
 
+    /// Every transaction execution site of the program with its
+    /// location, in program order, rejection blocks and error arms
+    /// included.
+    pub fn executions(&self) -> Vec<(StepLocation, &ExecuteTransaction)> {
+        self.steps_with_locations()
+            .into_iter()
+            .filter_map(|(location, step)| match step {
+                OperationStep::Transaction(execute) => Some((location, execute)),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// Every inline transaction of the program with its location, in
     /// program order. Derived from the program on demand; the program
     /// remains the source of truth.
     pub fn transactions(&self) -> Vec<(StepLocation, &Transaction)> {
-        self.steps_with_locations()
+        self.executions()
             .into_iter()
-            .filter_map(|(location, step)| match step {
-                OperationStep::Transaction(transaction) => Some((location, transaction)),
-                _ => None,
-            })
+            .map(|(location, execute)| (location, &execute.transaction))
             .collect()
     }
 
@@ -520,29 +635,53 @@ impl OperationBlock {
             block.transaction(id).is_some()
         }
 
-        let position = self.steps.iter().position(|step| match step {
-            OperationStep::Transaction(transaction) => &transaction.id == id,
-            OperationStep::MatchResult(matched) => {
-                contains(&matched.ok, id) || contains(&matched.err, id)
+        fn step_contains(step: &OperationStep, id: &Id) -> bool {
+            match step {
+                OperationStep::Transaction(execute) => {
+                    &execute.transaction.id == id
+                        || execute
+                            .rejected
+                            .as_ref()
+                            .is_some_and(|block| contains(block, id))
+                }
+
+                OperationStep::MatchResult(matched) => {
+                    contains(&matched.ok, id)
+                        || matched.errors.values().any(|block| contains(block, id))
+                }
+
+                OperationStep::Branch(branch) => {
+                    contains(&branch.then, id)
+                        || branch
+                            .otherwise
+                            .as_ref()
+                            .is_some_and(|block| contains(block, id))
+                }
+
+                _ => false,
             }
-            OperationStep::Branch(branch) => {
-                contains(&branch.then, id)
-                    || branch
-                        .otherwise
-                        .as_ref()
-                        .is_some_and(|block| contains(block, id))
-            }
-            _ => false,
-        })?;
+        }
+
+        let position = self.steps.iter().position(|step| step_contains(step, id))?;
 
         match &mut self.steps[position] {
-            OperationStep::Transaction(transaction) => Some(transaction),
+            OperationStep::Transaction(execute) => {
+                if &execute.transaction.id == id {
+                    Some(&mut execute.transaction)
+                } else {
+                    execute.rejected.as_mut()?.transaction_mut(id)
+                }
+            }
 
             OperationStep::MatchResult(matched) => {
                 if contains(&matched.ok, id) {
                     matched.ok.transaction_mut(id)
                 } else {
-                    matched.err.transaction_mut(id)
+                    matched
+                        .errors
+                        .values_mut()
+                        .find(|block| contains(block, id))?
+                        .transaction_mut(id)
                 }
             }
 
@@ -575,8 +714,8 @@ impl OperationBlock {
                     out.push((&step.effect_id, &step.effect));
                 }
 
-                OperationStep::Transaction(transaction) => {
-                    for inner in &transaction.steps {
+                OperationStep::Transaction(execute) => {
+                    for inner in &execute.transaction.steps {
                         if let super::TransactionStep::EstablishEffectIntent(establish) = inner {
                             out.push((&establish.effect_id, &establish.effect));
                         }
@@ -598,6 +737,8 @@ impl OperationBlock {
     /// `OutboxWriteEffect` contract rather than the general effect
     /// enum, and its one legal execution context — the containing
     /// transaction — is part of what a consumer needs to know.
+    /// Transition-scoped outbox writes are declared on the state
+    /// machine, not here.
     pub fn outbox_write_declarations(&self) -> Vec<(&Id, &WriteOutboxEffect)> {
         let mut out = Vec::new();
 

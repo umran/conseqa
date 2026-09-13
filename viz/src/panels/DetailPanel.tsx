@@ -1,42 +1,72 @@
 import { Button } from "@cloudflare/kumo/components/button";
+import { ClipboardText } from "@cloudflare/kumo/components/clipboard-text";
 import { Text } from "@cloudflare/kumo/components/text";
 import { ArrowSquareOutIcon, XIcon } from "@phosphor-icons/react";
-import type { ReactNode } from "react";
+import { Fragment, type ReactNode } from "react";
 
+import { definedAtLabel, usedAtLabel, type BindingKind } from "../lib/bindings";
 import { pathText, shortId } from "../lib/ids";
 import {
-  artifactRetention, commitGuarantee, delivery, externalIdempotency, externalIdentity,
-  externalResult, inheritedResult, intrinsicRedrive,
-  isolation, messageIdentity, requestIdentity, requestResult, resultBinding,
-  executionHandoff, invocationLock,
-  memberAssignment, memberConcurrency, requestRouting, subscriptionRouting,
-  transactionOutput, transportGrouping, transportOrdering,
+  artifactRetention, bindingKind, commitGuarantee, cursorRule, delivery, externalIdempotency,
+  externalIdentity, externalResult, fence, inheritedResult, intrinsicRedrive,
+  isolation, messageIdentity, objectVersion, orderingRequirement, requestIdentity, requestResult,
+  memberAssignment, memberConcurrency, requestRouting, serializabilityRequirement,
+  subscriptionRouting, transactionRejection, transportGrouping,
+  transportOrdering, type Explanation,
 } from "../lib/explain";
-import {
-  effectDef, effectResultType, effectSummary, findTransaction, intentExecutors, operationEffects,
-  walkProgram, type IndexEntry, type LocatedStep,
-} from "../lib/index";
+import { blockTerminates, effectDef, effectResultType, effectSummary, errArm, findDataObject, findTransaction, findTransactionSite, intentExecutors, operationEffects, operationTransactions, stepRejects, walkProgram, type IndexEntry, type LocatedStep } from "../lib/index";
 import { propertyMatchesRequirement } from "../lib/obligations";
 import { accessKeysToPartition, objectAccesses, partitionKeyOf } from "../lib/runtime";
 import { hashes } from "../lib/route";
-import { conditionText } from "../lib/text";
+import { predicateText, refString } from "../lib/text";
 import { useApp, useCitations, useObligationsAt, type DetailTarget } from "../state/AppState";
 import { CLIENT_NODE_ID, EXTERNAL_PREFIX, type Edge } from "../types/graph";
 import type { Id, IdempotencyKeyPropagation, OperationBlock, RequirementKind, ResultType } from "../types/model";
+import { useFrameMode } from "./frameMode";
+import { ProofSummary } from "./TransactionProof";
 import { ObligationCard } from "./ObligationCard";
 import {
-  DerivationView, FactNote, IdLink, KeyComponents, KeyValue, List, Mono, Muted, NavLink,
-  PredicateView, RefText, Section, Tag, TypeView,
+  BindingChip, ConditionView, DerivationView, FactNote, IdLink, KeyComponents, KeyValue, List, Mono, Muted,
+  NavLink, PredicateView, RefText, Section, Tag, TypeView, useProgramNavigation,
 } from "./parts";
 
-/** Chrome shared by every detail: kind label, close button, title block. */
+/** Chrome shared by every detail: kind label, close button, title block.
+ *
+ *  The same detail is drawn two ways. In the inspector beside the canvas
+ *  it is a narrow column with a close button; as a page in the canvas
+ *  it gets the page header the operation and machine pages have — the
+ *  kind, the name, the copyable id — and room to breathe. */
 function Frame({
   kind, title, subtitle, description, children,
 }: { kind: string; title: ReactNode; subtitle?: ReactNode; description?: ReactNode; children?: ReactNode }) {
   const { closeDetail } = useApp();
+  const mode = useFrameMode();
+  if (mode === "page") {
+    const idTitle = typeof title === "string" && !/\s/.test(title) ? title : null;
+    return (
+      <div className="h-full overflow-auto">
+        <div className="mx-auto max-w-[1240px] space-y-6 p-6">
+          <header className="space-y-3 border-b border-kumo-hairline pb-5">
+            <div className="text-[11px] font-semibold uppercase tracking-wider text-kumo-subtle">{kind}</div>
+            <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
+              <Text variant="heading" size="lg" as="h1">{idTitle !== null ? shortId(idTitle) : title}</Text>
+              {idTitle !== null && (
+                <ClipboardText text={idTitle} size="sm" tooltip={{ text: "Copy id", copiedText: "Copied" }} />
+              )}
+            </div>
+            {subtitle && <div className="text-sm text-kumo-subtle">{subtitle}</div>}
+            {description && <div className="max-w-3xl text-sm leading-relaxed text-kumo-default">{description}</div>}
+          </header>
+          <div className="max-w-[880px] space-y-3">{children}</div>
+        </div>
+      </div>
+    );
+  }
   return (
     <div className="flex h-full flex-col">
-      <header className="flex shrink-0 items-center justify-between border-b border-kumo-hairline px-4 py-2">
+      {/* The header takes the top bar's height, so its rule runs
+          straight across from the bar. */}
+      <header className="box-content flex h-12 shrink-0 items-center justify-between border-b border-kumo-hairline px-4">
         <span className="uppercase tracking-wider">
           <Text variant="secondary" size="xs" as="span">
             {kind}
@@ -105,34 +135,98 @@ function Propagation({ items }: { items: IdempotencyKeyPropagation[] }) {
   );
 }
 
-/** A Result<ok, err> contract as two schema links, with the error's
- *  declared disposition when it declares one. */
+/** A result contract: the ok schema link, then every named error class
+ *  as `class: schema [disposition]` — the disposition shown when the
+ *  class declares one. A contract with no classes reads `Result<ok>`. */
 function ResultContract({ result }: { result: ResultType }) {
+  const classes = Object.entries(result.errors);
   return (
     <span className="inline-flex flex-wrap items-center gap-1">
       <Mono className="text-kumo-subtle">Result&lt;</Mono>
       <IdLink id={result.ok}>{shortId(result.ok)}</IdLink>
-      <Mono className="text-kumo-subtle">,</Mono>
-      <IdLink id={result.err.schema}>{shortId(result.err.schema)}</IdLink>
-      {result.err.disposition !== "unspecified" && (
-        <Mono className="text-kumo-subtle">{result.err.disposition}</Mono>
-      )}
+      {classes.map(([cls, c]) => (
+        <span key={cls} className="inline-flex items-center gap-1">
+          <Mono className="text-kumo-subtle">,</Mono>
+          <Mono className="text-kumo-strong">{cls}:</Mono>
+          <IdLink id={c.schema}>{shortId(c.schema)}</IdLink>
+          {c.disposition !== "unspecified" && (
+            <Mono className="text-kumo-subtle">[{c.disposition}]</Mono>
+          )}
+        </span>
+      ))}
       <Mono className="text-kumo-subtle">&gt;</Mono>
     </span>
   );
 }
 
+/** Where a binding is bound, as a link to the producing card. */
+function BoundAt({ name }: { name: Id }) {
+  const { bindings } = useApp();
+  const { toProducer } = useProgramNavigation();
+  const def = bindings.defs.get(name);
+  if (!def) return <Muted>not bound by any step</Muted>;
+  return (
+    <span className="inline-flex flex-wrap items-center gap-1.5">
+      <button type="button" className="cursor-pointer font-mono text-[12px] text-kumo-link hover:underline" onClick={() => toProducer(def)}>
+        step {definedAtLabel(def)}
+      </button>
+      <span className="text-xs text-kumo-subtle">{def.producer}</span>
+    </span>
+  );
+}
+
+/** Every step that consumes a binding: where, how, and — for a value
+ *  reference — which payload and path it reads. Each row is a link to
+ *  that step in the flow. */
+function UsedAt({ name }: { name: Id }) {
+  const { bindings } = useApp();
+  const { toUse } = useProgramNavigation();
+  const def = bindings.defs.get(name);
+  const uses = def ? bindings.byOp.get(def.op)?.uses.get(name) ?? [] : [];
+  return (
+    <Section title="used at" count={uses.length}>
+      {uses.length ? (
+        <List items={uses.map((u, i) => (
+          <button
+            key={i}
+            type="button"
+            className="flex w-full cursor-pointer flex-wrap items-center gap-2 text-left hover:underline"
+            onClick={() => def && toUse(def.op, u)}
+          >
+            <Mono className="text-kumo-link">step {usedAtLabel(u)}</Mono>
+            <span className="text-xs text-kumo-subtle">
+              {u.how}
+              {u.arm && ` · ${u.arm} payload`}
+              {u.path && u.path.length > 0 && ` · .${pathText(u.path)}`}
+            </span>
+          </button>
+        ))} />
+      ) : (
+        <Muted>unused — no later step reads it</Muted>
+      )}
+    </Section>
+  );
+}
+
+/** The kind of a binding, explained: what it is, where it is available,
+ *  and what it is not. */
+function BindingKindNote({ kind }: { kind: BindingKind }) {
+  return <FactNote fact={bindingKind(kind)} />;
+}
+
 export function DetailPanel() {
   const { detail } = useApp();
   if (!detail) return null;
-  return <Dispatch target={detail} />;
+  return <DetailBody target={detail} />;
 }
 
-function Dispatch({ target }: { target: DetailTarget }) {
+/** The detail of one target, whatever it names — drawn in the frame the
+ *  surrounding mode asks for. */
+export function DetailBody({ target }: { target: DetailTarget }) {
   const { index, graph } = useApp();
   const { id, ctx } = target;
 
-  if (ctx.req) return <RequirementDetail opId={id} prop={ctx.req.prop} reqIndex={ctx.req.index} />;
+  if (ctx.req) return <RequirementDetail opId={id} prop={ctx.req.prop} reqIndex={ctx.req.index} transaction={ctx.req.transaction} />;
   if (ctx.txStep) return <TxStepDetail opId={ctx.txStep.op} txId={ctx.txStep.tx} stepIndex={ctx.txStep.index} />;
   if (ctx.step) return <StepDetail opId={ctx.step.op} location={ctx.step.location} />;
   if (ctx.edge) {
@@ -161,6 +255,7 @@ function Dispatch({ target }: { target: DetailTarget }) {
     case "effect": return <EffectDetail id={id} />;
     case "intent": return <IntentDetail entry={entry} id={id} />;
     case "output": return <OutputDetail entry={entry} id={id} />;
+    case "read": return <ReadBindingDetail entry={entry} id={id} />;
     case "binding": return <BindingDetail opId={entry.op} effectId={entry.effect} location={entry.location} id={id} />;
     case "handle": return <HandleDetail opId={entry.op} effectId={entry.effect} location={entry.location} id={id} />;
     case "transaction": return <TransactionDetail opId={entry.op} id={id} />;
@@ -184,21 +279,94 @@ function ServiceDetail({ id }: { id: Id }) {
 }
 
 /** One block of the program as a nested ordered list. Each step is one
- *  row: kind label, principal id, and arms indented beneath decisions. */
-function ProgramSummary({ opId, block, depth = 0 }: { opId: Id; block: OperationBlock; depth?: number }) {
+ *  row: kind label, principal id, the names it binds as defining chips,
+ *  the names it consumes as using chips, and arms indented beneath
+ *  decisions. A transaction's two outcomes are two labelled rows
+ *  beneath it, so a commit and a rejection read as alternatives. */
+function ProgramSummary({ opId, block, depth = 0, startIndex = 0 }: {
+  opId: Id; block: OperationBlock; depth?: number;
+  /** The index in the enclosing block of `block.steps[0]` — a tail
+   *  listed inside a transaction's committed row keeps its numbering. */
+  startIndex?: number;
+}) {
   const { model, index } = useApp();
-  const rows: ReactNode[] = block.steps.map((s, i) => {
+  const defines = (name: Id, kind: BindingKind) => (
+    <span className="ml-1.5 inline-flex items-center gap-1 align-baseline">
+      <BindingChip role="defines" name={name} kind={kind} />
+    </span>
+  );
+  const uses = (name: Id, kind: BindingKind) => (
+    <span className="inline-flex items-center align-baseline">
+      <BindingChip role="uses" name={name} kind={kind} />
+    </span>
+  );
+  const rows: ReactNode[] = block.steps.map((s, offset) => {
+    const i = startIndex + offset;
     const number = <span className="shrink-0"><Tag>{i + 1}</Tag></span>;
     switch (s.kind) {
       case "transaction": {
-        const n = s.steps.length;
+        const tx = s.transaction;
+        const n = tx.steps.length;
+        const tail = block.steps.slice(offset + 1);
+        const reads = tx.steps.flatMap((inner) => (inner.kind === "read" ? [inner.bind] : []));
+        const established = tx.steps.flatMap((inner): { name: Id; kind: BindingKind }[] => {
+          switch (inner.kind) {
+            case "establish_effect_intent": return [{ name: inner.bind, kind: "intent" }];
+            case "establish_transaction_output": return [{ name: inner.bind, kind: "output" }];
+            case "transition": return Object.values(inner.effect_intents).map((intent) => ({ name: intent.bind, kind: "intent" }));
+            default: return [];
+          }
+        });
         return (
           <li key={i} className="flex items-start gap-2 text-xs">
             {number}
-            <div className="min-w-0">
+            <div className="min-w-0 flex-1">
               <span className="text-kumo-subtle">transaction </span>
-              <IdLink id={s.id}>{shortId(s.id)}</IdLink>
+              <IdLink id={tx.id}>{shortId(tx.id)}</IdLink>
               <span className="ml-1.5 text-kumo-inactive">{n} step{n === 1 ? "" : "s"}</span>
+              {reads.length > 0 && (
+                <div className="mt-1 flex flex-wrap items-center gap-1 text-kumo-subtle">
+                  <span>binds inside</span>
+                  {reads.map((r) => <BindingChip key={r} role="defines" name={r} kind="read" />)}
+                  <span className="text-kumo-inactive">· transaction-local</span>
+                </div>
+              )}
+              {established.length > 0 && (
+                <div className="mt-1 flex flex-wrap items-center gap-1 text-kumo-subtle">
+                  <span>establishes</span>
+                  {established.map((b) => <BindingChip key={b.name} role="defines" name={b.name} kind={b.kind} />)}
+                  <span className="text-kumo-inactive">· available on the committed path</span>
+                </div>
+              )}
+              {s.rejected ? (
+                // The fork: the rejected block, indented under its
+                // label, and the committed path — which is the rest of
+                // this list, continuing explicitly below at this level.
+                <div className="mt-1 space-y-2">
+                  <div className="space-y-1 border-l-2 border-kumo-warning/50 pl-2">
+                    <div className="flex flex-wrap items-center gap-1.5">
+                      <Tag variant="warning">↘ rejected</Tag>
+                      <span className="text-kumo-subtle">nothing committed · no binding above is available</span>
+                      {!blockTerminates(s.rejected) && (
+                        <span className="text-kumo-inactive">
+                          · falls through, rejoining the committed path{tail.length ? ` at step ${i + 2}` : ""}
+                        </span>
+                      )}
+                    </div>
+                    <ProgramSummary opId={opId} block={s.rejected} depth={depth + 1} />
+                  </div>
+                  <div className="flex flex-wrap items-center gap-1.5 border-l-2 border-kumo-success/50 pl-2">
+                    <Tag variant="success">↓ committed</Tag>
+                    <span className="text-kumo-subtle">
+                      {tail.length
+                        ? `continues with step ${i + 2} below`
+                        : depth > 0 ? "falls through to the enclosing join" : "end of program"}
+                    </span>
+                  </div>
+                </div>
+              ) : (
+                <div className="mt-1 text-kumo-inactive">always commits</div>
+              )}
             </div>
           </li>
         );
@@ -210,7 +378,7 @@ function ProgramSummary({ opId, block, depth = 0 }: { opId: Id; block: Operation
             <div className="min-w-0">
               <span className="text-kumo-subtle">execute effect </span>
               <IdLink id={s.effect_id}>{shortId(s.effect_id)}</IdLink>
-              {s.bind && <span className="ml-1.5 text-kumo-subtle">binds <IdLink id={s.bind}>{s.bind}</IdLink></span>}
+              {s.bind && defines(s.bind, "result")}
               <div className="text-kumo-inactive">{effectSummary(model, index, s.effect_id)}</div>
             </div>
           </li>
@@ -221,8 +389,8 @@ function ProgramSummary({ opId, block, depth = 0 }: { opId: Id; block: Operation
             {number}
             <div className="min-w-0">
               <span className="text-kumo-subtle">execute intent </span>
-              <IdLink id={s.intent}>{shortId(s.intent)}</IdLink>
-              {s.bind && <span className="ml-1.5 text-kumo-subtle">binds <IdLink id={s.bind}>{s.bind}</IdLink></span>}
+              {uses(s.intent, "intent")}
+              {s.bind && defines(s.bind, "result")}
             </div>
           </li>
         );
@@ -233,7 +401,7 @@ function ProgramSummary({ opId, block, depth = 0 }: { opId: Id; block: Operation
             <div className="min-w-0">
               <span className="text-kumo-subtle">launch async </span>
               <IdLink id={s.effect_id}>{shortId(s.effect_id)}</IdLink>
-              <span className="ml-1.5 text-kumo-subtle">binds handle <IdLink id={s.handle}>{s.handle}</IdLink></span>
+              {defines(s.handle, "handle")}
               <div className="text-kumo-inactive">{effectSummary(model, index, s.effect_id)}</div>
             </div>
           </li>
@@ -244,8 +412,8 @@ function ProgramSummary({ opId, block, depth = 0 }: { opId: Id; block: Operation
             {number}
             <div className="min-w-0">
               <span className="text-kumo-subtle">launch intent async </span>
-              <IdLink id={s.intent}>{shortId(s.intent)}</IdLink>
-              <span className="ml-1.5 text-kumo-subtle">binds handle <IdLink id={s.handle}>{s.handle}</IdLink></span>
+              {uses(s.intent, "intent")}
+              {defines(s.handle, "handle")}
             </div>
           </li>
         );
@@ -258,8 +426,8 @@ function ProgramSummary({ opId, block, depth = 0 }: { opId: Id; block: Operation
               {s.handles.map((entry, j) => (
                 <span key={entry.handle}>
                   {j > 0 && <span className="text-kumo-inactive">, </span>}
-                  <IdLink id={entry.handle}>{entry.handle}</IdLink>
-                  {entry.bind && <span className="text-kumo-subtle"> binds <IdLink id={entry.bind}>{entry.bind}</IdLink></span>}
+                  {uses(entry.handle, "handle")}
+                  {entry.bind && defines(entry.bind, "result")}
                 </span>
               ))}
             </div>
@@ -274,10 +442,10 @@ function ProgramSummary({ opId, block, depth = 0 }: { opId: Id; block: Operation
               {s.handles.map((h, j) => (
                 <span key={h}>
                   {j > 0 && <span className="text-kumo-inactive">, </span>}
-                  <IdLink id={h}>{h}</IdLink>
+                  {uses(h, "handle")}
                 </span>
               ))}
-              {s.bind && <span className="ml-1.5 text-kumo-subtle">winner binds <IdLink id={s.bind}>{s.bind}</IdLink></span>}
+              {s.bind && <span className="ml-1.5 text-kumo-subtle">winner{defines(s.bind, "result")}</span>}
             </div>
           </li>
         );
@@ -287,12 +455,16 @@ function ProgramSummary({ opId, block, depth = 0 }: { opId: Id; block: Operation
             {number}
             <div className="min-w-0 flex-1">
               <span className="text-kumo-subtle">match </span>
-              <IdLink id={s.result}>{shortId(s.result)}</IdLink>
+              {uses(s.result, "result")}
               <div className="mt-1 space-y-1 border-l border-kumo-hairline pl-2">
                 <div><Tag variant="success">ok</Tag></div>
                 <ProgramSummary opId={opId} block={s.ok} depth={depth + 1} />
-                <div><Tag variant="warning">err</Tag></div>
-                <ProgramSummary opId={opId} block={s.err} depth={depth + 1} />
+                {Object.entries(s.errors).map(([error, arm]) => (
+                  <Fragment key={error}>
+                    <div><Tag variant="warning">{errArm(error)}</Tag></div>
+                    <ProgramSummary opId={opId} block={arm} depth={depth + 1} />
+                  </Fragment>
+                ))}
               </div>
             </div>
           </li>
@@ -303,7 +475,7 @@ function ProgramSummary({ opId, block, depth = 0 }: { opId: Id; block: Operation
             {number}
             <div className="min-w-0 flex-1">
               <span className="text-kumo-subtle">branch on </span>
-              <Mono className="text-kumo-subtle">{conditionText(s.condition)}</Mono>
+              <ConditionView condition={s.condition} />
               <div className="mt-1 space-y-1 border-l border-kumo-hairline pl-2">
                 <div><Tag>then</Tag></div>
                 <ProgramSummary opId={opId} block={s.then} depth={depth + 1} />
@@ -321,7 +493,9 @@ function ProgramSummary({ opId, block, depth = 0 }: { opId: Id; block: Operation
             {number}
             <div className="min-w-0">
               <span className="text-kumo-subtle">return </span>
-              <Tag variant={s.outcome.kind === "ok" ? "success" : "warning"}>{s.outcome.kind}</Tag>
+              <Tag variant={s.outcome.kind === "ok" ? "success" : "warning"}>
+                {s.outcome.kind === "ok" ? "ok" : errArm(s.outcome.error)}
+              </Tag>
               <span className="ml-1.5 text-kumo-subtle">for <IdLink id={s.request}>{shortId(s.request)}</IdLink></span>
             </div>
           </li>
@@ -348,11 +522,20 @@ function OperationDetail({ id }: { id: Id }) {
   const inputs = Object.entries(op.inputs);
   const effects = operationEffects(op).map(([eid]) => eid);
   const reqs = op.requirements;
+  // Transaction requirements first, in program order — properties of
+  // committed state, which the operation's own obligations build on.
   const reqRows: ReactNode[] = [];
-  reqs.serialization.forEach((r, i) => reqRows.push(
-    <div key={`s${i}`} className="flex flex-wrap items-center gap-1.5"><Tag variant="blue">serialization</Tag><RefText value={r.key} /></div>));
-  reqs.ordering.forEach((r, i) => reqRows.push(
-    <div key={`o${i}`} className="flex flex-wrap items-center gap-1.5"><Tag variant="purple">ordering</Tag><RefText value={r.key} /></div>));
+  for (const tx of operationTransactions(op)) {
+    tx.requirements.serializability.forEach((r, i) => reqRows.push(
+      <div key={`${tx.id}s${i}`} className="flex flex-wrap items-center gap-1.5">
+        <Tag variant="blue">serializability</Tag><IdLink id={tx.id}>{shortId(tx.id)}</IdLink><RefText value={r.key} />
+      </div>));
+    tx.requirements.ordering.forEach((r, i) => reqRows.push(
+      <div key={`${tx.id}o${i}`} className="flex flex-wrap items-center gap-1.5">
+        <Tag variant="purple">ordering</Tag><IdLink id={tx.id}>{shortId(tx.id)}</IdLink><RefText value={r.key} />
+        <span className="text-xs text-kumo-subtle">by</span><RefText value={r.position} />
+      </div>));
+  }
   reqs.idempotency.forEach((r, i) => reqRows.push(
     <div key={`i${i}`} className="flex flex-wrap items-center gap-1.5">
       <Tag variant="orange">idempotency</Tag>{r.result === "replay_consistent" && <Tag variant="info">replay_consistent</Tag>}
@@ -413,11 +596,6 @@ function OperationDetail({ id }: { id: Id }) {
         <Section title="state machines" count={node.machines.length}>
           <List items={node.machines.map((m) => <NavLink key={m} hash={hashes.machine(m)}>{m}</NavLink>)} />
         </Section>
-      )}
-      {op.invocation_lock && (
-        <FactNote fact={invocationLock()}>
-          <RefText value={op.invocation_lock.key} />
-        </FactNote>
       )}
       {reqRows.length > 0 && (
         <Section title="requirements" count={reqRows.length}>
@@ -570,7 +748,22 @@ function ObjectDetail({ dmId, id }: { dmId: Id; id: Id }) {
   const touchers = [...(objectAccesses(model).get(id)?.keys() ?? [])];
   return (
     <Frame kind="data object" title={id} subtitle={<span>persistent object in <IdLink id={dmId} /></span>}>
-      <KeyValue rows={[["schema", <IdLink key="s" id={obj.schema} />], ["identity", <Mono key="i">{obj.identity.map(pathText).join(", ")}</Mono>]]} />
+      <KeyValue rows={[
+        ["schema", <IdLink key="s" id={obj.schema} />],
+        ["identity", <Mono key="i">{obj.identity.map(pathText).join(", ")}</Mono>],
+        ["version", obj.version
+          ? <Mono key="v">{pathText(obj.version.field)}</Mono>
+          : <Muted key="v">none declared</Muted>],
+      ]} />
+      {obj.version ? (
+        <FactNote fact={objectVersion(obj.version.field)} />
+      ) : (
+        <p className="text-xs leading-relaxed text-kumo-subtle">
+          No version field: the object carries no application concurrency token, so no
+          validate_version guard can protect a read-then-write on it. Absence of the OCC route,
+          not a claim that concurrent mutation is safe.
+        </p>
+      )}
       <Section title="L1 · storage">
         {layout ? (
           <>
@@ -580,7 +773,7 @@ function ObjectDetail({ dmId, id }: { dmId: Id; id: Id }) {
             ]} />
             <p className="text-xs leading-relaxed text-kumo-subtle">
               Partitioned. A partition key says where rows live; it is not the object's identity and
-              not a routing key, and no serialization or ordering proof rests on it.
+              not a routing key, and no transaction proof rests on it.
             </p>
           </>
         ) : (
@@ -639,10 +832,32 @@ function TransitionDetail({ mId, id }: { mId: Id; id: Id }) {
   const { model, graph } = useApp();
   const t = model.state_machines[mId].transitions[id];
   const fx = Object.entries(t.side_effects);
+  const admissions = Object.entries(t.effects ?? {});
   const refs = graph.transition_refs[`${mId}/${id}`] ?? [];
   return (
-    <Frame kind="transition" title={id} subtitle={<span>transition of <IdLink id={mId} /></span>}>
+    <Frame
+      kind="transition"
+      title={id}
+      subtitle={<span>transition of <IdLink id={mId} /></span>}
+      description="An explicitly fallible commit guard: applied to a subject in one of its from states it continues; otherwise the containing transaction rejects — nothing commits, no intent is established, no admission is made — and control enters that step's rejected block. The transition never returns an operation error itself."
+    >
       <KeyValue rows={[["from", <Mono key="f">{t.from.join(", ")}</Mono>], ["to", <Mono key="t">{t.to}</Mono>]]} />
+      {admissions.length > 0 && (
+        <Section title="outbox admissions" count={admissions.length}>
+          <p className="text-xs leading-relaxed text-kumo-subtle">
+            Admitted atomically with the applying transaction's commit, and only when the
+            transition applies; the applying step supplies each message's derivation.
+          </p>
+          <List items={admissions.map(([eid, e]) => (
+            <div key={eid} className="space-y-0.5">
+              <IdLink id={eid} />
+              <div className="text-xs text-kumo-subtle">
+                write <IdLink id={e.schema} /> → outbox <IdLink id={e.outbox} />
+              </div>
+            </div>
+          ))} />
+        </Section>
+      )}
       {fx.length > 0 && (
         <Section title="side effects" count={fx.length}>
           <List items={fx.map(([eid, e]) => (
@@ -697,7 +912,6 @@ function InputDetail({ opId, id }: { opId: Id; id: Id }) {
               <FactNote fact={memberAssignment(routed[1].routing.member_assignment)} />
             )}
             {routerPool && <FactNote fact={memberConcurrency(routerPool.member_concurrency)} />}
-            {routerPool && <FactNote fact={executionHandoff(routerPool.execution_handoff)} />}
           </Section>
         )}
         <Citations id={id} />
@@ -732,7 +946,6 @@ function InputDetail({ opId, id }: { opId: Id; id: Id }) {
               <FactNote fact={memberAssignment(runtime.dispatch.routing.member_assignment)} />
             )}
             {pool && <FactNote fact={memberConcurrency(pool.member_concurrency)} />}
-            {pool && <FactNote fact={executionHandoff(pool.execution_handoff)} />}
           </Section>
         )}
         <Citations id={id} />
@@ -759,7 +972,6 @@ function InputDetail({ opId, id }: { opId: Id; id: Id }) {
             <FactNote fact={memberAssignment(runtime.dispatch.routing.member_assignment)} />
           )}
           {pool && <FactNote fact={memberConcurrency(pool.member_concurrency)} />}
-          {pool && <FactNote fact={executionHandoff(pool.execution_handoff)} />}
         </Section>
       ) : (
         <FactNote fact={delivery("unspecified")} />
@@ -835,11 +1047,16 @@ function IntentDetail({ entry, id }: { entry: Extract<IndexEntry, { kind: "inten
     <Frame kind="effect intent" title={id} subtitle={<span>intent binding of <IdLink id={entry.op} /></span>}
       description={entry.via ? <>The effect is owned by transition <IdLink id={entry.via.transition} />; applying it establishes this bound intent.</> : undefined}>
       <KeyValue rows={[
+        ["binding", <BindingChip key="b" role="defines" name={id} kind="intent" />],
         ["effect", <IdLink key="e" id={entry.effect} />],
         ["resolves to", effectSummary(model, index, entry.effect)],
         ["established by", <IdLink key="t" id={entry.transaction} />],
+        ["bound at", <BoundAt key="l" name={id} />],
+        ["available", "from the transaction on · committed path only"],
       ]} />
+      <BindingKindNote kind="intent" />
       {tx && <FactNote fact={artifactRetention(tx.idempotency)} />}
+      <UsedAt name={id} />
     </Frame>
   );
 }
@@ -850,11 +1067,47 @@ function OutputDetail({ entry, id }: { entry: Extract<IndexEntry, { kind: "outpu
   return (
     <Frame kind="transaction output" title={id} subtitle={<span>typed export of <IdLink id={entry.op} /></span>}>
       <KeyValue rows={[
+        ["binding", <BindingChip key="b" role="defines" name={id} kind="output" />],
         ["schema", <IdLink key="s" id={entry.schema} />],
         ["established by", <IdLink key="t" id={entry.transaction} />],
+        ["bound at", <BoundAt key="l" name={id} />],
+        ["available", "from the transaction on · committed path only"],
       ]} />
-      <FactNote fact={transactionOutput()} />
+      <BindingKindNote kind="output" />
       {tx && <FactNote fact={artifactRetention(tx.idempotency)} />}
+      <UsedAt name={id} />
+    </Frame>
+  );
+}
+
+/** A transaction-local read binding: the name a read step gives to what
+ *  the transaction observed, available to its later steps and to
+ *  nothing outside it. */
+function ReadBindingDetail({ entry, id }: { entry: Extract<IndexEntry, { kind: "read" }>; id: Id }) {
+  const { model } = useApp();
+  const step = findTransaction(model.operations[entry.op], entry.transaction)?.steps[entry.step];
+  const read = step?.kind === "read" ? step : null;
+  return (
+    <Frame kind="transaction read" title={id}
+      subtitle={<span>read binding of <IdLink id={entry.transaction} /> in <IdLink id={entry.op} /></span>}>
+      <KeyValue rows={[
+        ["binding", <BindingChip key="b" role="defines" name={id} kind="read" />],
+        ["reads", read ? <IdLink key="o" id={read.target.object} /> : <Muted key="o">unresolved read step</Muted>],
+        ["where", read ? <PredicateView key="p" predicate={read.target.predicate} /> : null],
+        ["fields", read
+          ? (read.fields.kind === "all"
+            ? <Tag key="f">all fields</Tag>
+            : <span key="f" className="inline-flex flex-wrap gap-1">{read.fields.fields.map((f, i) => <Mono key={i}>{pathText(f)}</Mono>)}</span>)
+          : null],
+        ["transaction", <IdLink key="t" id={entry.transaction} />],
+        ["bound at", <BoundAt key="l" name={id} />],
+        ["scope", <span key="s" className="inline-flex flex-wrap items-center gap-1.5">
+          <Tag variant="warning">transaction-local</Tag>
+          <span className="text-xs text-kumo-subtle">never available outside {entry.transaction}</span>
+        </span>],
+      ]} />
+      <BindingKindNote kind="read" />
+      <UsedAt name={id} />
     </Frame>
   );
 }
@@ -863,14 +1116,17 @@ function BindingDetail({ opId, effectId, location, id }: { opId: Id; effectId: I
   const { model, index } = useApp();
   const contract = effectResultType(model, index, effectId);
   return (
-    <Frame kind="effect result" title={id} subtitle={<span>result binding in <IdLink id={opId} /></span>}>
+    <Frame kind="effect result" title={id} subtitle={<span>result binding in <IdLink id={opId} /> · step {location}</span>}>
       <KeyValue rows={[
+        ["binding", <BindingChip key="b" role="defines" name={id} kind="result" />],
         ["observes", <IdLink key="e" id={effectId} />],
         ["which is", effectSummary(model, index, effectId)],
-        ["bound at step", <Mono key="l">{location}</Mono>],
+        ["bound at", <BoundAt key="l" name={id} />],
         ["contract", contract ? <ResultContract key="c" result={contract} /> : <Muted key="c">no synchronous result</Muted>],
+        ["available", "from this step on · ok and err payloads only inside the matching arm"],
       ]} />
-      <FactNote fact={resultBinding()} />
+      <BindingKindNote kind="result" />
+      <UsedAt name={id} />
     </Frame>
   );
 }
@@ -893,11 +1149,11 @@ function StepDetail({ opId, location }: { opId: Id; location: string }) {
     case "match_result":
       return (
         <Frame kind="program step" title={`match · ${shortId(step.result)}`} subtitle={sub}
-          description="Destructures the bound result: exactly one arm executes, and each variant payload is available only inside its own arm.">
+          description="Destructures the bound result into its ok arm and one arm per error class the contract declares: exactly one arm executes, the ok payload is available only inside the ok arm, and an error payload only inside the arm of its own class.">
           <KeyValue rows={[
-            ["result", <IdLink key="r" id={step.result} />],
+            ["result", <BindingChip key="r" role="uses" name={step.result} kind="result" />],
             arms("ok arm", step.ok),
-            arms("err arm", step.err),
+            ...Object.entries(step.errors).map(([error, arm]) => arms(`${errArm(error)} arm`, arm)),
           ]} />
           <Obligations obKey={opId} />
         </Frame>
@@ -909,40 +1165,61 @@ function StepDetail({ opId, location }: { opId: Id; location: string }) {
             ? "The condition declares no fact about how the decision is made, so a retry is not established to take the same arm."
             : "An ordinary control decision over modeled values; a retry takes the same arm exactly when the condition's roots are replay-stable."}>
           <KeyValue rows={[
-            ["condition", <Mono key="c" className="text-kumo-subtle">{conditionText(step.condition)}</Mono>],
+            ["condition", <ConditionView key="c" condition={step.condition} />],
             arms("then arm", step.then),
             arms("otherwise arm", step.otherwise),
           ]} />
         </Frame>
       );
-    case "return":
+    case "return": {
+      const outcome = step.outcome;
+      const arm = outcome.kind === "ok" ? "ok" : errArm(outcome.error);
+      const contract = op.inputs[step.request];
+      const cls = outcome.kind === "err" && contract?.kind === "request" ? contract.result.errors[outcome.error] : undefined;
       return (
-        <Frame kind="program step" title={`return ${step.outcome.kind}`} subtitle={sub}
-          description="Terminates the execution by constructing the request input's declared result.">
+        <Frame kind="program step" title={`return ${arm}`} subtitle={sub}
+          description={outcome.kind === "ok"
+            ? "Terminates the execution by constructing the request input's ok result."
+            : "Terminates the execution by constructing the payload of the named error class, which the request's result contract declares."}>
           <KeyValue rows={[
             ["request", <IdLink key="r" id={step.request} />],
-            ["variant", <Tag key="v" variant={step.outcome.kind === "ok" ? "success" : "warning"}>{step.outcome.kind}</Tag>],
+            ["arm", <Tag key="v" variant={outcome.kind === "ok" ? "success" : "warning"}>{arm}</Tag>],
+            ...(outcome.kind === "err"
+              ? [["error class", <span key="c" className="inline-flex flex-wrap items-center gap-1.5">
+                  <Mono className="text-kumo-strong">{outcome.error}</Mono>
+                  {cls && <IdLink id={cls.schema}>{shortId(cls.schema)}</IdLink>}
+                  {cls && cls.disposition !== "unspecified" && <Tag>{cls.disposition}</Tag>}
+                </span>] as [string, ReactNode]]
+              : []),
           ]} />
-          <Section title="payload provenance"><DerivationView value={step.outcome.values} /></Section>
+          <Section title="payload provenance"><DerivationView value={outcome.values} /></Section>
         </Frame>
       );
+    }
     case "complete":
       return (
         <Frame kind="program step" title="complete" subtitle={sub}
           description="Terminates the execution without a returned value, as is natural for a subscription-driven operation." />
       );
-    case "transaction":
+    case "transaction": {
+      const tx = step.transaction;
       return (
-        <Frame kind="program step" title={`transaction · ${shortId(step.id)}`} subtitle={sub}>
-          <KeyValue rows={[["transaction", <IdLink key="t" id={step.id} />]]} />
+        <Frame kind="program step" title={`transaction · ${shortId(tx.id)}`} subtitle={sub}
+          description="Declares and executes one atomic transaction at this point of the program, or resolves its prior keyed commit. An attempt commits, rejects, or is interrupted.">
+          <KeyValue rows={[
+            ["transaction", <IdLink key="t" id={tx.id} />],
+            ...(step.rejected ? [arms("rejected block", step.rejected)] : []),
+          ]} />
+          <FactNote fact={transactionRejection(step.rejected !== undefined)} />
         </Frame>
       );
+    }
     case "execute_effect":
       return (
         <Frame kind="program step" title={`execute effect · ${shortId(step.effect_id)}`} subtitle={sub}>
           <KeyValue rows={[
             ["effect", <IdLink key="e" id={step.effect_id} />],
-            ["binds", step.bind ? <IdLink key="b" id={step.bind} /> : <Muted key="b">nothing — the result is ignored</Muted>],
+            ["binds", step.bind ? <BindingChip key="b" role="defines" name={step.bind} kind="result" /> : <Muted key="b">nothing — the result is ignored</Muted>],
           ]} />
           <Section title="instance provenance"><DerivationView value={step.values} /></Section>
         </Frame>
@@ -951,8 +1228,8 @@ function StepDetail({ opId, location }: { opId: Id; location: string }) {
       return (
         <Frame kind="program step" title={`execute intent · ${shortId(step.intent)}`} subtitle={sub}>
           <KeyValue rows={[
-            ["intent", <IdLink key="i" id={step.intent} />],
-            ["binds", step.bind ? <IdLink key="b" id={step.bind} /> : <Muted key="b">nothing — the result is ignored</Muted>],
+            ["intent", <BindingChip key="i" role="uses" name={step.intent} kind="intent" />],
+            ["binds", step.bind ? <BindingChip key="b" role="defines" name={step.bind} kind="result" /> : <Muted key="b">nothing — the result is ignored</Muted>],
           ]} />
         </Frame>
       );
@@ -962,7 +1239,7 @@ function StepDetail({ opId, location }: { opId: Id; location: string }) {
           description="Constructs and initiates the effect instance without waiting for it to complete; only the handle is bound, and the result becomes available only at a join_all or race.">
           <KeyValue rows={[
             ["effect", <IdLink key="e" id={step.effect_id} />],
-            ["handle", <IdLink key="h" id={step.handle} />],
+            ["handle", <BindingChip key="h" role="defines" name={step.handle} kind="handle" />],
           ]} />
           <Section title="instance provenance"><DerivationView value={step.values} /></Section>
         </Frame>
@@ -972,8 +1249,8 @@ function StepDetail({ opId, location }: { opId: Id; location: string }) {
         <Frame kind="program step" title={`launch intent async · ${shortId(step.intent)}`} subtitle={sub}
           description="Initiates the exact instance the intent captured, without waiting for it to complete; only the handle is bound.">
           <KeyValue rows={[
-            ["intent", <IdLink key="i" id={step.intent} />],
-            ["handle", <IdLink key="h" id={step.handle} />],
+            ["intent", <BindingChip key="i" role="uses" name={step.intent} kind="intent" />],
+            ["handle", <BindingChip key="h" role="defines" name={step.handle} kind="handle" />],
           ]} />
         </Frame>
       );
@@ -984,9 +1261,9 @@ function StepDetail({ opId, location }: { opId: Id; location: string }) {
           <Section title="waits for" count={step.handles.length}>
             <List items={step.handles.map((entry) => (
               <span key={entry.handle} className="flex flex-wrap items-center gap-1.5">
-                <IdLink id={entry.handle} />
+                <BindingChip role="uses" name={entry.handle} kind="handle" />
                 {entry.bind
-                  ? <span className="text-xs text-kumo-subtle">binds <IdLink id={entry.bind} /></span>
+                  ? <span className="inline-flex items-center gap-1 text-xs text-kumo-subtle">binds <BindingChip role="defines" name={entry.bind} kind="result" /></span>
                   : <Muted>no result bound</Muted>}
               </span>
             ))} />
@@ -998,10 +1275,10 @@ function StepDetail({ opId, location }: { opId: Id; location: string }) {
         <Frame kind="program step" title="race" subtitle={sub}
           description="A first-completion barrier: the continuation follows whichever candidate completes first — first completion, not first success, so a winning Err is what a result-binding race observes. Losing executions are not cancelled and remain part of the operation's side-effect blast radius.">
           <Section title="candidates" count={step.handles.length}>
-            <List items={step.handles.map((h) => <IdLink key={h} id={h} />)} />
+            <List items={step.handles.map((h) => <BindingChip key={h} role="uses" name={h} kind="handle" />)} />
           </Section>
           <KeyValue rows={[
-            ["winner binds", step.bind ? <IdLink key="b" id={step.bind} /> : <Muted key="b">nothing — heterogeneous candidates may race unbound</Muted>],
+            ["winner binds", step.bind ? <BindingChip key="b" role="defines" name={step.bind} kind="result" /> : <Muted key="b">nothing — heterogeneous candidates may race unbound</Muted>],
           ]} />
         </Frame>
       );
@@ -1013,23 +1290,46 @@ function StepDetail({ opId, location }: { opId: Id; location: string }) {
 function HandleDetail({ opId, effectId, location, id }: { opId: Id; effectId: Id | null; location: string; id: Id }) {
   const { model, index } = useApp();
   return (
-    <Frame kind="async handle" title={id} subtitle={<span>async handle in <IdLink id={opId} /></span>}
-      description="Identifies one asynchronous execution occurrence for later synchronization. It is not application data: it has no schema, cannot be persisted or returned, and does not identify the logical effect itself — the effect id does.">
+    <Frame kind="async handle" title={id} subtitle={<span>async handle in <IdLink id={opId} /> · step {location}</span>}>
       <KeyValue rows={[
+        ["binding", <BindingChip key="b" role="defines" name={id} kind="handle" />],
         ["launches", effectId ? <IdLink key="e" id={effectId} /> : <Muted key="e">unresolved intent</Muted>],
         ["which is", effectId ? effectSummary(model, index, effectId) : "—"],
-        ["launched at step", <Mono key="l">{location}</Mono>],
+        ["bound at", <BoundAt key="l" name={id} />],
+        ["available", "from the launch on · consumed only by join_all or race"],
       ]} />
+      <BindingKindNote kind="handle" />
+      <UsedAt name={id} />
     </Frame>
   );
 }
 
 function TransactionDetail({ opId, id }: { opId: Id; id: Id }) {
-  const { model, openDetail } = useApp();
-  const tx = findTransaction(model.operations[opId], id);
-  if (!tx) return <Frame kind="transaction" title={id} subtitle={<span>inline transaction of <IdLink id={opId} /></span>} />;
+  const { model, openDetail, transactionProofs, navigateTo } = useApp();
+  const op = model.operations[opId];
+  const site = findTransactionSite(op, id);
+  if (!site) return <Frame kind="transaction" title={id} subtitle={<span>inline transaction of <IdLink id={opId} /></span>} />;
+  const tx = site.transaction;
+  const rejected = site.rejected;
   return (
-    <Frame kind="transaction" title={id} subtitle={<span>inline transaction of <IdLink id={opId} /></span>}>
+    <Frame
+      kind="transaction"
+      title={
+        <button
+          type="button"
+          className="inline-flex max-w-full cursor-pointer items-center gap-1.5 text-left text-kumo-link hover:underline"
+          title="Open the transaction page"
+          onClick={() => navigateTo(hashes.tx(id))}
+        >
+          <span className="break-all">{id}</span>
+          <ArrowSquareOutIcon size={13} className="shrink-0" />
+        </button>
+      }
+      subtitle={<span>inline transaction of <IdLink id={opId} /> · step {site.location}</span>}
+    >
+      <Button variant="secondary" size="xs" icon={ArrowSquareOutIcon} onClick={() => navigateTo(hashes.tx(id))}>
+        open transaction page
+      </Button>
       <KeyValue rows={[
         ["data model", tx.data_model ? <IdLink key="d" id={tx.data_model} /> : <Muted key="d">none (framework artifacts only)</Muted>],
       ]} />
@@ -1039,18 +1339,89 @@ function TransactionDetail({ opId, id }: { opId: Id; id: Id }) {
         )}
       </FactNote>
       <FactNote fact={isolation(tx.isolation)} />
+      <FactNote fact={transactionRejection(rejected !== null)}>
+        {rejected && (
+          <span className="text-xs text-kumo-subtle">
+            rejected block: {rejected.steps.length} step{rejected.steps.length === 1 ? "" : "s"} at {site.location}.rejected
+          </span>
+        )}
+      </FactNote>
+      {(tx.requirements.serializability.length > 0 || tx.requirements.ordering.length > 0) && (
+        <Section title="requirements" count={tx.requirements.serializability.length + tx.requirements.ordering.length}>
+          <p className="text-xs leading-relaxed text-kumo-subtle">
+            Obligations over this transaction's committed history, proven from the transactions
+            alone — never from runtime topology. The transaction page draws each argument in full.
+          </p>
+          {/* Each declaration, then its argument in summary — the
+              verdict, the route, the headline — and the way to the page
+              that draws it. */}
+          {tx.requirements.serializability.map((r, i) => {
+            const proof = transactionProofs.proofForRequirement(opId, id, "transaction_serializability", i);
+            return (
+              <div key={`s${i}`} className="space-y-2">
+                <FactNote fact={serializabilityRequirement(r.key)}>
+                  <span className="text-xs text-kumo-subtle">key <RefText value={r.key} /></span>
+                </FactNote>
+                {proof && <ProofSummary proof={proof} />}
+              </div>
+            );
+          })}
+          {tx.requirements.ordering.map((r, i) => {
+            const proof = transactionProofs.proofForRequirement(opId, id, "transaction_ordering", i);
+            return (
+              <div key={`o${i}`} className="space-y-2">
+                <FactNote fact={orderingRequirement(r.key, r.position)}>
+                  <span className="text-xs text-kumo-subtle">key <RefText value={r.key} /> · position <RefText value={r.position} /></span>
+                </FactNote>
+                {proof && <ProofSummary proof={proof} />}
+              </div>
+            );
+          })}
+        </Section>
+      )}
       <Section title="steps" count={tx.steps.length}>
         <List items={tx.steps.map((s, i) => (
-          <button key={i} type="button" className="flex w-full cursor-pointer items-center gap-2 text-left hover:underline"
+          <button key={i} type="button" className="flex w-full cursor-pointer flex-wrap items-center gap-2 text-left hover:underline"
             onClick={() => openDetail(id, { txStep: { op: opId, tx: id, index: i } })}>
             <Tag>{i + 1}</Tag>
             <span className="text-sm">{s.kind.replace(/_/g, " ")}</span>
             {s.kind === "read" && <Mono className="text-kumo-subtle">{shortId(s.bind)}</Mono>}
             {s.kind === "transition" && <Mono className="text-kumo-subtle">{shortId(s.transition)}</Mono>}
-            {(s.kind === "write" || s.kind === "delete" || s.kind === "lock") && <Mono className="text-kumo-subtle">{shortId(s.target.object)}</Mono>}
+            {(s.kind === "write" || s.kind === "delete" || s.kind === "lock")
+              && <Mono className="text-kumo-subtle">{shortId(s.target.object)}</Mono>}
+            {/* A guard's operands are the whole story of the step: which
+                instance it selects, and what it compares against — the
+                version an earlier read of this transaction observed, the
+                incoming position, the token. Naming only the object left
+                readers guessing where a version comes from. */}
+            {s.kind === "validate_version" && (
+              <span className="text-xs text-kumo-subtle">
+                <Mono>{shortId(s.target.object)}</Mono> where {predicateText(s.target.predicate)} still has
+                version <Mono>{refString(s.expected)}</Mono> at commit
+              </span>
+            )}
+            {s.kind === "bump_version" && (
+              <span className="text-xs text-kumo-subtle">
+                <Mono>{shortId(s.target.object)}</Mono> where {predicateText(s.target.predicate)} · version + 1
+              </span>
+            )}
+            {s.kind === "advance_cursor" && (
+              <span className="text-xs text-kumo-subtle">
+                <Mono>{shortId(s.target.object)}.{pathText(s.field)}</Mono> where {predicateText(s.target.predicate)} ←{" "}
+                <Mono>{refString(s.incoming)}</Mono> · {s.rule.replace(/_/g, " ")}
+              </span>
+            )}
+            {s.kind === "fence" && (
+              <span className="text-xs text-kumo-subtle">
+                <Mono>{shortId(s.target.object)}.{pathText(s.field)}</Mono> where {predicateText(s.target.predicate)} · token{" "}
+                <Mono>{refString(s.token)}</Mono>
+              </span>
+            )}
             {s.kind === "insert" && <Mono className="text-kumo-subtle">{shortId(s.object)}</Mono>}
             {s.kind === "establish_transaction_output" && <Mono className="text-kumo-subtle">{shortId(s.bind)}</Mono>}
             {s.kind === "establish_effect_intent" && <Mono className="text-kumo-subtle">{shortId(s.bind)}</Mono>}
+            {s.kind === "write_outbox" && <Mono className="text-kumo-subtle">{shortId(s.effect.outbox)}</Mono>}
+            {stepRejects(s) && <Tag variant="warning">commit guard</Tag>}
           </button>
         ))} />
       </Section>
@@ -1059,14 +1430,65 @@ function TransactionDetail({ opId, id }: { opId: Id; id: Id }) {
   );
 }
 
-function RequirementDetail({ opId, prop, reqIndex }: { opId: Id; prop: RequirementKind; reqIndex: number }) {
-  const { model } = useApp();
-  const reqs = model.operations[opId].requirements;
+/** One declared requirement. A transaction family is addressed by the
+ *  declaring transaction and its index into that transaction's list;
+ *  an operation family by the operation and its index. The verdicts are
+ *  the obligations anchored to exactly that declaration. */
+function RequirementDetail({ opId, prop, reqIndex, transaction }: { opId: Id; prop: RequirementKind; reqIndex: number; transaction?: Id }) {
+  const { model, transactionProofs } = useApp();
+  const op = model.operations[opId];
+
+  if (prop === "transaction_serializability" || prop === "transaction_ordering") {
+    const family = prop === "transaction_serializability" ? "serializability" : "ordering";
+    const proof = transaction !== undefined ? transactionProofs.proofForRequirement(opId, transaction, prop, reqIndex) : null;
+    const sub = (
+      <span>
+        declared on transaction {transaction !== undefined ? <IdLink id={transaction} /> : "?"} of <IdLink id={opId} />
+      </span>
+    );
+    const tx = transaction !== undefined ? findTransaction(op, transaction) : null;
+    const rows: [string, ReactNode][] = [];
+    let fact: Explanation | null = null;
+    if (tx && prop === "transaction_serializability") {
+      const r = tx.requirements.serializability[reqIndex];
+      if (r) {
+        rows.push(["key", <RefText key="k" value={r.key} />]);
+        fact = serializabilityRequirement(r.key);
+      }
+    } else if (tx) {
+      const r = tx.requirements.ordering[reqIndex];
+      if (r) {
+        rows.push(["key", <RefText key="k" value={r.key} />], ["position", <RefText key="p" value={r.position} />]);
+        fact = orderingRequirement(r.key, r.position);
+      }
+    }
+    return (
+      <Frame kind="transaction requirement" title={`${family} #${reqIndex}`} subtitle={sub}
+        description="An obligation over this transaction's committed history, together with every transaction it may conflict with. Proven from the transactions alone — isolation, locks, the version protocol, cursors, fences — and never from runtime topology, so its verdict survives any change of realization.">
+        {rows.length > 0 && <KeyValue rows={rows} />}
+        {fact && <FactNote fact={fact} />}
+        {/* The argument in summary, before the verdict that records it;
+            the transaction's page draws it in full. */}
+        {proof && (
+          <Section title={`${family} argument`}>
+            <ProofSummary proof={proof} />
+          </Section>
+        )}
+        {transaction !== undefined && (
+          <Obligations
+            obKey={`${opId}/${transaction}`}
+            filter={(ob) =>
+              ob.subject.kind === "transaction" && ob.subject.transaction === transaction &&
+              ob.subject.requirement === reqIndex && propertyMatchesRequirement(ob.property, prop)}
+          />
+        )}
+      </Frame>
+    );
+  }
+
+  const reqs = op.requirements;
   const rows: ReactNode[] = [];
-  if (prop === "serialization" || prop === "ordering") {
-    const r = reqs[prop][reqIndex];
-    rows.push(<RefText key="k" value={r.key} />);
-  } else if (prop === "idempotency") {
+  if (prop === "idempotency") {
     const r = reqs.idempotency[reqIndex];
     rows.push(<KeyComponents key="k" value={r.key} />);
   } else {
@@ -1075,9 +1497,7 @@ function RequirementDetail({ opId, prop, reqIndex }: { opId: Id; prop: Requireme
   }
   const extra: [string, ReactNode][] = prop === "idempotency"
     ? [["result", <Tag key="r" variant={reqs.idempotency[reqIndex].result === "replay_consistent" ? "info" : "neutral"}>{reqs.idempotency[reqIndex].result}</Tag>]]
-    : prop === "recoverability"
-      ? [["completion", <Tag key="c">{reqs.recoverability[reqIndex].completion}</Tag>]]
-      : [];
+    : [["completion", <Tag key="c">{reqs.recoverability[reqIndex].completion}</Tag>]];
   return (
     <Frame kind="requirement" title={`${prop} #${reqIndex}`} subtitle={<span>declared on <IdLink id={opId} /></span>}>
       <Section title="key"><List items={rows} /></Section>
@@ -1096,7 +1516,14 @@ function TxStepDetail({ opId, txId, stepIndex }: { opId: Id; txId: Id; stepIndex
     case "read":
       return (
         <Frame kind="transaction step" title={`read · ${step.bind}`} subtitle={sub}>
-          <KeyValue rows={[["object", <IdLink key="o" id={step.target.object} />], ["predicate", <PredicateView key="p" predicate={step.target.predicate} />]]} />
+          <KeyValue rows={[
+            ["binds", <span key="b" className="inline-flex flex-wrap items-center gap-1.5">
+              <BindingChip role="defines" name={step.bind} kind="read" />
+              <span className="text-xs text-kumo-subtle">transaction-local</span>
+            </span>],
+            ["object", <IdLink key="o" id={step.target.object} />],
+            ["predicate", <PredicateView key="p" predicate={step.target.predicate} />],
+          ]} />
           <Section title="fields read">
             {step.fields.kind === "all" ? <Tag>all fields</Tag> : <List items={step.fields.fields.map((f, i) => <Mono key={i}>{pathText(f)}</Mono>)} />}
           </Section>
@@ -1129,9 +1556,11 @@ function TxStepDetail({ opId, txId, stepIndex }: { opId: Id; txId: Id; stepIndex
           <KeyValue rows={[["object", <IdLink key="o" id={step.target.object} />], ["mode", <Tag key="m">{step.mode}</Tag>], ["order", <Tag key="r">{step.order.kind}</Tag>], ["predicate", <PredicateView key="p" predicate={step.target.predicate} />]]} />
         </Frame>
       );
-    case "transition":
+    case "transition": {
+      const admissions = Object.entries(step.effects ?? {});
       return (
-        <Frame kind="transaction step" title={`transition · ${shortId(step.transition)}`} subtitle={sub}>
+        <Frame kind="transaction step" title={`transition · ${shortId(step.transition)}`} subtitle={sub}
+          description="A commit guard over the subject's state: the transition applies only when the subject is in one of its from states. Otherwise the transaction rejects — nothing commits, no intent is established, no admission is made — and control enters the step's rejected block.">
           <KeyValue rows={[["machine", <IdLink key="m" id={step.machine} />], ["transition", <IdLink key="t" id={step.transition} />], ["subject", <IdLink key="s" id={step.subject.object} />], ["predicate", <PredicateView key="p" predicate={step.subject.predicate} />]]} />
           {Object.keys(step.effect_intents).length > 0 && (
             <Section title="bound intents">
@@ -1140,9 +1569,26 @@ function TxStepDetail({ opId, txId, stepIndex }: { opId: Id; txId: Id; stepIndex
                   <span className="flex flex-wrap items-center gap-1.5">
                     <IdLink id={eid} />
                     <span className="text-xs text-kumo-subtle">binds</span>
-                    <IdLink id={intent.bind} />
+                    <BindingChip role="defines" name={intent.bind} kind="intent" />
                   </span>
                   <DerivationView value={intent.values} />
+                </div>
+              ))}
+            </Section>
+          )}
+          {admissions.length > 0 && (
+            <Section title="outbox admissions" count={admissions.length}>
+              <p className="text-xs leading-relaxed text-kumo-subtle">
+                Admitted atomically with this transaction's commit, and only if the transition
+                applies; nothing is bound — an admission has no synchronous result.
+              </p>
+              {admissions.map(([eid, application]) => (
+                <div key={eid} className="space-y-1">
+                  <span className="flex flex-wrap items-center gap-1.5">
+                    <IdLink id={eid} />
+                    <span className="text-xs text-kumo-subtle">{effectSummary(model, index, eid)}</span>
+                  </span>
+                  <DerivationView value={application.values} />
                 </div>
               ))}
             </Section>
@@ -1150,11 +1596,66 @@ function TxStepDetail({ opId, txId, stepIndex }: { opId: Id; txId: Id; stepIndex
           <NavLink hash={hashes.machine(step.machine, step.transition)}>view in state machine →</NavLink>
         </Frame>
       );
+    }
+    case "validate_version": {
+      const version = findDataObject(model, step.target.object)?.object.version;
+      return (
+        <Frame kind="transaction step" title={`validate version · ${shortId(step.target.object)}`} subtitle={sub}
+          description="The observation guard of the version protocol. At commit the transaction proceeds only if the selected instance's version still equals the version an earlier read of this transaction observed; any change rejects it — nothing commits, and control enters the rejected block. The guard compares and never increments, holds no lock across the read-to-commit window, and is evaluated at commit wherever it sits in the step list. It is never required by validation: it is declared where the transaction relies on what it read, and a serializability proof over a read-then-write needs it on the reader's side together with the writer's bump_version — without the bump there is nothing for the guard to detect.">
+          <KeyValue rows={[
+            ["object", <IdLink key="o" id={step.target.object} />],
+            ["predicate", <PredicateView key="p" predicate={step.target.predicate} />],
+            ["expected", <RefText key="e" value={step.expected} />],
+          ]} />
+          {version && <FactNote fact={objectVersion(version.field)} />}
+        </Frame>
+      );
+    }
+    case "bump_version": {
+      const version = findDataObject(model, step.target.object)?.object.version;
+      return (
+        <Frame kind="transaction step" title={`bump version · ${shortId(step.target.object)}`} subtitle={sub}
+          description="The publishing half of the version protocol: at commit the selected instance's version becomes one higher than it is at that moment, unconditionally. The step compares nothing and never rejects; its purpose is other transactions, whose validate_version guards detect the moved token. Required beside every write or transition of a live versioned instance, at most once per instance; insert and delete need none. A bump on an instance the transaction never read is a legitimate blind write. With a validate_version on the same instance the two compose into a compare-and-swap from the observed version to that version plus one.">
+          <KeyValue rows={[
+            ["object", <IdLink key="o" id={step.target.object} />],
+            ["predicate", <PredicateView key="p" predicate={step.target.predicate} />],
+          ]} />
+          {version && <FactNote fact={objectVersion(version.field)} />}
+        </Frame>
+      );
+    }
+    case "advance_cursor":
+      return (
+        <Frame kind="transaction step" title={`advance cursor · ${shortId(step.target.object)}.${pathText(step.field)}`} subtitle={sub}
+          description="The ordered-cursor commit guard, and the only ordinary update of a cursor field: the transaction commits only when the incoming position is admissible after the stored one under the rule, and then sets the cursor to it atomically. An inadmissible position rejects the transaction. Two successful advances of one cursor domain are commit-ordered by their accepted positions — what an OrderedBy proof consumes.">
+          <KeyValue rows={[
+            ["object", <IdLink key="o" id={step.target.object} />],
+            ["predicate", <PredicateView key="p" predicate={step.target.predicate} />],
+            ["cursor field", <Mono key="f">{pathText(step.field)}</Mono>],
+            ["incoming position", <RefText key="i" value={step.incoming} />],
+            ["rule", <Tag key="r">{step.rule}</Tag>],
+          ]} />
+          <FactNote fact={cursorRule(step.rule)} />
+        </Frame>
+      );
+    case "fence":
+      return (
+        <Frame kind="transaction step" title={`fence · ${shortId(step.target.object)}.${pathText(step.field)}`} subtitle={sub}
+          description="The fencing commit guard over an authority-token field: state protected by the transaction cannot be mutated by an older authority generation once a newer one has been accepted. It does not claim the stale worker has terminated.">
+          <KeyValue rows={[
+            ["object", <IdLink key="o" id={step.target.object} />],
+            ["predicate", <PredicateView key="p" predicate={step.target.predicate} />],
+            ["fence field", <Mono key="f">{pathText(step.field)}</Mono>],
+            ["incoming token", <RefText key="t" value={step.token} />],
+          ]} />
+          <FactNote fact={fence()} />
+        </Frame>
+      );
     case "establish_effect_intent":
       return (
         <Frame kind="transaction step" title={`establish intent · ${shortId(step.bind)}`} subtitle={sub}>
           <KeyValue rows={[
-            ["binds", <IdLink key="b" id={step.bind} />],
+            ["binds", <BindingChip key="b" role="defines" name={step.bind} kind="intent" />],
             ["effect", <IdLink key="e" id={step.effect_id} />],
             ["which is", effectSummary(model, index, step.effect_id)],
           ]} />
@@ -1165,7 +1666,7 @@ function TxStepDetail({ opId, txId, stepIndex }: { opId: Id; txId: Id; stepIndex
       return (
         <Frame kind="transaction step" title={`establish output · ${shortId(step.bind)}`} subtitle={sub}>
           <KeyValue rows={[
-            ["binds", <IdLink key="b" id={step.bind} />],
+            ["binds", <BindingChip key="b" role="defines" name={step.bind} kind="output" />],
             ["schema", <IdLink key="s" id={step.schema} />],
           ]} />
           <Section title="value provenance"><DerivationView value={step.values} /></Section>
@@ -1198,10 +1699,41 @@ function EdgeDetail({ edge: e }: { edge: Edge }) {
   ) : null;
   const via = "via_transition" in e && e.via_transition ? (
     <div className="text-sm text-kumo-subtle">
-      Owned by transition <IdLink id={e.via_transition.transition} /> of <NavLink hash={hashes.machine(e.via_transition.machine)}>{shortId(e.via_transition.machine)}</NavLink>; it becomes intended when the transition commits.
+      {e.kind === "outbox_write" ? (
+        <>Scoped to transition <IdLink id={e.via_transition.transition} /> of <NavLink hash={hashes.machine(e.via_transition.machine)}>{shortId(e.via_transition.machine)}</NavLink>: the message is admitted atomically with the applying transaction, and only when the transition applies.</>
+      ) : (
+        <>Owned by transition <IdLink id={e.via_transition.transition} /> of <NavLink hash={hashes.machine(e.via_transition.machine)}>{shortId(e.via_transition.machine)}</NavLink>; it becomes intended when the transition commits.</>
+      )}
     </div>
   ) : null;
   switch (e.kind) {
+    case "outbox_write":
+      return (
+        <Frame kind="outbox write edge" title={<span><IdLink id={e.operation} /> → <IdLink id={e.to} /></span>}
+          description="A transactional admission: the message is durable if and only if the transaction whose commit stages it commits.">
+          <KeyValue rows={[
+            ["effect", <IdLink key="e" id={e.effect} />],
+            ["schema", <IdLink key="s" id={e.schema} />],
+            ["transaction", e.transaction ? <IdLink key="t" id={e.transaction} /> : <Muted key="t">none — a direct site, which validation rejects</Muted>],
+          ]} />
+          {via}{executed}
+        </Frame>
+      );
+    case "outbox_consume":
+      return (
+        <Frame kind="outbox consume edge" title={<span><IdLink id={e.from} /> → <IdLink id={e.operation} /></span>}>
+          <KeyValue rows={[
+            ["input", <IdLink key="i" id={e.input} />],
+            ["partitioning", <Tag key="pt">{e.partitioning ?? "no runtime"}</Tag>],
+            ["ordering", <Tag key="o">{e.ordering ?? "no runtime"}</Tag>],
+            ["routing", <Tag key="r">{e.routing ?? "no runtime"}</Tag>],
+            ["batching", <Tag key="b">{e.batching ?? "no runtime"}</Tag>],
+            ["pool", e.pool ? <IdLink key="p" id={e.pool} /> : "—"],
+          ]} />
+          <FactNote fact={intrinsicRedrive()} />
+          <Section title="consumed messages" count={e.schemas.length}><List items={e.schemas.map((s) => <IdLink key={s} id={s} />)} /></Section>
+        </Frame>
+      );
     case "publish":
       return (
         <Frame kind="publication edge" title={<span><IdLink id={e.operation} /> → <IdLink id={e.to} /></span>}>
@@ -1283,12 +1815,12 @@ function PoolDetail({ id }: { id: Id }) {
       description="How many members there are is not a conseqa fact: pool cardinality is an external scenario input, and every proof here is about one member's behaviour, not the population's size."
     >
       <FactNote fact={memberConcurrency(pool.member_concurrency)} />
-      <FactNote fact={executionHandoff(pool.execution_handoff)} />
       {assigned.length > 0 && (
         <Section title="boundaries assigned" count={assigned.length}>
           <p className="text-xs leading-relaxed text-kumo-subtle">
             These share an execution population. Sharing a pool relates their members, not their
-            routing domains — no serialization follows from it on its own.
+            routing domains: member assignment is placement only, and no transaction proof rests
+            on it.
           </p>
           <List
             items={assigned.map((b) => (
@@ -1316,7 +1848,7 @@ function RouterDetail({ id }: { id: Id }) {
       kind="router"
       title={id}
       subtitle={<span>L1 · realization of a request boundary</span>}
-      description="A router decides which member of its pool owns an invocation domain. It does not make requests ordered, and it carries no queue: what it establishes is affinity, and only when it declares a routing key."
+      description="A router decides which member of its pool an invocation domain is placed on. It does not make requests ordered, and it carries no queue: what it establishes is affinity, and only when it declares a routing key. Placement only — member assignment is not commit-order evidence, and no transaction proof rests on it."
     >
       <KeyValue rows={[
         ["operation", <IdLink key="o" id={router.boundary.operation} />],
@@ -1326,7 +1858,6 @@ function RouterDetail({ id }: { id: Id }) {
       <FactNote fact={requestRouting(router.routing?.key)} />
       {router.routing && <FactNote fact={memberAssignment(router.routing.member_assignment)} />}
       {pool && <FactNote fact={memberConcurrency(pool.member_concurrency)} />}
-      {pool && <FactNote fact={executionHandoff(pool.execution_handoff)} />}
       <Citations id={id} />
     </Frame>
   );
@@ -1342,7 +1873,7 @@ function StorageLayoutDetail({ id }: { id: Id }) {
       kind="storage layout"
       title={id}
       subtitle={<span>L1 · how one object is partitioned</span>}
-      description="A partition key is neither the object's identity nor a routing key. It says where rows live, and nothing about which member executes an invocation or in what order — no proof of serialization or ordering rests on it."
+      description="A partition key is neither the object's identity nor a routing key. It says where rows live, and nothing about which member executes an invocation or in what order — no transaction serializability or ordering proof rests on it."
     >
       <KeyValue rows={[
         ["data model", <IdLink key="d" id={layout.object.data_model} />],

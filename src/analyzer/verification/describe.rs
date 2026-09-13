@@ -1,7 +1,7 @@
 //! Shared rendering helpers for verification diagnostics.
 
 use crate::analyzer::Evidence;
-use crate::spec::{Id, ValueRef, ValueSource};
+use crate::spec::ValueSource;
 
 use super::paths::{DecisionTaken, PathRef};
 use super::replay::{
@@ -78,6 +78,17 @@ fn gap_sentence(gap: &ReplayGap) -> String {
 
         ReplayGap::ContainsDelete => {
             "the transaction deletes objects, and deletion replay outcomes are not defined"
+                .to_string()
+        }
+
+        ReplayGap::ContainsVersionBump => {
+            "the transaction bumps an object version, which re-execution would advance again"
+                .to_string()
+        }
+
+        ReplayGap::ContainsCursorAdvance => {
+            "the transaction advances a cursor, which re-execution with the same position \
+             would reject as stale"
                 .to_string()
         }
 
@@ -309,6 +320,23 @@ pub(crate) fn decision_gap_sentence(gap: &DecisionGap) -> String {
             "result `{result}` of `{effect}` is not replay-stable: {}",
             result_gap_sentence(gap)
         ),
+
+        DecisionGap::TransactionOutcomeUnstable {
+            transaction,
+            outcome,
+            recovery,
+        } => match outcome {
+            crate::spec::TransactionOutcome::Rejected => format!(
+                "`{transaction}` was rejected, which commits nothing, so a retry may \
+                 commit it instead"
+            ),
+
+            crate::spec::TransactionOutcome::Committed => format!(
+                "`{transaction}` committed, but a retry is not established to resolve \
+                 the same commit and may reject instead ({})",
+                gap_sentences(recovery)
+            ),
+        },
     }
 }
 
@@ -332,6 +360,12 @@ pub(crate) fn describe_decision(taken: &DecisionTaken) -> String {
         DecisionTaken::Branch { location, arm } => {
             format!("the branch at step `{location}`, taking its `{arm}` arm")
         }
+
+        DecisionTaken::Transaction {
+            location,
+            transaction,
+            outcome,
+        } => format!("the outcome of `{transaction}` at step `{location}`, {outcome}"),
     }
 }
 
@@ -345,24 +379,22 @@ pub(crate) fn describe_path(path: &PathRef) -> String {
     format!("the path `{}`", path_label(path))
 }
 
-/// The compact label of a path: `ok(result.payment) › then(step 3)`.
+/// The compact label of a path: `ok(result.payment) › then(step 3) ›
+/// committed(tx.charge)`.
 pub fn path_label(path: &PathRef) -> String {
     path.decisions
         .iter()
         .map(|decision| match decision {
             DecisionTaken::Match { result, arm, .. } => format!("{arm}({result})"),
             DecisionTaken::Branch { location, arm } => format!("{arm}(step {location})"),
+            DecisionTaken::Transaction {
+                transaction,
+                outcome,
+                ..
+            } => format!("{outcome}({transaction})"),
         })
         .collect::<Vec<_>>()
         .join(" › ")
-}
-
-pub(crate) fn describe_value_ref(value: &ValueRef) -> String {
-    format!(
-        "the key (`{}` of {})",
-        value.path,
-        describe_value_source(&value.source)
-    )
 }
 
 pub(crate) fn describe_value_source(source: &ValueSource) -> String {
@@ -375,8 +407,4 @@ pub(crate) fn describe_value_source(source: &ValueSource) -> String {
         ValueSource::EffectResultOk(id) => format!("the ok payload of effect result `{id}`"),
         ValueSource::EffectResultErr(id) => format!("the err payload of effect result `{id}`"),
     }
-}
-
-pub(crate) fn value_source_id(source: &ValueSource) -> Option<&Id> {
-    Some(source.id())
 }

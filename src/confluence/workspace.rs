@@ -15,9 +15,9 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 
 use crate::spec::{
-    DataModel, Id, IdempotencyRequirement, Input, InvocationLock, Model, Operation,
-    OperationBlock, OperationRequirements, OrderingRequirement, RecoverabilityRequirement,
-    Revision, RuntimeModel, Schema, SerializationRequirement, Service, StateMachine, Topic,
+    DataModel, Id, IdempotencyRequirement, Input, Model, Operation, OperationBlock,
+    OperationRequirements, RecoverabilityRequirement, Revision, RuntimeModel, Schema, Service,
+    StateMachine, Topic, TransactionOrderingRequirement, TransactionSerializabilityRequirement,
 };
 
 use super::symbol::RequirementFamily;
@@ -120,7 +120,6 @@ impl WorkspaceState {
                             service: draft.service.clone(),
                             description: draft.description.clone(),
                             inputs: draft.inputs.clone(),
-                            invocation_lock: draft.invocation_lock.clone(),
                             program: program.clone(),
                             requirements: draft.requirements.clone(),
                         },
@@ -190,17 +189,14 @@ pub struct DraftOperation {
     pub description: Option<String>,
     pub inputs: BTreeMap<Id, Input>,
 
-    /// The declared entry synchronization, carried on the interface
-    /// slice (see [`OperationInterfaceDraft::invocation_lock`]).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub invocation_lock: Option<InvocationLock>,
-
     /// None until the operation synthesis task commits.
     pub program: Option<OperationBlock>,
 
-    /// The adopted requirements. Proposals and their provenance live
-    /// on the workspace ([`RequirementProposal`]); adoption per run
-    /// policy is what lands one here.
+    /// The adopted operation-level requirements. Proposals and their
+    /// provenance live on the workspace ([`RequirementProposal`]);
+    /// adoption per run policy is what lands one here. Transaction
+    /// requirements are adopted onto the inline transaction they
+    /// constrain, inside `program`.
     pub requirements: OperationRequirements,
 
     pub stage: OperationDraftStage,
@@ -212,7 +208,6 @@ impl DraftOperation {
             service: operation.service.clone(),
             description: operation.description.clone(),
             inputs: operation.inputs.clone(),
-            invocation_lock: operation.invocation_lock.clone(),
             program: Some(operation.program.clone()),
             requirements: operation.requirements.clone(),
             stage: OperationDraftStage::ReadyForAssembly,
@@ -226,7 +221,6 @@ impl DraftOperation {
             service: interface.service,
             description: interface.description,
             inputs: interface.inputs,
-            invocation_lock: interface.invocation_lock,
             program: None,
             requirements: OperationRequirements::default(),
             stage: OperationDraftStage::Planned,
@@ -239,7 +233,6 @@ impl DraftOperation {
             service: self.service.clone(),
             description: self.description.clone(),
             inputs: self.inputs.clone(),
-            invocation_lock: self.invocation_lock.clone(),
         }
     }
 
@@ -261,10 +254,16 @@ impl DraftOperation {
     }
 
     fn has_requirements(&self) -> bool {
-        !(self.requirements.serialization.is_empty()
-            && self.requirements.ordering.is_empty()
-            && self.requirements.idempotency.is_empty()
-            && self.requirements.recoverability.is_empty())
+        let transactional = self.program.as_ref().is_some_and(|program| {
+            program
+                .transactions()
+                .iter()
+                .any(|(_, transaction)| !transaction.requirements.is_empty())
+        });
+
+        transactional
+            || !(self.requirements.idempotency.is_empty()
+                && self.requirements.recoverability.is_empty())
     }
 
     /// Whether the draft carries everything assembly needs.
@@ -294,15 +293,6 @@ pub struct OperationInterfaceDraft {
     pub service: Id,
     pub description: Option<String>,
     pub inputs: BTreeMap<Id, Input>,
-
-    /// The operation's declared entry synchronization. Part of the
-    /// interface slice because it is a boundary declaration — how
-    /// invocations are admitted into the program — authored with the
-    /// inputs it keys on, not with the program it brackets; and a
-    /// caller-relevant guarantee besides, since a locked operation
-    /// self-serializes whatever topology it lands on.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub invocation_lock: Option<InvocationLock>,
 }
 
 /// Identity of one explicit correctness statement extracted from the
@@ -343,21 +333,32 @@ pub enum PromptObligationStatus {
     Unmapped,
 
     /// Discharged into declared requirements.
-    Mapped { requirements: Vec<RequirementRef> },
+    Mapped {
+        requirements: Vec<RequirementRef>,
+    },
 
     /// The current DSL cannot express the obligation.
-    UnsupportedByCurrentDsl { reason: String },
+    UnsupportedByCurrentDsl {
+        reason: String,
+    },
 
     ExplicitlyWaivedByUser,
 }
 
-/// Names one declared requirement: the operation, the family, and the
-/// position in that family's list at the time of reference.
+/// Names one declared requirement: the operation, the family, the
+/// inline transaction for a transaction family, and the position in
+/// that family's list at the time of reference.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RequirementRef {
     pub operation: Id,
     pub family: RequirementFamily,
+
+    /// The transaction a transaction-family requirement is declared
+    /// on; absent for an operation-level family.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transaction: Option<Id>,
+
     pub index: usize,
 }
 
@@ -374,12 +375,20 @@ pub struct RequirementProposal {
 }
 
 /// One proposed requirement, in the family it belongs to. Idempotency
-/// carries its result-replay setting exactly as the DSL declares it.
+/// carries its result-replay setting exactly as the DSL declares it;
+/// the transaction families name the inline transaction of the
+/// operation's program they are declared on.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "family", content = "requirement", rename_all = "snake_case")]
 pub enum ProposedRequirement {
-    Serialization(SerializationRequirement),
-    Ordering(OrderingRequirement),
+    TransactionSerializability {
+        transaction: Id,
+        requirement: TransactionSerializabilityRequirement,
+    },
+    TransactionOrdering {
+        transaction: Id,
+        requirement: TransactionOrderingRequirement,
+    },
     Idempotency(IdempotencyRequirement),
     Recoverability(RecoverabilityRequirement),
 }
@@ -387,10 +396,21 @@ pub enum ProposedRequirement {
 impl ProposedRequirement {
     pub fn family(&self) -> RequirementFamily {
         match self {
-            Self::Serialization(_) => RequirementFamily::Serialization,
-            Self::Ordering(_) => RequirementFamily::Ordering,
+            Self::TransactionSerializability { .. } => {
+                RequirementFamily::TransactionSerializability
+            }
+            Self::TransactionOrdering { .. } => RequirementFamily::TransactionOrdering,
             Self::Idempotency(_) => RequirementFamily::Idempotency,
             Self::Recoverability(_) => RequirementFamily::Recoverability,
+        }
+    }
+
+    /// The transaction a transaction-family proposal targets.
+    pub fn transaction(&self) -> Option<&Id> {
+        match self {
+            Self::TransactionSerializability { transaction, .. }
+            | Self::TransactionOrdering { transaction, .. } => Some(transaction),
+            Self::Idempotency(_) | Self::Recoverability(_) => None,
         }
     }
 }

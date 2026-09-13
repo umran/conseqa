@@ -41,9 +41,15 @@ pub enum DiagnosticCode {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VerificationCode {
-    /// A declared serialization requirement is not established by the
-    /// declared facts. Epistemic, not a violation (§1.2).
-    SerializationUnproven,
+    /// A declared transaction serializability requirement is not
+    /// established by the declared facts. Epistemic, not a violation
+    /// (§1.2). The structured obstacles name the concrete conflict
+    /// chain and the unconstrained dependencies on it.
+    TransactionSerializabilityUnproven,
+
+    /// A declared transaction ordering requirement is not established
+    /// by the declared facts. Epistemic, not a violation (§1.2).
+    TransactionOrderingUnproven,
 
     /// A declared result-replay obligation is not established by the
     /// declared facts. Epistemic, not a violation (§1.2).
@@ -60,12 +66,8 @@ pub enum VerificationCode {
     /// A recoverability requirement is proven with completion
     /// guaranteed by retries, but no idempotency requirement keyed
     /// from the triggering input declares those retries safe. A
-    /// consistency warning, not a verdict.
+    /// coherence warning, not a verdict.
     RecoverabilityRetrySafetyUndeclared,
-
-    /// A declared ordering requirement is not established by the
-    /// declared facts. Epistemic, not a violation (§1.2).
-    OrderingUnproven,
 
     /// A subscription admits duplicate deliveries and its operation
     /// declares no idempotency requirement keyed from it, so the work
@@ -145,8 +147,38 @@ pub enum ValidationCode {
     ExternalReplayStabilityRequiresIdentity,
     ExternalResultReplayWithoutResult,
 
-    InvocationLockKeyNotFromInput,
-    InvocationLockKeyNotEvaluable,
+    // Transaction requirements.
+    TransactionRequirementKeyUnavailable,
+    TransactionOrderingPositionUnavailable,
+    TransactionOrderingPositionNotOrderedScalar,
+
+    // Transaction rejection control.
+    MissingTransactionRejectedArm,
+    UnexpectedTransactionRejectedArm,
+
+    // Transition-scoped outbox admission.
+    UnknownTransitionOutbox,
+    InvalidTransitionOutboxSchema,
+    TransitionOutboxOutsideDataModel,
+    InvalidTransitionOutboxDerivation,
+
+    // Object versions.
+    InvalidObjectVersionField,
+    DirectWriteToVersionField,
+    MissingVersionBump,
+    DuplicateVersionBump,
+    VersionValidationWithoutObservedVersion,
+    VersionProtocolOnUnversionedObject,
+
+    // Managed monotonic fields.
+    ManagedFieldRoleConflict,
+    DirectWriteToManagedField,
+    InvalidManagedFieldType,
+
+    // Result error classes.
+    UnknownResultErrorClass,
+    MissingResultErrorArm,
+    UnexpectedResultErrorArm,
 
     // L1 — runtime topology.
     EmptyRoutingKey,

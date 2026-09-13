@@ -9,18 +9,24 @@ import {
   type ReactNode,
 } from "react";
 
+import { modelBindings, type ModelBindings } from "../lib/bindings";
 import { citedIds } from "../lib/citations";
+import { indexTransactionProofs, type TransactionProofIndex } from "../lib/transactionProofs";
 import { buildIndex, type ModelIndex } from "../lib/index";
+import { pageHash } from "../lib/navigation";
 import { buildObligationIndex, reportRejection, type ObligationIndex } from "../lib/obligations";
 import { runtimeFacts, type RuntimeFacts } from "../lib/runtime";
-import { hashes, impliedSubject, navigate, routeKey, useRoute, type Route } from "../lib/route";
+import { hashes, impliedSubject, navigate, routeKey, routeSubject, useRoute, type Route } from "../lib/route";
 import type { Graph } from "../types/graph";
 import type { Id, Model, RequirementKind } from "../types/model";
 import type { PageData } from "../types/page";
 import type { Obligation, ProverReport } from "../types/report";
 
 export interface DetailContext {
-  req?: { prop: RequirementKind; index: number };
+  /** A declared requirement: an operation family is addressed by the
+   *  operation and an index; a transaction family also names the
+   *  inline transaction that declares it. */
+  req?: { prop: RequirementKind; index: number; transaction?: Id };
   txStep?: { op: Id; tx: Id; index: number };
   /** A program step, by its location in the operation's program. */
   step?: { op: Id; location: string };
@@ -32,6 +38,14 @@ export interface DetailContext {
 export interface DetailTarget {
   id: string;
   ctx: DetailContext;
+}
+
+/** The selection key of a requirement row on the operation page: the
+ *  family and index, with the declaring transaction for a transaction
+ *  family. Shared by the table that draws the rows and the obligation
+ *  focus that lands on one. */
+export function requirementKey(prop: string, index: number, transaction?: Id): string {
+  return transaction !== undefined ? `req:${prop}:${transaction}:${index}` : `req:${prop}:${index}`;
 }
 
 export type Theme = "dark" | "light";
@@ -56,6 +70,13 @@ interface AppState {
   citations: ObligationIndex;
   /** The declared L1 realization, as the views draw it. */
   runtime: RuntimeFacts;
+  /** The transaction proofs — the serializability and ordering
+   *  arguments — indexed by the obligation and the requirement they
+   *  belong to. */
+  transactionProofs: TransactionProofIndex;
+  /** Every binding each program defines and where it uses it, and every
+   *  definition by name — how a name is drawn the same way at both ends. */
+  bindings: ModelBindings;
   route: Route;
 
   selection: string | null;
@@ -67,6 +88,11 @@ interface AppState {
    *  application machine is the model, and the realization is a layer
    *  over it. */
   showRuntime: boolean;
+  /** Whether the system view draws the transaction conflict overlay:
+   *  an arc between two operations whose transactions may conflict,
+   *  coloured by whether every dependency between them is commit-ordered
+   *  by a declared fact. An L0 reading of the model — never topology. */
+  showConflicts: boolean;
   theme: Theme;
   /** False when a host owns the colour mode, so the app offers no
    *  control of its own. */
@@ -76,11 +102,15 @@ interface AppState {
   /** Selects a graph element and, when given, shows its detail. */
   select: (key: string | null, detail?: DetailTarget) => void;
   openDetail: (id: string, ctx?: DetailContext) => void;
+  /** Shows an entity: in the main canvas when it has a page of its own,
+   *  else in the inspector on the page it belongs to. */
+  openEntity: (id: string) => void;
   closeDetail: () => void;
   toggleTx: (key: string) => void;
   setSearch: (value: string) => void;
   setObligationsOpen: (value: boolean) => void;
   setShowRuntime: (value: boolean) => void;
+  setShowConflicts: (value: boolean) => void;
   setTheme: (value: Theme) => void;
   requestFit: () => void;
   /** Navigates to a view, applying a selection once it has rendered. */
@@ -123,6 +153,8 @@ export function AppStateProvider({ data, theme: hostTheme, children }: AppStateP
 
   const index = useMemo(() => buildIndex(data.model), [data.model]);
   const runtime = useMemo(() => runtimeFacts(data.model, data.graph), [data.model, data.graph]);
+  const transactionProofs = useMemo(() => indexTransactionProofs(data), [data]);
+  const bindings = useMemo(() => modelBindings(data.model), [data.model]);
 
   // A report this build cannot read is dropped here, once, rather than
   // being half-rendered: the panel would list verdicts the graph could
@@ -152,10 +184,13 @@ export function AppStateProvider({ data, theme: hostTheme, children }: AppStateP
   const [detail, setDetail] = useState<DetailTarget | null>(null);
   const [expandedTx, setExpandedTx] = useState<ReadonlySet<string>>(() => new Set());
   const [search, setSearch] = useState("");
-  const [obligationsOpen, setObligationsOpen] = useState(false);
+  const [obligationsOpen, setObligationsOpenState] = useState(false);
   // Drawn by default wherever there is anything to draw: the hierarchy is
   // the model, and a layer hidden until asked for reads as an extra.
   const [showRuntime, setShowRuntimeState] = useState(runtime.declared);
+  // On by default for the same reason: a declared argument is part of
+  // what the model says, and the overlay is how the system view says it.
+  const [showConflicts, setShowConflictsState] = useState(true);
   const [ownTheme, setOwnTheme] = useState<Theme>(initialTheme);
   const [fitRequest, setFitRequest] = useState(0);
 
@@ -168,17 +203,23 @@ export function AppStateProvider({ data, theme: hostTheme, children }: AppStateP
 
   // A route change resets the selection to whatever is pending from a
   // cross-view focus, else to the subject the route itself names. The
-  // detail panel survives so links keep their context, but when the
-  // route names a subject an open panel is retargeted to it, so history
-  // navigation and deep links show what the address bar says.
+  // detail panel survives so links keep their context — except when it
+  // is showing the very entity the new page is about, which the page
+  // now shows in full — and when the route names a subject an open
+  // panel is retargeted to it, so history navigation and deep links
+  // show what the address bar says.
+  const subject = routeSubject(route);
   useEffect(() => {
     const pending = pendingSelection.current;
     pendingSelection.current = null;
     setSelection(pending ?? (implied ? `t:${implied}` : null));
+    if (subject !== null) {
+      setDetail((current) => (current && current.id === subject && !current.ctx.txStep && !current.ctx.req ? null : current));
+    }
     if (pending === null && implied) {
       setDetail((current) => (current ? { id: implied, ctx: {} } : current));
     }
-  }, [key, implied]);
+  }, [key, implied, subject]);
 
   // The document belongs to whoever owns the mode: a host that supplies
   // one has already dressed the page, and writing `data-mode` or the
@@ -230,11 +271,29 @@ export function AppStateProvider({ data, theme: hostTheme, children }: AppStateP
 
   const requestFit = useCallback(() => setFitRequest((n) => n + 1), []);
 
+  // The obligations panel shares the row with the canvas, so toggling
+  // it changes the canvas's width; a toggle is the reader's own act, so
+  // the drawing is re-fitted to the room left. (The inspector a
+  // selection opens is not: the canvas keeps its camera and the panel
+  // simply covers part of the drawing, so the click that made the
+  // selection moves nothing.)
+  const setObligationsOpen = useCallback((value: boolean) => {
+    setObligationsOpenState(value);
+    setFitRequest((n) => n + 1);
+  }, []);
+
   // Showing or hiding a layer changes how much drawing there is, so the
   // view is re-fitted to it: a band that appears off-screen has not
   // appeared.
   const setShowRuntime = useCallback((value: boolean) => {
     setShowRuntimeState(value);
+    setFitRequest((n) => n + 1);
+  }, []);
+
+  // The overlay's arcs rise above the cards, so the drawing's extent
+  // changes with it and the view is re-fitted the same way.
+  const setShowConflicts = useCallback((value: boolean) => {
+    setShowConflictsState(value);
     setFitRequest((n) => n + 1);
   }, []);
 
@@ -248,6 +307,15 @@ export function AppStateProvider({ data, theme: hostTheme, children }: AppStateP
     navigate(hash);
   }, []);
 
+  const openEntity = useCallback(
+    (id: string) => {
+      const hash = pageHash(id, index);
+      if (hash) navigateTo(hash);
+      else openDetail(id);
+    },
+    [index, navigateTo, openDetail],
+  );
+
   const focusSubject = useCallback(
     (ob: Obligation) => {
       const s = ob.subject;
@@ -256,25 +324,34 @@ export function AppStateProvider({ data, theme: hostTheme, children }: AppStateP
           const prop = ob.property.kind === "result_replay" ? "idempotency" : ob.property.kind;
           navigateTo(
             hashes.op(s.operation),
-            s.requirement !== undefined ? `req:${prop}:${s.requirement}` : undefined,
+            s.requirement !== undefined ? requirementKey(prop, s.requirement) : undefined,
           );
           break;
         }
-        case "transaction":
-          navigateTo(hashes.op(s.operation), `tx:${s.transaction}`);
+        case "transaction": {
+          // A transaction's page carries its requirements with their
+          // arguments drawn in full; an obligation on one requirement
+          // opens the page on that requirement.
+          const prop = ob.property.kind;
+          const req =
+            s.requirement !== undefined && (prop === "transaction_serializability" || prop === "transaction_ordering")
+              ? { prop, index: s.requirement }
+              : null;
+          navigateTo(hashes.tx(s.transaction, req));
           break;
+        }
         case "state_machine":
           navigateTo(hashes.machine(s.machine, s.transition));
           break;
         case "topic":
-          navigateTo(hashes.system(), s.topic);
+          navigateTo(hashes.entity("topic", s.topic));
           break;
         case "object":
-          openDetail(s.object);
+          navigateTo(hashes.entity("object", s.object));
           break;
       }
     },
-    [navigateTo, openDetail],
+    [navigateTo],
   );
 
   const value = useMemo<AppState>(
@@ -289,6 +366,8 @@ export function AppStateProvider({ data, theme: hostTheme, children }: AppStateP
       obligations,
       citations,
       runtime,
+      transactionProofs,
+      bindings,
       route,
       selection,
       detail,
@@ -296,26 +375,29 @@ export function AppStateProvider({ data, theme: hostTheme, children }: AppStateP
       search,
       obligationsOpen,
       showRuntime,
+      showConflicts,
       theme,
       themeControllable,
       fitRequest,
       select,
       openDetail,
+      openEntity,
       closeDetail,
       toggleTx,
       setSearch,
       setObligationsOpen,
       setShowRuntime,
+      setShowConflicts,
       setTheme,
       requestFit,
       navigateTo,
       focusSubject,
     }),
     [
-      data, report, reportIssue, index, knownIds, obligations, citations, runtime, route,
-      selection, detail, expandedTx, search, obligationsOpen, showRuntime, theme,
-      themeControllable, fitRequest, select, openDetail, closeDetail, toggleTx,
-      setTheme, setShowRuntime, requestFit, navigateTo, focusSubject,
+      data, report, reportIssue, index, knownIds, obligations, citations, runtime, transactionProofs, bindings, route,
+      selection, detail, expandedTx, search, obligationsOpen, showRuntime, showConflicts, theme,
+      themeControllable, fitRequest, select, openDetail, openEntity, closeDetail, toggleTx,
+      setTheme, setObligationsOpen, setShowRuntime, setShowConflicts, requestFit, navigateTo, focusSubject,
     ],
   );
 

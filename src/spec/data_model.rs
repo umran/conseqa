@@ -73,4 +73,33 @@ pub struct DataObject {
     /// alias and interference analysis, locking, state-machine subject
     /// identity, and transaction reasoning rest on.
     pub identity: Vec<FieldPath>,
+
+    /// The object's application concurrency token, when it declares
+    /// one. Absent means the object carries no version protocol —
+    /// epistemic absence of the OCC route, not a claim that
+    /// concurrent mutation is safe.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<ObjectVersion>,
+}
+
+/// A versioned object's one monotonically increasing application
+/// concurrency token.
+///
+/// The field must be a non-optional `int` on the object's canonical
+/// schema, and must not be part of the object's identity. It is
+/// managed by the version protocol and never assigned directly:
+/// `Insert` creates the initial version, every `Write` or `Transition`
+/// of a live versioned instance must be accompanied by a `BumpVersion`
+/// of that instance (the unconditional increment that publishes the
+/// change), `Delete` removes the versioned instance, and an ordinary
+/// `Write` may not name the field. `ValidateVersion` is the other
+/// half: the transaction commits only if the version still equals the
+/// one an earlier read of this transaction observed, so a stale read
+/// can never silently participate in a successful commit. A proof over
+/// a read-then-write needs the reader's validation and the writer's
+/// bump; neither step implies the other.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ObjectVersion {
+    pub field: FieldPath,
 }

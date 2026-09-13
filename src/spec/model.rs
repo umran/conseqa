@@ -24,23 +24,33 @@ use super::{
 /// (`OutboxInput` loses its selector and acknowledgement,
 /// `OutboxRuntime` its delivery), and outbox dispatch declares an
 /// explicit routing block in place of a bare member assignment.
-/// Version 3 is the serialization-semantics revision: serialization
-/// gains the L0 `Operation.invocation_lock` proof route,
-/// `MemberAssignment` sheds its implicit safe-ownership-transfer
-/// rule — `consistent_hash` now asserts stable-epoch affinity only —
-/// and the topology serialization and ordering proofs require the new
-/// explicit `ExecutionPool.execution_handoff = exclusive_ownership`
-/// fact as their ownership-continuity leg.
+/// Version 3 was the serialization-semantics revision: serialization
+/// gained the L0 `Operation.invocation_lock` proof route,
+/// `MemberAssignment` shed its implicit safe-ownership-transfer
+/// rule, and the topology serialization and ordering proofs required
+/// an explicit `ExecutionPool.execution_handoff` fact. Version 4 is
+/// the DSL v4 revision, which retires all of that:
+/// operation-level serialization and ordering requirements,
+/// `InvocationLock`, and `ExecutionHandoff` are gone, and both
+/// families are declared per transaction — `SerializableBy(K)` and
+/// `OrderedBy(K, P)` in `Transaction.requirements` — and proven from a
+/// model-wide conflict analysis over transaction primitives: declared
+/// isolation, S/X locks, object versions (`ValidateVersion` /
+/// `BumpVersion`), ordered cursors (`AdvanceCursor`), and fences
+/// (`Fence`). Transactions become explicitly rejectable
+/// (`ExecuteTransaction.rejected`), state transitions become explicit
+/// commit guards with atomic outbox admissions (`Transition.effects`),
+/// and result contracts name their error classes. L1 keeps its
+/// placement, transport, grouping, and capacity facts and proves no
+/// transaction property from them.
 ///
 /// Independent of the stored-workspace `FORMAT` (a storage-encoding
 /// counter): a DSL bump forces a `FORMAT` bump, never conversely, and
 /// the numbers are not aligned.
-pub const DSL_VERSION: DslVersion = DslVersion(3);
+pub const DSL_VERSION: DslVersion = DslVersion(4);
 
 /// A declared DSL contract version.
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct DslVersion(pub u64);
 
@@ -123,7 +133,9 @@ impl Model {
             return self.topic_runtime(topic)?.grouping.clone();
         }
 
-        self.subscription_runtime(operation, input)?.grouping.clone()
+        self.subscription_runtime(operation, input)?
+            .grouping
+            .clone()
     }
 
     /// The transport precedence in force for one subscription,
@@ -142,12 +154,12 @@ impl Model {
     }
 
     /// The declared runtime facts for one subscription input, if any.
-    pub fn subscription_runtime(
-        &self,
-        operation: &Id,
-        input: &Id,
-    ) -> Option<&SubscriptionRuntime> {
-        self.runtime.as_ref()?.subscriptions.get(operation)?.get(input)
+    pub fn subscription_runtime(&self, operation: &Id, input: &Id) -> Option<&SubscriptionRuntime> {
+        self.runtime
+            .as_ref()?
+            .subscriptions
+            .get(operation)?
+            .get(input)
     }
 
     /// The subscription's declared delivery semantics.
@@ -163,12 +175,14 @@ impl Model {
     /// The named outbox and the data model that owns it, resolved
     /// through the global ID namespace.
     pub fn outbox(&self, outbox: &Id) -> Option<(&Id, &Outbox)> {
-        self.data_models.iter().find_map(|(data_model_id, data_model)| {
-            data_model
-                .outboxes
-                .get(outbox)
-                .map(|declared| (data_model_id, declared))
-        })
+        self.data_models
+            .iter()
+            .find_map(|(data_model_id, data_model)| {
+                data_model
+                    .outboxes
+                    .get(outbox)
+                    .map(|declared| (data_model_id, declared))
+            })
     }
 
     /// The declared runtime facts for one outbox input, if any.

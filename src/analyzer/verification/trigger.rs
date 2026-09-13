@@ -16,7 +16,7 @@ use std::collections::BTreeMap;
 use crate::spec::{
     Effect, ExternalEffect, Id, IdempotencyKey, Input, MessageSelector, Model, Operation,
     OutboxInput, OutboxWriteEffect, PublicationEffect, RequestEffect, ResultReplayRequirement,
-    SubscriptionInput, TransitionSideEffect, ValueSource,
+    SubscriptionInput, TransitionEffect, TransitionSideEffect, ValueSource,
 };
 
 /// A modeled consumer of messages on a topic: the operation and the
@@ -56,15 +56,27 @@ pub struct OutboxConsumer<'a> {
 }
 
 /// A modeled producer of messages into an outbox: a transactional
-/// outbox-write site and the operation and transaction that carry it.
-/// Only operations produce outbox writes — transitions cannot declare
-/// them.
+/// outbox-write site — an operation's `write_outbox` step, or a
+/// transition-scoped admission declared on a state machine and
+/// admitted by whichever transaction applies the transition.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OutboxProducer<'a> {
-    pub operation: &'a Id,
-    pub transaction: &'a Id,
+    pub site: OutboxProducerSite<'a>,
     pub effect: &'a Id,
     pub write: &'a OutboxWriteEffect,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutboxProducerSite<'a> {
+    /// A `write_outbox` step of the named transaction.
+    Operation {
+        operation: &'a Id,
+        transaction: &'a Id,
+    },
+
+    /// A transition-scoped admission (§15 of the DSL v4
+    /// revision).
+    Transition { machine: &'a Id, transition: &'a Id },
 }
 
 #[derive(Debug)]
@@ -166,11 +178,33 @@ impl<'a> TriggerGraph<'a> {
                     .entry(&write.effect.outbox)
                     .or_default()
                     .push(OutboxProducer {
-                        operation,
-                        transaction,
+                        site: OutboxProducerSite::Operation {
+                            operation,
+                            transaction,
+                        },
                         effect: &write.effect_id,
                         write: &write.effect,
                     });
+            }
+        }
+
+        for (machine, declaration) in &model.state_machines {
+            for (transition, declared) in &declaration.transitions {
+                for (effect, admission) in &declared.effects {
+                    let write = admission.outbox_write();
+
+                    outbox_writes
+                        .entry(&write.outbox)
+                        .or_default()
+                        .push(OutboxProducer {
+                            site: OutboxProducerSite::Transition {
+                                machine,
+                                transition,
+                            },
+                            effect,
+                            write,
+                        });
+                }
             }
         }
 
@@ -324,6 +358,14 @@ impl<'a> From<&'a TransitionSideEffect> for EffectContract<'a> {
     }
 }
 
+impl<'a> From<&'a TransitionEffect> for EffectContract<'a> {
+    fn from(effect: &'a TransitionEffect) -> Self {
+        match effect {
+            TransitionEffect::OutboxWrite(write) => Self::OutboxWrite(write),
+        }
+    }
+}
+
 /// The contract of an effect executed by `operation`: one of its own
 /// inline effect declarations, resolved from the program, or a
 /// transition side effect reached through one of its transition
@@ -349,6 +391,10 @@ pub fn effect_contract<'a>(
         for transition in machine.transitions.values() {
             if let Some(side_effect) = transition.side_effects.get(effect) {
                 return Some(EffectContract::from(side_effect));
+            }
+
+            if let Some(admission) = transition.effects.get(effect) {
+                return Some(EffectContract::from(admission));
             }
         }
     }

@@ -83,6 +83,73 @@ svg.arch-canvas text { font-size: 12px; fill: var(--arch-text); user-select: non
 .arch-edge-hit { fill: none; stroke: transparent; stroke-width: 14; cursor: pointer; pointer-events: stroke; }
 .arch-edge-label { font-size: 10.5px; fill: var(--arch-text-subtle); }
 
+/* ---------- transaction proofs ---------- */
+
+/* The conflict closure, drawn inline in a panel: the requiring
+   transaction and everything it may conflict with, one arrow per
+   ordered pair. Proven arrows are solid and green; an arrow no declared
+   fact commit-orders is dashed and amber, like every other unknown. */
+.arch-closure { overflow-x: auto; overflow-y: hidden; }
+.arch-closure svg { display: block; max-height: 360px; }
+/* On a transaction page the drawing is the section: it takes the width
+   it is given and as much height as it needs to stay legible. */
+.arch-closure-wide { overflow: visible; }
+.arch-closure-wide svg { max-height: 620px; }
+.arch-closure text { font-size: 12px; fill: var(--arch-text); user-select: none; pointer-events: none; }
+
+.arch-cx-node { cursor: pointer; }
+.arch-cx-node .body { fill: var(--arch-node-fill); stroke: var(--arch-node-line); stroke-width: 1.2; }
+.arch-cx-node:hover .body { stroke: var(--arch-accent); }
+.arch-cx-node.root .body { stroke: var(--arch-accent); stroke-width: 2; }
+.arch-cx-node .halo {
+  fill: color-mix(in srgb, var(--arch-unknown) 16%, transparent);
+  stroke: var(--arch-unknown);
+  stroke-width: 1.4;
+}
+.arch-cx-node .title { font-weight: 600; font-size: 13.5px; }
+.arch-cx-node .subtitle { fill: var(--arch-text-subtle); font-size: 11px; }
+.arch-cx-node .caption {
+  fill: var(--arch-accent);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+.arch-cx-node .pill { fill: var(--color-kumo-base); stroke: var(--arch-proven); stroke-width: 1.2; }
+.arch-cx-node .pill-text {
+  fill: var(--arch-proven);
+  font-size: 9.5px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+.arch-cx-pair { cursor: pointer; }
+.arch-cx-pair .line { fill: none; stroke: var(--arch-proven); stroke-width: 1.8; transition: stroke-width 120ms ease; }
+.arch-cx-pair.open .line { stroke: var(--arch-unknown); stroke-width: 2.2; stroke-dasharray: 6 4; }
+.arch-cx-pair .hit { fill: none; stroke: transparent; stroke-width: 16; pointer-events: stroke; }
+.arch-cx-pair:hover .line { stroke-width: 3; }
+.arch-cx-pair.selected .line { stroke-width: 3.2; }
+.arch-cx-pair .label { font-size: 11px; fill: var(--arch-text-subtle); }
+.arch-cx-pair .label .lead { fill: var(--arch-text); font-weight: 600; }
+.arch-cx-pair.open .label .lead { fill: var(--arch-unknown); }
+.arch-cx-pair.selected .label { fill: var(--arch-text); }
+.arch-cx-pair.selected .label .lead { fill: var(--arch-accent); }
+
+/* The overlay on the system view: an arc between two operations whose
+   transactions may conflict, and a loop on an operation whose
+   transaction may conflict with a concurrent execution of itself.
+   Contention is mutual, so there is no arrowhead. */
+.arch-conflict { fill: none; stroke: var(--arch-proven); stroke-width: 2; cursor: pointer; transition: opacity 120ms ease; }
+.arch-conflict.open { stroke: var(--arch-unknown); stroke-dasharray: 7 5; }
+.arch-conflict.dimmed { opacity: 0.12; }
+.arch-conflict.selected { stroke-width: 3.4; }
+.arch-conflict-hit { fill: none; stroke: transparent; stroke-width: 14; pointer-events: stroke; cursor: pointer; }
+
+/* The ordering mechanism: position, the rule, the managed field. */
+.arch-mechanism svg { display: block; overflow: visible; }
+.arch-mechanism .wire { stroke: var(--arch-proven); stroke-width: 2; }
+.arch-mechanism .wire.broken { stroke: var(--arch-unknown); stroke-dasharray: 5 4; }
+.arch-mechanism .rule { font-size: 10.5px; font-weight: 600; fill: var(--arch-text); }
+
 .arch-status-ring { fill: none; stroke-width: 2; stroke-dasharray: 3 3; opacity: 0.9; }
 .arch-status-ring.proven { stroke: var(--arch-proven); }
 .arch-status-ring.disproven { stroke: var(--arch-disproven); }
@@ -118,6 +185,9 @@ svg.arch-canvas text { font-size: 12px; fill: var(--arch-text); user-select: non
   stroke-width: 1.2;
 }
 .arch-real.subscription .body { stroke-dasharray: 5 3; }
+/* An outbox consumer's dispatch wears the outbox node's own dash, so the
+   vertex reads as the continuation of the edge it sits on. */
+.arch-real.outbox .body { stroke-dasharray: 7 3; }
 .arch-real:hover .body { stroke: var(--arch-l1); }
 .arch-real.selected .body { stroke: var(--arch-l1); stroke-width: 2; }
 .arch-real .kind-mark { font-size: 9.5px; fill: var(--arch-text-subtle); font-weight: 600; letter-spacing: 0.02em; }
@@ -169,3 +239,115 @@ svg.arch-canvas text { font-size: 12px; fill: var(--arch-text); user-select: non
 .arch-object.selected .body { stroke: var(--arch-l1); stroke-width: 2; stroke-dasharray: none; }
 .arch-object .title { font-weight: 600; font-size: 12px; }
 .arch-object .subtitle { fill: var(--arch-text-subtle); font-size: 10px; }
+
+/* ---------- bindings ---------- */
+
+/* The five kinds of binding, one hue each, on Kumo's badge and text
+   tokens: the ink is a colour Kumo already uses for text of that hue
+   (dark on a light ground, light on a dark one), so a chip reads as a
+   name, not a fill; the tint is that ink washed into the base surface.
+   Purple has no text token, so it is pulled toward the strong text
+   colour — further in dark mode, where the badge hue is darker. */
+:root {
+  --binding-read-ink: var(--text-color-kumo-badge-teal-subtle);
+  --binding-output-ink: var(--text-color-kumo-success);
+  --binding-intent-ink: color-mix(in srgb, var(--color-kumo-badge-purple) 78%, var(--text-color-kumo-strong));
+  --binding-result-ink: var(--text-color-kumo-info);
+  --binding-handle-ink: var(--text-color-kumo-badge-orange-subtle);
+  --binding-fill-mix: 11%;
+  --binding-tag-mix: 16%;
+}
+[data-mode="dark"] {
+  --binding-intent-ink: color-mix(in srgb, var(--color-kumo-badge-purple) 40%, var(--text-color-kumo-strong));
+  --binding-fill-mix: 16%;
+  --binding-tag-mix: 24%;
+}
+.binding-read { --binding-ink: var(--binding-read-ink); }
+.binding-output { --binding-ink: var(--binding-output-ink); }
+.binding-intent { --binding-ink: var(--binding-intent-ink); }
+.binding-result { --binding-ink: var(--binding-result-ink); }
+.binding-handle { --binding-ink: var(--binding-handle-ink); }
+
+/* A chip is a button: it names one binding and takes the reader to its
+   detail (a definition) or to the card that binds it (a use). A defining
+   chip is filled and leads with `≔`; a using chip is outlined and leads
+   with `↑`, pointing back up the program to where the name was bound. */
+.binding-chip {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0 0.35em;
+  max-width: 100%;
+  padding: 0 0.45em;
+  border: 1px solid color-mix(in srgb, var(--binding-ink) 45%, transparent);
+  border-radius: 0.3rem;
+  background: transparent;
+  color: var(--binding-ink);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  line-height: 1.55;
+  text-align: left;
+  vertical-align: baseline;
+  cursor: pointer;
+  transition: background-color 120ms ease, border-color 120ms ease;
+}
+.binding-chip .glyph { font-weight: 700; opacity: 0.85; }
+.binding-chip .name { overflow-wrap: anywhere; font-weight: 600; }
+.binding-chip.defines {
+  background: color-mix(in srgb, var(--binding-ink) var(--binding-fill-mix), var(--color-kumo-base));
+  border-color: color-mix(in srgb, var(--binding-ink) 30%, transparent);
+}
+.binding-chip.defines .name { font-weight: 700; }
+.binding-chip:hover {
+  border-color: var(--binding-ink);
+  background: color-mix(in srgb, var(--binding-ink) var(--binding-fill-mix), var(--color-kumo-base));
+}
+.binding-chip:focus-visible { outline: 2px solid var(--color-kumo-focus); outline-offset: 1px; }
+
+/* The kind of a binding, as a small tag: inside a defining chip, and on
+   its own in the legend. */
+.binding-kind {
+  display: inline-block;
+  padding: 0 0.4em;
+  border-radius: 0.25rem;
+  background: color-mix(in srgb, var(--binding-ink) var(--binding-tag-mix), transparent);
+  color: var(--binding-ink);
+  font-family: system-ui, sans-serif;
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  line-height: 1.6;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+.binding-kind.legend { font-size: 10px; padding: 0.1em 0.5em; cursor: help; }
+
+/* Which arm's payload a result reference reads: the ok payload exists
+   only inside the ok arm, an error payload only inside its class's arm. */
+.binding-arm {
+  font-family: system-ui, sans-serif;
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  opacity: 0.85;
+}
+
+/* A value source that is not a binding — an input — carries a plain
+   kind tag instead, so the reader never mistakes it for a name a step
+   bound. */
+.ref-tag {
+  display: inline-block;
+  margin-right: 0.35em;
+  padding: 0 0.4em;
+  border: 1px solid var(--color-kumo-hairline);
+  border-radius: 0.25rem;
+  color: var(--text-color-kumo-subtle);
+  font-family: system-ui, sans-serif;
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  line-height: 1.6;
+  text-transform: uppercase;
+  vertical-align: baseline;
+}

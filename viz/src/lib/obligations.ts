@@ -89,7 +89,9 @@ export function subjectText(subject: Subject): string {
         ? `${subject.operation} · requirement #${subject.requirement}`
         : subject.operation;
     case "transaction":
-      return `${subject.operation} · ${subject.transaction}`;
+      return subject.requirement !== undefined
+        ? `${subject.operation} · ${subject.transaction} · requirement #${subject.requirement}`
+        : `${subject.operation} · ${subject.transaction}`;
     case "object":
       return `${subject.data_model} · ${subject.object}`;
     case "state_machine":
@@ -124,7 +126,9 @@ export function propertyMatchesRequirement(property: Obligation["property"], kin
 /** Which semantic layer an obligation implicates. A proven obligation
  *  answers with the layers its proof consumed (`scope`); an unproven one
  *  with the layer the missing facts belong to (`remedy`). An obligation
- *  the checker classifies neither way answers `null`. */
+ *  the checker classifies neither way answers `null`. The transaction
+ *  families always answer `l0`: their proofs rest on the transaction
+ *  primitives, and their obstacles are application declarations. */
 export type Layer = "l0" | "runtime";
 
 export function obligationLayer(ob: Obligation): Layer | null {

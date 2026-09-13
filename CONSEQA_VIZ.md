@@ -25,6 +25,33 @@ rendering proceeds anyway, so imperfect models can still be inspected
 
 ## Views
 
+**Pages and navigation.** The canvas shows one page at a time and is
+the primary focus: the **system view** by default, else the entity the
+address bar names. Every entity with an identity of its own has a
+page — a service (`#/service/<id>`), an operation (`#/op/<id>`), one
+of its transactions (`#/tx/<id>`), a state machine (`#/machine/<id>`),
+a topic, an outbox, a data model, an object, a schema, the runtime
+realization (`#/runtime`) and each of its declarations, the clients, an
+external system — so a deep link, the browser history, and the
+breadcrumbs agree on where the reader is. The pages hang off one
+topological hierarchy: the system holds services, topics, data models,
+schemas, the runtime, and the boundary the model stops at; a service
+holds its operations; an operation its inline transactions; a data
+model its objects and outboxes; an object the machine that governs it;
+the runtime its pools, routers, and storage layouts. The **navigator**
+on the left, always in view, is that tree — the page in view marked,
+its path kept open, a filter, and a status dot on every node for the
+worst verdict at or beneath it — and the **breadcrumbs** in the top bar
+are the path down the tree to the page, every step a link back up. The
+navigator's filter row, the top bar, and the headers of the panels on
+the right share one height, so their rule runs straight across. An id in prose is
+a link: one with a page opens it in the canvas, the way a link goes
+somewhere; a sub-element with no page of its own — a step, a binding,
+an input, a transition — opens in the **inspector** on the right, which
+is the detail of whatever is selected on the page and survives
+navigation so a link keeps its context. Double-clicking anything on the
+system graph opens its page.
+
 **System view** (`#/system`). Services are drawn as boundary boxes with
 their operations inside; topics, outboxes, external systems, and a
 synthetic "clients" vertex (for request inputs no modeled operation
@@ -56,9 +83,15 @@ step executes; a solid edge's detail names the program steps that
 execute the effect, by location. Effects owned by state-machine
 transitions are attributed to the operations whose transactions bind
 them through transition applications and marked "via transition".
-Click anything for a structured detail panel; double-click an
-operation to drill in. The top bar's filter box dims non-matching
+Click anything for its detail in the inspector; double-click anything
+— an operation, a service, a topic, an object, a conflict arc — to
+open its page. The top bar's filter box dims non-matching
 vertices, and a fit control in the canvas corner re-centres the graph.
+The camera never moves on its own: when a selection opens the inspector
+beside the canvas, the canvas keeps its scale and position and the
+panel simply covers part of the drawing; only a deliberate act — the
+fit control, a layer switch, toggling the obligations panel — re-fits
+the drawing into the room that is left.
 
 *Layout.* The graph is layered left to right along the flow of
 information: columns follow reachability, and everything that can happen
@@ -81,15 +114,21 @@ a label, not a control: the machine is the model, not an overlay on it),
 and it is laid *onto* the machine rather than beside it, because every
 L1 fact is a fact about some L0 thing:
 
-- A **router** or a **subscription dispatch** realizes a boundary — the
-  way a caller or a topic enters an operation — so it is an intermediate
-  vertex *on that edge*: the caller/topic edge ends at the vertex and a
-  short arm carries on into the operation (caller → [router] → op, topic
-  → [dispatch] → op). The vertex is marked request (solid) or subscribe
-  (dashed) and names the execution pool, its member concurrency, and the
-  routing/affinity fact. The pool name is its own target: a pool is a
-  shared population, and selecting one lights every vertex that names it
-  — which is all "shared pool" means (§52), with no pool node to say it.
+- A **router**, a **subscription dispatch**, or an **outbox dispatch**
+  realizes a boundary — the way a caller, a topic, or an outbox enters
+  an operation — so it is an intermediate vertex *on that edge*: the
+  caller/topic/outbox edge ends at the vertex and a short arm carries on
+  into the operation (caller → [router] → op, topic → [dispatch] → op,
+  outbox → [dispatch] → op). The three boundaries are separate
+  primitives with one shape — a routing key and a member assignment
+  terminating at a pool — so they are drawn the same way. The vertex is
+  marked request (solid), subscribe (dashed), or consume (the outbox's
+  own dash) and names the execution pool, its member concurrency, and
+  the routing/affinity fact; every vertex of a drawing takes the width
+  the longest of those texts needs, so nothing on it overlaps. The pool
+  name is its own target: a pool is a shared population, and selecting
+  one lights every vertex that names it — which is all "shared pool"
+  means (§52), with no pool node to say it.
 - A **storage layout** is a fact about an object, so the objects
   operations persist to are drawn as a downstream data tier, wired to
   the operations that touch them by always-visible access edges. Each
@@ -101,25 +140,48 @@ L1 fact is a fact about some L0 thing:
 - A **topic** carries its transport facts (grouping, ordering) on its
   own node, since topic-scoped transport is a fact about the topic.
 
-The switch is disabled for a model that declares no L1 facts, and with
-L1 off none of the above appears — those are facts of the layer that
+A second switch, **conflicts**, offered whenever a transaction
+declares a serializability requirement, draws the **conflict arcs**:
+one arc between every two operations whose transactions may conflict
+on a persistent object — bowed over the plane between columns, nested
+brackets beside the cards of one column — and undirected, since
+contention is mutual. The arc is green when every dependency it stands
+for is commit-ordered by a declared fact — a strict lock, the version
+protocol, an ordered cursor — and amber, dashed, when at least one is
+not. A transaction that races a concurrent execution of itself, the
+write-skew shape when nothing orders it, is a small loop beside its
+operation's status chip in the same colours. Hovering an arc names the
+objects and the dependencies it stands for; selecting it opens the
+requiring transaction's serializability requirement in the inspector,
+summarized, and keeps both operations lit; double-clicking it opens the
+transaction's page with the argument drawn in full. None of this is a
+topology fact: the arcs come from the transactions' accesses, and their
+colour from the transactions' declarations alone.
+
+The L1 switch is disabled for a model that declares no L1 facts, and with
+L1 off none of the realization appears — those are facts of the layer that
 declares them. Selection follows what a thing is a fact *about*, and
-nothing wider: a router or a subscription lights only its own path — the
-caller edges, the vertex, the operation — not the operation's other
-edges; a pool lights every path it runs, which is what a shared pool is;
+nothing wider: a router or a dispatch lights only its own path — the
+caller, topic, or outbox edge, the vertex, the operation — not the
+operation's other edges; a pool lights every path it runs, which is what a shared pool is;
 an access edge lights just its operation and object. Selecting the
-operation itself still lights its one-hop neighbourhood, its
-realizations, and the objects it writes. Nothing is a parallel graph
+operation itself lights exactly its one-hop neighbourhood — its edges
+and what they join, its own realizations, the objects it writes — and
+never a neighbour's neighbour: an operation two hops away, sharing a
+topic or an object with it, stays dimmed. Selecting an object lights
+every operation that touches it. Nothing is a parallel graph
 joined by on-demand links: the realization sits on the paths and the
 entities it is about.
 
 **Operation view** (`#/op/<id>`). A page header (name, copyable id,
 description, and a fact strip: service, transaction and
 program-step counts, the state machines it drives, verdict tally),
-then three sections as Kumo layer cards. **Requirements** is a table —
-one row per declared requirement with its key, its semantics
-(replay-consistent result, guaranteed completion) and, when a report
-is loaded, the verdict over its obligations; **Inputs** is a table of
+then four sections as Kumo layer cards. **Requirements** is a table —
+one row per declared requirement, the operation's own and those of
+every transaction in its program, with its key (and position, for
+ordering), its semantics (replay-consistent result, guaranteed
+completion) and, when a report is loaded, the verdict over its
+obligations; **Inputs** is a table of
 what starts an invocation, split by layer: the **L0 contract** (request
 identity and result contract, or the messages a subscription consumes)
 and the **L1 realization** (for a request, the router, its routing key,
@@ -148,10 +210,64 @@ rendered as text — each arm a nested sequence of the same step cards;
 `return` cards name the request input and the variant and provenance
 of the payload they construct, and `complete` cards close a
 subscription-driven path. Transition steps link into the owning state
-machine. An obligation's evidence names paths by the arms they take
+machine.
+
+A transaction that can reject **forks the flow** below its card into
+two lanes of the same form, side by side. The **committed** lane is
+the block's own flow continuing — the steps after the transaction,
+its `return` or `complete` included, drawn as the explicit cards they
+are with the locations the checker names them by — headed by the
+bindings the commit makes available. The **rejected** lane holds the
+rejected block, located beneath the transaction as `n.rejected.m`,
+headed by the note that nothing committed and none of those bindings
+exists there and, when that block falls through, where it rejoins the
+committed lane. Neither lane is inside the transaction card, and
+nothing after the card is drawn in sequence with it, so the page never
+reads as "commit, then reject". A transaction that cannot reject forks
+nothing: its card says it never rejects, lists what its commit makes
+available, and the flow continues below it.
+
+**Bindings** — the names a step introduces for later steps — have one
+visual identity everywhere. There are five kinds and nothing else is a
+binding: a **read** (transaction-local, never available outside its
+transaction), an **output** (data the commit exports), an **intent**
+(work captured at commit, executed later), a **result** (an
+attempt-local observation whose ok and error payloads are reachable
+only inside the matching arm), and a **handle** (a synchronization
+artifact, not data). Wherever a step binds a name it shows a filled
+*defines* chip, `≔ name`, tagged with the kind; wherever a later step
+refers to one — a value source, a match, an intent execution, a
+barrier — it shows an outlined *uses* chip in the same colour that
+names where the binding was made and, clicked, selects the producing
+card and scrolls it into view. A result reference carries its `ok` or
+`err` arm tag, and a card whose derivation reads bindings shows them
+as uses chips with the count of its other roots. Execution-site ids
+(`tx.x`, `effect.x`), inputs (tagged as such), schemas, and objects
+never wear the chip, which is how a reader tells a variable from a
+declaration. The **Bindings** section is the table behind the
+chips: every binding of the operation with its kind, its scope
+(transaction-local or the program), the step that binds it, and every
+step that uses it, each location a click away. An obligation's evidence names paths by the arms they take
 (`ok(result.x) › then(step 3)`), which is how a reader finds the
 decision it points at. Selecting any row or card opens its detail
 panel.
+
+**Transaction page** (`#/tx/<id>`, optionally opened on one requirement
+with `?req=serializability.N` or `?req=ordering.N`). A page header
+(name, copyable id, the operation and program step it belongs to, data
+model, isolation, commit guarantee, whether it can reject, verdict
+tally), then **Requirements** — each declared `SerializableBy` or
+`OrderedBy` with its argument drawn in full, which a column beside the
+canvas never had room for: the conflict closure at page width with the
+dependency groups beside it, the mechanism strip for an ordering, the
+obstacles when it fails; the requirement a link names is ringed and
+scrolled into view — then **Steps** (the body as selectable rows, commit
+guards marked), **Outcomes** (where control goes on commit and on
+rejection, with the way back to the program), and **Obligations** (the
+report's verdicts on the transaction). The page is reached from the
+transaction card and the requirement rows of the operation page, from
+an obligation card's argument summary, from a conflict arc (double
+click), from the nodes of any closure drawing, and from the navigator.
 
 **State machine view** (`#/machine/<id>`). A page header (name,
 copyable id, governed object and state field, initial state, counts,
@@ -167,9 +283,10 @@ deep link or history navigation selects what the address bar names.
 
 ## Panels
 
-**Detail panel.** Every model entity — service, operation, topic,
+**Inspector.** The detail panel beside the canvas: the detail of
+whatever is selected on the page in view. Every model entity — service, operation, topic,
 schema, data object, state machine, state, transition, input, inline
-effect, intent binding, transaction-output binding, result binding,
+effect, read binding, intent binding, transaction-output binding, result binding,
 inline transaction, transaction step, program step, requirement, graph
 edge, or L1 declaration (execution pool, router, storage layout) —
 opens a detail panel organized into collapsible, counted sections
@@ -191,8 +308,9 @@ change to the topology would put back in question can be read off the
 declaration itself. Topics and inputs carry the same list, being where
 L1 facts attach to L0 entities.
 
-**Top bar.** Model name and revision, breadcrumbs for the current
-page, the id filter on the system view, and — when a report is loaded
+**Top bar.** Model name and revision,
+breadcrumbs — the path down the model's hierarchy to the current page,
+every step a link — the id filter on the system view, and — when a report is loaded
 — an "Obligations" button carrying the report's tally that opens the
 obligations panel. It names the model, not the tool: the document
 title already reads `<model> · conseqa`, and a host embedding the
@@ -209,6 +327,39 @@ crowded one.
 single obligation — today, a subscription that admits duplicate
 deliveries while its operation declares no idempotency requirement
 keyed from it — appear at the top of the obligations panel.
+
+**Transaction proofs.** A transaction serializability or ordering
+verdict is not paraphrased but drawn. The requiring transaction's
+**conflict closure** — every transaction of the model that may read or
+write what it writes, transitively — is a small graph: one node per
+transaction (its operation and isolation beneath it, the requiring one
+marked), and one arrow per ordered pair of transactions, standing for
+every potential serialization dependency between them (`wr`, `rw`,
+`ww`, on the objects and fields they meet on). A green arrow's
+dependencies are all commit-ordered by a declared fact; an amber,
+dashed one carries at least one that nothing orders, and the
+transactions of an unconstrained cycle are haloed — that cycle is the
+history the checker could not exclude. A loop on a node is the
+transaction against its own concurrent execution. The route is badged:
+*serializable isolation* when every closure member declares it and the
+database orders the closure itself, *serialization graph* when the
+arrows carry the argument. Beneath the drawing, each arrow expands to
+its dependencies — step to step, access modes, object and fields,
+overlap — each with its evidence pill (strict lock, version
+validation, ordered cursor, atomic write order, committed read) or its
+gap pills (no lock on the reader, no version validation, overlap not
+proven disjoint, …) and the checker's sentence, ids linked. An
+ordering verdict adds the **mechanism strip** above that argument: the
+position, the guard's rule (successor, monotonic after, or a fence),
+and the managed field it advances, with the step that carries it — or
+the amber note that no guard carries the position — and then the
+serializability argument over the same key, which an ordered history
+presupposes. The argument is drawn in full on the **transaction
+page**, where it has the width it needs; wherever else the verdict
+appears — an obligation card, a requirement's or a transaction's
+inspector detail, the requirement rows of the operation page — it is
+summarized (verdict, route, headline, closure size and open arrows, or
+the guard and its rule) with the way to the page.
 
 **Obligations panel.** The checker's obligations, grouped by the
 operation (or data model, machine, topic) they anchor to, with a
@@ -229,8 +380,10 @@ transitions in the machine view inherit theirs.
 ## The obligation report
 
 The report format is `conseqa::analyzer::report` (`ProverReport`,
-`format: 4`): one obligation per declared requirement — serialization,
-ordering, idempotency, result replay (the result half of an idempotency
+`format: 7`): one obligation per declared requirement — transaction
+serializability and transaction ordering (anchored to the transaction
+that declares them, with the operation whose program carries it),
+idempotency, result replay (the result half of an idempotency
 requirement declaring `result: replay_consistent`), recoverability —
 with status `proven`, `disproven`, or `unknown`. Format 2 replaced the
 response-replay property with result replay, dropped object-history
@@ -238,9 +391,15 @@ obligations and the flow subject, and made proofs cite the program
 paths and decisions they rest on; format 3 added proof `scope` and
 rebuilt the serialization and ordering arguments on the L1 runtime
 model; format 4 added `remedy` to unproven serialization and ordering
-obligations. Unknown is epistemic: the checker could not establish the
-property, typically because a required fact is `unspecified` or no V1
-verifier attempts that family. It is never evidence of a violation.
+obligations; formats 5 and 6 followed the outbox and serialization
+revisions; format 7 retired the operation-level serialization and
+ordering properties for `transaction_serializability` and
+`transaction_ordering`, proven from the transactions alone — isolation,
+strict locks, the version protocol, cursors and fences — and never
+from the runtime topology, so those proofs are always `l0_only`.
+Unknown is epistemic: the checker could not establish the property,
+typically because a required fact is `unspecified` or no V1 verifier
+attempts that family. It is never evidence of a violation.
 
 Each obligation carries its `summary`, `subject`, `scope`, `remedy`,
 `assumptions` (the declared facts a proof relies on — conditional, per
@@ -313,7 +472,8 @@ npm run build   # typecheck + single-file bundle → dist/index.html
 The production build is one `dist/index.html` with every script and
 stylesheet inlined (`vite-plugin-singlefile`). `conseqa::viz::render`
 embeds that file at compile time (`include_str!`) and injects the page
-data — title, model, derived graph, report — as `window.CONSEQA`, so
+data — title, model, derived graph, the transaction proofs, report —
+as `window.CONSEQA`, so
 `cargo` needs no Node toolchain. During development the app fetches
 `public/conseqa.json` instead; regenerate it with `npm run data`, or
 directly with `conseqa-viz <model> --verify --json --out <path>`.
@@ -339,18 +499,32 @@ binary reaches it only on its next start.
 ```
 src/bin/viz/
   main.rs      CLI: parse, validate, verify or load a report, render
+
+src/viz/
   graph.rs     Model → system graph (vertices, edges, indexes);
                resolves intents, transition ownership, message
                selectors so the front end never re-implements them
-  report.rs    re-export of conseqa::analyzer::report
+  transaction_proofs.rs
+               Model → the transaction proofs: per
+               declared requirement, the conflict closure, every
+               dependency with its commit-order evidence or gaps,
+               the arrows they group into, the unconstrained cycles,
+               and the ordering guard — joined to the report by
+               obligation id, so the front end draws the proof
   render.rs    embeds viz/dist/index.html and injects the page data
 
 viz/
-  src/types/   TypeScript mirrors of the model, graph, and report JSON
-  src/lib/     id index, obligation index, routing, text helpers
-  src/state/   app state (selection, detail target, filters, theme)
-  src/graph/   SVG canvas (pan/zoom), layouts, the three views
-  src/panels/  detail panel, obligations panel, shared Kumo parts
-  src/chrome/  top bar
+  src/types/   TypeScript mirrors of the model, graph, transaction proofs,
+               and report JSON
+  src/lib/     id index, obligation index, routing, the page hierarchy
+               (navigation.ts), text helpers
+  src/state/   app state (selection, inspector target, filters, theme)
+  src/graph/   SVG canvas (pan/zoom), layouts, the system, operation,
+               and machine views, the closure drawing
+  src/pages/   the transaction page, the runtime overview, the generic
+               entity page (an inspector detail drawn as a page)
+  src/panels/  the inspector's details, obligations panel, transaction
+               proofs, shared Kumo parts
+  src/chrome/  top bar, navigator
   dist/        committed single-file production bundle
 ```

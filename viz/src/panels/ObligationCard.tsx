@@ -9,6 +9,7 @@ import { shortId } from "../lib/ids";
 import { subjectText } from "../lib/obligations";
 import { useApp } from "../state/AppState";
 import { propertyName, type Obligation } from "../types/report";
+import { ProofSummary } from "./TransactionProof";
 import { CitedText, IdLink, StatusBadge } from "./parts";
 
 /** The layer note a verdict carries.
@@ -19,7 +20,9 @@ import { CitedText, IdLink, StatusBadge } from "./parts";
  *  An unproven one records the dual — the layer the facts it is waiting
  *  on belong to — so a reader knows whether the next declaration is an
  *  application one or a topology one. Neither is an alarm; the status
- *  badge beside it carries that. */
+ *  badge beside it carries that. A transaction serializability or
+ *  ordering obligation is always L0: its proof rests on the transaction
+ *  primitives, and its obstacles are application declarations. */
 function layerNote(ob: Obligation): { label: string; hint: string } | null {
   if (ob.scope) {
     return ob.scope === "runtime_dependent"
@@ -41,14 +44,15 @@ function layerNote(ob: Obligation): { label: string; hint: string } | null {
       ? {
           label: "needs L1 fact",
           hint:
-            "Every remaining obstacle names a runtime fact — grouping, ordering, routing, member " +
-            "assignment, or pool concurrency. A routing hint, not a promise: declaring one is " +
-            "where to go next, not proof that it closes the argument.",
+            "Every remaining obstacle names a runtime fact — delivery, transport, routing, or " +
+            "pool topology. A routing hint, not a promise: declaring one is where to go next, " +
+            "not proof that it closes the argument.",
         }
       : {
           label: "needs L0 fact",
           hint:
-            "At least one obstacle names an application fact — the program, the interface, or the " +
+            "At least one obstacle names an application fact — the program, the transaction's " +
+            "isolation, locks, version protocol, cursors or fences, the interface, or the " +
             "requirement itself — so no runtime declaration alone can discharge this.",
         };
   }
@@ -62,9 +66,13 @@ const STRIPE: Record<Obligation["status"], string> = {
 };
 
 export function ObligationCard({ ob, defaultOpen = false }: { ob: Obligation; defaultOpen?: boolean }) {
-  const { focusSubject } = useApp();
+  const { focusSubject, transactionProofs } = useApp();
   const [open, setOpen] = useState(defaultOpen);
-  const hasDetail = ob.assumptions.length > 0 || ob.evidence.length > 0 || !!ob.counterexample;
+  // A transaction-family verdict carries its argument as a structure —
+  // the conflict closure, the dependencies, the guard. The card gives
+  // its summary; the transaction's page draws it in full.
+  const proof = transactionProofs.proofForObligation(ob);
+  const hasDetail = ob.assumptions.length > 0 || ob.evidence.length > 0 || !!ob.counterexample || !!proof;
   const layer = layerNote(ob);
 
   return (
@@ -90,11 +98,17 @@ export function ObligationCard({ ob, defaultOpen = false }: { ob: Obligation; de
               <StatusBadge status={ob.status} />
             </span>
           </div>
-          <div className="text-sm leading-snug text-kumo-default">{ob.summary}</div>
-          <div className="font-mono text-[11px] text-kumo-inactive">{subjectText(ob.subject)}</div>
+          <div className="break-words text-sm leading-snug text-kumo-default">{ob.summary}</div>
+          <div className="break-all font-mono text-[11px] text-kumo-inactive">{subjectText(ob.subject)}</div>
         </Collapsible.Trigger>
         <Collapsible.Panel>
-          <div className="space-y-3 border-t border-kumo-hairline px-3 py-2.5">
+          <div className="min-w-0 space-y-3 border-t border-kumo-hairline px-3 py-2.5">
+            {proof && (
+              <div>
+                <div className="mb-1.5 text-[11px] font-semibold uppercase tracking-wider text-kumo-subtle">why</div>
+                <ProofSummary proof={proof} />
+              </div>
+            )}
             {ob.assumptions.length > 0 && (
               <div>
                 <div className="mb-1 text-[11px] font-semibold uppercase tracking-wider text-kumo-subtle">
@@ -152,9 +166,11 @@ export function ObligationCard({ ob, defaultOpen = false }: { ob: Obligation; de
               </div>
             )}
             {!hasDetail && <div className="text-sm text-kumo-inactive">no further detail recorded</div>}
-            <Button variant="ghost" size="xs" icon={CrosshairIcon} onClick={() => focusSubject(ob)}>
-              focus subject
-            </Button>
+            {!proof && (
+              <Button variant="ghost" size="xs" icon={CrosshairIcon} onClick={() => focusSubject(ob)}>
+                focus subject
+              </Button>
+            )}
           </div>
         </Collapsible.Panel>
       </div>

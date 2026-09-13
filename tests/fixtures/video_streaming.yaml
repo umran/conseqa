@@ -9,15 +9,16 @@
 # declare their own deduplication; subscriptions are at-least-once with
 # guaranteed completion. The transcoder branches on the engine's
 # synchronous result: a rendered manifest completes the job, a rejected
-# source fails it.
+# source fails it. Every transition can reject — a job already done, a
+# video already ready — and each transition transaction says what the
+# operation does then: nothing, and the delivery completes.
 #
-# Scalability: same-video work is serialized by the runtime topology —
-# the topic's video_id key names a routing domain, consistent-hash
-# assignment gives that domain one owning pool member, and the member
-# runs one invocation at a time — while different videos proceed in
-# parallel across the pool. Every serialization and ordering proof here
-# is therefore runtime-dependent: it holds of the topology declared at
-# the foot of this file and of no other.
+# Serializability: same-video work is serializable because every
+# transaction that touches a video or its job runs under serializable
+# isolation, so the closure of conflicting transactions is one the
+# database orders by itself. That proof is a property of the
+# transactions alone; the runtime topology at the foot of this file
+# describes placement and transport, and no proof consumes it.
 #
 # Every obligation proves. The engine deduplicates renders by
 # video_id, which fixes each video's one logical render and its
@@ -27,7 +28,7 @@
 # the retried match would not be established to replay, and the
 # transcoder's idempotency, with the upload's cascade, would be
 # unknown.
-dsl: 3
+dsl: 4
 revision: 1
 services:
   service.ingest:
@@ -232,68 +233,70 @@ operations:
           - upload_id
         result:
           ok: schema.UploadCompleteResponse
-          err: schema.RequestRejected
+          errors:
+            rejected: schema.RequestRejected
     program:
       steps:
       - kind: transaction
-        id: tx.complete_upload.register
-        data_model: data.videos
-        isolation: read_committed
-        idempotency:
-          kind: deduplicated_by
-          key:
-            components:
-            - source: input:input.complete_upload.request
-              path: upload_id
-        steps:
-        - kind: insert
-          object: object.video
-          values:
-            kind: deterministic
-            from:
-            - source: input:input.complete_upload.request
-              path: video_id
-            - source: input:input.complete_upload.request
-              path: owner_id
-            - source: input:input.complete_upload.request
-              path: source_uri
-        - kind: establish_effect_intent
-          bind: intent.complete_upload.publish_uploaded
-          effect_id: effect.complete_upload.publish_uploaded
-          effect:
-            kind: publication
-            topic: topic.video_events
-            schema: schema.VideoUploaded
-            idempotency_key_propagation:
-            - source:
-                components:
-                - source: input:input.complete_upload.request
-                  path: upload_id
-              target:
-                components:
-                - source: effect:effect.complete_upload.publish_uploaded
-                  path: event_id
-          values:
-            kind: deterministic
-            from:
-            - source: input:input.complete_upload.request
-              path: upload_id
-            - source: input:input.complete_upload.request
-              path: video_id
-            - source: input:input.complete_upload.request
-              path: owner_id
-            - source: input:input.complete_upload.request
-              path: source_uri
-        # status is the constant initial state, so the only provenance
-        # root is the video id.
-        - kind: establish_transaction_output
-          bind: output.complete_upload
-          schema: schema.UploadCompleteResponse
-          values:
-            kind: deterministic
-            from:
-            - source: input:input.complete_upload.request
-              path: video_id
+        transaction:
+          id: tx.complete_upload.register
+          data_model: data.videos
+          isolation: serializable
+          idempotency:
+            kind: deduplicated_by
+            key:
+              components:
+              - source: input:input.complete_upload.request
+                path: upload_id
+          steps:
+          - kind: insert
+            object: object.video
+            values:
+              kind: deterministic
+              from:
+              - source: input:input.complete_upload.request
+                path: video_id
+              - source: input:input.complete_upload.request
+                path: owner_id
+              - source: input:input.complete_upload.request
+                path: source_uri
+          - kind: establish_effect_intent
+            bind: intent.complete_upload.publish_uploaded
+            effect_id: effect.complete_upload.publish_uploaded
+            effect:
+              kind: publication
+              topic: topic.video_events
+              schema: schema.VideoUploaded
+              idempotency_key_propagation:
+              - source:
+                  components:
+                  - source: input:input.complete_upload.request
+                    path: upload_id
+                target:
+                  components:
+                  - source: effect:effect.complete_upload.publish_uploaded
+                    path: event_id
+            values:
+              kind: deterministic
+              from:
+              - source: input:input.complete_upload.request
+                path: upload_id
+              - source: input:input.complete_upload.request
+                path: video_id
+              - source: input:input.complete_upload.request
+                path: owner_id
+              - source: input:input.complete_upload.request
+                path: source_uri
+          # status is the constant initial state, so the only provenance
+          # root is the video id.
+          - kind: establish_transaction_output
+            bind: output.complete_upload
+            schema: schema.UploadCompleteResponse
+            values:
+              kind: deterministic
+              from:
+              - source: input:input.complete_upload.request
+                path: video_id
       - kind: execute_effect_intent
         intent: intent.complete_upload.publish_uploaded
       - kind: return
@@ -308,8 +311,6 @@ operations:
             - source: transaction_output:output.complete_upload
               path: status
     requirements:
-      serialization: []
-      ordering: []
       idempotency:
       - key:
           components:
@@ -336,37 +337,44 @@ operations:
     program:
       steps:
       - kind: transaction
-        id: tx.transcode_video.claim
-        data_model: data.transcoder
-        isolation: read_committed
-        idempotency:
-          kind: deduplicated_by
-          key:
-            components:
-            - source: input:input.transcode_video.uploaded
-              path: event_id
-        steps:
-        - kind: insert
-          object: object.job
-          values:
-            kind: deterministic
-            from:
-            - source: input:input.transcode_video.uploaded
-              path: video_id
-            - source: input:input.transcode_video.uploaded
-              path: source_uri
-        - kind: transition
-          machine: machine.job_lifecycle
-          transition: transition.job.start
-          subject:
+        # The job already left queued — a redelivery after the claim
+        # committed under another delivery's key — and the transition
+        # rejects. Nothing is claimed twice; the delivery completes.
+        rejected:
+          steps:
+          - kind: complete
+        transaction:
+          id: tx.transcode_video.claim
+          data_model: data.transcoder
+          isolation: serializable
+          idempotency:
+            kind: deduplicated_by
+            key:
+              components:
+              - source: input:input.transcode_video.uploaded
+                path: event_id
+          steps:
+          - kind: insert
             object: object.job
-            predicate:
-              kind: eq
-              field: video_id
-              value:
-                source: input:input.transcode_video.uploaded
+            values:
+              kind: deterministic
+              from:
+              - source: input:input.transcode_video.uploaded
                 path: video_id
-          effect_intents: {}
+              - source: input:input.transcode_video.uploaded
+                path: source_uri
+          - kind: transition
+            machine: machine.job_lifecycle
+            transition: transition.job.start
+            subject:
+              object: object.job
+              predicate:
+                kind: eq
+                field: video_id
+                value:
+                  source: input:input.transcode_video.uploaded
+                  path: video_id
+            effect_intents: {}
       - kind: execute_effect
         effect_id: effect.transcode_video.engine
         effect:
@@ -382,9 +390,10 @@ operations:
           result_replay: replay_stable
           result:
             ok: schema.RenderCompleted
-            err:
-              schema: schema.RenderFailed
-              disposition: terminal
+            errors:
+              failed:
+                schema: schema.RenderFailed
+                disposition: terminal
         values:
           kind: deterministic
           from:
@@ -398,93 +407,102 @@ operations:
         ok:
           steps:
           - kind: transaction
-            id: tx.transcode_video.complete
-            data_model: data.transcoder
-            isolation: read_committed
-            idempotency:
-              kind: deduplicated_by
-              key:
-                components:
-                - source: input:input.transcode_video.uploaded
-                  path: event_id
-            steps:
-            - kind: write
-              target:
-                object: object.job
-                predicate:
-                  kind: eq
-                  field: video_id
-                  value:
+            # The job is no longer running: the transition rejects, the
+            # manifest write with it, and the delivery completes.
+            rejected:
+              steps:
+              - kind: complete
+            transaction:
+              id: tx.transcode_video.complete
+              data_model: data.transcoder
+              isolation: serializable
+              idempotency:
+                kind: deduplicated_by
+                key:
+                  components:
+                  - source: input:input.transcode_video.uploaded
+                    path: event_id
+              requirements:
+                serializability:
+                - key:
                     source: input:input.transcode_video.uploaded
                     path: video_id
-              fields:
-              - manifest_uri
-              values:
-                kind: deterministic
-                from:
-                - source: effect_result_ok:result.transcode_video.render
-                  path: manifest_uri
-            - kind: transition
-              machine: machine.job_lifecycle
-              transition: transition.job.complete
-              subject:
-                object: object.job
-                predicate:
-                  kind: eq
-                  field: video_id
-                  value:
-                    source: input:input.transcode_video.uploaded
-                    path: video_id
-              effect_intents:
-                effect.job.completed:
-                  bind: intent.transcode_video.completed
-                  values:
-                    kind: deterministic
-                    from:
-                    - source: input:input.transcode_video.uploaded
-                      path: event_id
-                    - source: input:input.transcode_video.uploaded
+              steps:
+              - kind: write
+                target:
+                  object: object.job
+                  predicate:
+                    kind: eq
+                    field: video_id
+                    value:
+                      source: input:input.transcode_video.uploaded
                       path: video_id
-                    - source: effect_result_ok:result.transcode_video.render
-                      path: manifest_uri
+                fields:
+                - manifest_uri
+                values:
+                  kind: deterministic
+                  from:
+                  - source: effect_result_ok:result.transcode_video.render
+                    path: manifest_uri
+              - kind: transition
+                machine: machine.job_lifecycle
+                transition: transition.job.complete
+                subject:
+                  object: object.job
+                  predicate:
+                    kind: eq
+                    field: video_id
+                    value:
+                      source: input:input.transcode_video.uploaded
+                      path: video_id
+                effect_intents:
+                  effect.job.completed:
+                    bind: intent.transcode_video.completed
+                    values:
+                      kind: deterministic
+                      from:
+                      - source: input:input.transcode_video.uploaded
+                        path: event_id
+                      - source: input:input.transcode_video.uploaded
+                        path: video_id
+                      - source: effect_result_ok:result.transcode_video.render
+                        path: manifest_uri
           - kind: execute_effect_intent
             intent: intent.transcode_video.completed
           - kind: complete
-        err:
-          steps:
-          - kind: transaction
-            id: tx.transcode_video.fail
-            data_model: data.transcoder
-            isolation: read_committed
-            idempotency:
-              kind: deduplicated_by
-              key:
-                components:
-                - source: input:input.transcode_video.uploaded
-                  path: event_id
+        errors:
+          failed:
             steps:
-            - kind: transition
-              machine: machine.job_lifecycle
-              transition: transition.job.fail
-              subject:
-                object: object.job
-                predicate:
-                  kind: eq
-                  field: video_id
-                  value:
-                    source: input:input.transcode_video.uploaded
-                    path: video_id
-              effect_intents: {}
-          - kind: complete
+            - kind: transaction
+              # Already done or already failed: nothing to mark.
+              rejected:
+                steps:
+                - kind: complete
+              transaction:
+                id: tx.transcode_video.fail
+                data_model: data.transcoder
+                isolation: serializable
+                idempotency:
+                  kind: deduplicated_by
+                  key:
+                    components:
+                    - source: input:input.transcode_video.uploaded
+                      path: event_id
+                steps:
+                - kind: transition
+                  machine: machine.job_lifecycle
+                  transition: transition.job.fail
+                  subject:
+                    object: object.job
+                    predicate:
+                      kind: eq
+                      field: video_id
+                      value:
+                        source: input:input.transcode_video.uploaded
+                        path: video_id
+                  effect_intents: {}
+            - kind: complete
     requirements:
-      serialization:
-      - key:
-          source: input:input.transcode_video.uploaded
-          path: video_id
-      ordering:
-      - key:
-          source: input:input.transcode_video.uploaded
-          path: video_id
       idempotency:
       - key:
           components:
@@ -511,67 +529,70 @@ operations:
     program:
       steps:
       - kind: transaction
-        id: tx.publish_video.ready
-        data_model: data.videos
-        isolation: read_committed
-        idempotency:
-          kind: deduplicated_by
-          key:
-            components:
-            - source: input:input.publish_video.completed
-              path: event_id
-        steps:
-        - kind: write
-          target:
-            object: object.video
-            predicate:
-              kind: eq
-              field: video_id
-              value:
+        # The video is no longer in uploaded — already ready, or failed —
+        # so the transition rejects and the delivery completes.
+        rejected:
+          steps:
+          - kind: complete
+        transaction:
+          id: tx.publish_video.ready
+          data_model: data.videos
+          isolation: serializable
+          idempotency:
+            kind: deduplicated_by
+            key:
+              components:
+              - source: input:input.publish_video.completed
+                path: event_id
+          requirements:
+            serializability:
+            - key:
                 source: input:input.publish_video.completed
                 path: video_id
-          fields:
-          - manifest_uri
-          values:
-            kind: deterministic
-            from:
-            - source: input:input.publish_video.completed
-              path: manifest_uri
-        - kind: transition
-          machine: machine.video_lifecycle
-          transition: transition.video.mark_ready
-          subject:
-            object: object.video
-            predicate:
-              kind: eq
-              field: video_id
-              value:
-                source: input:input.publish_video.completed
-                path: video_id
-          effect_intents:
-            effect.video.published:
-              bind: intent.publish_video.published
-              values:
-                kind: deterministic
-                from:
-                - source: input:input.publish_video.completed
-                  path: event_id
-                - source: input:input.publish_video.completed
+          steps:
+          - kind: write
+            target:
+              object: object.video
+              predicate:
+                kind: eq
+                field: video_id
+                value:
+                  source: input:input.publish_video.completed
                   path: video_id
-                - source: input:input.publish_video.completed
-                  path: manifest_uri
+            fields:
+            - manifest_uri
+            values:
+              kind: deterministic
+              from:
+              - source: input:input.publish_video.completed
+                path: manifest_uri
+          - kind: transition
+            machine: machine.video_lifecycle
+            transition: transition.video.mark_ready
+            subject:
+              object: object.video
+              predicate:
+                kind: eq
+                field: video_id
+                value:
+                  source: input:input.publish_video.completed
+                  path: video_id
+            effect_intents:
+              effect.video.published:
+                bind: intent.publish_video.published
+                values:
+                  kind: deterministic
+                  from:
+                  - source: input:input.publish_video.completed
+                    path: event_id
+                  - source: input:input.publish_video.completed
+                    path: video_id
+                  - source: input:input.publish_video.completed
+                    path: manifest_uri
       - kind: execute_effect_intent
         intent: intent.publish_video.published
       - kind: complete
     requirements:
-      serialization:
-      - key:
-          source: input:input.publish_video.completed
-          path: video_id
-      ordering:
-      - key:
-          source: input:input.publish_video.completed
-          path: video_id
       idempotency:
       - key:
           components:
@@ -620,11 +641,6 @@ operations:
             path: video_id
       - kind: complete
     requirements:
-      serialization:
-      - key:
-          source: input:input.notify_published.published
-          path: video_id
-      ordering: []
       idempotency:
       - key:
           components:
@@ -648,43 +664,45 @@ operations:
           kind: unspecified
         result:
           ok: schema.PlaybackResponse
-          err: schema.RequestRejected
+          errors:
+            rejected: schema.RequestRejected
     program:
       steps:
       - kind: transaction
-        id: tx.get_playback.read
-        data_model: data.videos
-        isolation: read_committed
-        idempotency:
-          kind: unspecified
-        steps:
-        - kind: read
-          bind: read.get_playback.video
-          target:
-            object: object.video
-            predicate:
-              kind: eq
-              field: video_id
-              value:
-                source: input:input.get_playback.request
-                path: video_id
-          fields:
-            kind: only
+        transaction:
+          id: tx.get_playback.read
+          data_model: data.videos
+          isolation: serializable
+          idempotency:
+            kind: unspecified
+          steps:
+          - kind: read
+            bind: read.get_playback.video
+            target:
+              object: object.video
+              predicate:
+                kind: eq
+                field: video_id
+                value:
+                  source: input:input.get_playback.request
+                  path: video_id
             fields:
-            - status
-            - manifest_uri
-        - kind: establish_transaction_output
-          bind: output.get_playback
-          schema: schema.PlaybackResponse
-          values:
-            kind: deterministic
-            from:
-            - source: input:input.get_playback.request
-              path: video_id
-            - source: transaction_read:read.get_playback.video
-              path: status
-            - source: transaction_read:read.get_playback.video
-              path: manifest_uri
+              kind: only
+              fields:
+              - status
+              - manifest_uri
+          - kind: establish_transaction_output
+            bind: output.get_playback
+            schema: schema.PlaybackResponse
+            values:
+              kind: deterministic
+              from:
+              - source: input:input.get_playback.request
+                path: video_id
+              - source: transaction_read:read.get_playback.video
+                path: status
+              - source: transaction_read:read.get_playback.video
+                path: manifest_uri
       - kind: return
         request: input.get_playback.request
         outcome:
@@ -699,8 +717,6 @@ operations:
             - source: transaction_output:output.get_playback
               path: manifest_uri
     requirements:
-      serialization: []
-      ordering: []
       idempotency:
       - key:
           components:
@@ -744,19 +760,16 @@ runtime:
       member_concurrency:
         kind: bounded
         value: 1
-      execution_handoff: exclusive_ownership
 
     pool.catalog_workers:
       member_concurrency:
         kind: bounded
         value: 1
-      execution_handoff: exclusive_ownership
 
     pool.notifier_workers:
       member_concurrency:
         kind: bounded
         value: 1
-      execution_handoff: exclusive_ownership
 
     # The upload boundary needs no member affinity: its idempotency
     # and recoverability rest on the keyed commit, not on topology.

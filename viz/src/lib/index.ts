@@ -1,6 +1,6 @@
 import type {
-  Effect, Id, Model, Operation, OperationBlock, OperationStep, ResultType, Transaction,
-  TransitionSideEffect,
+  DataObject, Effect, Id, Model, Operation, OperationBlock, OperationStep, ResultType, Transaction,
+  TransactionStep, TransitionSideEffect,
 } from "../types/model";
 import { shortId } from "./ids";
 
@@ -28,6 +28,10 @@ export type IndexEntry =
   /** A transaction-output binding with its declared schema and the
    *  inline transaction that establishes it. */
   | { kind: "output"; op: Id; schema: Id; transaction: Id }
+  /** A transaction-local read binding: `step` is the 0-based index of
+   *  the `read` step inside the inline transaction that binds it. Never
+   *  available outside that transaction. */
+  | { kind: "read"; op: Id; transaction: Id; step: number }
   /** A result binding declared by a program step; `effect` is what it observes. */
   | { kind: "binding"; op: Id; effect: Id; location: string }
   /** An async handle bound by a launch step: an operation-local
@@ -44,15 +48,29 @@ export type IndexEntry =
 
 export type ModelIndex = Map<Id, IndexEntry>;
 
+/** The arm of a decision a nested block belongs to, spelled as the
+ *  checker spells it (`impl Display for Arm` in
+ *  `src/spec/operation/program.rs`): the `ok` arm or an error-class arm
+ *  `err:<class>` of a match, the `then` or `otherwise` arm of a branch,
+ *  or the `rejected` block of a transaction step. */
+export type Arm = "ok" | "then" | "otherwise" | "rejected" | `err:${string}`;
+
+/** The arm of the named error class of a match. */
+export function errArm(error: Id): Arm {
+  return `err:${error}`;
+}
+
 /** One hop of a step location: the step's index in its block and, for
  *  every level but the last, the arm entered beneath it. */
 export interface StepHop {
   step: number;
-  arm?: "ok" | "err" | "then" | "otherwise";
+  arm?: Arm;
 }
 
 /** A step location rendered as the checker names it: one-based, `3.ok.1`
- *  for the first step of the ok arm of the third top-level step. */
+ *  for the first step of the ok arm of the third top-level step,
+ *  `3.err:conflict.1` for an error arm, `3.rejected.1` for a rejection
+ *  block. */
 export function locationLabel(hops: StepHop[]): string {
   return hops.map((h) => `${h.step + 1}${h.arm ? `.${h.arm}` : ""}`).join(".");
 }
@@ -63,16 +81,22 @@ export interface LocatedStep {
   step: OperationStep;
 }
 
-/** Every step of a program with its location, depth first in program order. */
+/** Every step of a program with its location, depth first in program
+ *  order — the arms of every decision and the rejection block of every
+ *  rejectable transaction included. */
 export function walkProgram(block: OperationBlock, parent: StepHop[] = []): LocatedStep[] {
   const out: LocatedStep[] = [];
   block.steps.forEach((step, index) => {
     const hops = [...parent, { step: index }];
     out.push({ location: locationLabel(hops), hops, step });
-    const under = (arm: StepHop["arm"]) => [...parent, { step: index, arm }];
-    if (step.kind === "match_result") {
+    const under = (arm: Arm) => [...parent, { step: index, arm }];
+    if (step.kind === "transaction") {
+      if (step.rejected) out.push(...walkProgram(step.rejected, under("rejected")));
+    } else if (step.kind === "match_result") {
       out.push(...walkProgram(step.ok, under("ok")));
-      out.push(...walkProgram(step.err, under("err")));
+      for (const [error, arm] of Object.entries(step.errors)) {
+        out.push(...walkProgram(arm, under(errArm(error))));
+      }
     } else if (step.kind === "branch") {
       out.push(...walkProgram(step.then, under("then")));
       if (step.otherwise) out.push(...walkProgram(step.otherwise, under("otherwise")));
@@ -81,14 +105,91 @@ export function walkProgram(block: OperationBlock, parent: StepHop[] = []): Loca
   return out;
 }
 
+/** One transaction execution site of a program: where it sits, the
+ *  inline transaction, and the block control enters on rejection —
+ *  present exactly when the body contains a rejecting step. */
+export interface TransactionSite {
+  location: string;
+  transaction: Transaction;
+  rejected: OperationBlock | null;
+}
+
+/** Every transaction execution site of an operation's program, in
+ *  program order, rejection blocks and error arms included. */
+export function transactionSites(op: Operation): TransactionSite[] {
+  return walkProgram(op.program).flatMap(({ location, step }) =>
+    step.kind === "transaction"
+      ? [{ location, transaction: step.transaction, rejected: step.rejected ?? null }]
+      : [],
+  );
+}
+
 /** Every inline transaction of an operation's program, in program order. */
 export function operationTransactions(op: Operation): Transaction[] {
-  return walkProgram(op.program).flatMap(({ step }) => (step.kind === "transaction" ? [step] : []));
+  return transactionSites(op).map((site) => site.transaction);
+}
+
+/** A data object by id, with the data model that owns it. */
+export function findDataObject(model: Model, id: Id): { dataModel: Id; object: DataObject } | null {
+  for (const [dataModel, dm] of Object.entries(model.data_models)) {
+    const object = dm.objects[id];
+    if (object) return { dataModel, object };
+  }
+  return null;
 }
 
 /** The inline transaction with the given stable id. */
 export function findTransaction(op: Operation, id: Id): Transaction | null {
   return operationTransactions(op).find((tx) => tx.id === id) ?? null;
+}
+
+/** The execution site of the inline transaction with the given id. */
+export function findTransactionSite(op: Operation, id: Id): TransactionSite | null {
+  return transactionSites(op).find((site) => site.transaction.id === id) ?? null;
+}
+
+/** Whether a transaction step is a logical commit guard that may reject
+ *  the containing transaction: a transition (subject not in a `from`
+ *  state), a version validation, a cursor advance, or a fence. */
+/** Whether every path through the block ends at a terminal, by the
+ *  validator's rule: the last step is a `return` or `complete`, or a
+ *  decision whose every arm terminates (a branch needs an `otherwise`),
+ *  or a transaction step whose rejected block terminates and that is
+ *  followed by nothing — its committed path then falls through, so the
+ *  block does not terminate. A block that does not terminate falls
+ *  through to the join after the step that holds it. */
+export function blockTerminates(block: OperationBlock): boolean {
+  const last = block.steps[block.steps.length - 1];
+  if (!last) return false;
+  switch (last.kind) {
+    case "return":
+    case "complete":
+      return true;
+    case "match_result":
+      return blockTerminates(last.ok) && Object.values(last.errors).every(blockTerminates);
+    case "branch":
+      return blockTerminates(last.then) && last.otherwise !== null && blockTerminates(last.otherwise);
+    default:
+      return false;
+  }
+}
+
+export function stepRejects(step: TransactionStep): boolean {
+  switch (step.kind) {
+    case "transition":
+    case "validate_version":
+    case "advance_cursor":
+    case "fence":
+      return true;
+    default:
+      return false;
+  }
+}
+
+/** Whether any step of the body may reject the transaction — exactly
+ *  when its execution site must carry a `rejected` block. */
+export function transactionRejects(tx: Transaction): boolean {
+  return tx.steps.some(stepRejects);
 }
 
 /** Every operation-owned inline effect declaration with its id: direct
@@ -102,7 +203,7 @@ export function operationEffects(op: Operation): [Id, Effect][] {
     if (step.kind === "execute_effect" || step.kind === "execute_effect_async") {
       out.push([step.effect_id, step.effect]);
     } else if (step.kind === "transaction") {
-      for (const inner of step.steps) {
+      for (const inner of step.transaction.steps) {
         if (inner.kind === "establish_effect_intent") out.push([inner.effect_id, inner.effect]);
         if (inner.kind === "write_outbox") {
           out.push([inner.effect_id, { kind: "outbox_write", ...inner.effect }]);
@@ -148,27 +249,30 @@ export function buildIndex(model: Model): ModelIndex {
       if (step.kind === "execute_effect" || step.kind === "execute_effect_async") {
         put(step.effect_id, { kind: "effect", op: opId });
       } else if (step.kind === "transaction") {
-        put(step.id, { kind: "transaction", op: opId });
-        for (const inner of step.steps) {
-          if (inner.kind === "establish_effect_intent") {
+        const tx = step.transaction;
+        put(tx.id, { kind: "transaction", op: opId });
+        tx.steps.forEach((inner, i) => {
+          if (inner.kind === "read") {
+            put(inner.bind, { kind: "read", op: opId, transaction: tx.id, step: i });
+          } else if (inner.kind === "establish_effect_intent") {
             put(inner.effect_id, { kind: "effect", op: opId });
-            put(inner.bind, { kind: "intent", op: opId, effect: inner.effect_id, transaction: step.id });
+            put(inner.bind, { kind: "intent", op: opId, effect: inner.effect_id, transaction: tx.id });
           } else if (inner.kind === "write_outbox") {
             put(inner.effect_id, { kind: "effect", op: opId });
           } else if (inner.kind === "establish_transaction_output") {
-            put(inner.bind, { kind: "output", op: opId, schema: inner.schema, transaction: step.id });
+            put(inner.bind, { kind: "output", op: opId, schema: inner.schema, transaction: tx.id });
           } else if (inner.kind === "transition") {
             for (const [effectId, intent] of Object.entries(inner.effect_intents)) {
               put(intent.bind, {
                 kind: "intent",
                 op: opId,
                 effect: effectId,
-                transaction: step.id,
+                transaction: tx.id,
                 via: { machine: inner.machine, transition: inner.transition },
               });
             }
           }
-        }
+        });
       }
     }
 
@@ -216,9 +320,14 @@ export function buildIndex(model: Model): ModelIndex {
     }
   }
 
+  // Transition-owned effects: the side effects an application binds as
+  // intents, and the outbox admissions it makes atomically.
   for (const [mId, m] of Object.entries(model.state_machines)) {
     for (const [tId, t] of Object.entries(m.transitions)) {
       for (const eId of Object.keys(t.side_effects)) {
+        put(eId, { kind: "effect", machine: mId, transition: tId });
+      }
+      for (const eId of Object.keys(t.effects ?? {})) {
         put(eId, { kind: "effect", machine: mId, transition: tId });
       }
     }
@@ -246,8 +355,8 @@ export function effectDef(model: Model, index: ModelIndex, effectId: Id): Effect
     return found ? { effect: found[1], owner } : null;
   }
   if (owner.machine !== undefined && owner.transition !== undefined) {
-    const effect =
-      model.state_machines[owner.machine]?.transitions[owner.transition]?.side_effects[effectId];
+    const transition = model.state_machines[owner.machine]?.transitions[owner.transition];
+    const effect = transition?.side_effects[effectId] ?? transition?.effects?.[effectId];
     return effect ? { effect, owner } : null;
   }
   return null;

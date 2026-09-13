@@ -2,8 +2,10 @@ import { useMemo } from "react";
 
 import { shortId, truncate } from "../lib/ids";
 import { hashes } from "../lib/route";
+import { BOUNDARY_KIND, vertexLabels } from "../lib/runtime";
 import { useApp } from "../state/AppState";
 import type { Edge } from "../types/graph";
+import { layoutConflicts } from "./layoutConflicts";
 import { layoutSystem, type DataObjectBox, type RealizationBox } from "./layoutSystem";
 import { LegendChip, LegendLine, SvgCanvas, sel } from "./SvgCanvas";
 import { StatusChip, StatusRing } from "./status";
@@ -31,13 +33,21 @@ function edgeShortLabel(e: Edge): string {
 }
 
 export function SystemView() {
-  const { graph, report, selection, search, runtime, showRuntime } = useApp();
+  const { graph, report, selection, search, runtime, showRuntime, transactionProofs, showConflicts } = useApp();
   const drawRuntime = showRuntime && runtime.declared;
   const layout = useMemo(
     () => layoutSystem(graph, { runtime: drawRuntime ? runtime : null }),
     [graph, runtime, drawRuntime],
   );
   const plane = layout.runtime;
+
+  // The conflict overlay: contention between operations, read off the
+  // serializability arguments. Nothing about it is topology.
+  const drawConflicts = showConflicts && transactionProofs.serializability.length > 0;
+  const conflicts = useMemo(
+    () => (drawConflicts ? layoutConflicts(transactionProofs.serializability, layout.pos) : []),
+    [drawConflicts, transactionProofs, layout],
+  );
 
   const q = search.trim().toLowerCase();
   const matches = (id: string) =>
@@ -65,6 +75,15 @@ export function SystemView() {
         }
       }
     };
+
+    // Conflict arc: the two operations whose transactions contend, and
+    // nothing more — the contention is between exactly those two.
+    const arc = conflicts.find((c) => c.key === selection);
+    if (arc) {
+      set.add(arc.a);
+      set.add(arc.b);
+      return set;
+    }
 
     // Router / subscription vertex: only its own path.
     const vertex = runtime.links.find((l) => l.id === selection);
@@ -105,31 +124,49 @@ export function SystemView() {
       return set;
     }
 
-    // L0 selection: a service stands for its operations; light the
-    // one-hop neighbourhood, then its realizations and accessed objects.
-    for (const op of graph.services.find((s) => s.id === selection)?.operations ?? []) set.add(op);
+    // L0 selection: a service stands for its operations. What stays lit
+    // is exactly the one-hop neighbourhood of that seed — its edges and
+    // what they join — read off a fixed seed, never off the growing set:
+    // a neighbour's neighbour, an operation two hops away that shares a
+    // topic or a table with this one, is dimmed.
+    const seed = new Set<string>([selection]);
+    for (const op of graph.services.find((s) => s.id === selection)?.operations ?? []) seed.add(op);
+    for (const id of seed) set.add(id);
     for (const e of graph.edges) {
-      if (e.id === selection || set.has(e.from) || set.has(e.to)) {
+      if (e.id === selection || seed.has(e.from) || seed.has(e.to)) {
         set.add(e.id);
         set.add(e.from);
         set.add(e.to);
       }
     }
+    // A realization vertex stays lit when it belongs to a seeded
+    // operation or sits on a lit edge into one, with its pool and the
+    // approach through it.
     for (const link of runtime.links) {
-      if (set.has(link.operation)) {
+      const onLitEdge = graph.edges.some(
+        (e) => set.has(e.id) && "input" in e && e.to === link.operation && e.input === link.input,
+      );
+      if (seed.has(link.operation) || onLitEdge) {
         set.add(link.id);
         set.add(link.pool);
         pathInto(link.id);
       }
     }
+    // The objects a seeded operation persists to, by its own access
+    // edges — never the other operations that touch the same object;
+    // those light up when the object itself is selected.
     for (const a of plane?.access ?? []) {
-      if (set.has(a.operation)) {
+      if (seed.has(a.operation)) {
         set.add(a.id);
         set.add(a.object);
       }
     }
+    // An operation's own conflicts stay lit; a neighbour's do not.
+    for (const c of conflicts) {
+      if (c.a === selection || c.b === selection) set.add(c.key);
+    }
     return set;
-  }, [graph, runtime, plane, selection]);
+  }, [graph, runtime, plane, selection, conflicts]);
 
   const isDim = (key: string) => (q && !matches(key)) || (!!selection && !related.has(key));
 
@@ -157,6 +194,12 @@ export function SystemView() {
           <LegendChip color="var(--arch-l1)" label="L1 realization" />
           <LegendLine color="var(--arch-l1)" label="access, partition-keyed" />
           <LegendLine color="var(--arch-l1)" label="access, not keyed" dashed />
+        </>
+      )}
+      {drawConflicts && (
+        <>
+          <LegendLine color="var(--arch-proven)" label="conflict, commit-ordered" />
+          <LegendLine color="var(--arch-unknown)" label="conflict, unconstrained" dashed />
         </>
       )}
       {report && (
@@ -199,7 +242,7 @@ export function SystemView() {
       {layout.services.map((box) => {
         const svc = graph.services.find((s) => s.id === box.id);
         return (
-          <g key={box.id} className={`arch-service${isDim(box.id) ? " dimmed" : ""}`} data-sel={sel({ key: box.id, id: box.id })}>
+          <g key={box.id} className={`arch-service${isDim(box.id) ? " dimmed" : ""}`} data-sel={sel({ key: box.id, id: box.id })} data-dbl={hashes.entity("service", box.id)}>
             <rect className="box" x={box.x} y={box.y} width={box.w} height={box.h} rx={10} />
             <text className="label" x={box.x + 12} y={box.y + 20}>
               {truncate(shortId(box.id), 22)}
@@ -240,13 +283,53 @@ export function SystemView() {
         );
       })}
 
+      {/* Conflict arcs above the service boxes and the edges, behind the
+          cards they join: contention is a fact about the pair, and the
+          cards stay in front of it. A loop marks an operation whose
+          transaction may conflict with a concurrent execution of
+          itself. */}
+      {conflicts.map((c) => {
+        const dimmed = selection ? !related.has(c.key) : q ? !(matches(c.a) || matches(c.b)) : false;
+        const classes = ["arch-conflict", c.constrained ? "proven" : "open"];
+        if (dimmed) classes.push("dimmed");
+        if (selection === c.key) classes.push("selected");
+        const title =
+          (c.loop ? `${shortId(c.a)} ↔ a concurrent execution of itself` : `${shortId(c.a)} ↔ ${shortId(c.b)}`) +
+          `\nobjects: ${c.objects.map(shortId).join(", ")}\n` +
+          (c.constrained ? "every dependency commit-ordered by a declared fact" : "a dependency no declared fact commit-orders") +
+          `\n${c.summaries.join("\n")}`;
+        return (
+          <g
+            key={c.key}
+            data-sel={sel({
+              key: c.key,
+              id: c.view.operation,
+              ctx: {
+                req: {
+                  prop: "transaction_serializability",
+                  index: c.view.requirement,
+                  transaction: c.view.transaction,
+                },
+              },
+            })}
+            data-dbl={hashes.tx(c.view.transaction, { prop: "transaction_serializability", index: c.view.requirement })}
+          >
+            <path className={classes.join(" ")} d={c.d} />
+            <path className="arch-conflict-hit" d={c.d} />
+            <title>{title}</title>
+          </g>
+        );
+      })}
+
       {graph.operations.map((op) => {
         const p = layout.pos.get(op.id);
         if (!p) return null;
+        // S and O count the serializability and ordering requirements
+        // the operation's transactions declare; I and R its own.
         const r = op.requirements;
         const badges: string[] = [];
-        if (r.serialization) badges.push(`S${r.serialization}`);
-        if (r.ordering) badges.push(`O${r.ordering}`);
+        if (r.transaction_serializability) badges.push(`S${r.transaction_serializability}`);
+        if (r.transaction_ordering) badges.push(`O${r.transaction_ordering}`);
         if (r.idempotency) badges.push(`I${r.idempotency}`);
         if (r.recoverability) badges.push(`R${r.recoverability}`);
         if (op.machines.length) badges.push("SM");
@@ -266,7 +349,7 @@ export function SystemView() {
             <text className="badge-text" x={p.x + 10} y={p.y + 52}>
               {badges.join("  ")}
             </text>
-            <title>{op.id + (op.description ? `\n${op.description}` : "") + "\n(double-click to open the program)"}</title>
+            <title>{op.id + (op.description ? `\n${op.description}` : "") + "\n(double-click to open the operation page)"}</title>
             <StatusChip x={p.x + p.w - 6} y={p.y} obKey={op.id} />
           </g>
         );
@@ -298,7 +381,7 @@ export function SystemView() {
           ? `${t.grouping === "none" ? "ungrouped" : "keyed groups"} · ${ORDER_TEXT[t.ordering] ?? t.ordering}`
           : "per-subscription transport";
         return (
-          <g key={t.id} className={classes.join(" ")} data-sel={sel({ key: t.id, id: t.id })}>
+          <g key={t.id} className={classes.join(" ")} data-sel={sel({ key: t.id, id: t.id })} data-dbl={hashes.entity("topic", t.id)}>
             <StatusRing x={p.x} y={p.y} w={p.w} h={p.h} rx={24} obKey={t.id} />
             <rect className="body" x={p.x} y={p.y} width={p.w} height={p.h} rx={24} />
             <text className="title" x={p.x + p.w / 2} y={p.y + (drawRuntime ? 21 : 25)} textAnchor="middle">
@@ -327,7 +410,7 @@ export function SystemView() {
         const n = o.messages.length;
         const identity = o.message_identity === "keyed" ? "keyed identity" : "no message identity";
         return (
-          <g key={o.id} className={classes.join(" ")} data-sel={sel({ key: o.id, id: o.id })}>
+          <g key={o.id} className={classes.join(" ")} data-sel={sel({ key: o.id, id: o.id })} data-dbl={hashes.entity("outbox", o.id)}>
             <StatusRing x={p.x} y={p.y} w={p.w} h={p.h} rx={10} obKey={o.id} />
             <rect className="body" x={p.x} y={p.y} width={p.w} height={p.h} rx={10} />
             <text className="title" x={p.x + p.w / 2} y={p.y + 21} textAnchor="middle">
@@ -352,7 +435,7 @@ ${identity}`}</title>
         if (isDim(ext.id)) classes.push("dimmed");
         if (selection === ext.id) classes.push("selected");
         return (
-          <g key={ext.id} className={classes.join(" ")} data-sel={sel({ key: ext.id, id: ext.id })}>
+          <g key={ext.id} className={classes.join(" ")} data-sel={sel({ key: ext.id, id: ext.id })} data-dbl={hashes.external(ext.name)}>
             <rect className="body" x={p.x} y={p.y} width={p.w} height={p.h} rx={6} />
             <text className="title" x={p.x + p.w / 2} y={p.y + 21} textAnchor="middle">
               {truncate(ext.name, 24)}
@@ -371,7 +454,7 @@ ${identity}`}</title>
         if (isDim(graph.client.id)) classes.push("dimmed");
         if (selection === graph.client.id) classes.push("selected");
         return (
-          <g className={classes.join(" ")} data-sel={sel({ key: graph.client.id, id: graph.client.id })}>
+          <g className={classes.join(" ")} data-sel={sel({ key: graph.client.id, id: graph.client.id })} data-dbl={hashes.clients()}>
             <rect className="body" x={p.x} y={p.y} width={p.w} height={p.h} rx={10} />
             <text className="title" x={p.x + p.w / 2} y={p.y + 24} textAnchor="middle">
               clients
@@ -388,8 +471,9 @@ ${identity}`}</title>
 }
 
 /** One boundary's realization, on the approach into the operation it
- *  realizes. The pool name is its own click target: selecting a pool
- *  lights every tab that names it. */
+ *  realizes — a router on a request boundary, a dispatch on a
+ *  subscription or an outbox consumer. The pool name is its own click
+ *  target: selecting a pool lights every tab that names it. */
 function Realization({
   r,
   dimmed,
@@ -405,9 +489,9 @@ function Realization({
   const classes = ["arch-real", link.kind];
   if (dimmed) classes.push("dimmed");
   if (selected || poolSelected) classes.push("selected");
-  const affinity = link.routingKey ? `keyed · ${concurrencyShort(link.concurrency)}` : concurrencyShort(link.concurrency);
+  const labels = vertexLabels(link);
   const title =
-    `${link.kind === "request" ? "request boundary" : "subscription"} of ${link.operation} · ${link.input}\n` +
+    `${BOUNDARY_KIND[link.kind].title} of ${link.operation} · ${link.input}\n` +
     `pool ${link.pool} — ${link.concurrency} per member\n` +
     (link.routingKey ? `routed by ${link.routingKey} (${link.memberAssignment})` : "no member-affinity fact declared");
   return (
@@ -416,10 +500,10 @@ function Realization({
       <g data-sel={sel({ key: link.id, id: link.detail })}>
         <rect className="body" x={r.x} y={r.y} width={r.w} height={r.h} rx={7} />
         <text className="kind-mark" x={r.x + 8} y={r.y + 14}>
-          {link.kind === "request" ? "▸ request" : "◃ subscribe"}
+          {labels.mark}
         </text>
         <text className="affinity" x={r.x + r.w - 8} y={r.y + 14} textAnchor="end">
-          {affinity}
+          {labels.affinity}
         </text>
         <title>{title}</title>
       </g>
@@ -431,18 +515,10 @@ function Realization({
         y={r.y + 27}
         data-sel={sel({ key: link.pool, id: link.pool })}
       >
-        {truncate(shortId(link.pool), 22)}
+        {labels.pool}
       </text>
     </g>
   );
-}
-
-/** Concurrency, compressed for a tab: "bounded(1)" → "1/mbr". */
-function concurrencyShort(concurrency: string): string {
-  const m = concurrency.match(/^bounded\((\d+)\)$/);
-  if (m) return `${m[1]}/mbr`;
-  if (concurrency === "unbounded") return "∞/mbr";
-  return "?/mbr";
 }
 
 /** A persistent object, drawn so a partitioned store is distinct on
@@ -457,7 +533,7 @@ function DataObject({ obj, dimmed, selected }: { obj: DataObjectBox; dimmed: boo
     ? `${obj.object}\npartitioned`
     : `${obj.object}\nno storage layout declared`;
   return (
-    <g className={classes.join(" ")} data-sel={sel({ key: obj.object, id: obj.object })}>
+    <g className={classes.join(" ")} data-sel={sel({ key: obj.object, id: obj.object })} data-dbl={hashes.entity("object", obj.object)}>
       <rect className="body" x={obj.x} y={obj.y} width={obj.w} height={obj.h} rx={8} />
       {obj.partitioned && <rect className="spine" x={obj.x + 5} y={obj.y + 6} width={3} height={obj.h - 12} rx={1.5} />}
       <text className="title" x={obj.x + 16} y={obj.y + 26}>

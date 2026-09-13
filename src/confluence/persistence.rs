@@ -62,7 +62,15 @@ const EVENT_SEQ_KEY: &str = "task_event_seq";
 /// the verdicts stored beside them are relative to the revised proof
 /// semantics, so a format-4 workspace must not be silently reread as
 /// though its proofs still held.
-const FORMAT: u64 = 5;
+///
+/// Bumped to 6 with the DSL v4 revision (`dsl: 4`):
+/// operation requirements lost their serialization and ordering
+/// families, the interface its `invocation_lock`, and the pool its
+/// `execution_handoff`; transactions gained `requirements` and their
+/// execution sites a `rejected` block; result contracts name error
+/// classes; and the stored summaries and proposals speak the
+/// transaction families. None of it reads as a format-5 value.
+const FORMAT: u64 = 6;
 
 #[derive(Debug, thiserror::Error)]
 pub enum PersistenceError {
@@ -137,9 +145,8 @@ impl Persistence {
         if let Some(parent) = path.parent()
             && !parent.as_os_str().is_empty()
         {
-            std::fs::create_dir_all(parent).map_err(|error| {
-                PersistenceError::Storage(redb::Error::Io(error))
-            })?;
+            std::fs::create_dir_all(parent)
+                .map_err(|error| PersistenceError::Storage(redb::Error::Io(error)))?;
         }
 
         let db = Database::create(path)?;
@@ -148,8 +155,7 @@ impl Persistence {
     }
 
     pub fn in_memory() -> Result<Self, PersistenceError> {
-        let db = Database::builder()
-            .create_with_backend(redb::backends::InMemoryBackend::new())?;
+        let db = Database::builder().create_with_backend(redb::backends::InMemoryBackend::new())?;
 
         Self::init(db)
     }
@@ -412,9 +418,7 @@ fn update_task_state_in(
     let mut tasks = txn.open_table(TASKS)?;
     let key = task.0.to_string();
 
-    let existing = tasks
-        .get(key.as_str())?
-        .map(|bytes| bytes.value().to_vec());
+    let existing = tasks.get(key.as_str())?.map(|bytes| bytes.value().to_vec());
 
     if let Some(bytes) = existing {
         let mut record: TaskRecord = serde_json::from_slice(&bytes)?;
@@ -441,7 +445,10 @@ fn append_task_event(
 ) -> Result<(), PersistenceError> {
     let mut meta = txn.open_table(META)?;
 
-    let sequence = meta.get(EVENT_SEQ_KEY)?.map(|value| value.value()).unwrap_or(0);
+    let sequence = meta
+        .get(EVENT_SEQ_KEY)?
+        .map(|value| value.value())
+        .unwrap_or(0);
 
     meta.insert(EVENT_SEQ_KEY, sequence + 1)?;
 
@@ -471,10 +478,8 @@ mod tests {
     /// corrupt value.
     #[test]
     fn an_earlier_format_database_is_refused_by_version() {
-        let path = std::env::temp_dir().join(format!(
-            "conseqa-format-test-{}.redb",
-            uuid::Uuid::new_v4()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("conseqa-format-test-{}.redb", uuid::Uuid::new_v4()));
 
         // A fresh database stamps the current format.
         drop(Persistence::open_file(&path).expect("a fresh database opens"));
@@ -486,7 +491,8 @@ mod tests {
             let txn = db.begin_write().expect("write txn");
             {
                 let mut meta = txn.open_table(META).expect("meta table");
-                meta.insert(FORMAT_KEY, FORMAT - 1).expect("stamp old format");
+                meta.insert(FORMAT_KEY, FORMAT - 1)
+                    .expect("stamp old format");
             }
             txn.commit().expect("commit");
         }
@@ -502,7 +508,9 @@ mod tests {
         );
 
         assert!(
-            error.to_string().contains("start a new run against a fresh database"),
+            error
+                .to_string()
+                .contains("start a new run against a fresh database"),
             "{error}"
         );
 

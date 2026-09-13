@@ -1,3 +1,4 @@
+import type { TransactionProofs } from "./transactionProofs";
 import type { Graph } from "./graph";
 import type { Model } from "./model";
 import type { ProverReport } from "./report";
@@ -8,6 +9,9 @@ export interface PageData {
   title: string;
   model: Model;
   graph: Graph;
+  /** The transaction proofs — the serializability and ordering
+   *  arguments — drawn from the model. */
+  transaction_proofs: TransactionProofs;
   report: ProverReport | null;
 }
 

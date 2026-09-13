@@ -1,0 +1,634 @@
+# A multi-tenant ledger pipeline: a partitioned accounts store written
+# through a request boundary, a transactional outbox partitioned by
+# tenant, a relay pool routed by tenant, a per-tenant-ordered topic, and
+# two subscribers — one of which applies the events to a second
+# partitioned store in sequence order.
+#
+#   clients --post entry--> accounts ==outbox==> relay --EntryPosted--> ledger
+#                                                      \--EntryPosted--> notifier
+#
+# Every event carries a per-tenant sequence number. The producer
+# assigns it inside its transaction: an exclusive lock on the tenant
+# row, a read of the tenant's last sequence, the next one written back,
+# the entry inserted, and the EntryPosted admission staged — one
+# commit, so the sequence and the event agree, and same-tenant entries
+# are serializable by the lock. That is what makes the sequence mean
+# something downstream.
+#
+# The transport keeps per-tenant order: the outbox is partitioned by
+# tenant_id with partition ordering, its relay pool is routed by the
+# partition key under consistent hashing, and the topic groups by
+# tenant_id with order within each group. Every one of those is a
+# placement or transport fact of the runtime realization and proves no
+# transaction property: a redelivered message, a stale worker, or a
+# rebalance can still present an old event after a newer one at the
+# ledger. What proves that ledger writes apply in sequence order per
+# tenant is the ledger transaction itself — it validates the version of
+# the tenant's ledger row it observed, advances the row's
+# last_applied_sequence by the successor rule, and rejects anything
+# stale, duplicate, or out of order. The notifier needs no order and
+# declares none.
+#
+# Every declared obligation proves.
+dsl: 4
+revision: 1
+services:
+  service.accounts:
+    kind: backend
+  service.relay:
+    kind: worker
+  service.ledger:
+    kind: worker
+  service.notifier:
+    kind: worker
+schemas:
+  schema.PostEntryRequest:
+    kind: canonical
+    description: A client posts one entry to a tenant's account; retries carry the same request_id.
+    completeness: complete
+    fields:
+      request_id: string
+      tenant_id: uuid
+      entry_id: uuid
+      amount: decimal
+  schema.PostEntryResponse:
+    kind: canonical
+    completeness: complete
+    fields:
+      entry_id: uuid
+      sequence: int
+  schema.RequestRejected:
+    kind: canonical
+    completeness: complete
+    fields:
+      reason: string
+  schema.Tenant:
+    kind: canonical
+    description: The tenant's sequence counter — the source of every event's position.
+    completeness: complete
+    fields:
+      tenant_id: uuid
+      last_sequence: int
+  schema.Entry:
+    kind: canonical
+    completeness: complete
+    fields:
+      tenant_id: uuid
+      entry_id: uuid
+      sequence: int
+      amount: decimal
+  schema.EntryPosted:
+    kind: canonical
+    description: One posted entry, stamped with its tenant's sequence number.
+    completeness: complete
+    fields:
+      event_id: string
+      tenant_id: uuid
+      sequence: int
+      entry_id: uuid
+      amount: decimal
+  schema.TenantLedger:
+    kind: canonical
+    description: The tenant's running balance, with the last sequence applied to it and its version.
+    completeness: complete
+    fields:
+      tenant_id: uuid
+      balance: decimal
+      last_applied_sequence: int
+      version: int
+data_models:
+  data.accounts:
+    objects:
+      object.tenant:
+        schema: schema.Tenant
+        identity:
+        - tenant_id
+      object.entry:
+        schema: schema.Entry
+        identity:
+        - tenant_id
+        - entry_id
+    outboxes:
+      outbox.tenant_events:
+        messages:
+        - schema.EntryPosted
+        message_identity:
+          kind: keyed
+          mapping:
+            schema.EntryPosted:
+            - event_id
+  data.ledger:
+    objects:
+      object.tenant_ledger:
+        schema: schema.TenantLedger
+        identity:
+        - tenant_id
+        # The ledger row's concurrency token: every application
+        # validates the version it read and bumps it.
+        version:
+          field: version
+topics:
+  topic.tenant_events:
+    messages:
+    - schema.EntryPosted
+    message_identity:
+      kind: keyed
+      mapping:
+        schema.EntryPosted:
+        - event_id
+state_machines: {}
+operations:
+  operation.post_entry:
+    service: service.accounts
+    description: Record an entry against a tenant, assign it the tenant's next sequence number, and admit EntryPosted to the outbox in the same commit.
+    inputs:
+      input.post_entry.request:
+        kind: request
+        schema: schema.PostEntryRequest
+        identity:
+          kind: keyed
+          fields:
+          - request_id
+        result:
+          ok: schema.PostEntryResponse
+          errors:
+            rejected: schema.RequestRejected
+    program:
+      steps:
+      - kind: transaction
+        transaction:
+          id: tx.post_entry
+          data_model: data.accounts
+          isolation: read_committed
+          idempotency:
+            kind: deduplicated_by
+            key:
+              components:
+              - source: input:input.post_entry.request
+                path: request_id
+          # Same-tenant postings serialize on the tenant row's exclusive
+          # lock, taken before the sequence is read: the read-then-write
+          # of last_sequence is commit-ordered by strict locking, so two
+          # postings can never take one sequence number.
+          requirements:
+            serializability:
+            - key:
+                source: input:input.post_entry.request
+                path: tenant_id
+          steps:
+          - kind: lock
+            target:
+              object: object.tenant
+              predicate:
+                kind: eq
+                field: tenant_id
+                value:
+                  source: input:input.post_entry.request
+                  path: tenant_id
+            mode: exclusive
+            order:
+              kind: unspecified
+          - kind: read
+            bind: read.post_entry.tenant
+            target:
+              object: object.tenant
+              predicate:
+                kind: eq
+                field: tenant_id
+                value:
+                  source: input:input.post_entry.request
+                  path: tenant_id
+            fields:
+              kind: only
+              fields:
+              - last_sequence
+          # The next sequence: derived from the one just read.
+          - kind: write
+            target:
+              object: object.tenant
+              predicate:
+                kind: eq
+                field: tenant_id
+                value:
+                  source: input:input.post_entry.request
+                  path: tenant_id
+            fields:
+            - last_sequence
+            values:
+              kind: deterministic
+              from:
+              - source: transaction_read:read.post_entry.tenant
+                path: last_sequence
+          - kind: insert
+            object: object.entry
+            values:
+              kind: deterministic
+              from:
+              - source: input:input.post_entry.request
+                path: tenant_id
+              - source: input:input.post_entry.request
+                path: entry_id
+              - source: transaction_read:read.post_entry.tenant
+                path: last_sequence
+              - source: input:input.post_entry.request
+                path: amount
+          - kind: write_outbox
+            effect_id: effect.post_entry.outbox_posted
+            effect:
+              outbox: outbox.tenant_events
+              schema: schema.EntryPosted
+              idempotency_key_propagation:
+              - source:
+                  components:
+                  - source: input:input.post_entry.request
+                    path: request_id
+                target:
+                  components:
+                  - source: effect:effect.post_entry.outbox_posted
+                    path: event_id
+            values:
+              kind: deterministic
+              from:
+              - source: input:input.post_entry.request
+                path: request_id
+              - source: input:input.post_entry.request
+                path: tenant_id
+              - source: transaction_read:read.post_entry.tenant
+                path: last_sequence
+              - source: input:input.post_entry.request
+                path: entry_id
+              - source: input:input.post_entry.request
+                path: amount
+          - kind: establish_transaction_output
+            bind: output.post_entry
+            schema: schema.PostEntryResponse
+            values:
+              kind: deterministic
+              from:
+              - source: input:input.post_entry.request
+                path: entry_id
+              - source: transaction_read:read.post_entry.tenant
+                path: last_sequence
+      - kind: return
+        request: input.post_entry.request
+        outcome:
+          kind: ok
+          values:
+            kind: deterministic
+            from:
+            - source: transaction_output:output.post_entry
+              path: entry_id
+            - source: transaction_output:output.post_entry
+              path: sequence
+    requirements:
+      idempotency:
+      - key:
+          components:
+          - source: input:input.post_entry.request
+            path: request_id
+        result: replay_consistent
+      recoverability:
+      - key:
+          components:
+          - source: input:input.post_entry.request
+            path: request_id
+        completion: resumable
+  operation.relay_tenant_event:
+    service: service.relay
+    description: Relay one committed outbox message onto the tenant-events topic.
+    inputs:
+      input.relay_tenant_event.outbox:
+        kind: outbox
+        outbox: outbox.tenant_events
+    program:
+      steps:
+      - kind: execute_effect
+        effect_id: effect.relay_tenant_event.posted
+        effect:
+          kind: publication
+          topic: topic.tenant_events
+          schema: schema.EntryPosted
+          idempotency_key_propagation:
+          - source:
+              components:
+              - source: input:input.relay_tenant_event.outbox
+                path: event_id
+            target:
+              components:
+              - source: effect:effect.relay_tenant_event.posted
+                path: event_id
+        values:
+          kind: deterministic
+          from:
+          - source: input:input.relay_tenant_event.outbox
+            path: event_id
+          - source: input:input.relay_tenant_event.outbox
+            path: tenant_id
+          - source: input:input.relay_tenant_event.outbox
+            path: sequence
+          - source: input:input.relay_tenant_event.outbox
+            path: entry_id
+          - source: input:input.relay_tenant_event.outbox
+            path: amount
+      - kind: complete
+    requirements:
+      idempotency:
+      - key:
+          components:
+          - source: input:input.relay_tenant_event.outbox
+            path: event_id
+        result: unspecified
+      recoverability:
+      - key:
+          components:
+          - source: input:input.relay_tenant_event.outbox
+            path: event_id
+        completion: guaranteed
+  operation.apply_entry:
+    service: service.ledger
+    description: Apply a posted entry to the tenant's ledger balance, in sequence order per tenant.
+    inputs:
+      input.apply_entry.posted:
+        kind: subscription
+        topic: topic.tenant_events
+        messages:
+          kind: only
+          schemas:
+          - schema.EntryPosted
+    program:
+      steps:
+      - kind: transaction
+        transaction:
+          id: tx.apply_entry
+          data_model: data.ledger
+          isolation: read_committed
+          idempotency:
+            kind: deduplicated_by
+            key:
+              components:
+              - source: input:input.apply_entry.posted
+                path: event_id
+          # Serializable per tenant by the version protocol, and ordered
+          # by sequence through the successor cursor on the ledger row:
+          # an event that arrives early, late, or twice rejects here,
+          # whatever the transport did with it.
+          requirements:
+            serializability:
+            - key:
+                source: input:input.apply_entry.posted
+                path: tenant_id
+            ordering:
+            - key:
+                source: input:input.apply_entry.posted
+                path: tenant_id
+              position:
+                source: input:input.apply_entry.posted
+                path: sequence
+          steps:
+          - kind: read
+            bind: read.apply_entry.ledger
+            target:
+              object: object.tenant_ledger
+              predicate:
+                kind: eq
+                field: tenant_id
+                value:
+                  source: input:input.apply_entry.posted
+                  path: tenant_id
+            fields:
+              kind: only
+              fields:
+              - balance
+              - last_applied_sequence
+              - version
+          - kind: validate_version
+            target:
+              object: object.tenant_ledger
+              predicate:
+                kind: eq
+                field: tenant_id
+                value:
+                  source: input:input.apply_entry.posted
+                  path: tenant_id
+            expected:
+              source: transaction_read:read.apply_entry.ledger
+              path: version
+          - kind: advance_cursor
+            target:
+              object: object.tenant_ledger
+              predicate:
+                kind: eq
+                field: tenant_id
+                value:
+                  source: input:input.apply_entry.posted
+                  path: tenant_id
+            field: last_applied_sequence
+            incoming:
+              source: input:input.apply_entry.posted
+              path: sequence
+            rule: successor
+          - kind: write
+            target:
+              object: object.tenant_ledger
+              predicate:
+                kind: eq
+                field: tenant_id
+                value:
+                  source: input:input.apply_entry.posted
+                  path: tenant_id
+            fields:
+            - balance
+            values:
+              kind: deterministic
+              from:
+              - source: transaction_read:read.apply_entry.ledger
+                path: balance
+              - source: input:input.apply_entry.posted
+                path: amount
+          - kind: bump_version
+            target:
+              object: object.tenant_ledger
+              predicate:
+                kind: eq
+                field: tenant_id
+                value:
+                  source: input:input.apply_entry.posted
+                  path: tenant_id
+        # A stale observation, a duplicate, or an out-of-order sequence:
+        # nothing applied, and the delivery completes. The transport's
+        # redelivery brings the next event round again.
+        rejected:
+          steps:
+          - kind: complete
+      - kind: complete
+    requirements:
+      idempotency:
+      - key:
+          components:
+          - source: input:input.apply_entry.posted
+            path: event_id
+        result: unspecified
+      recoverability:
+      - key:
+          components:
+          - source: input:input.apply_entry.posted
+            path: event_id
+        completion: guaranteed
+  operation.notify_entry:
+    service: service.notifier
+    description: Tell the tenant's webhook about the entry, through a gateway that deduplicates by event id. Order is irrelevant here, and none is declared.
+    inputs:
+      input.notify_entry.posted:
+        kind: subscription
+        topic: topic.tenant_events
+        messages:
+          kind: only
+          schemas:
+          - schema.EntryPosted
+    program:
+      steps:
+      - kind: execute_effect
+        effect_id: effect.notify_entry.webhook
+        effect:
+          kind: external
+          name: webhook-gateway.deliver
+          identity:
+            kind: keyed
+            key:
+              components:
+              - source: input:input.notify_entry.posted
+                path: event_id
+          idempotency: identical_per_identity
+          result_replay: unspecified
+          result: null
+        values:
+          kind: deterministic
+          from:
+          - source: input:input.notify_entry.posted
+            path: event_id
+          - source: input:input.notify_entry.posted
+            path: tenant_id
+          - source: input:input.notify_entry.posted
+            path: entry_id
+          - source: input:input.notify_entry.posted
+            path: amount
+      - kind: complete
+    requirements:
+      idempotency:
+      - key:
+          components:
+          - source: input:input.notify_entry.posted
+            path: event_id
+        result: unspecified
+      recoverability:
+      - key:
+          components:
+          - source: input:input.notify_entry.posted
+            path: event_id
+        completion: guaranteed
+
+# ---------------------------------------------------------------------
+# L1 — the runtime realization: placement, transport, and capacity.
+#
+# The stores are partitioned by tenant, the outbox and the topic keep
+# per-tenant order, and the relay and ledger pools are routed by tenant
+# under consistent hashing with one invocation at a time per member.
+# Member counts are external scenario inputs — "multiple workers" is
+# not a Conseqa fact. None of these declarations enters a transaction
+# proof: they describe where same-tenant work ordinarily lands and in
+# what order it ordinarily arrives, and the ledger transaction's cursor
+# is what holds when the ordinary case does not.
+# ---------------------------------------------------------------------
+runtime:
+  topics:
+    topic.tenant_events:
+      grouping:
+        schema.EntryPosted: [tenant_id]
+      ordering: within_group
+
+  outboxes:
+    operation.relay_tenant_event:
+      input.relay_tenant_event.outbox:
+        partitioning:
+          kind: keyed
+          mapping:
+            schema.EntryPosted:
+            - tenant_id
+        ordering: partition
+        dispatch:
+          pool: pool.relay_workers
+          routing:
+            key: partition_key
+            member_assignment:
+              kind: consistent_hash
+
+  subscriptions:
+    operation.apply_entry:
+      input.apply_entry.posted:
+        delivery: at_least_once
+        dispatch:
+          pool: pool.ledger_workers
+          routing:
+            key: grouping_key
+            member_assignment:
+              kind: consistent_hash
+
+    operation.notify_entry:
+      input.notify_entry.posted:
+        delivery: at_least_once
+        dispatch:
+          pool: pool.notifier_workers
+
+  execution_pools:
+    pool.accounts_api:
+      member_concurrency:
+        kind: unbounded
+
+    pool.relay_workers:
+      member_concurrency:
+        kind: bounded
+        value: 1
+
+    pool.ledger_workers:
+      member_concurrency:
+        kind: bounded
+        value: 1
+
+    pool.notifier_workers:
+      member_concurrency:
+        kind: bounded
+        value: 8
+
+  routers:
+    router.post_entry:
+      boundary:
+        operation: operation.post_entry
+        input: input.post_entry.request
+      pool: pool.accounts_api
+      routing:
+        key:
+          - tenant_id
+        member_assignment:
+          kind: consistent_hash
+
+  storage_layouts:
+    layout.tenant:
+      object:
+        data_model: data.accounts
+        object: object.tenant
+      partition_key:
+        - tenant_id
+
+    layout.entry:
+      object:
+        data_model: data.accounts
+        object: object.entry
+      partition_key:
+        - tenant_id
+
+    layout.tenant_ledger:
+      object:
+        data_model: data.ledger
+        object: object.tenant_ledger
+      partition_key:
+        - tenant_id

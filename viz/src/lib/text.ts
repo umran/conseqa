@@ -2,12 +2,42 @@ import type {
   Condition,
   Derivation,
   MemberConcurrency,
+  OperationStep,
   SelectorPredicate,
   SelectorValue,
   TypeRef,
   ValueRef,
 } from "../types/model";
 import { pathText, shortId } from "./ids";
+
+/** A program step named the way its card is titled: the kind, then the
+ *  principal id — what a continuation line says control goes to next. */
+export function stepHeadline(step: OperationStep): string {
+  switch (step.kind) {
+    case "transaction":
+      return `transaction ${shortId(step.transaction.id)}`;
+    case "execute_effect":
+      return `execute effect ${shortId(step.effect_id)}`;
+    case "execute_effect_async":
+      return `launch async ${shortId(step.effect_id)}`;
+    case "execute_effect_intent":
+      return `execute intent ${step.intent}`;
+    case "execute_effect_intent_async":
+      return `launch intent async ${step.intent}`;
+    case "join_all":
+      return "join_all";
+    case "race":
+      return "race";
+    case "match_result":
+      return `match result ${step.result}`;
+    case "branch":
+      return "branch";
+    case "return":
+      return `return ${step.outcome.kind === "ok" ? "ok" : `err:${step.outcome.error}`}`;
+    case "complete":
+      return "complete";
+  }
+}
 
 export function refString(ref: ValueRef, short = true): string {
   const id = short ? shortId(ref.source.id) : ref.source.id;
