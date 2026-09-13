@@ -85,6 +85,11 @@ Click anything for its detail in the inspector; double-click anything
 — an operation, a service, a topic, an object, a conflict arc — to
 open its page. The top bar's filter box dims non-matching
 vertices, and a fit control in the canvas corner re-centres the graph.
+The camera never moves on its own: when a selection opens the inspector
+beside the canvas, the canvas keeps its scale and position and the
+panel simply covers part of the drawing; only a deliberate act — the
+fit control, a layer switch, toggling the navigator or the obligations
+panel — re-fits the drawing into the room that is left.
 
 *Layout.* The graph is layered left to right along the flow of
 information: columns follow reachability, and everything that can happen

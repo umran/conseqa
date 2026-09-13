@@ -71,6 +71,39 @@ export function useViewBox(svgRef: React.RefObject<SVGSVGElement | null>) {
     return () => svg.removeEventListener("wheel", onWheel);
   }, [svgRef, clientToWorld]);
 
+  // The canvas changes size whenever a panel opens or closes beside it —
+  // the inspector when something is selected, the obligations panel, the
+  // navigator. Left alone, the browser would fit the same viewBox into
+  // the new box, and the drawing would shift and rescale under the
+  // reader's eyes at the moment they clicked. Instead the world-to-screen
+  // mapping is held fixed: the scale stays what it was, and the world
+  // point under any screen point stays under it, so a panel covers or
+  // uncovers drawing and never moves it. A deliberate re-fit — the fit
+  // button, a layer switch, a panel toggle — is the caller's to request.
+  useEffect(() => {
+    const svg = svgRef.current;
+    if (!svg || typeof ResizeObserver === "undefined") return;
+    let last = svg.getBoundingClientRect();
+    const observer = new ResizeObserver(() => {
+      const rect = svg.getBoundingClientRect();
+      const prev = last;
+      last = rect;
+      if (prev.width < 1 || prev.height < 1 || rect.width < 1 || rect.height < 1) return;
+      if (rect.width === prev.width && rect.height === prev.height && rect.left === prev.left && rect.top === prev.top) return;
+      setViewBox((vb) => {
+        const scale = vb.w / prev.width;
+        return {
+          x: vb.x + (rect.left - prev.left) * scale,
+          y: vb.y + (rect.top - prev.top) * scale,
+          w: rect.width * scale,
+          h: rect.height * scale,
+        };
+      });
+    });
+    observer.observe(svg);
+    return () => observer.disconnect();
+  }, [svgRef]);
+
   const onPointerDown = useCallback(
     (e: PointerEvent<SVGSVGElement>) => {
       if (e.button !== 0) return;

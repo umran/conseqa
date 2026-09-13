@@ -204,7 +204,7 @@ export function AppStateProvider({ data, theme: hostTheme, children }: AppStateP
   const [detail, setDetail] = useState<DetailTarget | null>(null);
   const [expandedTx, setExpandedTx] = useState<ReadonlySet<string>>(() => new Set());
   const [search, setSearch] = useState("");
-  const [obligationsOpen, setObligationsOpen] = useState(false);
+  const [obligationsOpen, setObligationsOpenState] = useState(false);
   const [navOpen, setNavOpenState] = useState(initialNavOpen);
   // Drawn by default wherever there is anything to draw: the hierarchy is
   // the model, and a layer hidden until asked for reads as an extra.
@@ -300,10 +300,18 @@ export function AppStateProvider({ data, theme: hostTheme, children }: AppStateP
 
   const requestFit = useCallback(() => setFitRequest((n) => n + 1), []);
 
-  // The navigator shares the row with the canvas, so showing or hiding
-  // it changes the canvas's width and the drawing is re-fitted to it.
+  // The navigator and the obligations panel share the row with the
+  // canvas, so toggling either changes the canvas's width; a toggle is
+  // the reader's own act, so the drawing is re-fitted to the room left.
+  // (The inspector a selection opens is not: the canvas keeps its
+  // camera and the panel simply covers part of the drawing, so the
+  // click that made the selection moves nothing.)
   const setNavOpen = useCallback((value: boolean) => {
     setNavOpenState(value);
+    setFitRequest((n) => n + 1);
+  }, []);
+  const setObligationsOpen = useCallback((value: boolean) => {
+    setObligationsOpenState(value);
     setFitRequest((n) => n + 1);
   }, []);
 
@@ -424,7 +432,7 @@ export function AppStateProvider({ data, theme: hostTheme, children }: AppStateP
       data, report, reportIssue, index, knownIds, obligations, citations, runtime, transactionProofs, bindings, route,
       selection, detail, expandedTx, search, obligationsOpen, navOpen, showRuntime, showConflicts, theme,
       themeControllable, fitRequest, select, openDetail, openEntity, closeDetail, toggleTx,
-      setTheme, setNavOpen, setShowRuntime, setShowConflicts, requestFit, navigateTo, focusSubject,
+      setTheme, setNavOpen, setObligationsOpen, setShowRuntime, setShowConflicts, requestFit, navigateTo, focusSubject,
     ],
   );
 

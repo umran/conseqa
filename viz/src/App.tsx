@@ -10,6 +10,7 @@ import { RuntimePage } from "./pages/RuntimePage";
 import { TransactionPage } from "./pages/TransactionPage";
 import { DetailPanel } from "./panels/DetailPanel";
 import { ObligationsPanel } from "./panels/ObligationsPanel";
+import type { Route } from "./lib/route";
 import { AppStateProvider, useApp, type Theme } from "./state/AppState";
 import type { PageData } from "./types/page";
 
@@ -55,7 +56,7 @@ function Shell() {
       <main className="flex min-w-0 flex-1 flex-col">
         <TopBar />
         <div className="relative min-h-0 flex-1">
-          <Page />
+          <Page route={route} />
         </div>
       </main>
       {(detail || showObligations) && (
@@ -76,15 +77,19 @@ function Shell() {
       )}
     </div>
   );
+}
 
-  function Page() {
-    switch (route.view) {
-      case "system": return <SystemView />;
-      case "runtime": return <RuntimePage />;
-      case "op": return <OperationView id={route.id} />;
-      case "machine": return <MachineView id={route.id} highlight={route.highlight} />;
-      case "tx": return <TransactionPage id={route.id} req={route.req} />;
-      case "entity": return <EntityPage id={route.id} />;
-    }
+/** The page the route names. A component of its own at module scope —
+ *  declared inside the shell it would be a new component type on every
+ *  render, and React would remount the whole page, camera and all, at
+ *  every selection. */
+function Page({ route }: { route: Route }) {
+  switch (route.view) {
+    case "system": return <SystemView />;
+    case "runtime": return <RuntimePage />;
+    case "op": return <OperationView id={route.id} />;
+    case "machine": return <MachineView id={route.id} highlight={route.highlight} />;
+    case "tx": return <TransactionPage id={route.id} req={route.req} />;
+    case "entity": return <EntityPage id={route.id} />;
   }
 }
