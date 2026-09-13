@@ -40,8 +40,8 @@ pub struct Transaction {
     /// free to prove natural replayability from the body.
     pub idempotency: IdempotencyGuarantee,
 
-    /// The consistency obligations declared on this transaction's
-    /// state history: serializability and ordering, each keyed by a
+    /// The obligations declared on this transaction's committed
+    /// history: serializability and ordering, each keyed by a
     /// value available when the transaction begins.
     #[serde(default)]
     pub requirements: TransactionRequirements,
@@ -60,8 +60,8 @@ impl Transaction {
     }
 }
 
-/// The consistency requirements of one transaction (§7 of the
-/// transaction-consistency revision). Both families are obligations
+/// The requirements of one transaction (§7 of the DSL v4 revision):
+/// serializability and ordering. Both families are obligations
 /// over the committed state history of every transaction that may
 /// conflict with this one — never over an operation program, and
 /// never discharged by runtime topology.

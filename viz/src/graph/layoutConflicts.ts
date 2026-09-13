@@ -13,7 +13,7 @@
 // consulted here.
 
 import { shortId } from "../lib/ids";
-import type { SerializabilityView } from "../types/consistency";
+import type { SerializabilityView } from "../types/transactionProofs";
 import type { Id } from "../types/model";
 import type { Box, Point } from "./layoutSystem";
 

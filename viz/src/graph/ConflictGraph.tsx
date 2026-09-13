@@ -1,10 +1,10 @@
 import { useId, useMemo, useState, type KeyboardEvent } from "react";
 
-import { CLOSURE, layoutClosure, type NodeBox, type PairGeometry } from "../lib/consistency";
+import { CLOSURE, layoutClosure, type NodeBox, type PairGeometry } from "../lib/transactionProofs";
 import { shortId, truncate } from "../lib/ids";
 import { hashes } from "../lib/route";
 import { useApp } from "../state/AppState";
-import type { SerializabilityView } from "../types/consistency";
+import type { SerializabilityView } from "../types/transactionProofs";
 import { LegendChip, LegendLine } from "./SvgCanvas";
 
 /** Below this fraction of its natural size the drawing stops shrinking
@@ -34,7 +34,7 @@ interface Props {
  * selected; clicking an arrow selects the pair, so the panel around the
  * drawing can show the dependencies behind it.
  */
-export function ConsistencyGraph({ view, selectedPair, onSelectPair }: Props) {
+export function ConflictGraph({ view, selectedPair, onSelectPair }: Props) {
   const { navigateTo } = useApp();
   const [own, setOwn] = useState<string | null>(null);
   const controlled = selectedPair !== undefined;

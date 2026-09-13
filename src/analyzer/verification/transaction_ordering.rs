@@ -1,5 +1,5 @@
 //! Verification of transaction ordering requirements (§9, §54–§58 of
-//! the transaction-consistency revision).
+//! the DSL v4 revision).
 //!
 //! > `OrderedBy(K, P)`: within each domain identified by `key`, the
 //! > committed executions of the transaction take effect in the order

@@ -2518,12 +2518,12 @@ services:
     assert_eq!(model, reparsed);
 }
 /// The clean break of the v4 revision: the retired operation-level
-/// consistency surface is not aliased or migrated. An invocation lock,
+/// serialization and ordering surface is not aliased or migrated. An invocation lock,
 /// an execution handoff, and an operation-level serialization or
 /// ordering requirement each fail ordinary shape validation like any
 /// other unknown form, naming the retired field.
 #[test]
-fn retired_v3_consistency_declarations_are_refused_at_parse() {
+fn retired_v3_serialization_declarations_are_refused_at_parse() {
     let source = |operation_extra: &str, requirements_extra: &str, runtime: &str| {
         format!(
             "dsl: 4

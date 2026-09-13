@@ -13,7 +13,7 @@
 # video already ready — and each transition transaction says what the
 # operation does then: nothing, and the delivery completes.
 #
-# Consistency: same-video work is serializable because every
+# Serializability: same-video work is serializable because every
 # transaction that touches a video or its job runs under serializable
 # isolation, so the closure of conflicting transactions is one the
 # database orders by itself. That proof is a property of the

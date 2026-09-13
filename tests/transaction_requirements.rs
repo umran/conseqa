@@ -1,4 +1,4 @@
-//! The DSL v4 transaction-consistency matrix (§81 of the revision):
+//! The DSL v4 transaction-requirements matrix (§81 of the revision):
 //! transaction rejection, transition-scoped outbox effects, strict
 //! locks, the version protocol, the serializable-isolation closure,
 //! the serialization-graph route, cursors, fences, ordering, and the
@@ -1489,7 +1489,7 @@ fn no_transaction_verdict_depends_on_the_runtime_topology() {
 #[test]
 fn a_serial_pool_and_affinity_prove_nothing_about_a_transaction() {
     // reserve_inventory runs on a serial, consistent-hash-routed pool
-    // already, and stays unproven: placement is not consistency.
+    // already, and stays unproven: placement is not commit-order evidence.
     let model = load_flash_checkout();
 
     let runtime = model

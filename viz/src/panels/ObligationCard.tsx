@@ -9,7 +9,7 @@ import { shortId } from "../lib/ids";
 import { subjectText } from "../lib/obligations";
 import { useApp } from "../state/AppState";
 import { propertyName, type Obligation } from "../types/report";
-import { OrderingProof, SerializabilityProof } from "./ConsistencyProof";
+import { OrderingProof, SerializabilityProof } from "./TransactionProof";
 import { CitedText, IdLink, StatusBadge } from "./parts";
 
 /** The layer note a verdict carries.
@@ -66,12 +66,12 @@ const STRIPE: Record<Obligation["status"], string> = {
 };
 
 export function ObligationCard({ ob, defaultOpen = false }: { ob: Obligation; defaultOpen?: boolean }) {
-  const { focusSubject, consistency } = useApp();
+  const { focusSubject, transactionProofs } = useApp();
   const [open, setOpen] = useState(defaultOpen);
   // A transaction-family verdict carries its argument as a structure —
   // the conflict closure, the dependencies, the guard — drawn before
   // the prose that records the same facts.
-  const proof = consistency.proofForObligation(ob);
+  const proof = transactionProofs.proofForObligation(ob);
   const hasDetail = ob.assumptions.length > 0 || ob.evidence.length > 0 || !!ob.counterexample || !!proof;
   const layer = layerNote(ob);
 

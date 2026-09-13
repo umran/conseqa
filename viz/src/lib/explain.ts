@@ -22,7 +22,7 @@ import type {
   Topic,
   ValueRef,
 } from "../types/model";
-import type { SerializabilityRoute } from "../types/consistency";
+import type { SerializabilityRoute } from "../types/transactionProofs";
 import type { BindingKind } from "./bindings";
 import { pathText } from "./ids";
 import { refString } from "./text";
@@ -263,7 +263,7 @@ export function noRuntimeDeclared(): Explanation {
 }
 
 /** How a routing domain is placed on a pool member — a placement and
- *  affinity fact, never a consistency one. */
+ *  affinity fact, never commit-order evidence. */
 export function memberAssignment(value: MemberAssignment): Explanation {
   switch (value.kind) {
     case "consistent_hash":
@@ -548,7 +548,7 @@ export function transportOrdering(ordering: OrderingSemantics | undefined): Expl
 
 /** The runtime equivalence domains the transport groups into. A
  *  placement fact about how work arrives; ordering is a separate fact,
- *  and neither is transaction consistency. */
+ *  and neither is serializability or ordering. */
 export function transportGrouping(grouping: GroupingKey | undefined): Explanation {
   if (grouping) {
     return {
@@ -556,7 +556,7 @@ export function transportGrouping(grouping: GroupingKey | undefined): Explanatio
       tone: "info",
       summary:
         "Messages whose key tuples are equal belong to one runtime group. That is all it " +
-        "says — not precedence, not member assignment, and not transaction consistency, " +
+        "says — not precedence, not member assignment, and not serializability or ordering, " +
         "which no grouping fact ever proves.",
     };
   }

@@ -24,7 +24,7 @@
 //! wherever a decision or a value observes a request effect's result;
 //! ordering rests on the serializability prover for its closure. A
 //! model-wide deadlock checker remains earmarked (§71 of the
-//! transaction-consistency revision): strict locking can prove a
+//! DSL v4 revision): strict locking can prove a
 //! serializable committed history while still admitting deadlock, and
 //! the two are never conflated.
 //!
@@ -46,7 +46,7 @@
 //! Proofs therefore carry the facts they consumed.
 //!
 //! Requirements are L0 obligations, and the facts that discharge them
-//! may come from either layer. Transaction consistency never rests on
+//! may come from either layer. The transaction families never rest on
 //! L1: serializability and ordering are proven from transaction
 //! primitives alone — isolation, locks, versions, cursors, fences —
 //! because no placement, transport, or capacity fact survives

@@ -1,5 +1,5 @@
 //! Verification of transaction serializability requirements
-//! (§8, §35–§53 of the transaction-consistency revision).
+//! (§8, §35–§53 of the DSL v4 revision).
 //!
 //! > `SerializableBy(K)`: the committed state history of the
 //! > transaction's executions — together with every transaction they

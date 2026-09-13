@@ -122,7 +122,7 @@ transport grouping and ordering, subscription delivery and dispatch, \
 outbox partitioning, ordering, and dispatch, execution pools and \
 their member concurrency, request routers, storage layouts. L1 \
 describes placement, transport, grouping, precedence, and capacity; \
-it provides no transaction consistency guarantee, and only the replay \
+it provides no serializability or ordering guarantee, and only the replay \
 families consume its delivery facts. Author it after the programs \
 exist and verification has said what it has to discharge, not while \
 drafting the skeleton. Never invent topology to make a proof pass; \
@@ -1850,8 +1850,8 @@ L1 RUNTIME TOPOLOGY (all shared-skeleton writes; L1 is optional):
      only. Omit "routing" entirely to assign the boundary to a pool and
      declare no member affinity; that is not the same as round_robin,
      which states that affinity is known NOT to exist. Neither proves
-     serializability or ordering: L1 provides no transaction consistency
-     guarantee.)
+     serializability or ordering: no L1 fact is commit-order
+     evidence.)
   {"kind":"put_subscription_runtime","operation":"operation.x","input":"input.x.events",
    "value":{"delivery":"at_least_once",
             "dispatch":{"pool":"pool.x",

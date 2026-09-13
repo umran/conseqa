@@ -149,7 +149,7 @@ Given this operation's behavior, trigger semantics, effects, and role \
 in the system, propose the correctness obligations correct execution \
 reasonably requires: transaction serializability (`SerializableBy(K)`) \
 and transaction ordering (`OrderedBy(K, P)`) on the inline \
-transactions whose state histories must be consistent, and \
+transactions whose committed histories must be serializable or ordered, and \
 idempotency, result replay, and recoverability on the operation. A \
 transaction requirement names the transaction it constrains; its key \
 and position must be available when the transaction begins, and a \

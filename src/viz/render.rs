@@ -11,7 +11,7 @@
 use crate::spec::Model;
 use serde::Serialize;
 
-use super::{consistency, graph};
+use super::{graph, transaction_proofs};
 use crate::analyzer::report::ProverReport;
 
 const BUNDLE: &str = include_str!("../../viz/dist/index.html");
@@ -24,10 +24,10 @@ struct PageData<'a> {
     title: &'a str,
     model: &'a Model,
     graph: graph::Graph,
-    /// The transaction consistency arguments, drawn from the model so
-    /// the front end can show why a serializability or ordering
-    /// verdict holds.
-    consistency: consistency::ConsistencyView,
+    /// The transaction proofs — the serializability and ordering
+    /// arguments — drawn from the model so the front end can show why
+    /// a verdict holds.
+    transaction_proofs: transaction_proofs::TransactionProofs,
     report: Option<&'a ProverReport>,
 }
 
@@ -41,7 +41,7 @@ pub fn page_data_json(
         title,
         model,
         graph: graph::extract(model),
-        consistency: consistency::extract(model),
+        transaction_proofs: transaction_proofs::extract(model),
         report,
     };
 
@@ -54,7 +54,7 @@ pub fn render(model: &Model, report: Option<&ProverReport>, title: &str) -> Resu
         title,
         model,
         graph: graph::extract(model),
-        consistency: consistency::extract(model),
+        transaction_proofs: transaction_proofs::extract(model),
         report,
     };
 

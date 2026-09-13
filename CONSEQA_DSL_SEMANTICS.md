@@ -1,14 +1,14 @@
 # Conseqa DSL Semantics
 
 **Status:** Normative semantic contract for the DSL and the V1 verifiers — the single authoritative semantics document. The design drafts and revision documents that preceded it are retired; their normative content is consolidated here, and what they left open is §27.  
-**DSL contract version:** This document specifies **DSL contract version 4** (`DSL_VERSION`, `src/spec/model.rs`). The version names the normative semantic contract as a whole, not the parse schema: any normative change bumps it — vocabulary, validation, or proof semantics alike — while purely internal changes do not. Every specification document declares the version it is authored in (`dsl: 4`, the model root's first field, stamped at assembly and never authored); a consumer probes it before strict parsing and refuses a mismatch or absence by name. Version 4 is the transaction-consistency revision: serializability and ordering become properties of transactions, declared on the transaction they constrain and proven from transactions alone — serializable isolation across a conflict closure, strict locks, an object version protocol, ordered cursors, and fences — while the runtime topology describes placement, transport, grouping, precedence, and capacity and provides no transaction consistency guarantee (§7, §9, §10, §16, §17, §20, §22). Transactions are explicitly rejectable, transitions fallible, and request results carry named error classes.
+**DSL contract version:** This document specifies **DSL contract version 4** (`DSL_VERSION`, `src/spec/model.rs`). The version names the normative semantic contract as a whole, not the parse schema: any normative change bumps it — vocabulary, validation, or proof semantics alike — while purely internal changes do not. Every specification document declares the version it is authored in (`dsl: 4`, the model root's first field, stamped at assembly and never authored); a consumer probes it before strict parsing and refuses a mismatch or absence by name. Version 4 is the transaction serializability and ordering revision: both become properties of transactions, declared on the transaction they constrain and proven from transactions alone — serializable isolation across a conflict closure, strict locks, an object version protocol, ordered cursors, and fences — while the runtime topology describes placement, transport, grouping, precedence, and capacity and provides no serializability or ordering guarantee (§7, §9, §10, §16, §17, §20, §22). Transactions are explicitly rejectable, transitions fallible, and request results carry named error classes.
 
 | dsl | defined by |
 |---|---|
 | 1 | the External Boundary Guarantees and Decision Vocabulary revision — external `identity` / `idempotency` / `result_replay`, versioning itself; everything earlier is unversioned prehistory, refused as predating versioning |
 | 2 | the Outbox Semantics revision — exactly one `OutboxInput` per outbox, intrinsic durable re-drive in place of declared delivery and acknowledgement, `OutboxDispatch.routing` in place of a bare member assignment |
 | 3 | the Serialization Semantics revision — the L0 `Operation.invocation_lock` proof route; `MemberAssignment` reduced to stable-epoch affinity, its implicit safe-ownership-transfer rule removed; the explicit `ExecutionPool.execution_handoff` leg required by every topology serialization and ordering proof |
-| 4 | the Transaction Consistency and Ordering revision — operation-level serialization and ordering, `Operation.invocation_lock`, and `ExecutionPool.execution_handoff` removed; `Transaction.requirements` (`SerializableBy`, `OrderedBy`) proven from serializable-isolation closures and serialization graphs over strict locks, the object `version` protocol, ordered cursors, and fences; explicit transaction rejection (`rejected` arm, fallible transitions); transition-scoped outbox effects; named error classes on result contracts |
+| 4 | the Transaction Serializability and Ordering revision (specified in `Conseqa_Transaction_Consistency_and_Ordering_Revision__DSL_v4.md`) — operation-level serialization and ordering, `Operation.invocation_lock`, and `ExecutionPool.execution_handoff` removed; `Transaction.requirements` (`SerializableBy`, `OrderedBy`) proven from serializable-isolation closures and serialization graphs over strict locks, the object `version` protocol, ordered cursors, and fences; explicit transaction rejection (`rejected` arm, fallible transitions); transition-scoped outbox effects; named error classes on result contracts |
 
 **Implementation namespace:** `src/spec/` (surface), `src/analyzer/` (validation and verification).
 
@@ -35,7 +35,7 @@ The governing rule:
 
 L1 is **optional**. An L0-only model is complete, structurally valid, and analyzable; it simply has fewer facts from which its obligations can be discharged. Removing L1 from a valid model never makes it invalid — it only makes proofs that consumed runtime facts unavailable.
 
-The analyzer reasons across both layers, but the layers discharge different things. A transaction's consistency — serializability and ordering — is proven from L0 alone (§17): L1 describes placement, transport, grouping, precedence, and runtime capacity, and **it does not provide transaction consistency guarantees** (§10). A progress obligation may cite a delivery fact of L1 (§9). Every proof therefore records its **scope** (§25.1): `l0_only` when no L1 fact was required, `runtime_dependent` when at least one was. A runtime-dependent proof holds of the declared realization and must be re-examined whenever that realization changes.
+The analyzer reasons across both layers, but the layers discharge different things. A transaction's serializability and ordering are proven from L0 alone (§17): L1 describes placement, transport, grouping, precedence, and runtime capacity, and **it provides no serializability or ordering guarantee** (§10). A progress obligation may cite a delivery fact of L1 (§9). Every proof therefore records its **scope** (§25.1): `l0_only` when no L1 fact was required, `runtime_dependent` when at least one was. A runtime-dependent proof holds of the declared realization and must be re-examined whenever that realization changes.
 
 ### A layer is not a correctness layer
 
@@ -461,7 +461,7 @@ It does **not** imply:
 - that effects produced by the consumer cannot overtake one another,
 - or that independent producers had a meaningful business-level happens-before relationship.
 
-Transport order reaches the committed state only through the transactions that apply the messages: an ordered cursor on the keyed object (§17, §20) is what refuses an earlier message applied late — whatever the routing and member concurrency, which describe placement and never consistency (§10).
+Transport order reaches the committed state only through the transactions that apply the messages: an ordered cursor on the keyed object (§17, §20) is what refuses an earlier message applied late — whatever the routing and member concurrency, which describe placement and are never commit-order evidence (§10).
 
 ### Ordered transport does not invent business order
 
@@ -490,7 +490,7 @@ An operation declares **no execution-concurrency fact**. Runtime concurrency is 
 
 `description` is documentation only and has no proof semantics.
 
-### Consistency is a property of transactions
+### Serializability and ordering are properties of transactions
 
 An operation declares no serialization, ordering, or entry-exclusion fact of its own. What the architecture must get right is the **committed state history** of the transactions its invocations run, and that is what a transaction's own requirements state — `SerializableBy(K)` and `OrderedBy(K, P)` (§17) — and what its isolation, its locks, the object version protocol, and its cursors prove. Two invocations of one operation may run concurrently and still commit a serializable history; one invocation running alone, on a stale worker after a redelivery, may still commit a stale one. The runtime topology (§10) says where invocations execute and never whether the transactions they commit are consistent, which is why no operation-level or topology-level declaration can stand in for the transaction's own.
 
@@ -830,7 +830,7 @@ L1 describes selected facts about how the L0 machine is realized. It hangs off `
 
 The governing rule of the layer:
 
-> **L1 describes placement, transport, grouping, precedence, and runtime capacity. It does not provide transaction consistency guarantees.**
+> **L1 describes placement, transport, grouping, precedence, and runtime capacity. It provides no serializability or ordering guarantee: no L1 fact is commit-order evidence.**
 
 No serializability or ordering proof consumes an L1 fact. A routing key, a member assignment, and a serial pool member say where same-key invocations ordinarily execute; they never say that the transactions those invocations commit are serializable, because a stale worker, a redelivery, or a member replacement can put two of them side by side whatever the topology declares, and the committed history is decided by the database under the transactions' own isolation, locks, and version protocol (§17). What L1 still discharges is a progress fact: `delivery: at_least_once` is a retry driver for `completion: guaranteed` (§9). Everything else it declares serves the reader and the external analysis (§10.9).
 
@@ -932,7 +932,7 @@ Grouping without ordering is the sharp case: a transport that establishes
 same K  ->  same runtime group
 ```
 
-and no transport precedence whatever. An unordered queue with consistent-hash workers is an ordinary architecture, and with the two facts separate it is stated as it is — `grouping: keyed`, `ordering: none` — instead of claiming an order the transport does not provide in order to reach the key. Neither fact is a consistency proof: same-key deliveries landing in one group says where they go, not what their transactions commit (§17).
+and no transport precedence whatever. An unordered queue with consistent-hash workers is an ordinary architecture, and with the two facts separate it is stated as it is — `grouping: keyed`, `ordering: none` — instead of claiming an order the transport does not provide in order to reach the key. Neither fact is commit-order evidence: same-key deliveries landing in one group says where they go, not what their transactions commit (§17).
 
 #### One scope, exclusively
 
@@ -1107,7 +1107,7 @@ Routing does not imply attempt exclusivity. After redelivery or ownership uncert
 
 The declared fact that this consumer may retrieve or dispatch several logical source items together — how several logical source-item invocations cross the source-to-execution boundary, **not** whether the underlying database or transport happened to fetch several rows or records together. L0 is untouched: each item remains one logical per-message invocation (§8.3), batching changes no message, partition, or input identity, creates no new idempotency identity, and each item's intrinsic consumption is still judged on its own invocation's completion. The batch's internals — sequential iteration, parallel futures, vectorized APIs, sizes, wait durations — are deliberately opaque and partly external scenario inputs.
 
-The one semantic the declaration carries is `ordering`, explicit with no default: `preserved` guarantees the opaque batch processing does not let a later message overtake an earlier one against an already-established ordering relation — without requiring literal serial execution, if an implementation is observationally consistent with the guarantee; `unspecified` provides no usable fact, and a verifier must not propagate a source ordering guarantee through the stage. Preservation is **not** a no-overlap guarantee: opaque batch processing may still overlap logical item evaluations, and `member_concurrency` must not be silently read as a fact about batch-internal parallelism. No correctness proof consumes the declaration; it is a capacity fact for the external analysis (§10.9), and transaction consistency is proven elsewhere (§17). Absent `batching` declares no batching fact, and no default silently states preservation.
+The one semantic the declaration carries is `ordering`, explicit with no default: `preserved` guarantees the opaque batch processing does not let a later message overtake an earlier one against an already-established ordering relation — without requiring literal serial execution, if an implementation is observationally consistent with the guarantee; `unspecified` provides no usable fact, and a verifier must not propagate a source ordering guarantee through the stage. Preservation is **not** a no-overlap guarantee: opaque batch processing may still overlap logical item evaluations, and `member_concurrency` must not be silently read as a fact about batch-internal parallelism. No correctness proof consumes the declaration; it is a capacity fact for the external analysis (§10.9), and serializability and ordering are proven elsewhere (§17). Absent `batching` declares no batching fact, and no default silently states preservation.
 
 ### 10.4 `Router`
 
@@ -1200,7 +1200,7 @@ This is the "explicit negative routing guarantee" the initial model deferred (§
 
 #### Assignment is placement
 
-Earlier contracts read a safe-ownership-transfer rule, and then a serialization proof, into `consistent_hash`. Both are gone. An assignment says where a domain's invocations ordinarily execute, and a runtime that provides affinity without fencing, or fencing without affinity, is described exactly by declaring the placement it has — consistency is never at stake in the declaration, because the transactions carry it (§17).
+Earlier contracts read a safe-ownership-transfer rule, and then a serialization proof, into `consistent_hash`. Both are gone. An assignment says where a domain's invocations ordinarily execute, and a runtime that provides affinity without fencing, or fencing without affinity, is described exactly by declaring the placement it has — no serializability or ordering claim is at stake in the declaration, because the transactions carry both (§17).
 
 ### 10.7 `StorageLayout`
 
@@ -1818,7 +1818,7 @@ No explicit recovery step exists for a transaction output or an effect intent; r
     steps: [ ... ]
 ```
 
-Declares and executes one atomic transaction at that point in the operation program, or resolves its prior keyed commit. The step carries the whole transaction under `transaction` — its stable logical `id` together with the data-model boundary, isolation guarantee, idempotency guarantee, consistency requirements, and ordered body (§17) — and, when the body can reject, the `rejected` block the invocation continues in when it does. The ID identifies the inline transaction for keyed commit recovery, conformance, proof evidence, and diagnostics; it is not a reference to another declaration.
+Declares and executes one atomic transaction at that point in the operation program, or resolves its prior keyed commit. The step carries the whole transaction under `transaction` — its stable logical `id` together with the data-model boundary, isolation guarantee, idempotency guarantee, serializability and ordering requirements, and ordered body (§17) — and, when the body can reject, the `rejected` block the invocation continues in when it does. The ID identifies the inline transaction for keyed commit recovery, conformance, proof evidence, and diagnostics; it is not a reference to another declaration.
 
 A transaction execution has exactly one of three outcomes:
 
@@ -1954,7 +1954,7 @@ For a request operation, `race(A,B) -> R; return R` makes the request result cau
 
 Program reachability remains defined over synchronous control: no program step executes after a terminal, so `async A; complete; B` still makes B unreachable — a continuing asynchronous A does not make B reachable. Outstanding handles do not make an otherwise terminating path unterminated: they are launched side-effect executions, not additional control paths requiring terminals.
 
-Async overlap may invalidate an argument that depended on sequential execution within one invocation — two asynchronously launched effects cannot be assumed not to overlap. Transaction consistency is untouched by it: asynchronous execution is never permitted for transactions, so a transaction's committed history, and the `SerializableBy` and `OrderedBy` requirements over it (§17), concern the same committed executions whether the invocation's effects overlap or not. The two domains remain distinct.
+Async overlap may invalidate an argument that depended on sequential execution within one invocation — two asynchronously launched effects cannot be assumed not to overlap. Transaction serializability and ordering are untouched by it: asynchronous execution is never permitted for transactions, so a transaction's committed history, and the `SerializableBy` and `OrderedBy` requirements over it (§17), concern the same committed executions whether the invocation's effects overlap or not. The two domains remain distinct.
 
 ### `match_result`
 
@@ -2123,7 +2123,7 @@ A transaction is one atomic commit/abort unit, declared inline at the program st
 
 `id` is the transaction's stable logical identity: unique within the operation, carried by the inline declaration itself, and the identity under which a keyed commit is durably recognized. Its object accesses are interpreted against its declared `data_model`. Its steps are logically ordered as written.
 
-Atomicity does not imply serializability, and serializability is a statement about committed transactions only — it is not to be read as any stronger object-history property (§5). A transaction's execution ends committed, rejected, or interrupted (§16); only committed executions appear in the history the consistency requirements below speak of.
+Atomicity does not imply serializability, and serializability is a statement about committed transactions only — it is not to be read as any stronger object-history property (§5). A transaction's execution ends committed, rejected, or interrupted (§16); only committed executions appear in the history the requirements below speak of.
 
 Framework transaction artifacts established by the transaction — transaction outputs and effect intents (§23) — participate in the same logical atomic boundary as application-state mutations.
 
@@ -2251,9 +2251,9 @@ The declared step sequence represents logical program order inside the transacti
 
 This is especially important for lock-order/deadlock analysis, lock coverage (a lock protects only accesses after it), transaction-read provenance, state transitions, and reasoning about when transaction artifacts are established relative to application state.
 
-### Consistency requirements
+### Transaction requirements
 
-A transaction may declare the consistency it requires of its own committed history:
+A transaction may declare what it requires of its own committed history:
 
 ```yaml
 requirements:
@@ -2795,7 +2795,7 @@ transition.order.mark_paid:
       idempotency_key_propagation: []
 ```
 
-The outbox must exist, admit the schema, and belong to the data model of every transaction applying the transition (`UnknownTransitionOutbox`, `InvalidTransitionOutboxSchema`, `TransitionOutboxOutsideDataModel`). The applying `transition` step supplies one derivation per declared effect under `effects` — `effect.order.paid_admitted: { values: ... }` — keyed exactly by the transition's effect ids (`InvalidTransitionOutboxDerivation`). The effects are keyed, not listed, for the same reasons side effects are: the id is the admission's stable identity — a propagation target names it as `effect:<id>` — and the derivation belongs at the applying site, which can refer to the declared effect only by name (§15.1 of the transaction-consistency revision). The admission is part of the transition's atomic application: it exists on the committed path only, a rejected transition admits nothing, and the message reaches the outbox's consumer as any admitted message does (§13.4). It is not a side effect — no intent is established and no program step executes it — and it is not a database conflict edge for serializability analysis; whether a duplicate admission is the same logical message is the effect leg's question (§9).
+The outbox must exist, admit the schema, and belong to the data model of every transaction applying the transition (`UnknownTransitionOutbox`, `InvalidTransitionOutboxSchema`, `TransitionOutboxOutsideDataModel`). The applying `transition` step supplies one derivation per declared effect under `effects` — `effect.order.paid_admitted: { values: ... }` — keyed exactly by the transition's effect ids (`InvalidTransitionOutboxDerivation`). The effects are keyed, not listed, for the same reasons side effects are: the id is the admission's stable identity — a propagation target names it as `effect:<id>` — and the derivation belongs at the applying site, which can refer to the declared effect only by name (§15.1 of the DSL v4 revision). The admission is part of the transition's atomic application: it exists on the committed path only, a rejected transition admits nothing, and the message reaches the outbox's consumer as any admitted message does (§13.4). It is not a side effect — no intent is established and no program step executes it — and it is not a database conflict edge for serializability analysis; whether a duplicate admission is the same logical message is the effect leg's question (§9).
 
 ### Transition effect intents
 
@@ -2880,8 +2880,8 @@ The solver must preserve these distinctions:
 | **Semantic layer vs semantic category** | L0 versus L1 says which layer a fact belongs to; structural/guarantee/requirement says what kind of claim it makes. Correctness relevance decides neither. |
 | **Transport ordering vs execution ordering** | Ordered delivery can still lead to concurrent/overtaking execution. |
 | **Ordering vs serializability** | Serializability admits *some* serial order of the committed history; ordering fixes *which* — the order of the declared positions. |
-| **Placement vs consistency** | Routing, member assignment, and member concurrency say where invocations execute; what their transactions commit is decided by isolation, locks, the version protocol, and cursors. No L1 fact is a consistency proof. |
-| **Operation vs transaction as the consistency subject** | Invocations may overlap or not; only committed transactions have a history, so serializability and ordering are declared and proven on transactions. |
+| **Placement vs commit order** | Routing, member assignment, and member concurrency say where invocations execute; what their transactions commit is decided by isolation, locks, the version protocol, and cursors. No L1 fact is commit-order evidence. |
+| **Operation vs transaction as the subject** | Invocations may overlap or not; only committed transactions have a history, so serializability and ordering are declared and proven on transactions. |
 | **Transport order vs semantic order** | A broker can serialize concurrent producers without establishing a business-level happens-before relation. |
 | **Routing domain vs pool member** | A routing key names a semantic domain; `MemberAssignment` maps it onto a member. The domain keeps its identity across rebalances. |
 | **Serializable vs serializable closure** | A serializable transaction is serializable only with respect to other serializable ones; one beside a weaker conflicting transaction is ordered by nothing. |
@@ -2894,7 +2894,7 @@ The solver must preserve these distinctions:
 | **Routing domain vs storage partition** | Equal key expressions do not make execution affinity and physical partitioning the same concept. |
 | **Shared pool vs shared routing domain** | One execution population is not one ownership domain; two boundaries in one pool borrow no affinity from each other. |
 | **Routing absence vs unconstrained routing** | No routing block is no fact — not a declaration that routing is arbitrary. |
-| **Grouping vs ordering** | A transport may group without ordering, order without grouping, or both. Neither is a consistency proof. |
+| **Grouping vs ordering** | A transport may group without ordering, order without grouping, or both. Neither is commit-order evidence. |
 | **Grouping vs dispatch** | Grouping is a transport equivalence domain; dispatch maps it onto execution topology. Dispatch preserves precedence and never creates it. |
 | **Topic scope vs subscription scope** | Exclusive declaration modes, not a default and an override. Neither inherits from the other. |
 | **Serializability vs linearizability** | Serializable histories need not respect real-time precedence. The DSL currently declares no object-history requirement (§5); the distinction is kept so that `serializable` is never promoted into one. |
@@ -3039,7 +3039,7 @@ Serializable isolation, explicit locks, message identity, and `retry: may_repeat
 
 When declaring transport semantics, ask which of the two facts you actually have. Grouping and ordering are separate on purpose: a transport that groups by a key without ordering within it is an ordinary thing, and saying so earns a serialization proof without claiming an order that does not exist. Declaring `within_group` to reach a grouping key would be exactly the false statement §26 warns against.
 
-When declaring runtime topology, declare only what the architecture genuinely provides — and know that no topology fact makes a consistency proof pass. A serial pool member, a consistent-hash assignment, and an ordered transport describe where invocations land; the transactions carry consistency. When a `SerializableBy` or `OrderedBy` obligation is unproven, the honest fixes are on the transaction: serializable isolation the database genuinely provides across the whole closure, a strict lock the transaction genuinely takes before the access, a version the object genuinely carries and the transaction validates, or a cursor the keyed object genuinely advances. Declaring `isolation: serializable` on a transaction the database runs at read committed is the same error as declaring a guarantee the implementation does not offer. If the architecture does not constrain the history that way, leave the requirement unproven.
+When declaring runtime topology, declare only what the architecture genuinely provides — and know that no topology fact makes a serializability or ordering proof pass. A serial pool member, a consistent-hash assignment, and an ordered transport describe where invocations land; the transactions carry the proof. When a `SerializableBy` or `OrderedBy` obligation is unproven, the honest fixes are on the transaction: serializable isolation the database genuinely provides across the whole closure, a strict lock the transaction genuinely takes before the access, a version the object genuinely carries and the transaction validates, or a cursor the keyed object genuinely advances. Declaring `isolation: serializable` on a transaction the database runs at read committed is the same error as declaring a guarantee the implementation does not offer. If the architecture does not constrain the history that way, leave the requirement unproven.
 
 ---
 
@@ -3088,7 +3088,7 @@ What the DSL deliberately does not yet decide. Every entry is scoped so that res
 
 11. **External effect result replay** — *Resolved.* For a result-bearing external effect, `result_replay: replay_stable` over a keyed identity fixes the interaction's terminal result (§13.3), and each error class of `ResultType.errors` declares its own `ErrorDisposition` (§8.1), so heterogeneous dispositions inside one contract are expressible; a terminal external result over a class-fixed identity is a replay-stable root (§18 rule 6). Still open: any retry-execution vocabulary that would consume `retryable`.
 
-12. **Transaction consistency: deferred surfaces** — *Open; V1 stance adopted.* The serializability and ordering proofs of §17 are deliberately conservative where the model cannot yet say more: unknown selector overlap is a conflict, so a proof over a partially pinned selector needs a lock or version covering the widest instance set it may touch; predicate and phantom conflicts are read as instance conflicts over the selector's object, with no gap-lock vocabulary; there is no update lock mode; a rejection exposes no cause; and the `rejected` arm is one generic block. Each of these can gain precision — typed rejection causes, a disjointness precondition on inputs, predicate-lock facts, an upgrade mode — by adding what can be stated, and no V1 verdict rests on their absence being read as anything but unknown.
+12. **Transaction requirements: deferred surfaces** — *Open; V1 stance adopted.* The serializability and ordering proofs of §17 are deliberately conservative where the model cannot yet say more: unknown selector overlap is a conflict, so a proof over a partially pinned selector needs a lock or version covering the widest instance set it may touch; predicate and phantom conflicts are read as instance conflicts over the selector's object, with no gap-lock vocabulary; there is no update lock mode; a rejection exposes no cause; and the `rejected` arm is one generic block. Each of these can gain precision — typed rejection causes, a disjointness precondition on inputs, predicate-lock facts, an upgrade mode — by adding what can be stated, and no V1 verdict rests on their absence being read as anything but unknown.
 
 ### Deferred surfaces
 
@@ -3098,5 +3098,5 @@ What the DSL deliberately does not yet decide. Every entry is scoped so that res
 - **Retry execution.** `ErrorDisposition::retryable` states that another attempt is semantically admitted (§8.1); nothing models the mechanism that performs one — no retry policy, loop, attempt count, backoff, or timeout. A retry-execution revision may consume the disposition.
 - **Performance overlay.** The correctness vocabulary deliberately exposes distinctions a future probabilistic layer could consume — terminal versus retryable outcomes, attempt populations, member concurrency, member assignment, routing and partition keys — but no performance semantics exist in the model. L1 is qualitative by design: pool cardinality, traffic rates, key-frequency distributions, service-time distributions, storage-node counts, replication factors, capacity, queueing, and latency belong to an external simulation scenario evaluated *against* a Conseqa architecture, never inside it.
 - **Explicit negative routing** — *partly resolved.* There is still no `unconstrained` routing variant: absence of a routing block expresses that no member-affinity fact exists, and routing keeps exactly two components. The distinction between *unknown* and *known arbitrary* member behaviour is now carried where it belongs, on the assignment: `member_assignment: round_robin` (§10.6), admitted for the external analysis that needs it rather than for any proof. Still open is whether a routing *key* ever needs a comparable negative.
-- **Global execution gates** — *withdrawn.* The v3 operation-entry `invocation_lock` is removed with the operation-level serialization it served: whether two invocations overlap is not the property the architecture must get right, and no execution gate — keyed or global — says what the transactions commit. If a genuine need for an invocation-level exclusion primitive appears, it must be stated in terms of what it proves about committed histories, and it will not be a transaction consistency fact.
+- **Global execution gates** — *withdrawn.* The v3 operation-entry `invocation_lock` is removed with the operation-level serialization it served: whether two invocations overlap is not the property the architecture must get right, and no execution gate — keyed or global — says what the transactions commit. If a genuine need for an invocation-level exclusion primitive appears, it must be stated in terms of what it proves about committed histories, and it will not be commit-order evidence.
 - **Beyond the pool.** L1's execution abstraction stops at a population of interchangeable members. Physical database nodes, replica topology, consensus protocols, database lock-manager internals, hosts, containers, process ids, CPU, memory, availability zones, network links, queue capacities, and autoscaling policies are all outside it.

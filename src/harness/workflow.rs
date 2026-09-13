@@ -238,7 +238,7 @@ impl Workflow {
                     // and its requirements have settled. It realizes
                     // the model — placement, transport, grouping,
                     // capacity — and discharges no obligation: the
-                    // runtime provides no transaction consistency
+                    // runtime provides no serializability or ordering
                     // guarantee, so nothing below waits on it.
                     if !topology_authored && self.runtime_unauthored() {
                         topology_authored = true;
@@ -621,8 +621,8 @@ impl Workflow {
 
     /// Phase 7: repair every unproven obligation at `revision`.
     ///
-    /// Every obligation is an application-layer matter: transaction
-    /// consistency is proven from the transactions themselves, and
+    /// Every obligation is an application-layer matter: serializability
+    /// and ordering are proven from the transactions themselves, and
     /// idempotency, result replay, and recoverability from the
     /// programs, so no obstacle names the runtime realization. Repairs
     /// fan out one task per *operation*, each carrying all of that
@@ -666,7 +666,7 @@ impl Workflow {
                         transport declaration and dispatch for every subscription and \
                         outbox input, and a storage layout for every data object. \
                         Describe placement, transport, grouping, and capacity only. The \
-                        runtime provides no transaction consistency guarantee, so no \
+                        runtime provides no serializability or ordering guarantee, so no \
                         obligation is discharged here and none should be aimed at; \
                         leave every application-layer gap to the program authors."
                 .to_string(),

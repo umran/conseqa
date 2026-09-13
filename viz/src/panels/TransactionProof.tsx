@@ -5,13 +5,13 @@ import { Tooltip } from "@cloudflare/kumo/components/tooltip";
 import { CaretDownIcon, CaretRightIcon } from "@phosphor-icons/react";
 import { useEffect, useId, useMemo, useRef, useState, type ReactNode } from "react";
 
-import { ConsistencyGraph } from "../graph/ConsistencyGraph";
+import { ConflictGraph } from "../graph/ConflictGraph";
 import { cursorRule, fence, serializabilityRoute, type Explanation } from "../lib/explain";
 import { shortId } from "../lib/ids";
-import type { DependencyKind, DependencyView, OrderingView, PairView, SerializabilityView } from "../types/consistency";
+import type { DependencyKind, DependencyView, OrderingView, PairView, SerializabilityView } from "../types/transactionProofs";
 import { CitedText, FactBadge, FactNote, Mono, Section, StatusBadge } from "./parts";
 
-// The two transaction consistency arguments, drawn. A serializability
+// The two transaction proofs, drawn. A serializability
 // verdict is an argument over the conflict closure; an ordering verdict
 // is that argument plus one guard step. Everything here is read off the
 // argument the page data carries — the checker's own — and nothing
@@ -94,7 +94,7 @@ export function SerializabilityProof({ view, compact = false }: { view: Serializ
           <CitedText text={view.headline} />
         </p>
       </div>
-      <ConsistencyGraph view={view} selectedPair={selected} onSelectPair={select} />
+      <ConflictGraph view={view} selectedPair={selected} onSelectPair={select} />
       {compact && <RevealToggle open={expanded} onToggle={() => setExpanded((v) => !v)} />}
       {expanded && (
         <>

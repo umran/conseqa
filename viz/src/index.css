@@ -83,7 +83,7 @@ svg.arch-canvas text { font-size: 12px; fill: var(--arch-text); user-select: non
 .arch-edge-hit { fill: none; stroke: transparent; stroke-width: 14; cursor: pointer; pointer-events: stroke; }
 .arch-edge-label { font-size: 10.5px; fill: var(--arch-text-subtle); }
 
-/* ---------- transaction consistency ---------- */
+/* ---------- transaction proofs ---------- */
 
 /* The conflict closure, drawn inline in a panel: the requiring
    transaction and everything it may conflict with, one arrow per

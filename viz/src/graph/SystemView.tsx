@@ -32,7 +32,7 @@ function edgeShortLabel(e: Edge): string {
 }
 
 export function SystemView() {
-  const { graph, report, selection, search, runtime, showRuntime, consistency, showConsistency } = useApp();
+  const { graph, report, selection, search, runtime, showRuntime, transactionProofs, showConflicts } = useApp();
   const drawRuntime = showRuntime && runtime.declared;
   const layout = useMemo(
     () => layoutSystem(graph, { runtime: drawRuntime ? runtime : null }),
@@ -42,10 +42,10 @@ export function SystemView() {
 
   // The conflict overlay: contention between operations, read off the
   // serializability arguments. Nothing about it is topology.
-  const drawConsistency = showConsistency && consistency.serializability.length > 0;
+  const drawConflicts = showConflicts && transactionProofs.serializability.length > 0;
   const conflicts = useMemo(
-    () => (drawConsistency ? layoutConflicts(consistency.serializability, layout.pos) : []),
-    [drawConsistency, consistency, layout],
+    () => (drawConflicts ? layoutConflicts(transactionProofs.serializability, layout.pos) : []),
+    [drawConflicts, transactionProofs, layout],
   );
 
   const q = search.trim().toLowerCase();
@@ -181,7 +181,7 @@ export function SystemView() {
           <LegendLine color="var(--arch-l1)" label="access, not keyed" dashed />
         </>
       )}
-      {drawConsistency && (
+      {drawConflicts && (
         <>
           <LegendLine color="var(--arch-proven)" label="conflict, commit-ordered" />
           <LegendLine color="var(--arch-unknown)" label="conflict, unconstrained" dashed />

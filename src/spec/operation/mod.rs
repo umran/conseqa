@@ -30,8 +30,8 @@ use super::Id;
 /// [`ExecutionPool::member_concurrency`](crate::spec::ExecutionPool).
 ///
 /// Nor does an operation declare a serialization or ordering
-/// obligation of its own: consistency is a property of the
-/// transactions a program executes, so `SerializableBy(K)` and
+/// obligation of its own: serializability and ordering are properties
+/// of the transactions a program executes, so `SerializableBy(K)` and
 /// `OrderedBy(K, P)` are declared on the inline transaction they
 /// constrain ([`TransactionRequirements`]), never on the operation.
 /// The operation-level families that remain — idempotency and

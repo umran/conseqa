@@ -38,8 +38,8 @@
 //! And one rule governs what L1 may ever prove:
 //!
 //! > L1 describes placement, transport, grouping, precedence, and
-//! > runtime capacity. It does not provide transaction consistency
-//! > guarantees.
+//! > runtime capacity. It provides no serializability or ordering
+//! > guarantee: no L1 fact is commit-order evidence.
 //!
 //! Transport grouping and precedence describe how work ordinarily
 //! arrives; member assignment and member concurrency describe where and
@@ -607,7 +607,7 @@ pub struct RequestRouting {
 /// partition reassignment, or ownership rebalance. No correctness
 /// proof consumes it: a stale owner overlapping its successor is
 /// consistent with every declaration here, which is exactly why
-/// transaction consistency is proven from transaction primitives
+/// serializability and ordering are proven from transaction primitives
 /// (locks, versions, cursors, fences, isolation) and never from
 /// `consistent_hash`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

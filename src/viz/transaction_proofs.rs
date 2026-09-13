@@ -1,4 +1,4 @@
-//! The consistency proof view-model: what a reader has to see to
+//! The transaction proof view-model: what a reader has to see to
 //! understand *why* a transaction serializability or ordering verdict
 //! holds, in a shape a drawing can be made from.
 //!
@@ -37,7 +37,7 @@ use crate::spec::{CursorAdvanceRule, Id, Model, TransactionIsolation, Transactio
 /// Every declared transaction requirement of the model, as an argument
 /// a drawing can be made from.
 #[derive(Debug, Clone, Serialize)]
-pub struct ConsistencyView {
+pub struct TransactionProofs {
     pub serializability: Vec<SerializabilityView>,
     pub ordering: Vec<OrderingView>,
 }
@@ -194,9 +194,9 @@ pub struct MechanismView {
     pub carries_position: bool,
 }
 
-/// Extracts the consistency arguments of every declared transaction
-/// requirement.
-pub fn extract(model: &Model) -> ConsistencyView {
+/// Extracts the serializability and ordering arguments of every
+/// declared transaction requirement.
+pub fn extract(model: &Model) -> TransactionProofs {
     let index = ConflictIndex::build(model);
 
     let serializability = transaction_serializability::check(model)
@@ -314,7 +314,7 @@ pub fn extract(model: &Model) -> ConsistencyView {
         })
         .collect();
 
-    ConsistencyView {
+    TransactionProofs {
         serializability,
         ordering,
     }
@@ -797,9 +797,9 @@ mod tests {
 
     #[test]
     fn apply_payment_is_drawn_as_a_constrained_graph() {
-        let consistency = extract(&flash_checkout());
+        let proofs = extract(&flash_checkout());
 
-        let apply = view(&consistency.serializability, "tx.apply_payment");
+        let apply = view(&proofs.serializability, "tx.apply_payment");
 
         assert!(apply.proven);
         assert_eq!(apply.route.as_deref(), Some("conflict_graph"));
@@ -849,9 +849,9 @@ mod tests {
 
     #[test]
     fn reserve_inventory_is_drawn_with_its_unconstrained_cycle() {
-        let consistency = extract(&flash_checkout());
+        let proofs = extract(&flash_checkout());
 
-        let reserve = view(&consistency.serializability, "tx.reserve_inventory");
+        let reserve = view(&proofs.serializability, "tx.reserve_inventory");
 
         assert!(!reserve.proven);
         assert_eq!(reserve.route, None);
@@ -879,9 +879,9 @@ mod tests {
 
     #[test]
     fn apply_payment_ordering_shows_its_cursor_over_the_closure() {
-        let consistency = extract(&flash_checkout());
+        let proofs = extract(&flash_checkout());
 
-        let ordering = &consistency.ordering[0];
+        let ordering = &proofs.ordering[0];
 
         assert_eq!(ordering.transaction.0, "tx.apply_payment");
         assert!(ordering.proven);

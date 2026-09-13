@@ -74,7 +74,7 @@ pub enum OutboxProducerSite<'a> {
         transaction: &'a Id,
     },
 
-    /// A transition-scoped admission (§15 of the transaction-consistency
+    /// A transition-scoped admission (§15 of the DSL v4
     /// revision).
     Transition { machine: &'a Id, transition: &'a Id },
 }

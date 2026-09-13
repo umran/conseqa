@@ -29,10 +29,10 @@ use super::{
 /// `MemberAssignment` shed its implicit safe-ownership-transfer
 /// rule, and the topology serialization and ordering proofs required
 /// an explicit `ExecutionPool.execution_handoff` fact. Version 4 is
-/// the transaction-consistency revision, which retires all of that:
+/// the DSL v4 revision, which retires all of that:
 /// operation-level serialization and ordering requirements,
-/// `InvocationLock`, and `ExecutionHandoff` are gone, and consistency
-/// is declared per transaction — `SerializableBy(K)` and
+/// `InvocationLock`, and `ExecutionHandoff` are gone, and both
+/// families are declared per transaction — `SerializableBy(K)` and
 /// `OrderedBy(K, P)` in `Transaction.requirements` — and proven from a
 /// model-wide conflict analysis over transaction primitives: declared
 /// isolation, S/X locks, object versions (`ValidateVersion` /

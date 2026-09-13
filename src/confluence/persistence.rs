@@ -63,7 +63,7 @@ const EVENT_SEQ_KEY: &str = "task_event_seq";
 /// semantics, so a format-4 workspace must not be silently reread as
 /// though its proofs still held.
 ///
-/// Bumped to 6 with the transaction-consistency revision (`dsl: 4`):
+/// Bumped to 6 with the DSL v4 revision (`dsl: 4`):
 /// operation requirements lost their serialization and ordering
 /// families, the interface its `invocation_lock`, and the pool its
 /// `execution_handoff`; transactions gained `requirements` and their

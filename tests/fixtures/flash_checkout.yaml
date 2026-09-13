@@ -2,8 +2,8 @@
 # card, apply the payment — every hand-off an identified event on one
 # keyed topic.
 #
-# Consistency is a property of transactions here, proven from the
-# transactions themselves. The order object is versioned: applying a
+# Serializability and ordering are properties of transactions here,
+# proven from the transactions themselves. The order object is versioned: applying a
 # payment and cancelling an order both observe the order's version,
 # validate it at commit, apply their transition, and bump it, so a
 # stale observation rejects rather than commits — the OCC route that

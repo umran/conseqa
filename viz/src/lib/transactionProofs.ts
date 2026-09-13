@@ -1,8 +1,8 @@
-// The transaction consistency arguments, read the way the panels and
-// the drawings need them.
+// The transaction proofs — the serializability and ordering
+// arguments — read the way the panels and the drawings need them.
 //
 // The page data carries one structured argument per declared
-// serializability or ordering requirement (`types/consistency.ts`). This
+// serializability or ordering requirement (`types/transactionProofs.ts`). This
 // module indexes them by the obligation they belong to and lays the
 // conflict closure out as a small graph: the requiring transaction and
 // every transaction that may conflict with it, one arrow per ordered
@@ -12,7 +12,7 @@
 
 import type {
   ClosureNode, OrderingView, PairView, SerializabilityView,
-} from "../types/consistency";
+} from "../types/transactionProofs";
 import type { Id, RequirementKind } from "../types/model";
 import type { PageData } from "../types/page";
 import type { Obligation } from "../types/report";
@@ -31,7 +31,7 @@ export interface TransactionViews {
   ordering: OrderingView[];
 }
 
-export interface ConsistencyViews {
+export interface TransactionProofIndex {
   serializability: SerializabilityView[];
   ordering: OrderingView[];
   serializabilityFor(obligationId: string): SerializabilityView | null;
@@ -51,11 +51,11 @@ export function obligationId(operation: Id, transaction: Id, prop: RequirementKi
   return `oblig.${operation}.${transaction}.${prop}.${index}`;
 }
 
-export function consistencyViews(data: PageData): ConsistencyViews {
+export function indexTransactionProofs(data: PageData): TransactionProofIndex {
   // Tolerate a page written before the arguments were emitted: no
   // argument is then the absence of a drawing, never a broken page.
-  const serializability = data.consistency?.serializability ?? [];
-  const ordering = data.consistency?.ordering ?? [];
+  const serializability = data.transaction_proofs?.serializability ?? [];
+  const ordering = data.transaction_proofs?.ordering ?? [];
   const byS = new Map(serializability.map((v) => [v.obligation, v]));
   const byO = new Map(ordering.map((v) => [v.obligation, v]));
 

@@ -22,9 +22,9 @@ export function TopBar() {
   const app = useApp();
   const {
     data, model, report, reportIssue, route, search, obligationsOpen, runtime, showRuntime,
-    consistency, showConsistency, theme, themeControllable,
+    transactionProofs, showConflicts, theme, themeControllable,
   } = app;
-  const hasConsistency = consistency.serializability.length > 0;
+  const hasTransactionProofs = transactionProofs.serializability.length > 0;
   const counts = report ? statusCounts(report.obligations) : null;
   const tally = counts
     ? (["disproven", "unknown", "proven"] as const)
@@ -133,17 +133,17 @@ export function TopBar() {
                   serializability arguments. Offered only when the model
                   declares one; hiding it hides the drawing, never the
                   argument. */}
-              {hasConsistency && (
+              {hasTransactionProofs && (
                 <Tooltip
                   content="Conflict arcs between operations whose transactions may conflict: green when every dependency between them is commit-ordered by a declared fact, amber dashed when one is not. Read off the transactions alone — never from runtime topology."
                   render={
                     <span className="inline-flex">
                       <Switch
                         size="sm"
-                        label="consistency"
+                        label="conflicts"
                         controlFirst={false}
-                        checked={showConsistency}
-                        onCheckedChange={app.setShowConsistency}
+                        checked={showConflicts}
+                        onCheckedChange={app.setShowConflicts}
                         aria-label="Draw the transaction conflict overlay"
                       />
                     </span>

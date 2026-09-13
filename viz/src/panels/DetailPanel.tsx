@@ -21,7 +21,7 @@ import { predicateText, refString } from "../lib/text";
 import { useApp, useCitations, useObligationsAt, type DetailTarget } from "../state/AppState";
 import { CLIENT_NODE_ID, EXTERNAL_PREFIX, type Edge } from "../types/graph";
 import type { Id, IdempotencyKeyPropagation, OperationBlock, RequirementKind, ResultType } from "../types/model";
-import { OrderingProof, SerializabilityProof } from "./ConsistencyProof";
+import { OrderingProof, SerializabilityProof } from "./TransactionProof";
 import { ObligationCard } from "./ObligationCard";
 import {
   BindingChip, ConditionView, DerivationView, FactNote, IdLink, KeyComponents, KeyValue, List, Mono, Muted,
@@ -1272,7 +1272,7 @@ function HandleDetail({ opId, effectId, location, id }: { opId: Id; effectId: Id
 }
 
 function TransactionDetail({ opId, id }: { opId: Id; id: Id }) {
-  const { model, openDetail, consistency } = useApp();
+  const { model, openDetail, transactionProofs } = useApp();
   const op = model.operations[opId];
   const site = findTransactionSite(op, id);
   if (!site) return <Frame kind="transaction" title={id} subtitle={<span>inline transaction of <IdLink id={opId} /></span>} />;
@@ -1306,7 +1306,7 @@ function TransactionDetail({ opId, id }: { opId: Id; id: Id }) {
               the closure drawn, the guard drawn, the rest behind a
               toggle. */}
           {tx.requirements.serializability.map((r, i) => {
-            const proof = consistency.proofForRequirement(opId, id, "transaction_serializability", i);
+            const proof = transactionProofs.proofForRequirement(opId, id, "transaction_serializability", i);
             return (
               <div key={`s${i}`} className="space-y-2">
                 <FactNote fact={serializabilityRequirement(r.key)}>
@@ -1317,7 +1317,7 @@ function TransactionDetail({ opId, id }: { opId: Id; id: Id }) {
             );
           })}
           {tx.requirements.ordering.map((r, i) => {
-            const proof = consistency.proofForRequirement(opId, id, "transaction_ordering", i);
+            const proof = transactionProofs.proofForRequirement(opId, id, "transaction_ordering", i);
             return (
               <div key={`o${i}`} className="space-y-2">
                 <FactNote fact={orderingRequirement(r.key, r.position)}>
@@ -1385,12 +1385,12 @@ function TransactionDetail({ opId, id }: { opId: Id; id: Id }) {
  *  an operation family by the operation and its index. The verdicts are
  *  the obligations anchored to exactly that declaration. */
 function RequirementDetail({ opId, prop, reqIndex, transaction }: { opId: Id; prop: RequirementKind; reqIndex: number; transaction?: Id }) {
-  const { model, consistency } = useApp();
+  const { model, transactionProofs } = useApp();
   const op = model.operations[opId];
 
   if (prop === "transaction_serializability" || prop === "transaction_ordering") {
     const family = prop === "transaction_serializability" ? "serializability" : "ordering";
-    const proof = transaction !== undefined ? consistency.proofForRequirement(opId, transaction, prop, reqIndex) : null;
+    const proof = transaction !== undefined ? transactionProofs.proofForRequirement(opId, transaction, prop, reqIndex) : null;
     const sub = (
       <span>
         declared on transaction {transaction !== undefined ? <IdLink id={transaction} /> : "?"} of <IdLink id={opId} />
@@ -1799,7 +1799,7 @@ function RouterDetail({ id }: { id: Id }) {
       kind="router"
       title={id}
       subtitle={<span>L1 · realization of a request boundary</span>}
-      description="A router decides which member of its pool an invocation domain is placed on. It does not make requests ordered, and it carries no queue: what it establishes is affinity, and only when it declares a routing key. Placement only — member assignment is not a consistency fact, and no transaction proof rests on it."
+      description="A router decides which member of its pool an invocation domain is placed on. It does not make requests ordered, and it carries no queue: what it establishes is affinity, and only when it declares a routing key. Placement only — member assignment is not commit-order evidence, and no transaction proof rests on it."
     >
       <KeyValue rows={[
         ["operation", <IdLink key="o" id={router.boundary.operation} />],

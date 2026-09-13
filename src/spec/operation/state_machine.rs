@@ -55,7 +55,7 @@ pub struct Transition {
 
     /// Outbox messages admitted atomically with a successful
     /// application of this transition — the transition-scoped atomic
-    /// admission of §15 of the transaction-consistency revision.
+    /// admission of §15 of the DSL v4 revision.
     ///
     /// Keyed by effect id, exactly as `side_effects` is: the effect id
     /// is the stable identity of the admission site (lineage,

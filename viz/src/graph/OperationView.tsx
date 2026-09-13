@@ -28,7 +28,7 @@ import {
   subscriptionRouting,
   transactionRejection,
 } from "../lib/explain";
-import { proofSummary } from "../lib/consistency";
+import { proofSummary } from "../lib/transactionProofs";
 import { pathText, shortId } from "../lib/ids";
 import {
   effectDef, effectSummary, errArm, locationLabel, operationTransactions, stepRejects, walkProgram,
@@ -972,14 +972,14 @@ function BindingsLegend() {
  *  transaction row's verdicts are the obligations anchored to that
  *  transaction and its requirement index. */
 function RequirementsTable({ id, op }: { id: Id; op: Operation }) {
-  const { obligations, selection, select, consistency } = useApp();
+  const { obligations, selection, select, transactionProofs } = useApp();
   const reqs = op.requirements;
 
   // A transaction row ends with what its argument rests on — the
   // closure and the route, or the guard — so the shape of the proof is
   // readable before the row is opened.
   const argument = (tx: Id, prop: RequirementKind, i: number): ReactNode => {
-    const proof = consistency.proofForRequirement(id, tx, prop, i);
+    const proof = transactionProofs.proofForRequirement(id, tx, prop, i);
     return proof ? <span className="text-xs text-kumo-inactive">{proofSummary(proof)}</span> : null;
   };
 

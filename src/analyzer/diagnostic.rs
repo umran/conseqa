@@ -66,7 +66,7 @@ pub enum VerificationCode {
     /// A recoverability requirement is proven with completion
     /// guaranteed by retries, but no idempotency requirement keyed
     /// from the triggering input declares those retries safe. A
-    /// consistency warning, not a verdict.
+    /// coherence warning, not a verdict.
     RecoverabilityRetrySafetyUndeclared,
 
     /// A subscription admits duplicate deliveries and its operation

@@ -387,8 +387,8 @@ export interface TransactionOrderingRequirement {
   position: ValueRef;
 }
 
-/** The consistency obligations declared on one transaction's committed
- *  state history — never on an operation, and never discharged by
+/** The obligations declared on one transaction's committed history,
+ *  serializability and ordering — never on an operation, and never discharged by
  *  runtime topology. Always present; both lists may be empty. */
 export interface TransactionRequirements {
   serializability: TransactionSerializabilityRequirement[];
@@ -487,7 +487,7 @@ export type RequirementKind =
  *  transaction site that executes or establishes them — the program is
  *  the source of truth for every operation-owned execution
  *  occurrence. An operation declares no entry synchronization and no
- *  consistency requirement of its own. */
+ *  serializability or ordering requirement of its own. */
 export interface Operation {
   service: Id;
   description: string | null;
@@ -502,8 +502,8 @@ export interface Operation {
 
 /** The declared runtime realization. It describes placement, transport,
  *  grouping, precedence, and runtime capacity; it provides no
- *  transaction consistency guarantee, and no serializability or
- *  ordering proof consumes any fact declared here. */
+ *  serializability or ordering guarantee, and no transaction proof
+ *  consumes any fact declared here. */
 export interface RuntimeModel {
   topics?: Record<Id, TopicRuntime>;
   subscriptions?: Record<Id, Record<Id, SubscriptionRuntime>>;

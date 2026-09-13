@@ -11,7 +11,7 @@ import {
 
 import { modelBindings, type ModelBindings } from "../lib/bindings";
 import { citedIds } from "../lib/citations";
-import { consistencyViews, type ConsistencyViews } from "../lib/consistency";
+import { indexTransactionProofs, type TransactionProofIndex } from "../lib/transactionProofs";
 import { buildIndex, type ModelIndex } from "../lib/index";
 import { buildObligationIndex, reportRejection, type ObligationIndex } from "../lib/obligations";
 import { runtimeFacts, type RuntimeFacts } from "../lib/runtime";
@@ -69,9 +69,10 @@ interface AppState {
   citations: ObligationIndex;
   /** The declared L1 realization, as the views draw it. */
   runtime: RuntimeFacts;
-  /** The transaction consistency arguments, indexed by the obligation
-   *  and the requirement they belong to. */
-  consistency: ConsistencyViews;
+  /** The transaction proofs — the serializability and ordering
+   *  arguments — indexed by the obligation and the requirement they
+   *  belong to. */
+  transactionProofs: TransactionProofIndex;
   /** Every binding each program defines and where it uses it, and every
    *  definition by name — how a name is drawn the same way at both ends. */
   bindings: ModelBindings;
@@ -90,7 +91,7 @@ interface AppState {
    *  an arc between two operations whose transactions may conflict,
    *  coloured by whether every dependency between them is commit-ordered
    *  by a declared fact. An L0 reading of the model — never topology. */
-  showConsistency: boolean;
+  showConflicts: boolean;
   theme: Theme;
   /** False when a host owns the colour mode, so the app offers no
    *  control of its own. */
@@ -105,7 +106,7 @@ interface AppState {
   setSearch: (value: string) => void;
   setObligationsOpen: (value: boolean) => void;
   setShowRuntime: (value: boolean) => void;
-  setShowConsistency: (value: boolean) => void;
+  setShowConflicts: (value: boolean) => void;
   setTheme: (value: Theme) => void;
   requestFit: () => void;
   /** Navigates to a view, applying a selection once it has rendered. */
@@ -148,7 +149,7 @@ export function AppStateProvider({ data, theme: hostTheme, children }: AppStateP
 
   const index = useMemo(() => buildIndex(data.model), [data.model]);
   const runtime = useMemo(() => runtimeFacts(data.model, data.graph), [data.model, data.graph]);
-  const consistency = useMemo(() => consistencyViews(data), [data]);
+  const transactionProofs = useMemo(() => indexTransactionProofs(data), [data]);
   const bindings = useMemo(() => modelBindings(data.model), [data.model]);
 
   // A report this build cannot read is dropped here, once, rather than
@@ -185,7 +186,7 @@ export function AppStateProvider({ data, theme: hostTheme, children }: AppStateP
   const [showRuntime, setShowRuntimeState] = useState(runtime.declared);
   // On by default for the same reason: a declared argument is part of
   // what the model says, and the overlay is how the system view says it.
-  const [showConsistency, setShowConsistencyState] = useState(true);
+  const [showConflicts, setShowConflictsState] = useState(true);
   const [ownTheme, setOwnTheme] = useState<Theme>(initialTheme);
   const [fitRequest, setFitRequest] = useState(0);
 
@@ -270,8 +271,8 @@ export function AppStateProvider({ data, theme: hostTheme, children }: AppStateP
 
   // The overlay's arcs rise above the cards, so the drawing's extent
   // changes with it and the view is re-fitted the same way.
-  const setShowConsistency = useCallback((value: boolean) => {
-    setShowConsistencyState(value);
+  const setShowConflicts = useCallback((value: boolean) => {
+    setShowConflictsState(value);
     setFitRequest((n) => n + 1);
   }, []);
 
@@ -334,7 +335,7 @@ export function AppStateProvider({ data, theme: hostTheme, children }: AppStateP
       obligations,
       citations,
       runtime,
-      consistency,
+      transactionProofs,
       bindings,
       route,
       selection,
@@ -343,7 +344,7 @@ export function AppStateProvider({ data, theme: hostTheme, children }: AppStateP
       search,
       obligationsOpen,
       showRuntime,
-      showConsistency,
+      showConflicts,
       theme,
       themeControllable,
       fitRequest,
@@ -354,17 +355,17 @@ export function AppStateProvider({ data, theme: hostTheme, children }: AppStateP
       setSearch,
       setObligationsOpen,
       setShowRuntime,
-      setShowConsistency,
+      setShowConflicts,
       setTheme,
       requestFit,
       navigateTo,
       focusSubject,
     }),
     [
-      data, report, reportIssue, index, knownIds, obligations, citations, runtime, consistency, bindings, route,
-      selection, detail, expandedTx, search, obligationsOpen, showRuntime, showConsistency, theme,
+      data, report, reportIssue, index, knownIds, obligations, citations, runtime, transactionProofs, bindings, route,
+      selection, detail, expandedTx, search, obligationsOpen, showRuntime, showConflicts, theme,
       themeControllable, fitRequest, select, openDetail, closeDetail, toggleTx,
-      setTheme, setShowRuntime, setShowConsistency, requestFit, navigateTo, focusSubject,
+      setTheme, setShowRuntime, setShowConflicts, requestFit, navigateTo, focusSubject,
     ],
   );
 

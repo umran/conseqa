@@ -1,6 +1,6 @@
 //! Model-wide transaction conflict analysis: the shared machinery of
 //! the transaction serializability and ordering provers (§35–§52 of
-//! the transaction-consistency revision).
+//! the DSL v4 revision).
 //!
 //! A serializability obligation is a system-wide property over
 //! potentially conflicting transaction executions, so no prover may

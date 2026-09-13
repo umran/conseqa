@@ -101,7 +101,7 @@ L1 fact is a fact about some L0 thing:
 - A **topic** carries its transport facts (grouping, ordering) on its
   own node, since topic-scoped transport is a fact about the topic.
 
-A second switch, **consistency**, offered whenever a transaction
+A second switch, **conflicts**, offered whenever a transaction
 declares a serializability requirement, draws the **conflict arcs**:
 one arc between every two operations whose transactions may conflict
 on a persistent object — bowed over the plane between columns, nested
@@ -266,7 +266,7 @@ single obligation — today, a subscription that admits duplicate
 deliveries while its operation declares no idempotency requirement
 keyed from it — appear at the top of the obligations panel.
 
-**Consistency proofs.** A transaction serializability or ordering
+**Transaction proofs.** A transaction serializability or ordering
 verdict is not paraphrased but drawn. The requiring transaction's
 **conflict closure** — every transaction of the model that may read or
 write what it writes, transitively — is a small graph: one node per
@@ -409,7 +409,7 @@ npm run build   # typecheck + single-file bundle → dist/index.html
 The production build is one `dist/index.html` with every script and
 stylesheet inlined (`vite-plugin-singlefile`). `conseqa::viz::render`
 embeds that file at compile time (`include_str!`) and injects the page
-data — title, model, derived graph, the consistency arguments, report —
+data — title, model, derived graph, the transaction proofs, report —
 as `window.CONSEQA`, so
 `cargo` needs no Node toolchain. During development the app fetches
 `public/conseqa.json` instead; regenerate it with `npm run data`, or
@@ -441,8 +441,8 @@ src/viz/
   graph.rs     Model → system graph (vertices, edges, indexes);
                resolves intents, transition ownership, message
                selectors so the front end never re-implements them
-  consistency.rs
-               Model → the transaction consistency arguments: per
+  transaction_proofs.rs
+               Model → the transaction proofs: per
                declared requirement, the conflict closure, every
                dependency with its commit-order evidence or gaps,
                the arrows they group into, the unconstrained cycles,
@@ -451,7 +451,7 @@ src/viz/
   render.rs    embeds viz/dist/index.html and injects the page data
 
 viz/
-  src/types/   TypeScript mirrors of the model, graph, consistency,
+  src/types/   TypeScript mirrors of the model, graph, transaction proofs,
                and report JSON
   src/lib/     id index, obligation index, routing, text helpers
   src/state/   app state (selection, detail target, filters, theme)

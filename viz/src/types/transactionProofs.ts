@@ -1,5 +1,6 @@
-// Mirror of `src/viz/consistency.rs`: the transaction consistency
-// arguments, in the shape a drawing is made from.
+// Mirror of `src/viz/transaction_proofs.rs`: the transaction proofs —
+// the serializability and ordering arguments — in the shape a drawing
+// is made from.
 //
 // A serializability verdict is an argument over a graph — the
 // requiring transaction's conflict closure, the potential serialization
@@ -11,7 +12,7 @@
 
 import type { Id } from "./model";
 
-export interface ConsistencyView {
+export interface TransactionProofs {
   serializability: SerializabilityView[];
   ordering: OrderingView[];
 }
