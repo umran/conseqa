@@ -243,10 +243,12 @@ export function SystemView() {
       {graph.operations.map((op) => {
         const p = layout.pos.get(op.id);
         if (!p) return null;
+        // S and O count the serializability and ordering requirements
+        // the operation's transactions declare; I and R its own.
         const r = op.requirements;
         const badges: string[] = [];
-        if (r.serialization) badges.push(`S${r.serialization}`);
-        if (r.ordering) badges.push(`O${r.ordering}`);
+        if (r.transaction_serializability) badges.push(`S${r.transaction_serializability}`);
+        if (r.transaction_ordering) badges.push(`O${r.transaction_ordering}`);
         if (r.idempotency) badges.push(`I${r.idempotency}`);
         if (r.recoverability) badges.push(`R${r.recoverability}`);
         if (op.machines.length) badges.push("SM");

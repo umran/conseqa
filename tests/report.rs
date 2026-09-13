@@ -34,13 +34,25 @@ fn scaffold_enumerates_requirement_obligations() {
     let report = report::scaffold(&model);
 
     assert_eq!(report.format, report::FORMAT);
-    assert_eq!(report.format, 6);
+    assert_eq!(report.format, 7);
     assert_eq!(report.dsl, Some(conseqa::spec::DSL_VERSION));
     assert_eq!(report.model_revision, Some(1));
 
-    // 3 serialization + 3 ordering + 4 idempotency + 1 result replay
-    // + 3 recoverability.
-    assert_eq!(report.obligations.len(), 14);
+    // 2 transaction serializability + 1 transaction ordering
+    // + 4 idempotency + 1 result replay + 3 recoverability.
+    assert_eq!(report.obligations.len(), 11);
+
+    assert_eq!(
+        report
+            .obligations
+            .iter()
+            .filter(|obligation| matches!(
+                obligation.property,
+                Property::TransactionSerializability | Property::TransactionOrdering
+            ))
+            .count(),
+        3
+    );
 
     assert!(
         report
@@ -75,7 +87,7 @@ fn obligations_carry_real_verdicts() {
 
     let report = report::obligations(&model, &verification::verify(&model));
 
-    assert_eq!(report.obligations.len(), 14);
+    assert_eq!(report.obligations.len(), 11);
 
     let count = |status: Status| {
         report
@@ -85,13 +97,15 @@ fn obligations_carry_real_verdicts() {
             .count()
     };
 
-    // 3 serialization + 3 ordering + apply_payment idempotency +
-    // create_order result replay + create_order/apply_payment
-    // recoverability. create_order's idempotency is unknown through its
-    // cascade: reserve_inventory consumes OrderCreated and is itself
-    // unproven.
-    assert_eq!(count(Status::Proven), 10);
-    assert_eq!(count(Status::Unknown), 4);
+    // apply_payment's serializability and ordering + apply_payment
+    // idempotency + create_order result replay + create_order and
+    // apply_payment recoverability. reserve_inventory's serializability
+    // is the write-skew shape and unproven, its idempotency and
+    // recoverability with it; charge_payment's idempotency is unknown
+    // at the non-deduplicated card charge; create_order's idempotency
+    // is unknown through its cascade into reserve_inventory.
+    assert_eq!(count(Status::Proven), 6);
+    assert_eq!(count(Status::Unknown), 5);
     assert_eq!(count(Status::Disproven), 0);
 
     // Proven obligations state the facts their proofs rely on;

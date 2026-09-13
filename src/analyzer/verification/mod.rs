@@ -8,23 +8,25 @@
 //! A requirement is a proof obligation, not a guarantee: declaring it
 //! does not assert that the operation already satisfies it (§9).
 //!
-//! This module is the model checker. It grew one requirement family
-//! at a time and now discharges all five of §9: operation
-//! serialization (`serialization`), ordering (`ordering`), result
-//! replay consistency (`result_replay`), recoverability
-//! (`recoverability`), and operation idempotency (`idempotency`). The
-//! replay-based three share the replay engine (`replay`) — root
+//! This module is the model checker. It discharges five requirement
+//! families: transaction serializability
+//! (`transaction_serializability`) and transaction ordering
+//! (`transaction_ordering`), which share the model-wide conflict
+//! analysis of `transaction_conflicts`; and the three replay-based
+//! operation families — result replay consistency (`result_replay`),
+//! recoverability (`recoverability`), and operation idempotency
+//! (`idempotency`) — which share the replay engine (`replay`): root
 //! stability, natural transaction replayability, artifact replay
-//! availability, effect-result and decision replay — applied path by
+//! availability, effect-result and decision replay, applied path by
 //! path over the operation program (`paths`). Verifiers that follow
 //! effects into other operations share the trigger graph (`trigger`);
-//! ordering rests on the serialization verifier's key identity and on
-//! idempotency's verdicts for redelivery; idempotency and
-//! recoverability rest on result replay's verdicts wherever a decision
-//! or a value observes a request effect's result. Beyond §9, a
-//! model-wide deadlock checker is earmarked (§27 question 9),
-//! gated on the locking facts the DSL cannot yet state (§27
-//! question 8); no verifier here reasons about locks.
+//! idempotency and recoverability rest on result replay's verdicts
+//! wherever a decision or a value observes a request effect's result;
+//! ordering rests on the serializability prover for its closure. A
+//! model-wide deadlock checker remains earmarked (§71 of the
+//! transaction-consistency revision): strict locking can prove a
+//! serializable committed history while still admitting deadlock, and
+//! the two are never conflated.
 //!
 //! Two rules govern every verdict:
 //!
@@ -36,17 +38,21 @@
 //!    violation (§1.2). An unproven verdict records exactly which
 //!    facts are missing or insufficient, preserving the distinction
 //!    between an explicitly negative declaration (`unbounded`,
-//!    `unordered`) and an absent one (`unspecified`, or an absent
+//!    `distinguishable`) and an absent one (`unspecified`, or an absent
 //!    runtime declaration).
 //!
 //! Every proof is conditional (§1.3, §25): it holds only if the
 //! concrete implementation conforms to the declarations it cites.
 //! Proofs therefore carry the facts they consumed.
 //!
-//! Requirements are L0 obligations, but the facts that discharge them
-//! may come from either layer, and most serialization and ordering
-//! proofs now rest on the L1 runtime model. Every proven verdict
-//! therefore carries a [`ProofScope`]: `RuntimeDependent` marks an
+//! Requirements are L0 obligations, and the facts that discharge them
+//! may come from either layer. Transaction consistency never rests on
+//! L1: serializability and ordering are proven from transaction
+//! primitives alone — isolation, locks, versions, cursors, fences —
+//! because no placement, transport, or capacity fact survives
+//! redelivery, worker replacement, or reordering after failure. The
+//! replay families may still consume delivery facts, so every proven
+//! verdict carries a [`ProofScope`]: `RuntimeDependent` marks an
 //! argument that holds of the declared realization and must be
 //! re-examined when that realization changes. Removing L1 from a valid
 //! model makes such requirements unproven — never violated, and never
@@ -59,12 +65,13 @@
 
 mod describe;
 pub mod idempotency;
-pub mod ordering;
 pub mod paths;
 pub mod recoverability;
 pub mod replay;
 pub mod result_replay;
-pub mod serialization;
+pub mod transaction_conflicts;
+pub mod transaction_ordering;
+pub mod transaction_serializability;
 pub mod trigger;
 pub mod value_identity;
 
@@ -73,10 +80,6 @@ pub use idempotency::{
     ConsumerCollapse, EffectRetrySafety, EffectSafety, IdempotencyCheck, IdempotencyObstacle,
     IdempotencyProof, IdempotencyVerdict, IdentityLineage, LineageFact, LineageSource,
     PathRetrySafety, ProducerRef, RetryRoute, TransactionRetrySafety,
-};
-pub use ordering::{
-    DuplicateCoverage, DuplicateHandling, OrderingCheck, OrderingObstacle, OrderingProof,
-    OrderingVerdict, OutboxPrecedence, PrecedenceSource,
 };
 pub use paths::{DecisionTaken, PathRef};
 pub use recoverability::{
@@ -91,16 +94,27 @@ pub use replay::{
     StableRoot, UnstableRoot,
 };
 pub use result_replay::{
-    ResultReplayCheck, ResultReplayObstacle, ResultReplayProof, ResultReplayVerdict, ReturnedResult,
+    ResultReplayCheck, ResultReplayObstacle, ResultReplayProof, ResultReplayVerdict,
+    RetryableReturn, ReturnedResult,
 };
-pub use serialization::{
-    GroupingScope, InvocationLockKeyFact, KeyIdentity, MessageKeyFact, OutboxPartitionKeyFact,
-    RoutingKeyFact, SerializationCheck, SerializationObstacle, SerializationProof,
-    SerializationVerdict,
+pub use transaction_conflicts::{
+    AccessFields, AccessMode, CommitArtifact, CommitOrderEvidence, ConflictIndex,
+    DependencyEvidence, DependencyGap, DependencyKind, DependencySide, FieldOverlap, LockAccess,
+    LockRef, ManagedFieldRef, SelectorOverlap, TransactionAccess, TransactionRef,
+    TransactionTemplate,
+};
+pub use transaction_ordering::{
+    TransactionOrderingCheck, TransactionOrderingObstacle, TransactionOrderingProof,
+    TransactionOrderingVerdict,
+};
+pub use transaction_serializability::{
+    IsolationFact, TransactionSerializabilityCheck, TransactionSerializabilityObstacle,
+    TransactionSerializabilityProof, TransactionSerializabilityVerdict,
 };
 pub use trigger::{
-    Consumer, EffectContract, OutboxConsumer, OutboxProducer, Producer, ProducerSite,
-    TriggerGraph, collapses_duplicates, effect_contract, key_input, returns_consistently,
+    Consumer, EffectContract, OutboxConsumer, OutboxProducer, OutboxProducerSite, Producer,
+    ProducerSite, TriggerGraph, collapses_duplicates, effect_contract, key_input,
+    returns_consistently,
 };
 pub use value_identity::{CanonicalValuePath, canonical_value_path};
 
@@ -110,11 +124,11 @@ use crate::spec::{DeliverySemantics, Id, Input, Model};
 /// Which semantic layers a successful proof consumed.
 ///
 /// The analyzer reasons across every declared layer, so an L0
-/// obligation may well be discharged from L1 facts. What the scope
-/// records is the dependency: a `RuntimeDependent` proof holds of the
-/// declared runtime realization, and must be re-examined when that
-/// realization changes. The proof's own evidence names the exact
-/// declarations consumed.
+/// obligation may be discharged from L1 facts — a delivery fact, for
+/// a replay-family proof. What the scope records is the dependency: a
+/// `RuntimeDependent` proof holds of the declared runtime realization,
+/// and must be re-examined when that realization changes. The proof's
+/// own evidence names the exact declarations consumed.
 ///
 /// `L0Only` does not mean implementation-free. A proof resting on
 /// `isolation: serializable` is L0-only, and still assumes the
@@ -176,8 +190,9 @@ impl std::fmt::Display for ProofScope {
 #[serde(rename_all = "snake_case")]
 pub enum RemedyLayer {
     /// At least one obstacle names an L0 fact: the operation's
-    /// program, its interface, or the requirement itself. An L1
-    /// declaration alone cannot discharge the obligation.
+    /// program, its transactions, its interface, or the requirement
+    /// itself. An L1 declaration alone cannot discharge the
+    /// obligation.
     Application,
 
     /// Every obstacle names an L1 fact: grouping, ordering, routing,
@@ -195,12 +210,10 @@ impl RemedyLayer {
     /// it lands the obligation re-reports, and what remains routes to
     /// the runtime.
     pub fn joined(layers: impl IntoIterator<Item = Self>) -> Option<Self> {
-        layers
-            .into_iter()
-            .reduce(|a, b| match (a, b) {
-                (Self::Runtime, Self::Runtime) => Self::Runtime,
-                _ => Self::Application,
-            })
+        layers.into_iter().reduce(|a, b| match (a, b) {
+            (Self::Runtime, Self::Runtime) => Self::Runtime,
+            _ => Self::Application,
+        })
     }
 }
 
@@ -397,8 +410,8 @@ pub fn notes(model: &Model) -> Vec<ModelNote> {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct VerificationReport {
-    pub serialization: Vec<SerializationCheck>,
-    pub ordering: Vec<OrderingCheck>,
+    pub transaction_serializability: Vec<TransactionSerializabilityCheck>,
+    pub transaction_ordering: Vec<TransactionOrderingCheck>,
     pub idempotency: Vec<IdempotencyCheck>,
     pub result_replay: Vec<ResultReplayCheck>,
     pub recoverability: Vec<RecoverabilityCheck>,
@@ -417,10 +430,14 @@ impl VerificationReport {
     /// raising alongside, such as guaranteed retries whose safety no
     /// requirement declares.
     pub fn diagnostics(&self) -> Vec<Diagnostic> {
-        self.serialization
+        self.transaction_serializability
             .iter()
-            .filter_map(SerializationCheck::diagnostic)
-            .chain(self.ordering.iter().filter_map(OrderingCheck::diagnostic))
+            .filter_map(TransactionSerializabilityCheck::diagnostic)
+            .chain(
+                self.transaction_ordering
+                    .iter()
+                    .filter_map(TransactionOrderingCheck::diagnostic),
+            )
             .chain(
                 self.idempotency
                     .iter()
@@ -446,13 +463,15 @@ impl VerificationReport {
     }
 
     pub fn all_proven(&self) -> bool {
-        self.serialization
+        self.transaction_serializability.iter().all(|entry| {
+            matches!(
+                entry.verdict,
+                TransactionSerializabilityVerdict::Proven { .. }
+            )
+        }) && self
+            .transaction_ordering
             .iter()
-            .all(|entry| matches!(entry.verdict, SerializationVerdict::Proven { .. }))
-            && self
-                .ordering
-                .iter()
-                .all(|entry| matches!(entry.verdict, OrderingVerdict::Proven { .. }))
+            .all(|entry| matches!(entry.verdict, TransactionOrderingVerdict::Proven { .. }))
             && self
                 .idempotency
                 .iter()
@@ -470,20 +489,21 @@ impl VerificationReport {
 
 /// Verifies every declared requirement the checker currently supports.
 ///
-/// Result replay comes first: it depends on nothing but itself, and
-/// its proven set is what idempotency and recoverability consult when
-/// a decision or a value rests on a request effect's result.
+/// Result replay comes first among the replay families: it depends on
+/// nothing but itself, and its proven set is what idempotency and
+/// recoverability consult when a decision or a value rests on a
+/// request effect's result. The transaction families are independent
+/// of all three — serializability is a property of committed state
+/// histories, not of retries — and ordering invokes the
+/// serializability prover for its own closure.
 pub fn verify(model: &Model) -> VerificationReport {
     let result_replay = result_replay::check(model);
     let consistent = result_replay::consistent_set(&result_replay);
 
-    let idempotency = idempotency::check(model, &consistent);
-    let ordering = ordering::check(model, &idempotency);
-
     VerificationReport {
-        serialization: serialization::check(model),
-        ordering,
-        idempotency,
+        transaction_serializability: transaction_serializability::check(model),
+        transaction_ordering: transaction_ordering::check(model),
+        idempotency: idempotency::check(model, &consistent),
         result_replay,
         recoverability: recoverability::check(model, &consistent),
         notes: notes(model),

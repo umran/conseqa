@@ -117,9 +117,11 @@ entities it is about.
 description, and a fact strip: service, transaction and
 program-step counts, the state machines it drives, verdict tally),
 then three sections as Kumo layer cards. **Requirements** is a table —
-one row per declared requirement with its key, its semantics
-(replay-consistent result, guaranteed completion) and, when a report
-is loaded, the verdict over its obligations; **Inputs** is a table of
+one row per declared requirement, the operation's own and those of
+every transaction in its program, with its key (and position, for
+ordering), its semantics (replay-consistent result, guaranteed
+completion) and, when a report is loaded, the verdict over its
+obligations; **Inputs** is a table of
 what starts an invocation, split by layer: the **L0 contract** (request
 identity and result contract, or the messages a subscription consumes)
 and the **L1 realization** (for a request, the router, its routing key,
@@ -229,8 +231,10 @@ transitions in the machine view inherit theirs.
 ## The obligation report
 
 The report format is `conseqa::analyzer::report` (`ProverReport`,
-`format: 4`): one obligation per declared requirement — serialization,
-ordering, idempotency, result replay (the result half of an idempotency
+`format: 7`): one obligation per declared requirement — transaction
+serializability and transaction ordering (anchored to the transaction
+that declares them, with the operation whose program carries it),
+idempotency, result replay (the result half of an idempotency
 requirement declaring `result: replay_consistent`), recoverability —
 with status `proven`, `disproven`, or `unknown`. Format 2 replaced the
 response-replay property with result replay, dropped object-history
@@ -238,9 +242,15 @@ obligations and the flow subject, and made proofs cite the program
 paths and decisions they rest on; format 3 added proof `scope` and
 rebuilt the serialization and ordering arguments on the L1 runtime
 model; format 4 added `remedy` to unproven serialization and ordering
-obligations. Unknown is epistemic: the checker could not establish the
-property, typically because a required fact is `unspecified` or no V1
-verifier attempts that family. It is never evidence of a violation.
+obligations; formats 5 and 6 followed the outbox and serialization
+revisions; format 7 retired the operation-level serialization and
+ordering properties for `transaction_serializability` and
+`transaction_ordering`, proven from the transactions alone — isolation,
+strict locks, the version protocol, cursors and fences — and never
+from the runtime topology, so those proofs are always `l0_only`.
+Unknown is epistemic: the checker could not establish the property,
+typically because a required fact is `unspecified` or no V1 verifier
+attempts that family. It is never evidence of a violation.
 
 Each obligation carries its `summary`, `subject`, `scope`, `remedy`,
 `assumptions` (the declared facts a proof relies on — conditional, per

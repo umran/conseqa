@@ -1,53 +1,174 @@
 {
-  "format": 6,
-  "dsl": 3,
+  "format": 7,
+  "dsl": 4,
   "model_revision": 1,
   "obligations": [
     {
-      "id": "oblig.operation.apply_payment.serialization.0",
+      "id": "oblig.operation.apply_payment.tx.apply_payment.transaction_serializability.0",
       "property": {
-        "kind": "serialization"
+        "kind": "transaction_serializability"
       },
       "subject": {
-        "kind": "operation",
+        "kind": "transaction",
         "operation": "operation.apply_payment",
+        "transaction": "tx.apply_payment",
         "requirement": 0
       },
       "status": "proven",
-      "summary": "Invocations of operation.apply_payment sharing key input.apply_payment.captured.order_id never overlap.",
-      "scope": "runtime_dependent",
+      "summary": "Executions of tx.apply_payment sharing key input.apply_payment.captured.order_id commit in a history equivalent to some serial order, together with every transaction they may conflict with.",
+      "scope": "l0_only",
       "assumptions": [
-        "topic.order_events declares a keyed grouping for every subscription of it, and input.apply_payment.captured dispatches into pool.order_workers by that grouping key, so same-key deliveries share one routing domain",
-        "for schema.PaymentCaptured, the grouping key order_id is the serialization key field",
-        "consistent_hash assignment gives each routing domain one owning pool member during a stable ownership epoch",
-        "pool.order_workers declares exclusive_ownership execution handoff: when execution authority for a routing domain transfers between members or member incarnations, exclusive execution ownership is preserved, so a stale owner cannot overlap its successor",
-        "pool.order_workers bounds each member to one simultaneously active invocation, so the owning member runs same-key invocations one at a time"
+        "the conflict closure of tx.apply_payment under SerializableBy(input.apply_payment.captured.order_id) is {tx.apply_payment, tx.cancel_order, tx.create_order.new}: every transaction that may touch overlapping state, transitively",
+        "the read-write anti-dependency from `tx.apply_payment` (step 1) to `tx.apply_payment` (step 3) on `object.order` is commit-ordered by version validation: `tx.apply_payment` validates `object.order.version` at commit against the version it observed, and the conflicting mutation advances that version, so a stale observation rejects instead of committing",
+        "the read-write anti-dependency from `tx.apply_payment` (step 1) to `tx.apply_payment` (step 5) on `object.order` is commit-ordered by version validation: `tx.apply_payment` validates `object.order.version` at commit against the version it observed, and the conflicting mutation advances that version, so a stale observation rejects instead of committing",
+        "the read-write anti-dependency from `tx.apply_payment` (step 2) to `tx.apply_payment` (step 5) on `object.order` is commit-ordered by version validation: `tx.apply_payment` validates `object.order.version` at commit against the version it observed, and the conflicting mutation advances that version, so a stale observation rejects instead of committing",
+        "the write-read from `tx.apply_payment` (step 3) to `tx.apply_payment` (step 1) on `object.order` is commit-ordered: `tx.apply_payment` reads under read_committed isolation, so it observes only writes that had already committed",
+        "the write-read from `tx.apply_payment` (step 3) to `tx.apply_payment` (step 3) on `object.order` is commit-ordered by the cursor `object.order.last_applied_sequence` (successor): an older accepted position cannot commit after a newer one",
+        "the read-write anti-dependency from `tx.apply_payment` (step 3) to `tx.apply_payment` (step 3) on `object.order` is commit-ordered by the cursor `object.order.last_applied_sequence` (successor): an older accepted position cannot commit after a newer one",
+        "the write-write from `tx.apply_payment` (step 3) to `tx.apply_payment` (step 3) on `object.order` is commit-ordered by the cursor `object.order.last_applied_sequence` (successor): an older accepted position cannot commit after a newer one",
+        "the read-write anti-dependency from `tx.apply_payment` (step 4) to `tx.apply_payment` (step 4) on `object.order` is commit-ordered by version validation: `tx.apply_payment` validates `object.order.version` at commit against the version it observed, and the conflicting mutation advances that version, so a stale observation rejects instead of committing",
+        "the write-read from `tx.apply_payment` (step 4) to `tx.apply_payment` (step 4) on `object.order` is commit-ordered: `tx.apply_payment` reads under read_committed isolation, so it observes only writes that had already committed",
+        "the write-write from `tx.apply_payment` (step 4) to `tx.apply_payment` (step 4) on `object.order` is commit-ordered: conflicting writes under declared isolation (read_committed and read_committed) are installed in commit order",
+        "the write-read from `tx.apply_payment` (step 5) to `tx.apply_payment` (step 1) on `object.order` is commit-ordered: `tx.apply_payment` reads under read_committed isolation, so it observes only writes that had already committed",
+        "the write-read from `tx.apply_payment` (step 5) to `tx.apply_payment` (step 2) on `object.order` is commit-ordered: `tx.apply_payment` reads under read_committed isolation, so it observes only writes that had already committed",
+        "the write-write from `tx.apply_payment` (step 5) to `tx.apply_payment` (step 5) on `object.order` is commit-ordered: conflicting writes under declared isolation (read_committed and read_committed) are installed in commit order",
+        "the read-write anti-dependency from `tx.apply_payment` (step 1) to `tx.cancel_order` (step 4) on `object.order` is commit-ordered by version validation: `tx.apply_payment` validates `object.order.version` at commit against the version it observed, and the conflicting mutation advances that version, so a stale observation rejects instead of committing",
+        "the read-write anti-dependency from `tx.apply_payment` (step 2) to `tx.cancel_order` (step 4) on `object.order` is commit-ordered by version validation: `tx.apply_payment` validates `object.order.version` at commit against the version it observed, and the conflicting mutation advances that version, so a stale observation rejects instead of committing",
+        "the read-write anti-dependency from `tx.apply_payment` (step 4) to `tx.cancel_order` (step 3) on `object.order` is commit-ordered by version validation: `tx.apply_payment` validates `object.order.version` at commit against the version it observed, and the conflicting mutation advances that version, so a stale observation rejects instead of committing",
+        "the write-read from `tx.apply_payment` (step 4) to `tx.cancel_order` (step 3) on `object.order` is commit-ordered: `tx.cancel_order` reads under read_committed isolation, so it observes only writes that had already committed",
+        "the write-write from `tx.apply_payment` (step 4) to `tx.cancel_order` (step 3) on `object.order` is commit-ordered: conflicting writes under declared isolation (read_committed and read_committed) are installed in commit order",
+        "the write-read from `tx.apply_payment` (step 5) to `tx.cancel_order` (step 1) on `object.order` is commit-ordered: `tx.cancel_order` reads under read_committed isolation, so it observes only writes that had already committed",
+        "the write-read from `tx.apply_payment` (step 5) to `tx.cancel_order` (step 2) on `object.order` is commit-ordered: `tx.cancel_order` reads under read_committed isolation, so it observes only writes that had already committed",
+        "the write-write from `tx.apply_payment` (step 5) to `tx.cancel_order` (step 4) on `object.order` is commit-ordered: conflicting writes under declared isolation (read_committed and read_committed) are installed in commit order",
+        "the read-write anti-dependency from `tx.apply_payment` (step 1) to `tx.create_order.new` (step 1) on `object.order` is commit-ordered by version validation: `tx.apply_payment` validates `object.order.version` at commit against the version it observed, and the conflicting mutation advances that version, so a stale observation rejects instead of committing",
+        "the read-write anti-dependency from `tx.apply_payment` (step 2) to `tx.create_order.new` (step 1) on `object.order` is commit-ordered by version validation: `tx.apply_payment` validates `object.order.version` at commit against the version it observed, and the conflicting mutation advances that version, so a stale observation rejects instead of committing",
+        "the read-write anti-dependency from `tx.apply_payment` (step 3) to `tx.create_order.new` (step 1) on `object.order` is commit-ordered by version validation: `tx.apply_payment` validates `object.order.version` at commit against the version it observed, and the conflicting mutation advances that version, so a stale observation rejects instead of committing",
+        "the write-write from `tx.apply_payment` (step 3) to `tx.create_order.new` (step 1) on `object.order` is commit-ordered: conflicting writes under declared isolation (read_committed and read_committed) are installed in commit order",
+        "the read-write anti-dependency from `tx.apply_payment` (step 4) to `tx.create_order.new` (step 1) on `object.order` is commit-ordered by version validation: `tx.apply_payment` validates `object.order.version` at commit against the version it observed, and the conflicting mutation advances that version, so a stale observation rejects instead of committing",
+        "the write-write from `tx.apply_payment` (step 4) to `tx.create_order.new` (step 1) on `object.order` is commit-ordered: conflicting writes under declared isolation (read_committed and read_committed) are installed in commit order",
+        "the write-write from `tx.apply_payment` (step 5) to `tx.create_order.new` (step 1) on `object.order` is commit-ordered: conflicting writes under declared isolation (read_committed and read_committed) are installed in commit order",
+        "the read-write anti-dependency from `tx.cancel_order` (step 1) to `tx.apply_payment` (step 5) on `object.order` is commit-ordered by version validation: `tx.cancel_order` validates `object.order.version` at commit against the version it observed, and the conflicting mutation advances that version, so a stale observation rejects instead of committing",
+        "the read-write anti-dependency from `tx.cancel_order` (step 2) to `tx.apply_payment` (step 5) on `object.order` is commit-ordered by version validation: `tx.cancel_order` validates `object.order.version` at commit against the version it observed, and the conflicting mutation advances that version, so a stale observation rejects instead of committing",
+        "the read-write anti-dependency from `tx.cancel_order` (step 3) to `tx.apply_payment` (step 4) on `object.order` is commit-ordered by version validation: `tx.cancel_order` validates `object.order.version` at commit against the version it observed, and the conflicting mutation advances that version, so a stale observation rejects instead of committing",
+        "the write-read from `tx.cancel_order` (step 3) to `tx.apply_payment` (step 4) on `object.order` is commit-ordered: `tx.apply_payment` reads under read_committed isolation, so it observes only writes that had already committed",
+        "the write-write from `tx.cancel_order` (step 3) to `tx.apply_payment` (step 4) on `object.order` is commit-ordered: conflicting writes under declared isolation (read_committed and read_committed) are installed in commit order",
+        "the write-read from `tx.cancel_order` (step 4) to `tx.apply_payment` (step 1) on `object.order` is commit-ordered: `tx.apply_payment` reads under read_committed isolation, so it observes only writes that had already committed",
+        "the write-read from `tx.cancel_order` (step 4) to `tx.apply_payment` (step 2) on `object.order` is commit-ordered: `tx.apply_payment` reads under read_committed isolation, so it observes only writes that had already committed",
+        "the write-write from `tx.cancel_order` (step 4) to `tx.apply_payment` (step 5) on `object.order` is commit-ordered: conflicting writes under declared isolation (read_committed and read_committed) are installed in commit order",
+        "the read-write anti-dependency from `tx.cancel_order` (step 1) to `tx.cancel_order` (step 4) on `object.order` is commit-ordered by version validation: `tx.cancel_order` validates `object.order.version` at commit against the version it observed, and the conflicting mutation advances that version, so a stale observation rejects instead of committing",
+        "the read-write anti-dependency from `tx.cancel_order` (step 2) to `tx.cancel_order` (step 4) on `object.order` is commit-ordered by version validation: `tx.cancel_order` validates `object.order.version` at commit against the version it observed, and the conflicting mutation advances that version, so a stale observation rejects instead of committing",
+        "the read-write anti-dependency from `tx.cancel_order` (step 3) to `tx.cancel_order` (step 3) on `object.order` is commit-ordered by version validation: `tx.cancel_order` validates `object.order.version` at commit against the version it observed, and the conflicting mutation advances that version, so a stale observation rejects instead of committing",
+        "the write-read from `tx.cancel_order` (step 3) to `tx.cancel_order` (step 3) on `object.order` is commit-ordered: `tx.cancel_order` reads under read_committed isolation, so it observes only writes that had already committed",
+        "the write-write from `tx.cancel_order` (step 3) to `tx.cancel_order` (step 3) on `object.order` is commit-ordered: conflicting writes under declared isolation (read_committed and read_committed) are installed in commit order",
+        "the write-read from `tx.cancel_order` (step 4) to `tx.cancel_order` (step 1) on `object.order` is commit-ordered: `tx.cancel_order` reads under read_committed isolation, so it observes only writes that had already committed",
+        "the write-read from `tx.cancel_order` (step 4) to `tx.cancel_order` (step 2) on `object.order` is commit-ordered: `tx.cancel_order` reads under read_committed isolation, so it observes only writes that had already committed",
+        "the write-write from `tx.cancel_order` (step 4) to `tx.cancel_order` (step 4) on `object.order` is commit-ordered: conflicting writes under declared isolation (read_committed and read_committed) are installed in commit order",
+        "the read-write anti-dependency from `tx.cancel_order` (step 1) to `tx.create_order.new` (step 1) on `object.order` is commit-ordered by version validation: `tx.cancel_order` validates `object.order.version` at commit against the version it observed, and the conflicting mutation advances that version, so a stale observation rejects instead of committing",
+        "the read-write anti-dependency from `tx.cancel_order` (step 2) to `tx.create_order.new` (step 1) on `object.order` is commit-ordered by version validation: `tx.cancel_order` validates `object.order.version` at commit against the version it observed, and the conflicting mutation advances that version, so a stale observation rejects instead of committing",
+        "the read-write anti-dependency from `tx.cancel_order` (step 3) to `tx.create_order.new` (step 1) on `object.order` is commit-ordered by version validation: `tx.cancel_order` validates `object.order.version` at commit against the version it observed, and the conflicting mutation advances that version, so a stale observation rejects instead of committing",
+        "the write-write from `tx.cancel_order` (step 3) to `tx.create_order.new` (step 1) on `object.order` is commit-ordered: conflicting writes under declared isolation (read_committed and read_committed) are installed in commit order",
+        "the write-write from `tx.cancel_order` (step 4) to `tx.create_order.new` (step 1) on `object.order` is commit-ordered: conflicting writes under declared isolation (read_committed and read_committed) are installed in commit order",
+        "the write-read from `tx.create_order.new` (step 1) to `tx.apply_payment` (step 1) on `object.order` is commit-ordered: `tx.apply_payment` reads under read_committed isolation, so it observes only writes that had already committed",
+        "the write-read from `tx.create_order.new` (step 1) to `tx.apply_payment` (step 2) on `object.order` is commit-ordered: `tx.apply_payment` reads under read_committed isolation, so it observes only writes that had already committed",
+        "the write-read from `tx.create_order.new` (step 1) to `tx.apply_payment` (step 3) on `object.order` is commit-ordered: `tx.apply_payment` reads under read_committed isolation, so it observes only writes that had already committed",
+        "the write-write from `tx.create_order.new` (step 1) to `tx.apply_payment` (step 3) on `object.order` is commit-ordered: conflicting writes under declared isolation (read_committed and read_committed) are installed in commit order",
+        "the write-read from `tx.create_order.new` (step 1) to `tx.apply_payment` (step 4) on `object.order` is commit-ordered: `tx.apply_payment` reads under read_committed isolation, so it observes only writes that had already committed",
+        "the write-write from `tx.create_order.new` (step 1) to `tx.apply_payment` (step 4) on `object.order` is commit-ordered: conflicting writes under declared isolation (read_committed and read_committed) are installed in commit order",
+        "the write-write from `tx.create_order.new` (step 1) to `tx.apply_payment` (step 5) on `object.order` is commit-ordered: conflicting writes under declared isolation (read_committed and read_committed) are installed in commit order",
+        "the write-read from `tx.create_order.new` (step 1) to `tx.cancel_order` (step 1) on `object.order` is commit-ordered: `tx.cancel_order` reads under read_committed isolation, so it observes only writes that had already committed",
+        "the write-read from `tx.create_order.new` (step 1) to `tx.cancel_order` (step 2) on `object.order` is commit-ordered: `tx.cancel_order` reads under read_committed isolation, so it observes only writes that had already committed",
+        "the write-read from `tx.create_order.new` (step 1) to `tx.cancel_order` (step 3) on `object.order` is commit-ordered: `tx.cancel_order` reads under read_committed isolation, so it observes only writes that had already committed",
+        "the write-write from `tx.create_order.new` (step 1) to `tx.cancel_order` (step 3) on `object.order` is commit-ordered: conflicting writes under declared isolation (read_committed and read_committed) are installed in commit order",
+        "the write-write from `tx.create_order.new` (step 1) to `tx.cancel_order` (step 4) on `object.order` is commit-ordered: conflicting writes under declared isolation (read_committed and read_committed) are installed in commit order",
+        "the write-write from `tx.create_order.new` (step 1) to `tx.create_order.new` (step 1) on `object.order` is commit-ordered: conflicting writes under declared isolation (read_committed and read_committed) are installed in commit order",
+        "no cyclic conflict component contains an unconstrained dependency: an apparent cycle would imply a cycle in strict commit order and cannot occur in a committed history"
       ],
       "evidence": []
     },
     {
-      "id": "oblig.operation.apply_payment.ordering.0",
+      "id": "oblig.operation.apply_payment.tx.apply_payment.transaction_ordering.0",
       "property": {
-        "kind": "ordering"
+        "kind": "transaction_ordering"
       },
       "subject": {
-        "kind": "operation",
+        "kind": "transaction",
         "operation": "operation.apply_payment",
+        "transaction": "tx.apply_payment",
         "requirement": 0
       },
       "status": "proven",
-      "summary": "Invocations of operation.apply_payment sharing key input.apply_payment.captured.order_id take effect in their semantic order.",
-      "scope": "runtime_dependent",
+      "summary": "Executions of tx.apply_payment sharing key input.apply_payment.captured.order_id take effect in the order of input.apply_payment.captured.sequence.",
+      "scope": "l0_only",
       "assumptions": [
-        "the transport for topic.order_events orders messages within a group; that order is the precedence",
-        "topic.order_events declares a keyed grouping for every subscription of it",
-        "for schema.PaymentCaptured, the grouping key order_id is the ordering key field",
-        "input.apply_payment.captured dispatches by the grouping key, so same-key deliveries belong to the one routing domain the grouping established",
-        "consistent_hash assignment gives each routing domain one owning pool member during a stable ownership epoch",
-        "pool.order_workers declares exclusive_ownership execution handoff: when execution authority for a routing domain transfers between members or member incarnations, exclusive execution ownership is preserved, so a stale owner cannot overlap its successor",
-        "pool.order_workers bounds each member to one simultaneously active invocation, so a later invocation cannot overtake an earlier one",
-        "dispatch preserves the transport's established same-key precedence when admitting invocations, including across failure-driven redelivery and ownership reassignment",
-        "a duplicate of a completed delivery repeats an invocation that already took effect in order; its work is idempotency requirement #0's obligation (proven)"
+        "transaction state history is serializable:",
+        "  the conflict closure of tx.apply_payment under SerializableBy(input.apply_payment.captured.order_id) is {tx.apply_payment, tx.cancel_order, tx.create_order.new}: every transaction that may touch overlapping state, transitively",
+        "  the read-write anti-dependency from `tx.apply_payment` (step 1) to `tx.apply_payment` (step 3) on `object.order` is commit-ordered by version validation: `tx.apply_payment` validates `object.order.version` at commit against the version it observed, and the conflicting mutation advances that version, so a stale observation rejects instead of committing",
+        "  the read-write anti-dependency from `tx.apply_payment` (step 1) to `tx.apply_payment` (step 5) on `object.order` is commit-ordered by version validation: `tx.apply_payment` validates `object.order.version` at commit against the version it observed, and the conflicting mutation advances that version, so a stale observation rejects instead of committing",
+        "  the read-write anti-dependency from `tx.apply_payment` (step 2) to `tx.apply_payment` (step 5) on `object.order` is commit-ordered by version validation: `tx.apply_payment` validates `object.order.version` at commit against the version it observed, and the conflicting mutation advances that version, so a stale observation rejects instead of committing",
+        "  the write-read from `tx.apply_payment` (step 3) to `tx.apply_payment` (step 1) on `object.order` is commit-ordered: `tx.apply_payment` reads under read_committed isolation, so it observes only writes that had already committed",
+        "  the write-read from `tx.apply_payment` (step 3) to `tx.apply_payment` (step 3) on `object.order` is commit-ordered by the cursor `object.order.last_applied_sequence` (successor): an older accepted position cannot commit after a newer one",
+        "  the read-write anti-dependency from `tx.apply_payment` (step 3) to `tx.apply_payment` (step 3) on `object.order` is commit-ordered by the cursor `object.order.last_applied_sequence` (successor): an older accepted position cannot commit after a newer one",
+        "  the write-write from `tx.apply_payment` (step 3) to `tx.apply_payment` (step 3) on `object.order` is commit-ordered by the cursor `object.order.last_applied_sequence` (successor): an older accepted position cannot commit after a newer one",
+        "  the read-write anti-dependency from `tx.apply_payment` (step 4) to `tx.apply_payment` (step 4) on `object.order` is commit-ordered by version validation: `tx.apply_payment` validates `object.order.version` at commit against the version it observed, and the conflicting mutation advances that version, so a stale observation rejects instead of committing",
+        "  the write-read from `tx.apply_payment` (step 4) to `tx.apply_payment` (step 4) on `object.order` is commit-ordered: `tx.apply_payment` reads under read_committed isolation, so it observes only writes that had already committed",
+        "  the write-write from `tx.apply_payment` (step 4) to `tx.apply_payment` (step 4) on `object.order` is commit-ordered: conflicting writes under declared isolation (read_committed and read_committed) are installed in commit order",
+        "  the write-read from `tx.apply_payment` (step 5) to `tx.apply_payment` (step 1) on `object.order` is commit-ordered: `tx.apply_payment` reads under read_committed isolation, so it observes only writes that had already committed",
+        "  the write-read from `tx.apply_payment` (step 5) to `tx.apply_payment` (step 2) on `object.order` is commit-ordered: `tx.apply_payment` reads under read_committed isolation, so it observes only writes that had already committed",
+        "  the write-write from `tx.apply_payment` (step 5) to `tx.apply_payment` (step 5) on `object.order` is commit-ordered: conflicting writes under declared isolation (read_committed and read_committed) are installed in commit order",
+        "  the read-write anti-dependency from `tx.apply_payment` (step 1) to `tx.cancel_order` (step 4) on `object.order` is commit-ordered by version validation: `tx.apply_payment` validates `object.order.version` at commit against the version it observed, and the conflicting mutation advances that version, so a stale observation rejects instead of committing",
+        "  the read-write anti-dependency from `tx.apply_payment` (step 2) to `tx.cancel_order` (step 4) on `object.order` is commit-ordered by version validation: `tx.apply_payment` validates `object.order.version` at commit against the version it observed, and the conflicting mutation advances that version, so a stale observation rejects instead of committing",
+        "  the read-write anti-dependency from `tx.apply_payment` (step 4) to `tx.cancel_order` (step 3) on `object.order` is commit-ordered by version validation: `tx.apply_payment` validates `object.order.version` at commit against the version it observed, and the conflicting mutation advances that version, so a stale observation rejects instead of committing",
+        "  the write-read from `tx.apply_payment` (step 4) to `tx.cancel_order` (step 3) on `object.order` is commit-ordered: `tx.cancel_order` reads under read_committed isolation, so it observes only writes that had already committed",
+        "  the write-write from `tx.apply_payment` (step 4) to `tx.cancel_order` (step 3) on `object.order` is commit-ordered: conflicting writes under declared isolation (read_committed and read_committed) are installed in commit order",
+        "  the write-read from `tx.apply_payment` (step 5) to `tx.cancel_order` (step 1) on `object.order` is commit-ordered: `tx.cancel_order` reads under read_committed isolation, so it observes only writes that had already committed",
+        "  the write-read from `tx.apply_payment` (step 5) to `tx.cancel_order` (step 2) on `object.order` is commit-ordered: `tx.cancel_order` reads under read_committed isolation, so it observes only writes that had already committed",
+        "  the write-write from `tx.apply_payment` (step 5) to `tx.cancel_order` (step 4) on `object.order` is commit-ordered: conflicting writes under declared isolation (read_committed and read_committed) are installed in commit order",
+        "  the read-write anti-dependency from `tx.apply_payment` (step 1) to `tx.create_order.new` (step 1) on `object.order` is commit-ordered by version validation: `tx.apply_payment` validates `object.order.version` at commit against the version it observed, and the conflicting mutation advances that version, so a stale observation rejects instead of committing",
+        "  the read-write anti-dependency from `tx.apply_payment` (step 2) to `tx.create_order.new` (step 1) on `object.order` is commit-ordered by version validation: `tx.apply_payment` validates `object.order.version` at commit against the version it observed, and the conflicting mutation advances that version, so a stale observation rejects instead of committing",
+        "  the read-write anti-dependency from `tx.apply_payment` (step 3) to `tx.create_order.new` (step 1) on `object.order` is commit-ordered by version validation: `tx.apply_payment` validates `object.order.version` at commit against the version it observed, and the conflicting mutation advances that version, so a stale observation rejects instead of committing",
+        "  the write-write from `tx.apply_payment` (step 3) to `tx.create_order.new` (step 1) on `object.order` is commit-ordered: conflicting writes under declared isolation (read_committed and read_committed) are installed in commit order",
+        "  the read-write anti-dependency from `tx.apply_payment` (step 4) to `tx.create_order.new` (step 1) on `object.order` is commit-ordered by version validation: `tx.apply_payment` validates `object.order.version` at commit against the version it observed, and the conflicting mutation advances that version, so a stale observation rejects instead of committing",
+        "  the write-write from `tx.apply_payment` (step 4) to `tx.create_order.new` (step 1) on `object.order` is commit-ordered: conflicting writes under declared isolation (read_committed and read_committed) are installed in commit order",
+        "  the write-write from `tx.apply_payment` (step 5) to `tx.create_order.new` (step 1) on `object.order` is commit-ordered: conflicting writes under declared isolation (read_committed and read_committed) are installed in commit order",
+        "  the read-write anti-dependency from `tx.cancel_order` (step 1) to `tx.apply_payment` (step 5) on `object.order` is commit-ordered by version validation: `tx.cancel_order` validates `object.order.version` at commit against the version it observed, and the conflicting mutation advances that version, so a stale observation rejects instead of committing",
+        "  the read-write anti-dependency from `tx.cancel_order` (step 2) to `tx.apply_payment` (step 5) on `object.order` is commit-ordered by version validation: `tx.cancel_order` validates `object.order.version` at commit against the version it observed, and the conflicting mutation advances that version, so a stale observation rejects instead of committing",
+        "  the read-write anti-dependency from `tx.cancel_order` (step 3) to `tx.apply_payment` (step 4) on `object.order` is commit-ordered by version validation: `tx.cancel_order` validates `object.order.version` at commit against the version it observed, and the conflicting mutation advances that version, so a stale observation rejects instead of committing",
+        "  the write-read from `tx.cancel_order` (step 3) to `tx.apply_payment` (step 4) on `object.order` is commit-ordered: `tx.apply_payment` reads under read_committed isolation, so it observes only writes that had already committed",
+        "  the write-write from `tx.cancel_order` (step 3) to `tx.apply_payment` (step 4) on `object.order` is commit-ordered: conflicting writes under declared isolation (read_committed and read_committed) are installed in commit order",
+        "  the write-read from `tx.cancel_order` (step 4) to `tx.apply_payment` (step 1) on `object.order` is commit-ordered: `tx.apply_payment` reads under read_committed isolation, so it observes only writes that had already committed",
+        "  the write-read from `tx.cancel_order` (step 4) to `tx.apply_payment` (step 2) on `object.order` is commit-ordered: `tx.apply_payment` reads under read_committed isolation, so it observes only writes that had already committed",
+        "  the write-write from `tx.cancel_order` (step 4) to `tx.apply_payment` (step 5) on `object.order` is commit-ordered: conflicting writes under declared isolation (read_committed and read_committed) are installed in commit order",
+        "  the read-write anti-dependency from `tx.cancel_order` (step 1) to `tx.cancel_order` (step 4) on `object.order` is commit-ordered by version validation: `tx.cancel_order` validates `object.order.version` at commit against the version it observed, and the conflicting mutation advances that version, so a stale observation rejects instead of committing",
+        "  the read-write anti-dependency from `tx.cancel_order` (step 2) to `tx.cancel_order` (step 4) on `object.order` is commit-ordered by version validation: `tx.cancel_order` validates `object.order.version` at commit against the version it observed, and the conflicting mutation advances that version, so a stale observation rejects instead of committing",
+        "  the read-write anti-dependency from `tx.cancel_order` (step 3) to `tx.cancel_order` (step 3) on `object.order` is commit-ordered by version validation: `tx.cancel_order` validates `object.order.version` at commit against the version it observed, and the conflicting mutation advances that version, so a stale observation rejects instead of committing",
+        "  the write-read from `tx.cancel_order` (step 3) to `tx.cancel_order` (step 3) on `object.order` is commit-ordered: `tx.cancel_order` reads under read_committed isolation, so it observes only writes that had already committed",
+        "  the write-write from `tx.cancel_order` (step 3) to `tx.cancel_order` (step 3) on `object.order` is commit-ordered: conflicting writes under declared isolation (read_committed and read_committed) are installed in commit order",
+        "  the write-read from `tx.cancel_order` (step 4) to `tx.cancel_order` (step 1) on `object.order` is commit-ordered: `tx.cancel_order` reads under read_committed isolation, so it observes only writes that had already committed",
+        "  the write-read from `tx.cancel_order` (step 4) to `tx.cancel_order` (step 2) on `object.order` is commit-ordered: `tx.cancel_order` reads under read_committed isolation, so it observes only writes that had already committed",
+        "  the write-write from `tx.cancel_order` (step 4) to `tx.cancel_order` (step 4) on `object.order` is commit-ordered: conflicting writes under declared isolation (read_committed and read_committed) are installed in commit order",
+        "  the read-write anti-dependency from `tx.cancel_order` (step 1) to `tx.create_order.new` (step 1) on `object.order` is commit-ordered by version validation: `tx.cancel_order` validates `object.order.version` at commit against the version it observed, and the conflicting mutation advances that version, so a stale observation rejects instead of committing",
+        "  the read-write anti-dependency from `tx.cancel_order` (step 2) to `tx.create_order.new` (step 1) on `object.order` is commit-ordered by version validation: `tx.cancel_order` validates `object.order.version` at commit against the version it observed, and the conflicting mutation advances that version, so a stale observation rejects instead of committing",
+        "  the read-write anti-dependency from `tx.cancel_order` (step 3) to `tx.create_order.new` (step 1) on `object.order` is commit-ordered by version validation: `tx.cancel_order` validates `object.order.version` at commit against the version it observed, and the conflicting mutation advances that version, so a stale observation rejects instead of committing",
+        "  the write-write from `tx.cancel_order` (step 3) to `tx.create_order.new` (step 1) on `object.order` is commit-ordered: conflicting writes under declared isolation (read_committed and read_committed) are installed in commit order",
+        "  the write-write from `tx.cancel_order` (step 4) to `tx.create_order.new` (step 1) on `object.order` is commit-ordered: conflicting writes under declared isolation (read_committed and read_committed) are installed in commit order",
+        "  the write-read from `tx.create_order.new` (step 1) to `tx.apply_payment` (step 1) on `object.order` is commit-ordered: `tx.apply_payment` reads under read_committed isolation, so it observes only writes that had already committed",
+        "  the write-read from `tx.create_order.new` (step 1) to `tx.apply_payment` (step 2) on `object.order` is commit-ordered: `tx.apply_payment` reads under read_committed isolation, so it observes only writes that had already committed",
+        "  the write-read from `tx.create_order.new` (step 1) to `tx.apply_payment` (step 3) on `object.order` is commit-ordered: `tx.apply_payment` reads under read_committed isolation, so it observes only writes that had already committed",
+        "  the write-write from `tx.create_order.new` (step 1) to `tx.apply_payment` (step 3) on `object.order` is commit-ordered: conflicting writes under declared isolation (read_committed and read_committed) are installed in commit order",
+        "  the write-read from `tx.create_order.new` (step 1) to `tx.apply_payment` (step 4) on `object.order` is commit-ordered: `tx.apply_payment` reads under read_committed isolation, so it observes only writes that had already committed",
+        "  the write-write from `tx.create_order.new` (step 1) to `tx.apply_payment` (step 4) on `object.order` is commit-ordered: conflicting writes under declared isolation (read_committed and read_committed) are installed in commit order",
+        "  the write-write from `tx.create_order.new` (step 1) to `tx.apply_payment` (step 5) on `object.order` is commit-ordered: conflicting writes under declared isolation (read_committed and read_committed) are installed in commit order",
+        "  the write-read from `tx.create_order.new` (step 1) to `tx.cancel_order` (step 1) on `object.order` is commit-ordered: `tx.cancel_order` reads under read_committed isolation, so it observes only writes that had already committed",
+        "  the write-read from `tx.create_order.new` (step 1) to `tx.cancel_order` (step 2) on `object.order` is commit-ordered: `tx.cancel_order` reads under read_committed isolation, so it observes only writes that had already committed",
+        "  the write-read from `tx.create_order.new` (step 1) to `tx.cancel_order` (step 3) on `object.order` is commit-ordered: `tx.cancel_order` reads under read_committed isolation, so it observes only writes that had already committed",
+        "  the write-write from `tx.create_order.new` (step 1) to `tx.cancel_order` (step 3) on `object.order` is commit-ordered: conflicting writes under declared isolation (read_committed and read_committed) are installed in commit order",
+        "  the write-write from `tx.create_order.new` (step 1) to `tx.cancel_order` (step 4) on `object.order` is commit-ordered: conflicting writes under declared isolation (read_committed and read_committed) are installed in commit order",
+        "  the write-write from `tx.create_order.new` (step 1) to `tx.create_order.new` (step 1) on `object.order` is commit-ordered: conflicting writes under declared isolation (read_committed and read_committed) are installed in commit order",
+        "  no cyclic conflict component contains an unconstrained dependency: an apparent cycle would imply a cycle in strict commit order and cannot occur in a committed history",
+        "the ordering key input.apply_payment.captured.order_id identifies the cursor domain: every identity field of object.order is pinned by it or by a literal",
+        "the logical position input.apply_payment.captured.sequence is persisted as cursor object.order.last_applied_sequence under the successor rule at step 3: the transaction commits only when the position is admissible after the stored one, so an older accepted position cannot commit after a newer one",
+        "the successor rule additionally makes accepted progression gap-free: a stale, duplicate, or skipped position rejects",
+        "no ordinary write touches object.order.last_applied_sequence, and every advance of it uses the successor rule"
       ],
       "evidence": []
     },
@@ -65,12 +186,18 @@
       "summary": "Repeated attempts at operation.apply_payment sharing the declared key produce the effects of a single invocation.",
       "scope": "l0_only",
       "assumptions": [
-        "tx.apply_payment commits are deduplicated by input.apply_payment.captured.event_id, stable across the attempt class",
-        "duplicate executions of effect.order.paid publish the same logical message under topic.order_events's message identity (intent intent.apply_payment.order_paid is recovered from tx.apply_payment's keyed commit)",
-        "no modeled subscription on topic.order_events admits schema.OrderPaid; the cascade ends at the topic",
+        "on committed(tx.apply_payment): tx.apply_payment is committed on every attempt: tx.apply_payment commits are deduplicated by input.apply_payment.captured.event_id, so every attempt resolves the one commit",
+        "on committed(tx.apply_payment): tx.apply_payment commits are deduplicated by input.apply_payment.captured.event_id, stable across the attempt class",
+        "on committed(tx.apply_payment): duplicate executions of effect.order.paid publish the same logical message under topic.order_events's message identity (intent intent.apply_payment.order_paid is recovered from tx.apply_payment's keyed commit)",
+        "on committed(tx.apply_payment): no modeled subscription on topic.order_events admits schema.OrderPaid; the cascade ends at the topic",
         "the identity of schema.PaymentCaptured on topic.order_events is carried by its producer's idempotency key (input.charge_payment.reserved.event_id, requirement #0): declared propagation from operation.charge_payment through effect.charge_payment.publish_captured"
       ],
-      "evidence": []
+      "evidence": [
+        {
+          "subject": "tx.apply_payment",
+          "message": "the outcome of tx.apply_payment is not established to replay; a rejection commits nothing and performs only its rejection block's work, judged duplicate-safe on its own path, so divergence between rejection and commit cannot duplicate modeled work — the returned result is the result-replay obligation's concern."
+        }
+      ]
     },
     {
       "id": "oblig.operation.apply_payment.recoverability.0",
@@ -87,56 +214,8 @@
       "scope": "runtime_dependent",
       "assumptions": [
         "input.apply_payment.captured redelivers via topic.order_events at least once, re-driving interrupted invocations",
-        "tx.apply_payment resolves on re-encounter through its keyed commit (input.apply_payment.captured.event_id)",
-        "artifact intent.apply_payment.order_paid is recovered from tx.apply_payment's keyed commit on resumption"
-      ],
-      "evidence": []
-    },
-    {
-      "id": "oblig.operation.charge_payment.serialization.0",
-      "property": {
-        "kind": "serialization"
-      },
-      "subject": {
-        "kind": "operation",
-        "operation": "operation.charge_payment",
-        "requirement": 0
-      },
-      "status": "proven",
-      "summary": "Invocations of operation.charge_payment sharing key input.charge_payment.reserved.order_id never overlap.",
-      "scope": "runtime_dependent",
-      "assumptions": [
-        "topic.order_events declares a keyed grouping for every subscription of it, and input.charge_payment.reserved dispatches into pool.payment_workers by that grouping key, so same-key deliveries share one routing domain",
-        "for schema.InventoryReserved, the grouping key order_id is the serialization key field",
-        "consistent_hash assignment gives each routing domain one owning pool member during a stable ownership epoch",
-        "pool.payment_workers declares exclusive_ownership execution handoff: when execution authority for a routing domain transfers between members or member incarnations, exclusive execution ownership is preserved, so a stale owner cannot overlap its successor",
-        "pool.payment_workers bounds each member to one simultaneously active invocation, so the owning member runs same-key invocations one at a time"
-      ],
-      "evidence": []
-    },
-    {
-      "id": "oblig.operation.charge_payment.ordering.0",
-      "property": {
-        "kind": "ordering"
-      },
-      "subject": {
-        "kind": "operation",
-        "operation": "operation.charge_payment",
-        "requirement": 0
-      },
-      "status": "proven",
-      "summary": "Invocations of operation.charge_payment sharing key input.charge_payment.reserved.order_id take effect in their semantic order.",
-      "scope": "runtime_dependent",
-      "assumptions": [
-        "the transport for topic.order_events orders messages within a group; that order is the precedence",
-        "topic.order_events declares a keyed grouping for every subscription of it",
-        "for schema.InventoryReserved, the grouping key order_id is the ordering key field",
-        "input.charge_payment.reserved dispatches by the grouping key, so same-key deliveries belong to the one routing domain the grouping established",
-        "consistent_hash assignment gives each routing domain one owning pool member during a stable ownership epoch",
-        "pool.payment_workers declares exclusive_ownership execution handoff: when execution authority for a routing domain transfers between members or member incarnations, exclusive execution ownership is preserved, so a stale owner cannot overlap its successor",
-        "pool.payment_workers bounds each member to one simultaneously active invocation, so a later invocation cannot overtake an earlier one",
-        "dispatch preserves the transport's established same-key precedence when admitting invocations, including across failure-driven redelivery and ownership reassignment",
-        "a duplicate of a completed delivery repeats an invocation that already took effect in order; its work is idempotency requirement #0's obligation (unproven)"
+        "on committed(tx.apply_payment): tx.apply_payment resolves on re-encounter through its keyed commit (input.apply_payment.captured.event_id)",
+        "on committed(tx.apply_payment): artifact intent.apply_payment.order_paid is recovered from tx.apply_payment's keyed commit on resumption"
       ],
       "evidence": []
     },
@@ -165,7 +244,7 @@
         },
         {
           "subject": "effect.charge_payment.publish_failed",
-          "message": "The instance `effect.charge_payment.publish_failed` constructs on the path `err(result.charge_payment.card)` depends on roots that are not replay-stable: `reason` (effect result `result.charge_payment.card` of `effect.charge_payment.card` is not replay-stable: the external boundary declares no terminal-result replay guarantee, so no same-identity terminal result is fixed)."
+          "message": "The instance `effect.charge_payment.publish_failed` constructs on the path `err:declined(result.charge_payment.card)` depends on roots that are not replay-stable: `reason` (effect result `result.charge_payment.card` of `effect.charge_payment.card` is not replay-stable: the external boundary declares no terminal-result replay guarantee, so no same-identity terminal result is fixed)."
         }
       ]
     },
@@ -229,52 +308,42 @@
       "evidence": []
     },
     {
-      "id": "oblig.operation.reserve_inventory.serialization.0",
+      "id": "oblig.operation.reserve_inventory.tx.reserve_inventory.transaction_serializability.0",
       "property": {
-        "kind": "serialization"
+        "kind": "transaction_serializability"
       },
       "subject": {
-        "kind": "operation",
+        "kind": "transaction",
         "operation": "operation.reserve_inventory",
+        "transaction": "tx.reserve_inventory",
         "requirement": 0
       },
-      "status": "proven",
-      "summary": "Invocations of operation.reserve_inventory sharing key input.reserve_inventory.created.order_id never overlap.",
-      "scope": "runtime_dependent",
-      "assumptions": [
-        "topic.order_events declares a keyed grouping for every subscription of it, and input.reserve_inventory.created dispatches into pool.order_workers by that grouping key, so same-key deliveries share one routing domain",
-        "for schema.OrderCreated, the grouping key order_id is the serialization key field",
-        "consistent_hash assignment gives each routing domain one owning pool member during a stable ownership epoch",
-        "pool.order_workers declares exclusive_ownership execution handoff: when execution authority for a routing domain transfers between members or member incarnations, exclusive execution ownership is preserved, so a stale owner cannot overlap its successor",
-        "pool.order_workers bounds each member to one simultaneously active invocation, so the owning member runs same-key invocations one at a time"
-      ],
-      "evidence": []
-    },
-    {
-      "id": "oblig.operation.reserve_inventory.ordering.0",
-      "property": {
-        "kind": "ordering"
-      },
-      "subject": {
-        "kind": "operation",
-        "operation": "operation.reserve_inventory",
-        "requirement": 0
-      },
-      "status": "proven",
-      "summary": "Invocations of operation.reserve_inventory sharing key input.reserve_inventory.created.order_id take effect in their semantic order.",
-      "scope": "runtime_dependent",
-      "assumptions": [
-        "the transport for topic.order_events orders messages within a group; that order is the precedence",
-        "topic.order_events declares a keyed grouping for every subscription of it",
-        "for schema.OrderCreated, the grouping key order_id is the ordering key field",
-        "input.reserve_inventory.created dispatches by the grouping key, so same-key deliveries belong to the one routing domain the grouping established",
-        "consistent_hash assignment gives each routing domain one owning pool member during a stable ownership epoch",
-        "pool.order_workers declares exclusive_ownership execution handoff: when execution authority for a routing domain transfers between members or member incarnations, exclusive execution ownership is preserved, so a stale owner cannot overlap its successor",
-        "pool.order_workers bounds each member to one simultaneously active invocation, so a later invocation cannot overtake an earlier one",
-        "dispatch preserves the transport's established same-key precedence when admitting invocations, including across failure-driven redelivery and ownership reassignment",
-        "a duplicate of a completed delivery repeats an invocation that already took effect in order; its work is idempotency requirement #0's obligation (unproven)"
-      ],
-      "evidence": []
+      "status": "unknown",
+      "summary": "Executions of tx.reserve_inventory sharing key input.reserve_inventory.created.order_id commit in a history equivalent to some serial order, together with every transaction they may conflict with.",
+      "remedy": "application",
+      "assumptions": [],
+      "evidence": [
+        {
+          "subject": "tx.reserve_inventory",
+          "message": "The serializable-isolation route does not apply: 2 transactions in the conflict closure declare weaker isolation than serializable (`tx.reserve_inventory` is read_committed, `tx.transfer_stock` is read_committed). Every transaction that may conflict must be serializable for that route, since a serializable transaction is serializable only with respect to other serializable ones."
+        },
+        {
+          "subject": "tx.reserve_inventory",
+          "message": "A cyclic conflict component through `tx.reserve_inventory` → `tx.transfer_stock` → `tx.reserve_inventory` contains a dependency no declared fact commit-orders, so a non-serializable committed history through that chain cannot be excluded."
+        },
+        {
+          "subject": "tx.reserve_inventory",
+          "message": "Read-write anti-dependency: `tx.reserve_inventory` may read `object.stock` (step 1) before `tx.reserve_inventory` writes it (step 2), and neither strict locking nor version validation constrains the commit order — the anti-dependency behind write skew. Lock coverage is missing on the reader side: `tx.reserve_inventory` holds no shared or exclusive lock covering its step-1 access to `object.stock`. Lock coverage is missing on the writer side: `tx.reserve_inventory` holds no exclusive lock covering its step-2 access to `object.stock`. `tx.reserve_inventory` does not validate the version of `object.stock` it observed at commit, so a stale observation can still participate in a successful commit. The selected `object.stock` domains could not be proven disjoint, so the dependency is assumed (unknown selector overlap is never treated as disjoint)."
+        },
+        {
+          "subject": "tx.reserve_inventory",
+          "message": "Read-write anti-dependency: `tx.reserve_inventory` may read `object.stock` (step 1) before `tx.transfer_stock` writes it (step 4), and neither strict locking nor version validation constrains the commit order — the anti-dependency behind write skew. Lock coverage is missing on the reader side: `tx.reserve_inventory` holds no shared or exclusive lock covering its step-1 access to `object.stock`. `tx.reserve_inventory` does not validate the version of `object.stock` it observed at commit, so a stale observation can still participate in a successful commit. The selected `object.stock` domains could not be proven disjoint, so the dependency is assumed (unknown selector overlap is never treated as disjoint)."
+        },
+        {
+          "subject": "tx.reserve_inventory",
+          "message": "Read-write anti-dependency: `tx.reserve_inventory` may read `object.stock` (step 1) before `tx.transfer_stock` writes it (step 5), and neither strict locking nor version validation constrains the commit order — the anti-dependency behind write skew. Lock coverage is missing on the reader side: `tx.reserve_inventory` holds no shared or exclusive lock covering its step-1 access to `object.stock`. `tx.reserve_inventory` does not validate the version of `object.stock` it observed at commit, so a stale observation can still participate in a successful commit. The selected `object.stock` domains could not be proven disjoint, so the dependency is assumed (unknown selector overlap is never treated as disjoint)."
+        }
+      ]
     },
     {
       "id": "oblig.operation.reserve_inventory.idempotency.0",

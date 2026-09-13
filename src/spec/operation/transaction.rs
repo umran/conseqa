@@ -40,7 +40,79 @@ pub struct Transaction {
     /// free to prove natural replayability from the body.
     pub idempotency: IdempotencyGuarantee,
 
+    /// The consistency obligations declared on this transaction's
+    /// state history: serializability and ordering, each keyed by a
+    /// value available when the transaction begins.
+    #[serde(default)]
+    pub requirements: TransactionRequirements,
+
     pub steps: Vec<TransactionStep>,
+}
+
+impl Transaction {
+    /// Whether any step of the body is a logical commit guard that may
+    /// reject the whole transaction: a state transition, a version
+    /// validation, a cursor advance, or a fence. Such a transaction
+    /// must carry a `rejected` block at its execution site; one without
+    /// any must not.
+    pub fn rejects(&self) -> bool {
+        self.steps.iter().any(TransactionStep::rejects)
+    }
+}
+
+/// The consistency requirements of one transaction (§7 of the
+/// transaction-consistency revision). Both families are obligations
+/// over the committed state history of every transaction that may
+/// conflict with this one — never over an operation program, and
+/// never discharged by runtime topology.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TransactionRequirements {
+    #[serde(default)]
+    pub serializability: Vec<TransactionSerializabilityRequirement>,
+
+    #[serde(default)]
+    pub ordering: Vec<TransactionOrderingRequirement>,
+}
+
+impl TransactionRequirements {
+    pub fn is_empty(&self) -> bool {
+        self.serializability.is_empty() && self.ordering.is_empty()
+    }
+}
+
+/// `SerializableBy(K)`: executions of this transaction whose evaluated
+/// keys are equal — together with every transaction in their conflict
+/// closure — commit in a history equivalent to some serial order.
+///
+/// The key identifies the logical conflict domain the obligation is
+/// about. It must be available when the transaction begins: an input,
+/// a prior transaction output, or a synchronous result already bound
+/// on the reaching path. It may not derive from a `transaction_read`
+/// performed inside the same transaction.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TransactionSerializabilityRequirement {
+    pub key: ValueRef,
+}
+
+/// `OrderedBy(K, P)`: within each ordering domain identified by `key`,
+/// committed executions of this transaction take effect in the order
+/// of their `position` values.
+///
+/// Both references must be available at transaction entry, and the
+/// position must resolve to a non-optional ordered scalar — `int`,
+/// `decimal`, or `timestamp`. `float` is excluded because NaN and
+/// implementation-specific comparison make it no total order; `uuid`,
+/// `bool`, structured schemas, and lists are not positions. The proof
+/// rests on transaction serializability plus a persisted cursor or
+/// fence whose incoming value is the position; transport precedence
+/// is never a route.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TransactionOrderingRequirement {
+    pub key: ValueRef,
+    pub position: ValueRef,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -61,7 +133,11 @@ pub enum TransactionStep {
     Delete(Delete),
     Lock(Lock),
 
+    /// Applies a state-machine transition: an explicit commit guard
+    /// over the subject's state that rejects the transaction when the
+    /// current state is not among the transition's `from` states.
     Transition(StateTransition),
+
     EstablishEffectIntent(EstablishEffectIntent),
     EstablishTransactionOutput(EstablishTransactionOutput),
 
@@ -69,6 +145,26 @@ pub enum TransactionStep {
     /// transaction's commit — the one legal execution site of an
     /// `OutboxWriteEffect`.
     WriteOutbox(WriteOutboxEffect),
+
+    /// A commit guard over a versioned object: the transaction commits
+    /// only if the object's version at commit arbitration still equals
+    /// the version an earlier read of the same instance observed.
+    ValidateVersion(ValidateVersion),
+
+    /// Advances a versioned object's version by one, atomically with
+    /// the commit. Required beside every write or transition of a live
+    /// versioned instance.
+    BumpVersion(BumpVersion),
+
+    /// A commit guard over an ordered cursor field: the transaction
+    /// commits only when the incoming position is admissible under the
+    /// cursor rule, and then sets the cursor to it atomically.
+    AdvanceCursor(AdvanceCursor),
+
+    /// A commit guard over a fencing-token field: a token older than
+    /// the persisted fence rejects the transaction; an equal token
+    /// leaves the fence; a newer token advances it atomically.
+    Fence(Fence),
 }
 
 impl TransactionStep {
@@ -103,6 +199,36 @@ impl TransactionStep {
                     roots.extend(intent.values.roots());
                 }
 
+                for effect in transition.effects.values() {
+                    roots.extend(effect.values.roots());
+                }
+
+                roots
+            }
+
+            Self::ValidateVersion(validate) => {
+                let mut roots = validate.target.predicate.roots();
+
+                roots.push(&validate.expected);
+
+                roots
+            }
+
+            Self::BumpVersion(bump) => bump.target.predicate.roots(),
+
+            Self::AdvanceCursor(advance) => {
+                let mut roots = advance.target.predicate.roots();
+
+                roots.push(&advance.incoming);
+
+                roots
+            }
+
+            Self::Fence(fence) => {
+                let mut roots = fence.target.predicate.roots();
+
+                roots.push(&fence.token);
+
                 roots
             }
 
@@ -126,6 +252,29 @@ impl TransactionStep {
 
                 roots
             }
+        }
+    }
+
+    /// Whether the step is a logical commit guard that may reject the
+    /// containing transaction. The match is deliberately exhaustive: a
+    /// new step kind must decide here whether it can reject, rather
+    /// than becoming infallible by joining the enum.
+    pub fn rejects(&self) -> bool {
+        match self {
+            Self::Transition(_)
+            | Self::ValidateVersion(_)
+            | Self::AdvanceCursor(_)
+            | Self::Fence(_) => true,
+
+            Self::Read(_)
+            | Self::Write(_)
+            | Self::Insert(_)
+            | Self::Delete(_)
+            | Self::Lock(_)
+            | Self::BumpVersion(_)
+            | Self::EstablishEffectIntent(_)
+            | Self::EstablishTransactionOutput(_)
+            | Self::WriteOutbox(_) => false,
         }
     }
 }
@@ -569,6 +718,17 @@ pub struct StateTransition {
     /// context at this step, so they may reference preceding
     /// transaction reads.
     pub effect_intents: BTreeMap<Id, TransitionEffectIntent>,
+
+    /// The message derivations of the transition's declared outbox
+    /// effects, keyed by the transition's effect ID.
+    ///
+    /// The keys must exactly match the transition's declared
+    /// `effects`. Each message is admitted to its outbox atomically
+    /// with the transaction iff this transition applies; a rejected
+    /// transition admits none of them. The derivations are evaluated
+    /// in the enclosing transaction context at this step.
+    #[serde(default)]
+    pub effects: BTreeMap<Id, TransitionEffectApplication>,
 }
 
 /// One transition side effect's application facts: the concrete
@@ -582,6 +742,117 @@ pub struct TransitionEffectIntent {
 
     /// Provenance of the intent's logical contents.
     pub values: Derivation,
+}
+
+/// One transition-scoped outbox effect's application facts: the
+/// provenance of the complete logical message admitted when the
+/// transition applies. Nothing is bound — an admission has no
+/// synchronous result.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TransitionEffectApplication {
+    /// Provenance of the admitted message's logical contents.
+    pub values: Derivation,
+}
+
+/// The optimistic-concurrency commit guard: the transaction may commit
+/// only if the selected instance's version at commit arbitration still
+/// equals `expected`.
+///
+/// `expected` must be a `transaction_read` of the same target's
+/// declared version field, observed by a preceding read of the same
+/// instance. Mismatch is logical rejection — the check is a commit
+/// guard, not a comparison performed at the step's wall-clock instant
+/// — so a stale observation can never silently participate in a
+/// successful commit. That is what makes it serialization evidence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ValidateVersion {
+    pub target: ObjectSelector,
+    pub expected: ValueRef,
+}
+
+/// `version := version + 1` on the selected instance, atomically with
+/// the commit. The version field is never assigned through a
+/// derivation, and one transaction bumps one selected instance at most
+/// once.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BumpVersion {
+    pub target: ObjectSelector,
+}
+
+/// The ordered-cursor commit guard and the only ordinary update of a
+/// cursor field.
+///
+/// For stored position `S` and incoming position `P`, the transaction
+/// commits only when the rule admits `P` after `S`, and then sets the
+/// cursor to `P` atomically with the commit. An inadmissible position
+/// — stale, duplicate, or (under `successor`) a gap — rejects the
+/// transaction. Two successful advances of one cursor domain are
+/// therefore commit-ordered by their accepted positions, which is what
+/// an `OrderedBy(K, P)` proof consumes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdvanceCursor {
+    pub target: ObjectSelector,
+
+    /// The cursor field on the target object: a non-optional `int`
+    /// under `successor`, or a non-optional `int`, `decimal`, or
+    /// `timestamp` under `monotonic_after`.
+    pub field: FieldPath,
+
+    /// The incoming position, of the cursor field's type.
+    pub incoming: ValueRef,
+
+    pub rule: CursorAdvanceRule,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CursorAdvanceRule {
+    /// Admits `P` iff `P = S + 1`: gap-free progression. A stale or
+    /// duplicate position and a gap both reject.
+    Successor,
+
+    /// Admits `P` iff `P > S`: monotonic progression that permits
+    /// gaps — high-water marks, snapshot versions, log positions,
+    /// superseding updates. Not sufficient where every predecessor
+    /// must be applied.
+    MonotonicAfter,
+}
+
+impl std::fmt::Display for CursorAdvanceRule {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Successor => "successor",
+            Self::MonotonicAfter => "monotonic_after",
+        })
+    }
+}
+
+/// The fencing commit guard: for persisted fence `F` and incoming
+/// token `T`, `T < F` rejects the transaction, `T = F` leaves the
+/// authority valid, and `T > F` advances the fence to `T` atomically
+/// with the commit.
+///
+/// A fence asserts that state protected by the transaction cannot be
+/// mutated by an older authority generation after a newer generation
+/// has been accepted. It does not claim the stale worker has
+/// terminated, and equal tokens establish no relative order — which
+/// is why fencing is not by itself a serializability proof, only an
+/// ordering route on top of one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Fence {
+    pub target: ObjectSelector,
+
+    /// The fence field on the target object: a non-optional `int`,
+    /// `decimal`, or `timestamp`.
+    pub field: FieldPath,
+
+    /// The incoming authority token, of the fence field's type.
+    pub token: ValueRef,
 }
 
 /// Declares an effect contract, constructs one concrete logical effect

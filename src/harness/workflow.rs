@@ -17,10 +17,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::confluence::{
     AnalysisSnapshot, AnalysisState, BundleSpec, ConfluenceEngine, DependencyRequest,
-    DependencyResolution, EvidenceRef, PromptEvidence, PromptObligationStatus,
-    RequirementFamily, SymbolKey, SymbolVersion, TaskKind, WriteGrant, WriteScope,
+    DependencyResolution, EvidenceRef, PromptEvidence, PromptObligationStatus, RequirementFamily,
+    SymbolKey, SymbolVersion, TaskKind, WriteGrant, WriteScope,
 };
-use crate::analyzer::verification::RemedyLayer;
 use crate::spec::{Id, Model, Revision};
 
 use super::scheduler::{LogicalTask, Scheduler, SchedulerError};
@@ -124,6 +123,11 @@ impl Workflow {
 
         // Phases 4–7 repeat to a fixpoint (§75).
         let mut iterations = 0;
+
+        // The runtime realization is authored once per run, after L0
+        // has converged; an author that commits nothing is not asked
+        // again.
+        let mut topology_authored = false;
 
         loop {
             iterations += 1;
@@ -229,9 +233,30 @@ impl Workflow {
                         continue;
                     }
 
-                    // Phase 6–7b: verify, then repair the unproven —
-                    // runtime obstacles through the topology author,
-                    // the rest per operation.
+                    // Phase 6: the runtime realization, authored once
+                    // by a single L1 author after the application model
+                    // and its requirements have settled. It realizes
+                    // the model — placement, transport, grouping,
+                    // capacity — and discharges no obligation: the
+                    // runtime provides no transaction consistency
+                    // guarantee, so nothing below waits on it.
+                    if !topology_authored && self.runtime_unauthored() {
+                        topology_authored = true;
+
+                        self.synthesize_topology().await?;
+
+                        // A commit moves the head; a filed dependency
+                        // request is progress too, and the next
+                        // iteration dispatches it.
+                        if self.engine().head_revision() != before
+                            || !self.engine().open_dependency_requests().is_empty()
+                        {
+                            continue;
+                        }
+                    }
+
+                    // Phase 7: verify, then repair the unproven per
+                    // operation.
                     let repaired = self.repair_unproven(revision).await?;
 
                     if repaired == 0 {
@@ -303,15 +328,20 @@ impl Workflow {
     async fn decompose(&self) -> Result<(), WorkflowError> {
         // Only decompose an empty head; an adopted model skips
         // straight to convergence.
-        if !self.engine().head_snapshot().workspace.operations.is_empty() {
+        if !self
+            .engine()
+            .head_snapshot()
+            .workspace
+            .operations
+            .is_empty()
+        {
             return Ok(());
         }
 
-        let objective =
-            "Decompose the application prompt into the shared architecture skeleton: \
+        let objective = "Decompose the application prompt into the shared architecture skeleton: \
              services, schemas, data models, topics, state machines, one interface per \
              planned operation, and the explicit prompt obligations. Commit one patch."
-                .to_string();
+            .to_string();
 
         self.scheduler
             .run(&LogicalTask {
@@ -510,9 +540,10 @@ impl Workflow {
                 || runtime.storage_layouts.contains_key(&id)
         };
 
-        errors.iter().cloned().partition(|error| {
-            error.runtime || error.subject.as_deref().is_some_and(runtime_owned)
-        })
+        errors
+            .iter()
+            .cloned()
+            .partition(|error| error.runtime || error.subject.as_deref().is_some_and(runtime_owned))
     }
 
     /// Sends the L1 validation obstacles to the single topology
@@ -560,7 +591,7 @@ impl Workflow {
             head.workspace
                 .operations
                 .iter()
-                .filter(|(_, draft)| requirements_empty(&draft.requirements))
+                .filter(|(_, draft)| requirements_empty(draft))
                 .map(|(id, _)| id.clone())
                 .collect()
         };
@@ -588,24 +619,15 @@ impl Workflow {
         Ok(ran)
     }
 
-    /// Phases 6–7: repair every unproven obligation at `revision`.
+    /// Phase 7: repair every unproven obligation at `revision`.
     ///
-    /// Obligations split by the layer their obstacles name. Those
-    /// waiting on the runtime realization go to a single topology task
-    /// holding the whole L1 grant — one writer, because a grouping key,
-    /// its router and the pool it terminates at are one decision.
-    /// Everything else fans out one task per *operation*, each carrying
-    /// all of that operation's unproven obligations.
-    ///
-    /// Topology goes first, and a topology commit ends the round: it
-    /// moves the head, which leaves both the unproven set and its
-    /// remedy classification stale. An obligation classified
-    /// `application` because one of its obstacles was an L0 one may
-    /// have had its runtime obstacles cleared in passing, or not — and
-    /// a repair task created now would pin a snapshot whose analysis
-    /// has not run, so it would carry no obstacle evidence either.
-    /// Re-verifying first costs one loop iteration and repairs against
-    /// facts that are actually current.
+    /// Every obligation is an application-layer matter: transaction
+    /// consistency is proven from the transactions themselves, and
+    /// idempotency, result replay, and recoverability from the
+    /// programs, so no obstacle names the runtime realization. Repairs
+    /// fan out one task per *operation*, each carrying all of that
+    /// operation's unproven obligations — never two concurrent writers
+    /// of one program.
     ///
     /// Returns how many tasks ran.
     async fn repair_unproven(&self, revision: Revision) -> Result<u32, WorkflowError> {
@@ -613,66 +635,41 @@ impl Workflow {
             return Ok(0);
         };
 
-        let (runtime, application): (Vec<RepairTarget>, Vec<RepairTarget>) =
-            unproven_targets(&analysis)
-                .into_iter()
-                .partition(RepairTarget::is_runtime);
+        let targets = unproven_targets(&analysis);
 
-        let mut ran = 0;
+        let tasks = application_repair_tasks(targets, &analysis, self.prompt_evidence());
 
-        if !runtime.is_empty() {
-            let before = self.engine().head_revision();
-
-            ran += self.synthesize_topology(&runtime, &analysis).await?;
-
-            if self.engine().head_revision() != before {
-                return Ok(ran);
-            }
-
-            // The author declined to change anything. Fall through:
-            // the application repairs may still make progress, and
-            // without them a run whose topology is genuinely finished
-            // would stop at the no-progress check with L0 work left.
-        }
-
-        let tasks = application_repair_tasks(application, &analysis, self.prompt_evidence());
-
-        ran += tasks.len() as u32;
+        let ran = tasks.len() as u32;
 
         self.scheduler.run_many(tasks).await?;
 
         Ok(ran)
     }
 
-    /// Runs the single L1 author over the obligations waiting on it.
-    ///
-    /// One task, not one per obligation: the runtime model is shared,
-    /// and two concurrent writers would each see the other's pool and
-    /// router declarations as conflicting writes. Batching them also
-    /// lets the author declare one grouping that discharges several
-    /// requirements at once, which per-obligation tasks cannot see.
-    async fn synthesize_topology(
-        &self,
-        targets: &[RepairTarget],
-        analysis: &AnalysisSnapshot,
-    ) -> Result<u32, WorkflowError> {
-        let listed = targets
-            .iter()
-            .map(|target| format!("- the {}", target.label()))
-            .collect::<Vec<_>>()
-            .join("\n");
+    /// Whether the runtime realization is still unauthored: no pool,
+    /// router, transport, or layout declaration at all.
+    fn runtime_unauthored(&self) -> bool {
+        self.engine().head_snapshot().workspace.runtime.is_empty()
+    }
 
+    /// Runs the single L1 author over the converged application model.
+    ///
+    /// One task, never one per operation: the runtime model is shared,
+    /// and two concurrent writers would each see the other's pool and
+    /// router declarations as conflicting writes. The author realizes
+    /// the model and proves nothing by doing so.
+    async fn synthesize_topology(&self) -> Result<u32, WorkflowError> {
         let task = LogicalTask {
             kind: TaskKind::TopologySynthesis,
-            objective: format!(
-                "Author the runtime topology that discharges these obligations, \
-                 which are unproven for want of L1 facts alone:\n{listed}\n\n\
-                 {}\n\n\
-                 Read `requirement_report` for anything the evidence leaves \
-                 unclear. Leave unproven anything the architecture does not \
-                 genuinely constrain.",
-                inline_obligations(targets, analysis)
-            ),
+            objective: "Author the runtime topology that realizes the application model: \
+                        an execution pool and router for every request boundary, a \
+                        transport declaration and dispatch for every subscription and \
+                        outbox input, and a storage layout for every data object. \
+                        Describe placement, transport, grouping, and capacity only. The \
+                        runtime provides no transaction consistency guarantee, so no \
+                        obligation is discharged here and none should be aimed at; \
+                        leave every application-layer gap to the program authors."
+                .to_string(),
             write_scope: WriteScope::runtime_topology(),
             bundle: BundleSpec {
                 operation: None,
@@ -699,9 +696,12 @@ impl Workflow {
             return Ok(state);
         }
 
-        tokio::time::timeout(self.config.analysis_timeout, self.engine().analysis_ready(revision))
-            .await
-            .map_err(|_| WorkflowError::AnalysisTimeout(revision))
+        tokio::time::timeout(
+            self.config.analysis_timeout,
+            self.engine().analysis_ready(revision),
+        )
+        .await
+        .map_err(|_| WorkflowError::AnalysisTimeout(revision))
     }
 
     fn missing_program_operations(&self) -> Vec<Id> {
@@ -715,10 +715,7 @@ impl Workflow {
             .collect()
     }
 
-    fn operations_named_by(
-        &self,
-        errors: &[crate::confluence::AnalysisDiagnostic],
-    ) -> Vec<Id> {
+    fn operations_named_by(&self, errors: &[crate::confluence::AnalysisDiagnostic]) -> Vec<Id> {
         let head = self.engine().head_snapshot();
         let mut named = Vec::new();
 
@@ -937,9 +934,7 @@ impl Workflow {
         head.workspace
             .prompt_obligations
             .iter()
-            .filter(|(_, obligation)| {
-                matches!(obligation.status, PromptObligationStatus::Unmapped)
-            })
+            .filter(|(_, obligation)| matches!(obligation.status, PromptObligationStatus::Unmapped))
             .map(|(id, _)| format!("prompt obligation {} is unmapped", id.0))
             .collect()
     }
@@ -965,12 +960,17 @@ impl Workflow {
         // An open cross-scope ask is unfinished work by definition:
         // some worker needed a change it could not make, and nothing
         // has settled it (§75).
-        labels.extend(self.engine().open_dependency_requests().iter().map(|request| {
-            format!(
-                "unresolved dependency request on {}: {}",
-                request.target, request.requested_change
-            )
-        }));
+        labels.extend(
+            self.engine()
+                .open_dependency_requests()
+                .iter()
+                .map(|request| {
+                    format!(
+                        "unresolved dependency request on {}: {}",
+                        request.target, request.requested_change
+                    )
+                }),
+        );
 
         labels
     }
@@ -981,23 +981,37 @@ impl Workflow {
 struct RepairTarget {
     operation: Id,
     family: RequirementFamily,
-    index: usize,
 
-    /// Which layer the checker says the missing facts belong to.
-    /// `None` for families that do not classify their obstacles, read
-    /// as the application layer — the pre-existing behavior.
-    remedy: Option<RemedyLayer>,
+    /// The inline transaction a transaction-family requirement is
+    /// declared on.
+    transaction: Option<Id>,
+
+    index: usize,
 }
 
 impl RepairTarget {
-    /// Whether this obligation is waiting on the runtime topology
-    /// alone, so no program edit can discharge it.
-    fn is_runtime(&self) -> bool {
-        self.remedy == Some(RemedyLayer::Runtime)
+    fn label(&self) -> String {
+        match &self.transaction {
+            Some(transaction) => format!(
+                "{} requirement #{} of {} in {}",
+                self.family, self.index, transaction, self.operation
+            ),
+            None => format!(
+                "{} requirement #{} of {}",
+                self.family, self.index, self.operation
+            ),
+        }
     }
 
-    fn label(&self) -> String {
-        format!("{} requirement #{} of {}", self.family, self.index, self.operation)
+    /// The obligation id the report gives this target.
+    fn obligation_id(&self) -> String {
+        match &self.transaction {
+            Some(transaction) => format!(
+                "oblig.{}.{}.{}.{}",
+                self.operation, transaction, self.family, self.index
+            ),
+            None => format!("oblig.{}.{}.{}", self.operation, self.family, self.index),
+        }
     }
 }
 
@@ -1010,20 +1024,27 @@ fn unproven_targets(analysis: &AnalysisSnapshot) -> Vec<RepairTarget> {
             continue;
         }
 
-        let crate::analyzer::report::Subject::Operation {
-            operation,
-            requirement: Some(index),
-        } = &obligation.subject
-        else {
-            continue;
+        let (operation, transaction, index) = match &obligation.subject {
+            crate::analyzer::report::Subject::Operation {
+                operation,
+                requirement: Some(index),
+            } => (operation, None, *index),
+
+            crate::analyzer::report::Subject::Transaction {
+                operation,
+                transaction,
+                requirement: Some(index),
+            } => (operation, Some(transaction.clone()), *index),
+
+            _ => continue,
         };
 
         if let Some(family) = repair_family(&obligation.property) {
             targets.push(RepairTarget {
                 operation: operation.clone(),
                 family,
-                index: *index,
-                remedy: obligation.remedy,
+                transaction,
+                index,
             });
         }
     }
@@ -1034,10 +1055,7 @@ fn unproven_targets(analysis: &AnalysisSnapshot) -> Vec<RepairTarget> {
 /// One target's analyzer obligation at the analyzed revision, as
 /// compact JSON.
 fn obligation_evidence(analysis: &AnalysisSnapshot, target: &RepairTarget) -> Option<String> {
-    let id = format!(
-        "oblig.{}.{}.{}",
-        target.operation, target.family, target.index
-    );
+    let id = target.obligation_id();
 
     analysis
         .obligations
@@ -1116,7 +1134,7 @@ fn application_repair_tasks(
                     operation: Some(operation),
                     requirements: targets
                         .iter()
-                        .map(|target| (target.family, target.index))
+                        .map(|target| (target.family, target.transaction.clone(), target.index))
                         .collect(),
                     include: Vec::new(),
                 },
@@ -1208,7 +1226,9 @@ fn operation_owned_ids(
 
     for (_, step) in program.steps_with_locations() {
         match step {
-            OperationStep::Transaction(transaction) => {
+            OperationStep::Transaction(execute) => {
+                let transaction = &execute.transaction;
+
                 owned.insert(transaction.id.0.clone());
 
                 for inner in &transaction.steps {
@@ -1277,19 +1297,27 @@ fn operation_owned_ids(
     owned
 }
 
-fn requirements_empty(requirements: &crate::spec::OperationRequirements) -> bool {
-    requirements.serialization.is_empty()
-        && requirements.ordering.is_empty()
-        && requirements.idempotency.is_empty()
-        && requirements.recoverability.is_empty()
+/// Whether a draft declares no requirement at all — none on the
+/// operation, and none on any inline transaction of its program.
+fn requirements_empty(draft: &crate::confluence::DraftOperation) -> bool {
+    let transactional = draft.program.as_ref().is_some_and(|program| {
+        program
+            .transactions()
+            .iter()
+            .any(|(_, transaction)| !transaction.requirements.is_empty())
+    });
+
+    !transactional
+        && draft.requirements.idempotency.is_empty()
+        && draft.requirements.recoverability.is_empty()
 }
 
 fn repair_family(property: &crate::analyzer::report::Property) -> Option<RequirementFamily> {
     use crate::analyzer::report::Property;
 
     Some(match property {
-        Property::Serialization => RequirementFamily::Serialization,
-        Property::Ordering => RequirementFamily::Ordering,
+        Property::TransactionSerializability => RequirementFamily::TransactionSerializability,
+        Property::TransactionOrdering => RequirementFamily::TransactionOrdering,
         Property::Idempotency => RequirementFamily::Idempotency,
         Property::ResultReplay => RequirementFamily::ResultReplay,
         Property::Recoverability => RequirementFamily::Recoverability,
@@ -1312,14 +1340,16 @@ mod tests {
     };
     use crate::analyzer::report::{Obligation, Property, ProverReport, Status, Subject};
     use crate::analyzer::verification::VerificationReport;
+    use crate::confluence::symbol::RequirementFamily;
     use crate::confluence::{
         AnalysisSnapshot, DependencyRequest, DependencyRequestId, DraftOperation,
         OperationInterfaceDraft, SymbolKey, TaskId, WriteGrant, WriteScope,
     };
     use crate::spec::{
         Derivation, Effect, EstablishEffectIntent, EstablishTransactionOutput, ExecuteEffectIntent,
-        Id, IdempotencyGuarantee, OperationBlock, OperationStep, PublicationEffect, ResultOutcome,
-        Return, Revision, Transaction, TransactionIsolation, TransactionStep,
+        ExecuteTransaction, Id, IdempotencyGuarantee, OperationBlock, OperationStep,
+        PublicationEffect, ResultOutcome, Return, Revision, Transaction, TransactionIsolation,
+        TransactionStep,
     };
     use std::collections::BTreeMap;
 
@@ -1345,19 +1375,44 @@ mod tests {
         }
     }
 
+    fn transaction_obligation(
+        operation: &str,
+        transaction: &str,
+        property: Property,
+        family: &str,
+        index: usize,
+    ) -> Obligation {
+        Obligation {
+            id: format!("oblig.{operation}.{transaction}.{family}.{index}"),
+            property,
+            subject: Subject::Transaction {
+                operation: id(operation),
+                transaction: id(transaction),
+                requirement: Some(index),
+            },
+            status: Status::Unknown,
+            summary: format!("the {family} requirement #{index} of {transaction}"),
+            scope: None,
+            remedy: None,
+            assumptions: Vec::new(),
+            evidence: Vec::new(),
+            counterexample: None,
+        }
+    }
+
     fn analysis_with(obligations: Vec<Obligation>) -> AnalysisSnapshot {
         AnalysisSnapshot {
             revision: Revision(7),
             verification: VerificationReport {
-                serialization: Vec::new(),
-                ordering: Vec::new(),
+                transaction_serializability: Vec::new(),
+                transaction_ordering: Vec::new(),
                 idempotency: Vec::new(),
                 result_replay: Vec::new(),
                 recoverability: Vec::new(),
                 notes: Vec::new(),
             },
             obligations: ProverReport {
-                format: 2,
+                format: crate::analyzer::report::FORMAT,
                 dsl: Some(crate::spec::DSL_VERSION),
                 model_revision: Some(7),
                 obligations,
@@ -1383,13 +1438,27 @@ mod tests {
     // carrying both — never two concurrent writers of one program —
     // with each obligation inlined verbatim so the worker holds its
     // obstacles even when its own snapshot's analysis lags or was
-    // coalesced away.
+    // coalesced away. A transaction-anchored obligation belongs to the
+    // operation whose program declares the transaction, and its id
+    // carries the transaction.
     #[test]
     fn repair_tasks_merge_per_operation_and_inline_their_obligations() {
         let analysis = analysis_with(vec![
-            obligation("operation.pay", Property::Serialization, "serialization", 0),
+            transaction_obligation(
+                "operation.pay",
+                "tx.charge",
+                Property::TransactionSerializability,
+                "transaction_serializability",
+                0,
+            ),
             obligation("operation.pay", Property::Idempotency, "idempotency", 0),
-            obligation("operation.ship", Property::Ordering, "ordering", 0),
+            transaction_obligation(
+                "operation.ship",
+                "tx.dispatch",
+                Property::TransactionOrdering,
+                "transaction_ordering",
+                0,
+            ),
         ]);
 
         let targets = unproven_targets(&analysis);
@@ -1412,10 +1481,21 @@ mod tests {
 
         assert_eq!(pay.bundle.requirements.len(), 2);
 
+        assert!(
+            pay.bundle
+                .requirements
+                .iter()
+                .any(|(family, transaction, _)| {
+                    *family == RequirementFamily::TransactionSerializability
+                        && transaction.as_ref() == Some(&id("tx.charge"))
+                }),
+            "the transaction obligation names its transaction in the bundle"
+        );
+
         for expected in [
-            "serialization requirement #0",
+            "transaction_serializability requirement #0 of tx.charge",
             "idempotency requirement #0",
-            "oblig.operation.pay.serialization.0",
+            "oblig.operation.pay.tx.charge.transaction_serializability.0",
             "oblig.operation.pay.idempotency.0",
         ] {
             assert!(
@@ -1433,13 +1513,21 @@ mod tests {
         let order = SymbolKey::Schema(id("schema.Order"));
 
         let groups = group_dependency_requests(vec![
-            request(order.clone(), "add a tenant_id field", "serialization needs it"),
+            request(
+                order.clone(),
+                "add a tenant_id field",
+                "serialization needs it",
+            ),
             request(
                 SymbolKey::Topic(id("topic.events")),
                 "admit schema.Refund",
                 "refunds publish here",
             ),
-            request(order.clone(), "widen status to an enum", "replay checks need it"),
+            request(
+                order.clone(),
+                "widen status to an enum",
+                "replay checks need it",
+            ),
         ]);
 
         assert_eq!(groups.len(), 2);
@@ -1485,33 +1573,38 @@ mod tests {
             service: id("service.x"),
             description: None,
             inputs: BTreeMap::new(),
-            invocation_lock: None,
         });
 
         draft.program = Some(OperationBlock {
             steps: vec![
-                OperationStep::Transaction(Transaction {
-                    id: id("tx.echo.write"),
-                    data_model: None,
-                    isolation: TransactionIsolation::ReadCommitted,
-                    idempotency: IdempotencyGuarantee::NotDeduplicated,
-                    steps: vec![
-                        TransactionStep::EstablishTransactionOutput(EstablishTransactionOutput {
-                            bind: id("output.echo"),
-                            schema: id("schema.Result"),
-                            values: Derivation::Unspecified,
-                        }),
-                        TransactionStep::EstablishEffectIntent(EstablishEffectIntent {
-                            bind: id("intent.echo.notify"),
-                            effect_id: id("effect.echo.notify"),
-                            effect: Effect::Publication(PublicationEffect {
-                                topic: id("topic.events"),
-                                schema: id("schema.Event"),
-                                idempotency_key_propagation: Vec::new(),
+                OperationStep::Transaction(ExecuteTransaction {
+                    transaction: Transaction {
+                        id: id("tx.echo.write"),
+                        data_model: None,
+                        isolation: TransactionIsolation::ReadCommitted,
+                        idempotency: IdempotencyGuarantee::NotDeduplicated,
+                        requirements: Default::default(),
+                        steps: vec![
+                            TransactionStep::EstablishTransactionOutput(
+                                EstablishTransactionOutput {
+                                    bind: id("output.echo"),
+                                    schema: id("schema.Result"),
+                                    values: Derivation::Unspecified,
+                                },
+                            ),
+                            TransactionStep::EstablishEffectIntent(EstablishEffectIntent {
+                                bind: id("intent.echo.notify"),
+                                effect_id: id("effect.echo.notify"),
+                                effect: Effect::Publication(PublicationEffect {
+                                    topic: id("topic.events"),
+                                    schema: id("schema.Event"),
+                                    idempotency_key_propagation: Vec::new(),
+                                }),
+                                values: Derivation::Unspecified,
                             }),
-                            values: Derivation::Unspecified,
-                        }),
-                    ],
+                        ],
+                    },
+                    rejected: None,
                 }),
                 OperationStep::ExecuteEffectIntent(ExecuteEffectIntent {
                     intent: id("intent.echo.notify"),

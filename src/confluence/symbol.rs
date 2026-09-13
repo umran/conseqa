@@ -25,26 +25,36 @@ use crate::spec::Id;
 use super::fingerprint::SemanticHash;
 use super::workspace::PromptObligationId;
 
-/// The five requirement families verification discharges. Result
-/// replay is the result half of an idempotency declaration, split out
-/// because it is proven separately.
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize,
-)]
+/// The five requirement families verification discharges. The two
+/// transaction families are declared on an inline transaction of the
+/// operation's program; result replay is the result half of an
+/// idempotency declaration, split out because it is proven separately.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RequirementFamily {
-    Serialization,
-    Ordering,
+    TransactionSerializability,
+    TransactionOrdering,
     Idempotency,
     ResultReplay,
     Recoverability,
 }
 
+impl RequirementFamily {
+    /// Whether the family is declared on a transaction rather than on
+    /// the operation.
+    pub fn is_transactional(self) -> bool {
+        matches!(
+            self,
+            Self::TransactionSerializability | Self::TransactionOrdering
+        )
+    }
+}
+
 impl fmt::Display for RequirementFamily {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
-            Self::Serialization => "serialization",
-            Self::Ordering => "ordering",
+            Self::TransactionSerializability => "transaction_serializability",
+            Self::TransactionOrdering => "transaction_ordering",
             Self::Idempotency => "idempotency",
             Self::ResultReplay => "result_replay",
             Self::Recoverability => "recoverability",
@@ -57,9 +67,7 @@ impl fmt::Display for RequirementFamily {
 /// Program-local symbols — transactions, effect sites, bindings — use
 /// the stable logical IDs the DSL already gives them; positional
 /// `StepLocation` is never promoted to durable semantic identity.
-#[derive(
-    Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize,
-)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "value", rename_all = "snake_case")]
 pub enum SymbolKey {
     Service(Id),
@@ -280,9 +288,7 @@ impl fmt::Display for SymbolKey {
 }
 
 /// The kind of a symbol, as node metadata.
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize,
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SymbolKind {
     Service,
@@ -328,9 +334,7 @@ pub enum SymbolOwner {
 /// Monotonic per-symbol version. Bumped exactly when the symbol's
 /// semantic fingerprint changes; primarily diagnostics and a fast
 /// short-circuit — the fingerprint comparison is authoritative.
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize,
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct SymbolVersion(pub u64);
 

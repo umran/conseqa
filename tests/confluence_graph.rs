@@ -6,8 +6,7 @@ use std::collections::BTreeMap;
 
 use conseqa::confluence::{
     DraftOperation, EdgeKind, EffectRef, GraphQuery, OperationInterfaceDraft, ProvenanceRoot,
-    QueryRow, RunId, RunMetadata, SymbolGraph, SymbolKey, WorkspaceState, graph_build,
-    graph_query,
+    QueryRow, RunId, RunMetadata, SymbolGraph, SymbolKey, WorkspaceState, graph_build, graph_query,
 };
 use conseqa::spec::{
     Derivation, Effect, ExecuteEffect, Field, FieldPath, Id, OperationBlock, OperationStep,
@@ -16,8 +15,8 @@ use conseqa::spec::{
 };
 
 fn fixture_workspace() -> WorkspaceState {
-    let source = std::fs::read_to_string("tests/fixtures/flash_checkout.yaml")
-        .expect("fixture exists");
+    let source =
+        std::fs::read_to_string("tests/fixtures/flash_checkout.yaml").expect("fixture exists");
 
     let model = conseqa::parser::yaml::parse(&source).expect("fixture parses");
 
@@ -48,7 +47,6 @@ fn gateway_operation() -> DraftOperation {
         service: id("service.checkout"),
         description: Some("Calls create_order.".to_string()),
         inputs: BTreeMap::new(),
-        invocation_lock: None,
     });
 
     draft.program = Some(OperationBlock {
@@ -100,8 +98,7 @@ fn changed_content_bumps_only_the_changed_symbol() {
 
     let mut changed = workspace.clone();
 
-    let Some(Schema::Canonical(schema)) = changed.schemas.get_mut(&id("schema.OrderRecord"))
-    else {
+    let Some(Schema::Canonical(schema)) = changed.schemas.get_mut(&id("schema.OrderRecord")) else {
         panic!("fixture declares schema.OrderRecord as canonical");
     };
 
@@ -474,11 +471,9 @@ fn reverse_references_are_recorded() {
     }));
 
     // The subscriber's interface contract depends on the schema.
-    assert!(
-        froms.contains(&&SymbolKey::OperationInterface(id(
-            "operation.reserve_inventory"
-        )))
-    );
+    assert!(froms.contains(&&SymbolKey::OperationInterface(id(
+        "operation.reserve_inventory"
+    ))));
 }
 
 #[test]
@@ -500,7 +495,10 @@ fn runtime_declarations_are_tracked_symbols_with_their_references() {
             input: id("input.reserve_inventory.created"),
         },
     ] {
-        assert!(graph.node(&key).is_some(), "{key} should be a tracked symbol");
+        assert!(
+            graph.node(&key).is_some(),
+            "{key} should be a tracked symbol"
+        );
     }
 
     let referrers = |symbol: SymbolKey| -> Vec<SymbolKey> {

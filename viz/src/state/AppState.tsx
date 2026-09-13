@@ -20,7 +20,10 @@ import type { PageData } from "../types/page";
 import type { Obligation, ProverReport } from "../types/report";
 
 export interface DetailContext {
-  req?: { prop: RequirementKind; index: number };
+  /** A declared requirement: an operation family is addressed by the
+   *  operation and an index; a transaction family also names the
+   *  inline transaction that declares it. */
+  req?: { prop: RequirementKind; index: number; transaction?: Id };
   txStep?: { op: Id; tx: Id; index: number };
   /** A program step, by its location in the operation's program. */
   step?: { op: Id; location: string };
@@ -32,6 +35,14 @@ export interface DetailContext {
 export interface DetailTarget {
   id: string;
   ctx: DetailContext;
+}
+
+/** The selection key of a requirement row on the operation page: the
+ *  family and index, with the declaring transaction for a transaction
+ *  family. Shared by the table that draws the rows and the obligation
+ *  focus that lands on one. */
+export function requirementKey(prop: string, index: number, transaction?: Id): string {
+  return transaction !== undefined ? `req:${prop}:${transaction}:${index}` : `req:${prop}:${index}`;
 }
 
 export type Theme = "dark" | "light";
@@ -256,12 +267,20 @@ export function AppStateProvider({ data, theme: hostTheme, children }: AppStateP
           const prop = ob.property.kind === "result_replay" ? "idempotency" : ob.property.kind;
           navigateTo(
             hashes.op(s.operation),
-            s.requirement !== undefined ? `req:${prop}:${s.requirement}` : undefined,
+            s.requirement !== undefined ? requirementKey(prop, s.requirement) : undefined,
           );
           break;
         }
         case "transaction":
-          navigateTo(hashes.op(s.operation), `tx:${s.transaction}`);
+          // A transaction requirement has a row of its own in the
+          // operation's requirements table; the transaction itself is
+          // the fallback for an obligation anchored to the whole of it.
+          navigateTo(
+            hashes.op(s.operation),
+            s.requirement !== undefined
+              ? requirementKey(ob.property.kind, s.requirement, s.transaction)
+              : `tx:${s.transaction}`,
+          );
           break;
         case "state_machine":
           navigateTo(hashes.machine(s.machine, s.transition));

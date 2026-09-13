@@ -173,7 +173,9 @@ fn collect_operation<'w>(
 
         for (_, step) in program.steps_with_locations() {
             match step {
-                OperationStep::Transaction(transaction) => {
+                OperationStep::Transaction(execute) => {
+                    let transaction = &execute.transaction;
+
                     facts.transactions.push(transaction);
 
                     for inner in &transaction.steps {
@@ -485,7 +487,10 @@ impl<'w> Builder<'w> {
         draft: &DraftOperation,
         facts: &OperationFacts<'_>,
     ) {
-        self.add_node(SymbolKey::Operation(operation.clone()), SemanticHash::of(draft));
+        self.add_node(
+            SymbolKey::Operation(operation.clone()),
+            SemanticHash::of(draft),
+        );
 
         self.add_node(
             SymbolKey::OperationInterface(operation.clone()),
@@ -561,7 +566,6 @@ impl<'w> Builder<'w> {
                 fingerprint,
             );
         }
-
     }
 
     fn add_shared_edges(&mut self) {
@@ -577,7 +581,11 @@ impl<'w> Builder<'w> {
                     }
 
                     for target in referenced {
-                        self.link(from, EdgeKind::References, &SymbolKey::Schema(target.clone()));
+                        self.link(
+                            from,
+                            EdgeKind::References,
+                            &SymbolKey::Schema(target.clone()),
+                        );
                     }
                 }
 
@@ -635,7 +643,11 @@ impl<'w> Builder<'w> {
             let from = self.node_ids[&SymbolKey::Topic(id.clone())];
 
             for message in &topic.messages {
-                self.link(from, EdgeKind::References, &SymbolKey::Schema(message.clone()));
+                self.link(
+                    from,
+                    EdgeKind::References,
+                    &SymbolKey::Schema(message.clone()),
+                );
             }
         }
 
@@ -783,7 +795,11 @@ impl<'w> Builder<'w> {
                 input: input.clone(),
             }];
 
-            self.link(from, EdgeKind::References, &SymbolKey::Input { operation, input });
+            self.link(
+                from,
+                EdgeKind::References,
+                &SymbolKey::Input { operation, input },
+            );
             self.link(from, EdgeKind::References, &SymbolKey::ExecutionPool(pool));
 
             // A subscription-scoped grouping key names schemas of its
@@ -809,7 +825,11 @@ impl<'w> Builder<'w> {
         for (router, operation, input, pool) in routers {
             let from = self.node_ids[&SymbolKey::Router(router)];
 
-            self.link(from, EdgeKind::References, &SymbolKey::Input { operation, input });
+            self.link(
+                from,
+                EdgeKind::References,
+                &SymbolKey::Input { operation, input },
+            );
             self.link(from, EdgeKind::References, &SymbolKey::ExecutionPool(pool));
         }
 
@@ -845,8 +865,7 @@ impl<'w> Builder<'w> {
         let operation_node = self.node_ids[&SymbolKey::Operation(operation.clone())];
         let interface_node = self.node_ids[&SymbolKey::OperationInterface(operation.clone())];
         let program_node = self.node_ids[&SymbolKey::OperationProgram(operation.clone())];
-        let requirements_node =
-            self.node_ids[&SymbolKey::OperationRequirements(operation.clone())];
+        let requirements_node = self.node_ids[&SymbolKey::OperationRequirements(operation.clone())];
 
         for part in [
             SymbolKey::OperationInterface(operation.clone()),
@@ -880,11 +899,12 @@ impl<'w> Builder<'w> {
 
             match input {
                 crate::spec::Input::Request(request) => {
-                    for schema in [
-                        &request.schema,
-                        &request.result.ok,
-                        &request.result.err.schema,
-                    ] {
+                    let error_schemas = request.result.errors.values().map(|class| &class.schema);
+
+                    for schema in [&request.schema, &request.result.ok]
+                        .into_iter()
+                        .chain(error_schemas)
+                    {
                         self.link(
                             interface_node,
                             EdgeKind::ContractDependsOn,
@@ -978,10 +998,13 @@ impl<'w> Builder<'w> {
             .data_models
             .iter()
             .find_map(|(data_model_id, data_model)| {
-                data_model.outboxes.contains_key(outbox).then(|| SymbolKey::Outbox {
-                    data_model: data_model_id.clone(),
-                    outbox: outbox.clone(),
-                })
+                data_model
+                    .outboxes
+                    .contains_key(outbox)
+                    .then(|| SymbolKey::Outbox {
+                        data_model: data_model_id.clone(),
+                        outbox: outbox.clone(),
+                    })
             })
     }
 
@@ -1028,11 +1051,7 @@ impl<'w> Builder<'w> {
                         self.link(site_node, EdgeKind::WritesOutbox, &outbox_key);
 
                         if !write.idempotency_key_propagation.is_empty() {
-                            self.link(
-                                site_node,
-                                EdgeKind::PropagatesIdempotencyKey,
-                                &outbox_key,
-                            );
+                            self.link(site_node, EdgeKind::PropagatesIdempotencyKey, &outbox_key);
                         }
                     }
 
@@ -1114,7 +1133,9 @@ impl<'w> Builder<'w> {
 
                 SiteContract::Effect(Effect::External(external)) => {
                     if let Some(result) = &external.result {
-                        for schema in [&result.ok, &result.err.schema] {
+                        let error_schemas = result.errors.values().map(|class| &class.schema);
+
+                        for schema in std::iter::once(&result.ok).chain(error_schemas) {
                             self.link(
                                 site_node,
                                 EdgeKind::References,
@@ -1289,8 +1310,16 @@ impl<'w> Builder<'w> {
                         transition: transition.transition.clone(),
                     };
 
-                    self.link(transaction_node, EdgeKind::AppliesStateMachine, &machine_key);
-                    self.link(transaction_node, EdgeKind::AppliesTransition, &transition_key);
+                    self.link(
+                        transaction_node,
+                        EdgeKind::AppliesStateMachine,
+                        &machine_key,
+                    );
+                    self.link(
+                        transaction_node,
+                        EdgeKind::AppliesTransition,
+                        &transition_key,
+                    );
 
                     self.indexes
                         .transition_users
@@ -1303,15 +1332,15 @@ impl<'w> Builder<'w> {
 
                     // Applying the transition writes the subject's
                     // state field.
-                    let state_field = self
-                        .workspace
-                        .state_machines
-                        .get(&transition.machine)
-                        .map(|machine| {
-                            let StateMachineSubject::Object { state, .. } = &machine.subject;
+                    let state_field =
+                        self.workspace
+                            .state_machines
+                            .get(&transition.machine)
+                            .map(|machine| {
+                                let StateMachineSubject::Object { state, .. } = &machine.subject;
 
-                            state.clone()
-                        });
+                                state.clone()
+                            });
 
                     self.record_object_access(
                         transaction.data_model.as_ref(),
@@ -1323,6 +1352,53 @@ impl<'w> Builder<'w> {
                             Some(field) => FieldAccess::Fields(vec![field]),
                             None => FieldAccess::All,
                         },
+                    );
+                }
+
+                // The version protocol reads and writes the object's
+                // version field; the cursor and fence guards read and
+                // conditionally write theirs.
+                TransactionStep::ValidateVersion(validate) => {
+                    self.record_object_access(
+                        transaction.data_model.as_ref(),
+                        &validate.target.object,
+                        transaction_node,
+                        transaction_ref,
+                        EdgeKind::ReadsObject,
+                        FieldAccess::All,
+                    );
+                }
+
+                TransactionStep::BumpVersion(bump) => {
+                    self.record_object_access(
+                        transaction.data_model.as_ref(),
+                        &bump.target.object,
+                        transaction_node,
+                        transaction_ref,
+                        EdgeKind::WritesObject,
+                        FieldAccess::All,
+                    );
+                }
+
+                TransactionStep::AdvanceCursor(advance) => {
+                    self.record_object_access(
+                        transaction.data_model.as_ref(),
+                        &advance.target.object,
+                        transaction_node,
+                        transaction_ref,
+                        EdgeKind::WritesObject,
+                        FieldAccess::Fields(vec![advance.field.clone()]),
+                    );
+                }
+
+                TransactionStep::Fence(fence) => {
+                    self.record_object_access(
+                        transaction.data_model.as_ref(),
+                        &fence.target.object,
+                        transaction_node,
+                        transaction_ref,
+                        EdgeKind::WritesObject,
+                        FieldAccess::Fields(vec![fence.field.clone()]),
                     );
                 }
 
@@ -1389,8 +1465,11 @@ impl<'w> Builder<'w> {
 
             let requirement_node = self.node_ids[&requirement_key];
 
-            self.edges
-                .push((requirement_node, EdgeKind::RequirementTargets, operation_node));
+            self.edges.push((
+                requirement_node,
+                EdgeKind::RequirementTargets,
+                operation_node,
+            ));
 
             for root in roots {
                 if let ValueSource::Input(input) = &root.source {
@@ -1437,7 +1516,8 @@ impl<'w> Builder<'w> {
         let mut outgoing: Vec<SmallVec<[Edge; 4]>> = vec![SmallVec::new(); self.nodes.len()];
         let mut incoming: Vec<SmallVec<[Edge; 4]>> = vec![SmallVec::new(); self.nodes.len()];
 
-        self.edges.sort_unstable_by_key(|(from, kind, to)| (*from, *kind, *to));
+        self.edges
+            .sort_unstable_by_key(|(from, kind, to)| (*from, *kind, *to));
         self.edges.dedup();
 
         for (from, kind, to) in &self.edges {
@@ -1525,24 +1605,30 @@ fn requirement_entries(
         *occurrence += 1;
     }
 
-    for requirement in &draft.requirements.serialization {
-        push(
-            &mut seen,
-            &mut entries,
-            RequirementFamily::Serialization,
-            SemanticHash::of(requirement),
-            vec![&requirement.key],
-        );
-    }
+    // Transaction requirements are declared inside the program, one
+    // family list per inline transaction, enumerated in program order.
+    if let Some(program) = &draft.program {
+        for (_, transaction) in program.transactions() {
+            for requirement in &transaction.requirements.serializability {
+                push(
+                    &mut seen,
+                    &mut entries,
+                    RequirementFamily::TransactionSerializability,
+                    SemanticHash::of(requirement),
+                    vec![&requirement.key],
+                );
+            }
 
-    for requirement in &draft.requirements.ordering {
-        push(
-            &mut seen,
-            &mut entries,
-            RequirementFamily::Ordering,
-            SemanticHash::of(requirement),
-            vec![&requirement.key],
-        );
+            for requirement in &transaction.requirements.ordering {
+                push(
+                    &mut seen,
+                    &mut entries,
+                    RequirementFamily::TransactionOrdering,
+                    SemanticHash::of(requirement),
+                    vec![&requirement.key, &requirement.position],
+                );
+            }
+        }
     }
 
     for requirement in &draft.requirements.idempotency {

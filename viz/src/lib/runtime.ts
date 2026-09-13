@@ -85,7 +85,10 @@ function pinsKey(predicate: SelectorPredicate, key: FieldPath[]): boolean {
 
 /** Every operation's selector predicates against each object, by the
  *  transaction steps that bear one. Insert has no selector — it writes a
- *  row whose values place it — so it is recorded with a null predicate. */
+ *  row whose values place it — so it is recorded with a null predicate.
+ *  The version-protocol steps select an instance to guard or bump, and a
+ *  cursor or fence reads and writes its target object's managed field,
+ *  so each is an access to the target. */
 export function objectAccesses(model: Model): Map<Id, Map<Id, (SelectorPredicate | null)[]>> {
   const out = new Map<Id, Map<Id, (SelectorPredicate | null)[]>>();
   const add = (object: Id, op: Id, predicate: SelectorPredicate | null) => {
@@ -103,6 +106,10 @@ export function objectAccesses(model: Model): Map<Id, Map<Id, (SelectorPredicate
           case "write":
           case "delete":
           case "lock":
+          case "validate_version":
+          case "bump_version":
+          case "advance_cursor":
+          case "fence":
             add(step.target.object, opId, step.target.predicate);
             break;
           case "insert":

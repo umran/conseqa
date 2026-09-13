@@ -7,12 +7,19 @@
 //! flows were, plus the decisions that selected it — so the replay
 //! engine's forward pass applies unchanged, and what a decision rests
 //! on is judged where it is taken.
+//!
+//! A rejectable transaction is a decision too: its execution site
+//! forks into the committed continuation, which carries the
+//! transaction step and everything it establishes, and the rejected
+//! continuation, which carries nothing — no mutation, artifact, or
+//! admission survives rejection — and enters the `rejected` block
+//! before rejoining the enclosing block if it falls through.
 
 use serde::{Deserialize, Serialize};
 
 use crate::spec::{
-    Arm, AsyncJoin, Condition, Derivation, Effect, Id, OperationBlock, OperationStep,
-    ResultOutcome, ResultVariant, StepLocation, Transaction,
+    Arm, AsyncJoin, Condition, Derivation, Effect, Id, OperationBlock, OperationStep, ResultArm,
+    ResultOutcome, StepLocation, Transaction, TransactionOutcome,
 };
 
 /// One path through the program: its linear steps in order and the
@@ -25,7 +32,8 @@ pub struct Path<'a> {
 
 #[derive(Debug, Clone)]
 pub enum PathStep<'a> {
-    /// The inline transaction declared and executed at this step.
+    /// The inline transaction declared and executed at this step,
+    /// committed on this path.
     Transaction {
         location: StepLocation,
         transaction: &'a Transaction,
@@ -89,9 +97,24 @@ pub enum PathStep<'a> {
 
 #[derive(Debug, Clone)]
 pub enum Decision<'a> {
-    Match { result: &'a Id, arm: ResultVariant },
+    Match {
+        result: &'a Id,
+        arm: ResultArm,
+    },
 
-    Branch { condition: &'a Condition, arm: Arm },
+    Branch {
+        condition: &'a Condition,
+        arm: Arm,
+    },
+
+    /// A rejectable transaction's outcome. On the committed
+    /// continuation the decision follows the transaction step, since
+    /// the execution is what decides it; on the rejected continuation
+    /// no transaction step precedes it.
+    Transaction {
+        transaction: &'a Id,
+        outcome: TransactionOutcome,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -124,12 +147,21 @@ impl<'a> Path<'a> {
                         Decision::Match { result, arm } => DecisionTaken::Match {
                             location: location.clone(),
                             result: (*result).clone(),
-                            arm: *arm,
+                            arm: arm.clone(),
                         },
 
                         Decision::Branch { arm, .. } => DecisionTaken::Branch {
                             location: location.clone(),
-                            arm: *arm,
+                            arm: arm.clone(),
+                        },
+
+                        Decision::Transaction {
+                            transaction,
+                            outcome,
+                        } => DecisionTaken::Transaction {
+                            location: location.clone(),
+                            transaction: (*transaction).clone(),
+                            outcome: *outcome,
                         },
                     }),
 
@@ -177,17 +209,24 @@ pub enum DecisionTaken {
     Match {
         location: StepLocation,
         result: Id,
-        arm: ResultVariant,
+        arm: ResultArm,
     },
 
     Branch {
         location: StepLocation,
         arm: Arm,
     },
+
+    Transaction {
+        location: StepLocation,
+        transaction: Id,
+        outcome: TransactionOutcome,
+    },
 }
 
 /// Every path through the program, in program order: the first arm of
-/// each decision before its second.
+/// each decision before its second, and a transaction's committed
+/// continuation before its rejected one.
 pub fn paths(program: &OperationBlock) -> Vec<Path<'_>> {
     let mut out = Vec::new();
 
@@ -221,19 +260,62 @@ fn walk<'a>(
     let mut open = vec![prefix];
 
     for (index, step) in steps.iter().enumerate() {
-        let location = OperationBlock::location(parent, arm, index);
+        let location = OperationBlock::location(parent, arm.clone(), index);
 
         let mut next = Vec::new();
 
         for mut prefix in open {
             match step {
-                OperationStep::Transaction(transaction) => {
-                    prefix.push(PathStep::Transaction {
-                        location: location.clone(),
-                        transaction,
-                    });
+                OperationStep::Transaction(execute) => {
+                    let transaction = &execute.transaction;
 
-                    next.push(prefix);
+                    match &execute.rejected {
+                        None => {
+                            prefix.push(PathStep::Transaction {
+                                location: location.clone(),
+                                transaction,
+                            });
+
+                            next.push(prefix);
+                        }
+
+                        Some(rejected) => {
+                            let mut committed = prefix.clone();
+
+                            committed.push(PathStep::Transaction {
+                                location: location.clone(),
+                                transaction,
+                            });
+
+                            committed.push(PathStep::Decision {
+                                location: location.clone(),
+                                decision: Decision::Transaction {
+                                    transaction: &transaction.id,
+                                    outcome: TransactionOutcome::Committed,
+                                },
+                            });
+
+                            next.push(committed);
+
+                            let mut refused = prefix;
+
+                            refused.push(PathStep::Decision {
+                                location: location.clone(),
+                                decision: Decision::Transaction {
+                                    transaction: &transaction.id,
+                                    outcome: TransactionOutcome::Rejected,
+                                },
+                            });
+
+                            next.extend(walk(
+                                refused,
+                                &rejected.steps,
+                                &location,
+                                Some(Arm::Rejected),
+                                out,
+                            ));
+                        }
+                    }
                 }
 
                 OperationStep::ExecuteEffect(step) => {
@@ -300,17 +382,20 @@ fn walk<'a>(
                 }
 
                 OperationStep::MatchResult(step) => {
-                    for (variant, block) in [
-                        (ResultVariant::Ok, &step.ok),
-                        (ResultVariant::Err, &step.err),
-                    ] {
+                    let arms = std::iter::once((ResultArm::Ok, &step.ok)).chain(
+                        step.errors
+                            .iter()
+                            .map(|(error, block)| (ResultArm::err(error), block)),
+                    );
+
+                    for (result_arm, block) in arms {
                         let mut taken = prefix.clone();
 
                         taken.push(PathStep::Decision {
                             location: location.clone(),
                             decision: Decision::Match {
                                 result: &step.result,
-                                arm: variant,
+                                arm: result_arm.clone(),
                             },
                         });
 
@@ -318,7 +403,7 @@ fn walk<'a>(
                             taken,
                             &block.steps,
                             &location,
-                            Some(Arm::of(variant)),
+                            Some(Arm::of(&result_arm)),
                             out,
                         ));
                     }

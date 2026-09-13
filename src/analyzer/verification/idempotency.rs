@@ -63,8 +63,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::analyzer::{Diagnostic, DiagnosticCode, Evidence, Severity, VerificationCode};
 use crate::spec::{
-    DeliverySemantics, ExternalIdempotency, ExternalIdentity, FieldPath, Id, IdempotencyKey,
-    Input, MessageIdentity, MessageIdentityKey, MessageSelector, Model, Operation, ValueSource,
+    DeliverySemantics, ExternalIdempotency, ExternalIdentity, FieldPath, Id, IdempotencyKey, Input,
+    MessageIdentity, MessageIdentityKey, MessageSelector, Model, Operation, ValueSource,
 };
 
 use super::ProofScope;
@@ -78,7 +78,9 @@ use super::replay::{
     InstanceStability, PathContext, ReplayAnalysis, ReplayGap, StableRoot, TracedStep,
     UnstableRoot,
 };
-use super::trigger::{EffectContract, ProducerSite, TriggerGraph, collapses_duplicates, key_input};
+use super::trigger::{
+    EffectContract, OutboxProducerSite, ProducerSite, TriggerGraph, collapses_duplicates, key_input,
+};
 
 /// The verdict for one declared idempotency requirement's side-effect
 /// obligation.
@@ -216,9 +218,7 @@ impl IdempotencyProof {
     /// through the requirements it leans on.
     pub fn direct_scope(&self) -> ProofScope {
         match self {
-            Self::NoAdmittedInvocations { .. } | Self::NoAdmittedPaths { .. } => {
-                ProofScope::L0Only
-            }
+            Self::NoAdmittedInvocations { .. } | Self::NoAdmittedPaths { .. } => ProofScope::L0Only,
 
             // `at_most_once` is a delivery fact, and delivery is L1.
             Self::SingleDelivery { .. } => ProofScope::RuntimeDependent,
@@ -748,9 +748,7 @@ fn lineage(scope: &Scope<'_>, operation: &Operation, key: &IdempotencyKey) -> Ve
     };
 
     match operation.inputs.get(input_id) {
-        Some(Input::Subscription(subscription)) => {
-            subscription_lineage(scope, subscription)
-        }
+        Some(Input::Subscription(subscription)) => subscription_lineage(scope, subscription),
 
         Some(Input::Outbox(outbox_input)) => outbox_lineage(scope, outbox_input),
 
@@ -793,15 +791,18 @@ fn propagation_fact(
                 .iter()
                 .all(|field| targets.contains(&field))
                 .then(|| {
-                    let requirement = producer_operation.and_then(|operation| {
-                        scope.model.operations.get(operation).and_then(|declaration| {
-                            declaration
-                                .requirements
-                                .idempotency
-                                .iter()
-                                .position(|requirement| requirement.key == propagation.source)
-                        })
-                    });
+                    let requirement =
+                        producer_operation.and_then(|operation| {
+                            scope
+                                .model
+                                .operations
+                                .get(operation)
+                                .and_then(|declaration| {
+                                    declaration.requirements.idempotency.iter().position(
+                                        |requirement| requirement.key == propagation.source,
+                                    )
+                                })
+                        });
 
                     LineageFact::Propagated {
                         source: propagation.source.clone(),
@@ -874,10 +875,7 @@ fn subscription_lineage(
     out
 }
 
-fn outbox_lineage(
-    scope: &Scope<'_>,
-    input: &crate::spec::OutboxInput,
-) -> Vec<IdentityLineage> {
+fn outbox_lineage(scope: &Scope<'_>, input: &crate::spec::OutboxInput) -> Vec<IdentityLineage> {
     let Some((_, outbox)) = scope.model.outbox(&input.outbox) else {
         return Vec::new();
     };
@@ -893,9 +891,14 @@ fn outbox_lineage(
 
     for (schema, identity) in identified_schemas(mapping, admitted) {
         for producer in scope.graph.outbox_producers(&input.outbox, schema) {
+            let producer_operation = match producer.site {
+                OutboxProducerSite::Operation { operation, .. } => Some(operation),
+                OutboxProducerSite::Transition { .. } => None,
+            };
+
             let fact = propagation_fact(
                 scope,
-                Some(producer.operation),
+                producer_operation,
                 producer.effect,
                 &producer.write.idempotency_key_propagation,
                 identity,
@@ -906,9 +909,20 @@ fn outbox_lineage(
                     outbox: input.outbox.clone(),
                 },
                 schema: schema.clone(),
-                producer: ProducerRef::Operation {
-                    operation: producer.operation.clone(),
-                    effect: producer.effect.clone(),
+                producer: match producer.site {
+                    OutboxProducerSite::Operation { operation, .. } => ProducerRef::Operation {
+                        operation: operation.clone(),
+                        effect: producer.effect.clone(),
+                    },
+
+                    OutboxProducerSite::Transition {
+                        machine,
+                        transition,
+                    } => ProducerRef::Transition {
+                        machine: machine.clone(),
+                        transition: transition.clone(),
+                        effect: producer.effect.clone(),
+                    },
                 },
                 fact,
             });
@@ -955,9 +969,8 @@ fn check_requirement(
 
     if analysis.admits_no_attempts() {
         return IdempotencyVerdict::proven(IdempotencyProof::NoAdmittedInvocations {
-                input: analysis.input().clone(),
-            },
-        );
+            input: analysis.input().clone(),
+        });
     }
 
     // The single-delivery vacuous route: at most one attempt per
@@ -967,10 +980,9 @@ fn check_requirement(
         && analysis.payload_identified()
     {
         return IdempotencyVerdict::proven(IdempotencyProof::SingleDelivery {
-                input: analysis.input().clone(),
-                topic: subscription.topic.clone(),
-            },
-        );
+            input: analysis.input().clone(),
+            topic: subscription.topic.clone(),
+        });
     }
 
     // No outbox counterpart exists: intrinsic durable re-drive admits
@@ -986,9 +998,8 @@ fn check_requirement(
 
     if admitted.is_empty() {
         return IdempotencyVerdict::proven(IdempotencyProof::NoAdmittedPaths {
-                input: analysis.input().clone(),
-            },
-        );
+            input: analysis.input().clone(),
+        });
     }
 
     let mut obstacles = Vec::new();
@@ -1042,8 +1053,11 @@ impl IdempotencyObstacle {
                 *path = PathRef::default();
 
                 match decision {
-                    DecisionTaken::Match { arm, .. } => *arm = crate::spec::ResultVariant::Ok,
+                    DecisionTaken::Match { arm, .. } => *arm = crate::spec::ResultArm::Ok,
                     DecisionTaken::Branch { arm, .. } => *arm = crate::spec::Arm::Then,
+                    DecisionTaken::Transaction { outcome, .. } => {
+                        *outcome = crate::spec::TransactionOutcome::Committed
+                    }
                 }
             }
 
@@ -1211,6 +1225,25 @@ fn analyze_path(
                     rule: DecisionRule::IdempotencyInertContinuation,
                 }),
 
+                // A transaction outcome: a rejection commits nothing
+                // and does only its block's work, a commit only its
+                // continuation's, and each path's work is judged
+                // duplicate-safe on its own — so the divergence cannot
+                // duplicate work, and the committed transaction's own
+                // retry safety is judged where it is traced.
+                Err(_) if matches!(taken, DecisionTaken::Transaction { .. }) => {
+                    let DecisionTaken::Transaction { transaction, .. } = taken else {
+                        unreachable!("matched above");
+                    };
+
+                    decisions.push(DecisionReplay {
+                        decision: taken.clone(),
+                        rule: DecisionRule::OutcomeDivergenceAddsNoWork {
+                            transaction: transaction.clone(),
+                        },
+                    });
+                }
+
                 Err(gap) => {
                     obstacles.push(IdempotencyObstacle::PathDecisionUnstable {
                         path: reference.clone(),
@@ -1324,15 +1357,14 @@ fn contract_safety(
             let outbox = &write.outbox;
             let schema = &write.schema;
 
-            let identified = scope
-                .model
-                .outbox(outbox)
-                .is_some_and(|(_, outbox)| match &outbox.message_identity {
+            let identified = scope.model.outbox(outbox).is_some_and(|(_, outbox)| {
+                match &outbox.message_identity {
                     MessageIdentity::Keyed(MessageIdentityKey { mapping }) => {
                         mapping.contains_key(schema)
                     }
                     MessageIdentity::Unspecified => false,
-                });
+                }
+            });
 
             if !identified {
                 obstacles.push(IdempotencyObstacle::OutboxWriteNotIdentified {
@@ -1471,7 +1503,9 @@ fn contract_safety(
                     .topics
                     .get(topic)
                     .is_some_and(|topic| match &topic.message_identity {
-                        MessageIdentity::Keyed(MessageIdentityKey { mapping }) => mapping.contains_key(schema),
+                        MessageIdentity::Keyed(MessageIdentityKey { mapping }) => {
+                            mapping.contains_key(schema)
+                        }
                         MessageIdentity::Unspecified => false,
                     });
 

@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fmt;
 
 use serde::de::value::MapAccessDeserializer;
@@ -8,7 +9,8 @@ use crate::spec::Id;
 
 /// A first-class `Result<Ok, Err>` contract: a tagged sum holding
 /// exactly one of an `Ok` payload shaped by `ok` or an `Err` payload
-/// shaped by `err.schema`.
+/// belonging to one of the named logical error classes in `errors`,
+/// shaped by that class's schema.
 ///
 /// Mutual exclusivity is structural. Conseqa models the algebraic
 /// outcome, not any language's API around it.
@@ -17,25 +19,90 @@ use crate::spec::Id;
 /// completed and reported a modeled failure, such as a declined card.
 /// It is not an interrupted execution: a crash, a timeout, or a lost
 /// connection is an idempotency and recoverability question, not an
-/// `Err` payload.
+/// `Err` payload. Execution interruption is never synthesized as an
+/// `Err`.
 ///
 /// `Ok` is terminal by definition: it resolves the logical interaction.
-/// Whether an `Err` does the same is the error's declared
+/// Whether an `Err` does the same is each class's declared
 /// [`ErrorDisposition`], which belongs to this contract, not to the
-/// schema.
+/// schema — one error schema may be terminal in one class and
+/// retryable in another.
+///
+/// ```yaml
+/// result:
+///   ok: schema.Payment
+///   errors:
+///     already_processed:
+///       schema: schema.AlreadyProcessed
+///       disposition: terminal
+///     conflict:
+///       schema: schema.ConcurrentConflict
+///       disposition: retryable
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ResultType {
     pub ok: Id,
-    pub err: ErrorResultType,
+
+    /// The logical error classes, keyed by class id. A contract with
+    /// no error classes returns `Ok` alone.
+    #[serde(default)]
+    pub errors: BTreeMap<Id, ErrorResultType>,
 }
 
 impl ResultType {
-    /// The schema of one variant's payload.
-    pub fn schema(&self, variant: ResultVariant) -> &Id {
-        match variant {
-            ResultVariant::Ok => &self.ok,
-            ResultVariant::Err => &self.err.schema,
+    /// The declared error class, if the contract names it.
+    pub fn error(&self, class: &Id) -> Option<&ErrorResultType> {
+        self.errors.get(class)
+    }
+
+    /// The schema of one arm's payload: the `ok` schema, or the schema
+    /// of the named error class when the contract declares it.
+    pub fn schema_of(&self, arm: &ResultArm) -> Option<&Id> {
+        match arm {
+            ResultArm::Ok => Some(&self.ok),
+            ResultArm::Err { error } => self.errors.get(error).map(|class| &class.schema),
+        }
+    }
+}
+
+/// Which arm of a `Result` an outcome, a match arm, or a decision
+/// refers to: the `ok` arm, or the arm of one named error class.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ResultArm {
+    Ok,
+    Err { error: Id },
+}
+
+impl ResultArm {
+    pub fn err(error: &Id) -> Self {
+        Self::Err {
+            error: error.clone(),
+        }
+    }
+
+    pub fn variant(&self) -> ResultVariant {
+        match self {
+            Self::Ok => ResultVariant::Ok,
+            Self::Err { .. } => ResultVariant::Err,
+        }
+    }
+
+    /// The error class this arm selects, if it is an error arm.
+    pub fn error(&self) -> Option<&Id> {
+        match self {
+            Self::Ok => None,
+            Self::Err { error } => Some(error),
+        }
+    }
+}
+
+impl fmt::Display for ResultArm {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Ok => f.write_str("ok"),
+            Self::Err { error } => write!(f, "err:{error}"),
         }
     }
 }

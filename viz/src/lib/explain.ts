@@ -4,11 +4,12 @@
 // these are what they mean (CONSEQA_DSL_SEMANTICS.md §8, §9, §13, §17).
 
 import type {
+  CursorAdvanceRule,
   DeliverySemantics,
-  ExecutionHandoff,
   ExternalIdempotency,
   ExternalIdentity,
   ExternalResultReplay,
+  FieldPath,
   IdempotencyGuarantee,
   Input,
   MemberAssignment,
@@ -19,8 +20,10 @@ import type {
   ResultType,
   SubscriptionRoutingKey,
   Topic,
+  ValueRef,
 } from "../types/model";
 import { pathText } from "./ids";
+import { refString } from "./text";
 
 export type Tone = "success" | "warning" | "neutral" | "info";
 
@@ -105,7 +108,7 @@ export function isolation(level: "unspecified" | "read_committed" | "snapshot" |
         tone: "neutral",
         summary:
           "Reads see only committed data, but a value may change between two reads, and " +
-          "read-then-write races are possible unless locks or serialization prevent them.",
+          "read-then-write races are possible unless a lock or the version protocol constrains them.",
       };
     case "snapshot":
       return {
@@ -120,8 +123,9 @@ export function isolation(level: "unspecified" | "read_committed" | "snapshot" |
         label: "serializable",
         tone: "neutral",
         summary:
-          "Committed transactions are equivalent to some serial order. This does not imply " +
-          "real-time precedence, nor that a retry is safe.",
+          "Committed transactions are equivalent to some serial order: the closure of " +
+          "conflicting transactions is ordered by the database itself when every one of them is " +
+          "serializable. This does not imply real-time precedence, nor that a retry is safe.",
       };
     case "unspecified":
       return { label: "isolation unspecified", tone: "warning", summary: "No isolation fact may be assumed." };
@@ -256,27 +260,29 @@ export function noRuntimeDeclared(): Explanation {
   };
 }
 
-/** How a routing domain is mapped onto a pool member. */
+/** How a routing domain is placed on a pool member — a placement and
+ *  affinity fact, never a consistency one. */
 export function memberAssignment(value: MemberAssignment): Explanation {
   switch (value.kind) {
     case "consistent_hash":
       return {
         label: "consistent-hash assignment",
-        tone: "success",
+        tone: "info",
         summary:
-          "Equal routing domains are owned by the same pool member during a stable ownership " +
-          "epoch, and ownership transfers safely when membership changes. Different domains may " +
-          "share a member.",
+          "Equal routing domains are placed on the same pool member during a stable ownership " +
+          "epoch; different domains may share a member. Placement only: it says nothing about a " +
+          "stale owner overlapping its successor across replacement or rebalance, so no " +
+          "transaction serializability or ordering proof rests on it.",
       };
     case "round_robin":
       return {
         label: "round-robin assignment",
-        tone: "warning",
+        tone: "neutral",
         summary:
           "Each invocation goes to the next member in rotation, irrespective of routing domain. " +
           "Affinity is known not to exist here — a stronger statement than declaring no routing " +
-          "at all — so same-key invocations land on different members and no serialization or " +
-          "ordering proof can rest on it.",
+          "at all — so same-key invocations land on different members. A placement fact for " +
+          "load and locality; no transaction proof rests on either assignment.",
       };
   }
 }
@@ -303,71 +309,144 @@ export function requestRouting(key: string[][] | null | undefined): Explanation 
   };
 }
 
+/** A pool member's execution capacity — what an external scenario reads
+ *  for throughput and contention. It proves no transaction property. */
 export function memberConcurrency(value: MemberConcurrency): Explanation {
   switch (value.kind) {
     case "bounded":
       return value.value === 1
         ? {
             label: "one invocation at a time per member",
-            tone: "success",
+            tone: "info",
             summary:
               "A pool member runs at most one invocation at once, across every workload assigned " +
-              "to it. It binds each member separately: only with a matching routing key AND " +
-              "exclusive execution handoff do same-key invocations never overlap.",
+              "to it. A capacity fact about one member: it still overlaps every other member, its " +
+              "own replacement, and a stale incarnation of itself, so no transaction " +
+              "serializability or ordering proof rests on it.",
           }
         : {
             label: `up to ${value.value} at a time per member`,
-            tone: "warning",
+            tone: "neutral",
             summary:
-              "A pool member may run several invocations at once, so same-key invocations may " +
-              "overlap however they are routed.",
+              "A pool member may run several invocations at once. A capacity fact: it constrains " +
+              "load on one member and proves no transaction property.",
           };
     case "unbounded":
       return {
         label: "unbounded member concurrency",
-        tone: "warning",
+        tone: "neutral",
         summary: "No finite member-level execution bound may be assumed.",
       };
     case "unspecified":
       return {
         label: "member concurrency unspecified",
-        tone: "warning",
+        tone: "neutral",
         summary: "No usable fact about simultaneous execution on one pool member.",
       };
   }
 }
 
-export function executionHandoff(value: ExecutionHandoff | null | undefined): Explanation {
-  if (value === "exclusive_ownership") {
+/** A data object's declared version field: its application concurrency
+ *  token, managed only by the version protocol. */
+export function objectVersion(field: FieldPath): Explanation {
+  return {
+    label: `versioned by ${pathText(field)}`,
+    tone: "success",
+    summary:
+      "The object's application concurrency token: a transaction that observed the version " +
+      "validates it at commit, so a stale read rejects instead of committing, and every " +
+      "mutation of a live instance bumps it. Never assigned directly, and no part of the identity.",
+  };
+}
+
+/** `SerializableBy(key)` declared on a transaction. */
+export function serializabilityRequirement(key: ValueRef): Explanation {
+  return {
+    label: `SerializableBy(${refString(key)})`,
+    tone: "info",
+    summary:
+      "Within each key value, committed executions of this transaction and of every transaction " +
+      "that may conflict with it are equivalent to some serial order — proven from the " +
+      "transactions alone: serializable isolation across the whole conflict closure, or a " +
+      "conflict-graph argument with commit-order evidence from strict locks and the version " +
+      "protocol. Never from runtime topology.",
+  };
+}
+
+/** `OrderedBy(key, position)` declared on a transaction. */
+export function orderingRequirement(key: ValueRef, position: ValueRef): Explanation {
+  return {
+    label: `OrderedBy(${refString(key)}, ${refString(position)})`,
+    tone: "info",
+    summary:
+      "Within each key value, committed executions take effect in position order — proven on " +
+      "top of serializability by an advance_cursor (successor or monotonic_after rule) or a fence " +
+      "on a managed field of the keyed object, whose incoming value is the position. Transport " +
+      "precedence is never a route.",
+  };
+}
+
+/** How an `advance_cursor` step admits an incoming position. */
+export function cursorRule(rule: CursorAdvanceRule): Explanation {
+  switch (rule) {
+    case "successor":
+      return {
+        label: "successor rule",
+        tone: "info",
+        summary:
+          "Admits exactly the next position: the incoming value must be the stored position plus " +
+          "one, so a stale, duplicate, or gapped position rejects the transaction. Gap-free " +
+          "progression — every predecessor has been applied.",
+      };
+    case "monotonic_after":
+      return {
+        label: "monotonic-after rule",
+        tone: "info",
+        summary:
+          "Admits any greater position: the incoming value must exceed the stored one, so a stale " +
+          "or duplicate position rejects while gaps are permitted — high-water marks, snapshot " +
+          "versions, superseding updates. Not sufficient where every predecessor must be applied.",
+      };
+  }
+}
+
+/** A `fence` step: the fencing commit guard. */
+export function fence(): Explanation {
+  return {
+    label: "fencing token",
+    tone: "info",
+    summary:
+      "A stale token rejects: a token older than the persisted fence rejects the transaction, an " +
+      "equal one leaves the authority valid, and a newer one advances the fence atomically with " +
+      "the commit. It keeps an older authority generation from mutating state a newer one has " +
+      "taken over; equal tokens establish no relative order, so it is an ordering route on top " +
+      "of serializability, never a serializability proof by itself.",
+  };
+}
+
+/** Whether a transaction step names a rejection block, which it must
+ *  exactly when its body contains a rejecting step. */
+export function transactionRejection(hasRejectedArm: boolean): Explanation {
+  if (hasRejectedArm) {
     return {
-      label: "exclusive ownership handoff",
-      tone: "success",
+      label: "can reject",
+      tone: "warning",
       summary:
-        "When execution authority for a routing domain transfers between members or member " +
-        "incarnations, exclusive execution ownership is preserved: a stale owner cannot still " +
-        "be executing while its successor begins.",
+        "The body contains a commit guard — a transition, a version validation, a cursor " +
+        "advance, or a fence — so an attempt commits, rejects, or is interrupted. On rejection " +
+        "nothing commits, no artifact or admission is established, and control enters the " +
+        "rejected block; if that block falls through, control rejoins after the step with the " +
+        "transaction's artifacts unavailable. Interruption is never rejection: what a later " +
+        "attempt finds is the idempotency and recoverability question.",
     };
   }
 
   return {
-    label: "no execution-handoff fact",
-    tone: "warning",
+    label: "never rejects",
+    tone: "neutral",
     summary:
-      "Nothing establishes that exclusive execution ownership survives member replacement or " +
-      "reassignment. Affinity holds per stable epoch and bounded(1) binds each member " +
-      "separately, so a stale owner may overlap its successor — no topology serialization or " +
-      "ordering proof holds without the declared handoff.",
-  };
-}
-
-export function invocationLock(): Explanation {
-  return {
-    label: "invocation lock",
-    tone: "success",
-    summary:
-      "An exclusive lock on the evaluated key, acquired at operation entry before any program " +
-      "step and held to the invocation's terminal: equal keys never execute concurrently, " +
-      "whatever the topology. No FIFO guarantee — it proves serialization, never ordering.",
+      "No step of the body is a commit guard, so an attempt either commits or is interrupted; " +
+      "there is no rejected block, and control always continues after the step on commit.",
   };
 }
 
@@ -389,53 +468,58 @@ export function messageIdentity(identity: Topic["message_identity"]): Explanatio
 }
 
 /** The transport precedence in force — a realization fact, not a
- *  property of the logical channel, and independent of grouping. */
+ *  property of the logical channel, and independent of grouping. It
+ *  describes how work ordinarily arrives; no transaction ordering
+ *  proof consumes it. */
 export function transportOrdering(ordering: OrderingSemantics | undefined): Explanation {
   switch (ordering) {
     case "within_group":
       return {
         label: "ordered within each group",
-        tone: "success",
+        tone: "info",
         summary:
           "The transport delivers messages of one runtime group in publication order; " +
-          "different groups are unordered relative to each other.",
+          "different groups are unordered relative to each other. Arrival precedence only: it " +
+          "does not survive redelivery or worker replacement, so no transaction ordering proof " +
+          "rests on it — that is what an ordered cursor or a fence is for.",
       };
     case "global":
       return {
         label: "globally ordered",
-        tone: "success",
+        tone: "info",
         summary:
           "Every message is part of one ordered sequence — stronger than per-group order, " +
-          "and it needs no grouping key of its own. It does not imply ordered execution: " +
-          "the execution topology must still preserve the precedence.",
+          "and it needs no grouping key of its own. It does not imply ordered execution, and " +
+          "no transaction ordering proof rests on it: precedence does not survive redelivery " +
+          "or worker replacement.",
       };
     default:
       return {
         label: "no transport order",
-        tone: "warning",
+        tone: "neutral",
         summary: "No usable precedence guarantee; observed order may not be relied on.",
       };
   }
 }
 
-/** The runtime equivalence domains the transport groups into. Enough
- *  on its own for serialization to reason about; ordering is a
- *  separate fact. */
+/** The runtime equivalence domains the transport groups into. A
+ *  placement fact about how work arrives; ordering is a separate fact,
+ *  and neither is transaction consistency. */
 export function transportGrouping(grouping: GroupingKey | undefined): Explanation {
   if (grouping) {
     return {
       label: "grouped by key",
-      tone: "success",
+      tone: "info",
       summary:
         "Messages whose key tuples are equal belong to one runtime group. That is all it " +
-        "says — not ordering, not serialization, not member assignment, each of which " +
-        "needs its own declared fact.",
+        "says — not precedence, not member assignment, and not transaction consistency, " +
+        "which no grouping fact ever proves.",
     };
   }
 
   return {
     label: "no grouping",
-    tone: "warning",
+    tone: "neutral",
     summary: "The transport establishes no equivalence domain over these messages.",
   };
 }
@@ -462,25 +546,26 @@ export function externalIdempotency(idempotency: ExternalIdempotency): Explanati
   }
 }
 
-/** A request input's declared `Result<Ok, Err>` contract. */
+/** A request input's declared result contract: an `ok` schema and named
+ *  error classes. */
 export function requestResult(): Explanation {
   return {
-    label: "returns Result<ok, err>",
+    label: "returns Result<ok, errors>",
     tone: "info",
     summary:
-      "A request through this input completes with exactly one of two typed outcomes: an ok " +
-      "payload or an err payload. Err is a logical outcome the boundary returned — a declined " +
-      "card, a rejected request — not a crash, a timeout, or a lost connection. The err's " +
-      "disposition says whether observing it terminally resolves the logical request or " +
-      "semantically admits another attempt; it causes no retry by itself.",
+      "A request through this input completes with exactly one typed outcome: the ok payload, " +
+      "or the payload of one named error class. An error is a logical outcome the boundary " +
+      "returned — a declined card, a rejected request — not a crash, a timeout, or a lost " +
+      "connection. Each class's disposition says whether observing it terminally resolves the " +
+      "logical request or semantically admits another attempt; it causes no retry by itself.",
   };
 }
 
 /** What an external boundary's result says under its declared
  *  `result_replay` behaviour: `replay_stable` over a keyed identity
- *  fixes one interaction's terminal result, and the error's
- *  disposition decides whether an observed err is that terminal
- *  result. Independent of the idempotency axis. */
+ *  fixes one interaction's terminal result, and each error class's
+ *  disposition decides whether an observed error of that class is that
+ *  terminal result. Independent of the idempotency axis. */
 export function externalResult(
   result: ResultType | null,
   resultReplay: ExternalResultReplay,
@@ -507,43 +592,55 @@ export function externalResult(
       label: "returns a result",
       tone: "warning",
       summary:
-        "The boundary returns Result<ok, err>, and the program may branch on it — but without " +
+        "The boundary returns Result<ok, errors>, and the program may branch on it — but without " +
         "result_replay: replay_stable, nothing fixes the interaction's terminal result, so a " +
         "decision on this result is not established to replay.",
     };
   }
-  switch (result.err.disposition) {
-    case "terminal":
-      return {
-        label: "returns a fixed terminal result",
-        tone: "success",
-        summary:
-          "Equal identity keys are one logical interaction whose terminal result the guarantee " +
-          "fixes: ok is terminal by definition and the err is declared terminal, so a same-key " +
-          "repeat observes the same outcome again and a decision on this result replays " +
-          "whenever the identity key is class-fixed.",
-      };
-    case "retryable":
-      return {
-        label: "returns a result with a retryable err",
-        tone: "info",
-        summary:
-          "Equal identity keys are one logical interaction, and its terminal ok is fixed — but " +
-          "the retryable err conclusively ends only its own attempt: a later same-key " +
-          "application may observe a different outcome, so only the ok arm of a decision on " +
-          "this result is established to replay.",
-      };
-    case "unspecified":
-      return {
-        label: "returns a result",
-        tone: "info",
-        summary:
-          "Equal identity keys are one logical interaction, and its terminal ok is fixed — but " +
-          "the err's disposition is unspecified: no fact says whether an observed err " +
-          "terminally resolved the interaction, so the err arm of a decision on this result " +
-          "is not established to replay.",
-      };
+
+  const classes = Object.entries(result.errors);
+  const named = (disposition: string) =>
+    classes.filter(([, c]) => c.disposition === disposition).map(([id]) => id);
+  const retryable = named("retryable");
+  const unspecified = named("unspecified");
+  const list = (ids: string[]) => ids.join(", ");
+
+  if (!retryable.length && !unspecified.length) {
+    return {
+      label: "returns a fixed terminal result",
+      tone: "success",
+      summary:
+        "Equal identity keys are one logical interaction whose terminal result the guarantee " +
+        "fixes: ok is terminal by definition and every error class is declared terminal" +
+        (classes.length ? "" : " (there are none)") +
+        ", so a same-key repeat observes the same outcome again and a decision on this result " +
+        "replays whenever the identity key is class-fixed.",
+    };
   }
+  if (unspecified.length) {
+    return {
+      label: "returns a result",
+      tone: "info",
+      summary:
+        "Equal identity keys are one logical interaction, and its terminal ok is fixed — but " +
+        `the disposition of error class${unspecified.length === 1 ? "" : "es"} ${list(unspecified)} ` +
+        "is unspecified: no fact says whether observing it terminally resolved the interaction, " +
+        "so that arm of a decision on this result is not established to replay" +
+        (retryable.length
+          ? `; ${list(retryable)} conclusively ends only its own attempt, so that arm is not either.`
+          : "."),
+    };
+  }
+  return {
+    label: "returns a result with a retryable err",
+    tone: "info",
+    summary:
+      "Equal identity keys are one logical interaction, and its terminal ok is fixed — but " +
+      `the retryable error class${retryable.length === 1 ? "" : "es"} ${list(retryable)} ` +
+      "conclusively ends only its own attempt: a later same-key application may observe a " +
+      "different outcome, so only the ok arm and the terminal error arms of a decision on this " +
+      "result are established to replay.",
+  };
 }
 
 /** A request effect's result, inherited from the input it targets. */
@@ -552,9 +649,9 @@ export function inheritedResult(): Explanation {
     label: "inherits the target's result",
     tone: "info",
     summary:
-      "The request yields the Result<ok, err> its target input declares. Repeated payload-equal " +
-      "requests observe the same outcome exactly when the target proves its result " +
-      "replay-consistent for that input.",
+      "The request yields the Result<ok, errors> its target input declares. Repeated " +
+      "payload-equal requests observe the same outcome exactly when the target proves its " +
+      "result replay-consistent for that input.",
   };
 }
 
@@ -577,7 +674,8 @@ export function resultBinding(): Explanation {
     tone: "neutral",
     summary:
       "The bound result is available to the steps after the binding; its ok payload only inside " +
-      "the ok arm of a match on it, its err payload only inside the err arm. It is not a " +
-      "transaction artifact and is not durable: a retry re-executes the effect and observes afresh.",
+      "the ok arm of a match on it, an error payload only inside the arm of its own class. It is " +
+      "not a transaction artifact and is not durable: a retry re-executes the effect and " +
+      "observes afresh.",
   };
 }

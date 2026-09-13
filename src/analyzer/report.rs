@@ -17,19 +17,16 @@
 use serde::{Deserialize, Serialize};
 
 use crate::analyzer::verification::{
-    self, ArtifactReplay, ConsumerCollapse, DecisionReplay, DecisionRule, EffectSafety,
-    IdempotencyProof, IdempotencyVerdict, InstanceStability, KeyIdentity,
-    OutboxPartitionKeyFact, PathRef, RecoverabilityProof, RecoverabilityVerdict, Resolution,
-    ResultReplayProof, ResultReplayVerdict, ResultStabilityRule, RetryDriver, RetryRoute,
-    SerializationProof, SerializationVerdict, StableRoot, VerificationReport,
-};
-use crate::analyzer::verification::{
-    DuplicateHandling, GroupingScope, LineageFact, MessageKeyFact, ModelNote, OrderingProof,
-    OrderingVerdict, PrecedenceSource, ProofScope, RemedyLayer,
+    self, ArtifactReplay, CommitArtifact, CommitOrderEvidence, ConsumerCollapse, DecisionReplay,
+    DecisionRule, EffectSafety, IdempotencyProof, IdempotencyVerdict, InstanceStability,
+    LineageFact, ModelNote, PathRef, ProofScope, RecoverabilityProof, RecoverabilityVerdict,
+    RemedyLayer, Resolution, ResultReplayProof, ResultReplayVerdict, ResultStabilityRule,
+    RetryDriver, RetryRoute, StableRoot, TransactionOrderingProof, TransactionOrderingVerdict,
+    TransactionRef, TransactionSerializabilityProof, TransactionSerializabilityVerdict,
+    VerificationReport,
 };
 use crate::spec::{
-    CompletionRequirement, Id, MemberAssignment, Model, ResultReplayRequirement,
-    SubscriptionRoutingKey, ValueRef,
+    CompletionRequirement, CursorAdvanceRule, Id, Model, ResultReplayRequirement, ValueRef,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -62,18 +59,20 @@ pub struct ProverReport {
 /// property with result replay, dropped object-history obligations and
 /// the flow subject, and made proofs cite program paths. Format 3 added
 /// proof `scope` and rebuilt the serialization and ordering arguments
-/// on the L1 runtime model — routing domains, member assignment, and
-/// execution-pool member concurrency in place of dispatch lanes and
-/// operation-global concurrency. Format 4 added `remedy` to unproven
+/// on the L1 runtime model. Format 4 added `remedy` to unproven
 /// serialization and ordering obligations. Format 5 added the `dsl`
 /// contract version the verdicts are relative to, and rebuilt the
 /// external-boundary evidence on the identity / idempotency /
 /// result-replay decomposition. Format 6 split the ownership leg of
-/// the topology serialization and ordering arguments — stable-epoch
-/// member affinity and exclusive execution handoff are now separate
-/// cited facts — and added the L0 invocation-lock serialization
-/// proof.
-pub const FORMAT: u32 = 6;
+/// the topology serialization and ordering arguments and added the L0
+/// invocation-lock serialization proof. Format 7 retires the
+/// operation-level serialization and ordering families with every
+/// topology and invocation-lock proof, and replaces them with the
+/// transaction serializability and ordering families: obligations
+/// anchored to a transaction, proven from the model-wide conflict
+/// closure — serializable isolation, strict locks, version validation,
+/// ordered cursors, fences — and never from L1.
+pub const FORMAT: u32 = 7;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -119,13 +118,15 @@ pub struct Obligation {
 
 /// The correctness property an obligation discharges.
 ///
-/// The first four mirror `OperationRequirements`; `result_replay`
-/// splits out the result half of an idempotency requirement.
+/// The two transaction properties mirror `TransactionRequirements`;
+/// idempotency and recoverability mirror `OperationRequirements`, and
+/// `result_replay` splits out the result half of an idempotency
+/// requirement.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Property {
-    Serialization,
-    Ordering,
+    TransactionSerializability,
+    TransactionOrdering,
     Idempotency,
     Recoverability,
     ResultReplay,
@@ -135,8 +136,8 @@ pub enum Property {
 /// The model entity an obligation is anchored to.
 ///
 /// `requirement` indexes into the corresponding requirement list on
-/// the operation, tying the obligation back to the declaration that
-/// produced it.
+/// the operation or transaction, tying the obligation back to the
+/// declaration that produced it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Subject {
@@ -148,6 +149,8 @@ pub enum Subject {
     Transaction {
         operation: Id,
         transaction: Id,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        requirement: Option<usize>,
     },
     Object {
         data_model: Id,
@@ -236,38 +239,74 @@ pub fn scaffold(model: &Model) -> ProverReport {
         }
     }
 
+    fn transaction_obligation(
+        op_id: &Id,
+        transaction: &Id,
+        property: Property,
+        index: usize,
+        summary: String,
+    ) -> Obligation {
+        Obligation {
+            id: transaction_obligation_id(op_id, transaction, property_slug(&property), index),
+            property,
+            subject: Subject::Transaction {
+                operation: op_id.clone(),
+                transaction: transaction.clone(),
+                requirement: Some(index),
+            },
+            status: Status::Unknown,
+            summary,
+            scope: None,
+            remedy: None,
+            assumptions: Vec::new(),
+            evidence: Vec::new(),
+            counterexample: None,
+        }
+    }
+
     for (op_id, op) in &model.operations {
+        // Transaction obligations first, in program order: they are
+        // properties of committed state, which is what the operation's
+        // own obligations build on.
+        for (_, transaction) in op.program.transactions() {
+            for (i, r) in transaction.requirements.serializability.iter().enumerate() {
+                obligations.push(transaction_obligation(
+                    op_id,
+                    &transaction.id,
+                    Property::TransactionSerializability,
+                    i,
+                    format!(
+                        "Executions of {} sharing key {} commit in a history equivalent \
+                         to some serial order, together with every transaction they may \
+                         conflict with.",
+                        transaction.id,
+                        value_ref_label(&r.key)
+                    ),
+                ));
+            }
+
+            for (i, r) in transaction.requirements.ordering.iter().enumerate() {
+                obligations.push(transaction_obligation(
+                    op_id,
+                    &transaction.id,
+                    Property::TransactionOrdering,
+                    i,
+                    format!(
+                        "Executions of {} sharing key {} take effect in the order of {}.",
+                        transaction.id,
+                        value_ref_label(&r.key),
+                        value_ref_label(&r.position)
+                    ),
+                ));
+            }
+        }
+
         let push = |obligations: &mut Vec<Obligation>,
                     property: Property,
                     index: usize,
                     summary: String| {
             obligations.push(requirement_obligation(op_id, property, index, summary));
         };
-
-        for (i, r) in op.requirements.serialization.iter().enumerate() {
-            push(
-                &mut obligations,
-                Property::Serialization,
-                i,
-                format!(
-                    "Invocations of {op_id} sharing key {} never overlap.",
-                    value_ref_label(&r.key)
-                ),
-            );
-        }
-
-        for (i, r) in op.requirements.ordering.iter().enumerate() {
-            push(
-                &mut obligations,
-                Property::Ordering,
-                i,
-                format!(
-                    "Invocations of {op_id} sharing key {} take effect in \
-                     their semantic order.",
-                    value_ref_label(&r.key)
-                ),
-            );
-        }
 
         for (i, r) in op.requirements.idempotency.iter().enumerate() {
             push(
@@ -294,7 +333,7 @@ pub fn scaffold(model: &Model) -> ProverReport {
                          returns an equivalent result."
                     ),
                     scope: None,
-            remedy: None,
+                    remedy: None,
                     assumptions: Vec::new(),
                     evidence: Vec::new(),
                     counterexample: None,
@@ -335,25 +374,45 @@ pub fn scaffold(model: &Model) -> ProverReport {
 pub fn obligations(model: &Model, verification: &VerificationReport) -> ProverReport {
     let mut report = scaffold(model);
 
-    for check in &verification.serialization {
-        let id = obligation_id(&check.operation, "serialization", check.requirement);
+    for check in &verification.transaction_serializability {
+        let id = transaction_obligation_id(
+            &check.operation,
+            &check.transaction,
+            "transaction_serializability",
+            check.requirement,
+        );
 
         patch(&mut report, &id, || match &check.verdict {
-            SerializationVerdict::Proven { proof, scope } => {
-                Ok((*scope, serialization_assumptions(proof)))
+            TransactionSerializabilityVerdict::Proven { proof, scope } => {
+                let mut assumptions = transaction_serializability_assumptions(proof);
+
+                assumptions.extend(commit_artifact_assumptions(&check.artifacts));
+
+                Ok((*scope, assumptions))
             }
-            SerializationVerdict::Unproven { .. } => Err(check.diagnostic()),
+            TransactionSerializabilityVerdict::Unproven { .. } => Err(check.diagnostic()),
         });
 
         set_remedy(&mut report, &id, check.remedy());
     }
 
-    for check in &verification.ordering {
-        let id = obligation_id(&check.operation, "ordering", check.requirement);
+    for check in &verification.transaction_ordering {
+        let id = transaction_obligation_id(
+            &check.operation,
+            &check.transaction,
+            "transaction_ordering",
+            check.requirement,
+        );
 
         patch(&mut report, &id, || match &check.verdict {
-            OrderingVerdict::Proven { proof, scope } => Ok((*scope, ordering_assumptions(proof))),
-            OrderingVerdict::Unproven { .. } => Err(check.diagnostic()),
+            TransactionOrderingVerdict::Proven { proof, scope } => {
+                let mut assumptions = transaction_ordering_assumptions(proof);
+
+                assumptions.extend(commit_artifact_assumptions(&check.artifacts));
+
+                Ok((*scope, assumptions))
+            }
+            TransactionOrderingVerdict::Unproven { .. } => Err(check.diagnostic()),
         });
 
         set_remedy(&mut report, &id, check.remedy());
@@ -385,18 +444,37 @@ pub fn obligations(model: &Model, verification: &VerificationReport) -> ProverRe
             {
                 for path in paths {
                     for decision in &path.decisions {
-                        if matches!(decision.rule, DecisionRule::IdempotencyInertContinuation) {
-                            obligation.evidence.push(EvidenceItem {
-                                subject: None,
-                                message: format!(
-                                    "{} is not established to replay; every continuation \
-                                     to a terminal is idempotency-inert, so divergence \
-                                     cannot add modeled work and may affect only terminal \
-                                     construction — which is the result-replay obligation's \
-                                     concern, not this one's.",
-                                    decision_label(&decision.decision),
-                                ),
-                            });
+                        match &decision.rule {
+                            DecisionRule::IdempotencyInertContinuation => {
+                                obligation.evidence.push(EvidenceItem {
+                                    subject: None,
+                                    message: format!(
+                                        "{} is not established to replay; every continuation \
+                                         to a terminal is idempotency-inert, so divergence \
+                                         cannot add modeled work and may affect only terminal \
+                                         construction — which is the result-replay \
+                                         obligation's concern, not this one's.",
+                                        decision_label(&decision.decision),
+                                    ),
+                                });
+                            }
+
+                            DecisionRule::OutcomeDivergenceAddsNoWork { transaction } => {
+                                obligation.evidence.push(EvidenceItem {
+                                    subject: Some(transaction.clone()),
+                                    message: format!(
+                                        "{} is not established to replay; a rejection \
+                                         commits nothing and performs only its rejection \
+                                         block's work, judged duplicate-safe on its own \
+                                         path, so divergence between rejection and commit \
+                                         cannot duplicate modeled work — the returned \
+                                         result is the result-replay obligation's concern.",
+                                        decision_label(&decision.decision),
+                                    ),
+                                });
+                            }
+
+                            _ => {}
                         }
                     }
                 }
@@ -548,11 +626,20 @@ fn obligation_id(operation: &Id, slug: &str, requirement: usize) -> String {
     format!("oblig.{operation}.{slug}.{requirement}")
 }
 
+fn transaction_obligation_id(
+    operation: &Id,
+    transaction: &Id,
+    slug: &str,
+    requirement: usize,
+) -> String {
+    format!("oblig.{operation}.{transaction}.{slug}.{requirement}")
+}
+
 /// Records which layer an unproven obligation is waiting on.
 ///
-/// Separate from `patch` because only the serialization and ordering
-/// families classify their obstacles today; the rest leave it absent,
-/// which a coordinator reads as the application layer.
+/// Separate from `patch` because only the transaction families
+/// classify their obstacles today; the rest leave it absent, which a
+/// coordinator reads as the application layer.
 fn set_remedy(report: &mut ProverReport, id: &str, remedy: Option<RemedyLayer>) {
     if let Some(obligation) = report
         .obligations
@@ -605,8 +692,8 @@ fn patch(
 
 fn property_slug(property: &Property) -> &str {
     match property {
-        Property::Serialization => "serialization",
-        Property::Ordering => "ordering",
+        Property::TransactionSerializability => "transaction_serializability",
+        Property::TransactionOrdering => "transaction_ordering",
         Property::Idempotency => "idempotency",
         Property::Recoverability => "recoverability",
         Property::ResultReplay => "result_replay",
@@ -618,453 +705,194 @@ fn value_ref_label(value: &ValueRef) -> String {
     format!("{}.{}", value.source.id(), value.path)
 }
 
-fn serialization_assumptions(proof: &SerializationProof) -> Vec<String> {
-    match proof {
-        SerializationProof::NoAdmittedInvocations { input } => vec![format!(
-            "{input} admits no message schemas; the requirement constrains no \
-             invocations"
-        )],
+fn closure_label(closure: &[TransactionRef]) -> String {
+    closure
+        .iter()
+        .map(|member| member.transaction.to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
 
-        SerializationProof::InvocationLocked {
-            input,
+fn transaction_serializability_assumptions(proof: &TransactionSerializabilityProof) -> Vec<String> {
+    match proof {
+        TransactionSerializabilityProof::SerializableIsolationClosure { root, key, closure } => {
+            vec![
+                format!(
+                    "the conflict closure of {root} under SerializableBy({}) is {{{}}}: every \
+                     transaction that may touch overlapping state, transitively",
+                    value_ref_label(key),
+                    closure_label(closure)
+                ),
+                "every transaction in the closure declares isolation: serializable, so their \
+                 committed history is equivalent to some serial order"
+                    .to_string(),
+            ]
+        }
+
+        TransactionSerializabilityProof::ConflictGraph {
+            root,
             key,
-            key_identities,
+            closure,
+            dependencies,
         } => {
             let mut assumptions = vec![format!(
-                "the operation acquires an exclusive invocation lock keyed by \
-                 {} at entry, before any program step, and holds it to the \
-                 invocation's terminal",
-                value_ref_label(key)
+                "the conflict closure of {root} under SerializableBy({}) is {{{}}}: every \
+                 transaction that may touch overlapping state, transitively",
+                value_ref_label(key),
+                closure_label(closure)
             )];
 
-            for fact in key_identities {
-                assumptions.push(match &fact.identity {
-                    KeyIdentity::SamePath => format!(
-                        "for {}, the lock key is the serialization key field, so \
-                         same-key invocations contend on one lock",
-                        fact.schema
-                    ),
+            let mut cited: Vec<String> = Vec::new();
+            let mut unconstrained = 0usize;
 
-                    KeyIdentity::SameCanonicalValue { schema, path } => format!(
-                        "for {}, the lock key carries the serialization key's value \
-                         ({schema}.{path} via fragment aliasing), so same-key \
-                         invocations contend on one lock",
-                        fact.schema
-                    ),
-                });
+            for dependency in dependencies {
+                if dependency.evidence == CommitOrderEvidence::None {
+                    unconstrained += 1;
+
+                    continue;
+                }
+
+                let sentence =
+                    verification::transaction_serializability::evidence_sentence(dependency);
+
+                if !cited.contains(&sentence) {
+                    cited.push(sentence);
+                }
             }
 
-            assumptions.push(format!(
-                "equal lock keys exclude concurrent execution of the operation \
-                 program, whatever member of whatever pool runs the invocations \
-                 of {input} — no routing, concurrency, or handoff fact \
-                 participates"
-            ));
+            assumptions.extend(cited);
 
-            assumptions
-        }
-
-        SerializationProof::RequestRouted {
-            input,
-            router,
-            pool,
-            routing_key,
-            member_assignment,
-            execution_handoff,
-        } => {
-            let mut assumptions = vec![format!(
-                "{router} routes invocations of {input} into {pool} by a semantic \
-                 routing key"
-            )];
-
-            for component in routing_key {
-                assumptions.push(match &component.identity {
-                    KeyIdentity::SamePath => format!(
-                        "the routing-key component {} is the serialization key field, \
-                         so same-key invocations share one routing domain",
-                        component.path
-                    ),
-
-                    KeyIdentity::SameCanonicalValue { schema, path } => format!(
-                        "the routing-key component {} carries the serialization key's \
-                         value ({schema}.{path} via fragment aliasing), so same-key \
-                         invocations share one routing domain",
-                        component.path
-                    ),
-                });
+            if unconstrained > 0 {
+                assumptions.push(format!(
+                    "{unconstrained} potential {} on no cyclic conflict component and need no \
+                     commit-order evidence",
+                    if unconstrained == 1 {
+                        "dependency lies"
+                    } else {
+                        "dependencies lie"
+                    }
+                ));
             }
 
-            assumptions.push(member_assignment_assumption(member_assignment));
-
-            assumptions.push(execution_handoff_assumption(pool, execution_handoff));
-
-            assumptions.push(format!(
-                "{pool} bounds each member to one simultaneously active invocation, so \
-                 the owning member runs same-key invocations one at a time"
-            ));
-
-            assumptions
-        }
-
-        SerializationProof::SubscriptionRouted {
-            input,
-            topic,
-            pool,
-            grouping_scope,
-            message_keys,
-            member_assignment,
-            execution_handoff,
-        } => {
-            let mut assumptions = vec![format!(
-                "{}, and {input} dispatches into {pool} by that grouping key, so \
-                 same-key deliveries share one routing domain",
-                grouping_declaration(grouping_scope, topic)
-            )];
-
-            assumptions.extend(grouping_key_assumptions(message_keys, "serialization"));
-
-            assumptions.push(member_assignment_assumption(member_assignment));
-
-            assumptions.push(execution_handoff_assumption(pool, execution_handoff));
-
-            assumptions.push(format!(
-                "{pool} bounds each member to one simultaneously active invocation, so \
-                 the owning member runs same-key invocations one at a time"
-            ));
-
-            assumptions
-        }
-
-        SerializationProof::OutboxRouted {
-            input,
-            outbox,
-            pool,
-            partition_keys,
-            member_assignment,
-            execution_handoff,
-        } => {
-            let mut assumptions = vec![format!(
-                "{outbox} consumption through {input} is partitioned by a keyed \
-                 partition, and dispatch into {pool} assigns each partition to a \
-                 member, so same-key deliveries share one partition domain"
-            )];
-
-            assumptions.extend(partition_key_assumptions(partition_keys, "serialization"));
-
-            assumptions.push(member_assignment_assumption(member_assignment));
-
-            assumptions.push(execution_handoff_assumption(pool, execution_handoff));
-
-            assumptions.push(format!(
-                "{pool} bounds each member to one simultaneously active invocation, so \
-                 the owning member runs same-key invocations one at a time"
-            ));
-
-            assumptions.push(format!(
-                "{input} dispatches without a batching stage, so no opaque \
-                 batch-internal parallelism escapes the member-concurrency bound"
-            ));
+            assumptions.push(
+                "no cyclic conflict component contains an unconstrained dependency: an \
+                 apparent cycle would imply a cycle in strict commit order and cannot occur \
+                 in a committed history"
+                    .to_string(),
+            );
 
             assumptions
         }
     }
 }
 
-/// What a member assignment guarantees about domain ownership within a
-/// stable ownership epoch — affinity only; continuity across epochs is
-/// the execution-handoff fact's separate assumption.
-fn member_assignment_assumption(assignment: &MemberAssignment) -> String {
-    match assignment {
-        MemberAssignment::ConsistentHash => "consistent_hash assignment gives each routing \
-             domain one owning pool member during a stable ownership epoch"
-            .to_string(),
+fn transaction_ordering_assumptions(proof: &TransactionOrderingProof) -> Vec<String> {
+    let mut assumptions = vec!["transaction state history is serializable:".to_string()];
 
-        // Unreachable through a well-formed proof: the verifiers gate
-        // both routed routes on `assignment_owns_one_member`, which is
-        // false here. Rendered rather than panicked, and worded so that
-        // it reads as obviously wrong inside a proof if that gate is
-        // ever lost.
-        MemberAssignment::RoundRobin => "round_robin assignment gives no routing domain an \
-             owning pool member, so this proof cites a fact that does not support it"
-            .to_string(),
-    }
-}
+    assumptions.extend(
+        transaction_serializability_assumptions(proof.serializability())
+            .into_iter()
+            .map(|assumption| format!("  {assumption}")),
+    );
 
-/// What the pool's execution-handoff declaration guarantees across
-/// ownership and member transitions — the leg stable-epoch affinity
-/// and member concurrency cannot supply.
-fn execution_handoff_assumption(
-    pool: &Id,
-    handoff: &crate::spec::ExecutionHandoff,
-) -> String {
-    match handoff {
-        crate::spec::ExecutionHandoff::ExclusiveOwnership => format!(
-            "{pool} declares exclusive_ownership execution handoff: when execution \
-             authority for a routing domain transfers between members or member \
-             incarnations, exclusive execution ownership is preserved, so a stale \
-             owner cannot overlap its successor"
-        ),
-    }
-}
-
-/// Which declaration supplied the grouping — the two scopes are
-/// exclusive, so naming it tells a reader exactly what to look at, and
-/// which declaration changing would invalidate the proof.
-fn grouping_declaration(scope: &GroupingScope, topic: &Id) -> String {
-    match scope {
-        GroupingScope::Topic { topic } => {
-            format!("{topic} declares a keyed grouping for every subscription of it")
-        }
-
-        GroupingScope::Subscription { input, .. } => {
-            format!("{input} declares its own keyed grouping over {topic}")
-        }
-    }
-}
-
-/// The precedence half, named the same way.
-fn ordering_declaration(scope: &GroupingScope, topic: &Id) -> String {
-    match scope {
-        GroupingScope::Topic { topic } => topic.to_string(),
-        GroupingScope::Subscription { input, .. } => format!("{input} on {topic}"),
-    }
-}
-
-/// Per admitted schema, why the grouping key carries the requirement
-/// key's value.
-fn grouping_key_assumptions(keys: &[MessageKeyFact], requirement: &str) -> Vec<String> {
-    keys.iter()
-        .map(|key| match &key.identity {
-            KeyIdentity::SamePath => format!(
-                "for {}, the grouping key {} is the {requirement} key field",
-                key.schema, key.grouping_key
-            ),
-
-            KeyIdentity::SameCanonicalValue { schema, path } => format!(
-                "for {}, the grouping key {} carries the {requirement} key's value \
-                 ({schema}.{path} via fragment aliasing)",
-                key.schema, key.grouping_key
-            ),
-        })
-        .collect()
-}
-
-/// Per admitted schema, why the outbox partition key carries the
-/// requirement key's value.
-fn partition_key_assumptions(keys: &[OutboxPartitionKeyFact], requirement: &str) -> Vec<String> {
-    keys.iter()
-        .map(|key| match &key.identity {
-            KeyIdentity::SamePath => format!(
-                "for {}, the partition key {} is the {requirement} key field",
-                key.schema, key.partition_key
-            ),
-
-            KeyIdentity::SameCanonicalValue { schema, path } => format!(
-                "for {}, the partition key {} carries the {requirement} key's value \
-                 ({schema}.{path} via fragment aliasing)",
-                key.schema, key.partition_key
-            ),
-        })
-        .collect()
-}
-
-fn ordering_assumptions(proof: &OrderingProof) -> Vec<String> {
     match proof {
-        OrderingProof::NoAdmittedInvocations { input } => vec![format!(
-            "{input} admits no message schemas; no invocation bears the key and \
-             no precedence exists to preserve"
-        )],
-
-        OrderingProof::RoutedOrder {
-            input,
-            topic,
-            pool,
-            precedence,
-            scope,
-            message_keys,
-            routing_key,
-            member_assignment,
-            execution_handoff,
-            duplicates,
+        TransactionOrderingProof::Cursor {
+            key,
+            position,
+            cursor,
+            rule,
+            step,
+            ..
         } => {
-            let mut assumptions = Vec::new();
-
-            // Precedence and grouping are independent facts, and the
-            // proof cites them as two.
-            assumptions.push(match precedence {
-                PrecedenceSource::WithinGroup => format!(
-                    "the transport for {} orders messages within a group; that order \
-                     is the precedence",
-                    ordering_declaration(scope, topic)
-                ),
-
-                PrecedenceSource::Global => format!(
-                    "the transport for {} orders every message; that order is the \
-                     precedence for any key",
-                    ordering_declaration(scope, topic)
-                ),
-            });
-
-            assumptions.push(grouping_declaration(scope, topic));
-
-            assumptions.extend(grouping_key_assumptions(message_keys, "ordering"));
-
-            assumptions.push(match routing_key {
-                SubscriptionRoutingKey::GroupingKey => format!(
-                    "{input} dispatches by the grouping key, so same-key deliveries \
-                     belong to the one routing domain the grouping established"
-                ),
-            });
-
-            assumptions.push(member_assignment_assumption(member_assignment));
-
-            assumptions.push(execution_handoff_assumption(pool, execution_handoff));
-
             assumptions.push(format!(
-                "{pool} bounds each member to one simultaneously active invocation, so a \
-                 later invocation cannot overtake an earlier one"
+                "the ordering key {} identifies the cursor domain: every identity field \
+                 of {} is pinned by it or by a literal",
+                value_ref_label(key),
+                cursor.object
             ));
 
-            match duplicates {
-                DuplicateHandling::SingleDelivery => assumptions.push(format!(
-                    "{input} receives each logical message at most once, so neither \
-                     redelivery nor a duplicate exists"
-                )),
+            assumptions.push(format!(
+                "the logical position {} is persisted as cursor {cursor} under the {rule} \
+                 rule at step {}: the transaction commits only when the position is \
+                 admissible after the stored one, so an older accepted position cannot \
+                 commit after a newer one",
+                value_ref_label(position),
+                step + 1
+            ));
 
-                DuplicateHandling::OrderPreservingRedelivery { idempotency } => {
-                    assumptions.push(
-                        "dispatch preserves the transport's established same-key \
-                         precedence when admitting invocations, including across \
-                         failure-driven redelivery and ownership reassignment"
-                            .to_string(),
-                    );
-
-                    assumptions.push(match idempotency {
-                        Some(coverage) => format!(
-                            "a duplicate of a completed delivery repeats an invocation \
-                             that already took effect in order; its work is idempotency \
-                             requirement #{}'s obligation ({})",
-                            coverage.requirement,
-                            if coverage.proven {
-                                "proven"
-                            } else {
-                                "unproven"
-                            }
-                        ),
-
-                        None => format!(
-                            "a duplicate of a completed delivery repeats an invocation \
-                             that already took effect in order; no idempotency \
-                             requirement keyed from {input} answers for its work"
-                        ),
-                    });
-                }
+            if *rule == CursorAdvanceRule::Successor {
+                assumptions.push(
+                    "the successor rule additionally makes accepted progression gap-free: \
+                     a stale, duplicate, or skipped position rejects"
+                        .to_string(),
+                );
             }
 
-            assumptions
+            assumptions.push(format!(
+                "no ordinary write touches {cursor}, and every advance of it uses the {rule} \
+                 rule"
+            ));
         }
 
-        OrderingProof::OutboxRoutedOrder {
-            input,
-            outbox,
-            pool,
-            precedence,
-            partition_keys,
-            member_assignment,
-            execution_handoff,
-            batching,
-            duplicates,
+        TransactionOrderingProof::Fence {
+            key,
+            position,
+            fence,
+            step,
+            ..
         } => {
-            let mut assumptions = Vec::new();
-
-            assumptions.push(match precedence {
-                verification::OutboxPrecedence::Partition => format!(
-                    "the outbox runtime of {input} on {outbox} orders messages within \
-                     each partition; that order is the precedence"
-                ),
-
-                verification::OutboxPrecedence::Global => format!(
-                    "the outbox runtime of {input} on {outbox} orders every message it \
-                     consumes; that order is the precedence for any key"
-                ),
-            });
-
-            assumptions.extend(partition_key_assumptions(partition_keys, "ordering"));
-
-            assumptions.push(member_assignment_assumption(member_assignment));
-
-            assumptions.push(execution_handoff_assumption(pool, execution_handoff));
-
             assumptions.push(format!(
-                "{pool} bounds each member to one simultaneously active invocation, so a \
-                 later invocation cannot overtake an earlier one"
+                "the ordering key {} identifies the fence domain: every identity field of \
+                 {} is pinned by it or by a literal",
+                value_ref_label(key),
+                fence.object
             ));
 
-            match batching {
-                None => assumptions.push(format!(
-                    "{input} dispatches without a batching stage, so no batch obstacle \
-                     exists to clear"
-                )),
+            assumptions.push(format!(
+                "the logical position {} is the fencing token of {fence} at step {}: a \
+                 token older than the accepted fence rejects, so a lower generation \
+                 cannot commit after a higher one has been accepted; equal tokens \
+                 establish no relative order",
+                value_ref_label(position),
+                step + 1
+            ));
 
-                Some(crate::spec::BatchOrderingPreservation::Preserved) => {
-                    assumptions.push(format!(
-                        "the batching stage of {input} declares order preservation: its \
-                         opaque batch processing does not let a later message overtake \
-                         an earlier one against the established order"
-                    ))
-                }
-
-                // Unreachable through a well-formed proof — the route
-                // gates on it — worded to read as obviously wrong if
-                // that gate is ever lost.
-                Some(crate::spec::BatchOrderingPreservation::Unspecified) => {
-                    assumptions.push(format!(
-                        "the batching stage of {input} declares no ordering \
-                         preservation, so this proof cites a fact that does not \
-                         support it"
-                    ))
-                }
-            }
-
-            match duplicates {
-                DuplicateHandling::SingleDelivery => assumptions.push(format!(
-                    "{input} receives each logical message at most once, so neither \
-                     redelivery nor a duplicate exists"
-                )),
-
-                DuplicateHandling::OrderPreservingRedelivery { idempotency } => {
-                    assumptions.push(
-                        "dispatch preserves the established same-key precedence when \
-                         admitting invocations, including across failure-driven \
-                         redelivery and ownership reassignment"
-                            .to_string(),
-                    );
-
-                    assumptions.push(match idempotency {
-                        Some(coverage) => format!(
-                            "a duplicate of a completed delivery repeats an invocation \
-                             that already took effect in order; its work is idempotency \
-                             requirement #{}'s obligation ({})",
-                            coverage.requirement,
-                            if coverage.proven {
-                                "proven"
-                            } else {
-                                "unproven"
-                            }
-                        ),
-
-                        None => format!(
-                            "a duplicate of a completed delivery repeats an invocation \
-                             that already took effect in order; no idempotency \
-                             requirement keyed from {input} answers for its work"
-                        ),
-                    });
-                }
-            }
-
-            assumptions
+            assumptions.push(format!("no ordinary write touches {fence}"));
         }
     }
+
+    assumptions
+}
+
+/// The outbox admissions a transaction commits, rendered beside its
+/// proof: they are part of the same ordered commit, and nothing here
+/// claims anything about their later consumption.
+fn commit_artifact_assumptions(artifacts: &[CommitArtifact]) -> Vec<String> {
+    let mut assumptions = Vec::new();
+
+    for artifact in artifacts {
+        if let CommitArtifact::OutboxWrite {
+            effect,
+            outbox,
+            schema,
+            transition,
+        } = artifact
+        {
+            assumptions.push(match transition {
+                Some(transition) => format!(
+                    "transition {transition} atomically admits {schema} to {outbox} through \
+                     {effect}: the admission is part of the same ordered transaction \
+                     commit, and no claim is made about later consumption order"
+                ),
+                None => format!(
+                    "{effect} admits {schema} to {outbox} atomically with the commit; no \
+                     claim is made about later consumption order"
+                ),
+            });
+        }
+    }
+
+    assumptions
 }
 
 fn idempotency_assumptions(proof: &IdempotencyProof) -> Vec<String> {
@@ -1181,16 +1009,15 @@ fn idempotency_assumptions(proof: &IdempotencyProof) -> Vec<String> {
                             instance_label(instance)
                         )),
 
-                        EffectSafety::TransactionDeduplicated { transaction, key } => {
-                            assumptions.push(format!(
+                        EffectSafety::TransactionDeduplicated { transaction, key } => assumptions
+                            .push(format!(
                                 "{prefix}{} commits atomically with {transaction}, whose \
                                  commits are deduplicated by {}, stable across the \
                                  attempt class: at most one committed occurrence of the \
                                  outbox write exists",
                                 effect.effect,
                                 root_labels(key)
-                            ))
-                        }
+                            )),
 
                         EffectSafety::SameLogicalOutboxMessage {
                             outbox,
@@ -1253,18 +1080,20 @@ fn result_replay_assumptions(proof: &ResultReplayProof) -> Vec<String> {
              to stabilize"
         )],
 
-        ResultReplayProof::ClassFixedResult { returns } => {
+        ResultReplayProof::ClassFixedResult { returns, retryable } => {
             let mut assumptions = Vec::new();
 
+            let path_count = returns.len() + retryable.len();
+
             for returned in returns {
-                let prefix = path_prefix(returns.len(), &returned.path);
+                let prefix = path_prefix(path_count, &returned.path);
 
                 assumptions.extend(decision_assumptions(&prefix, &returned.decisions));
 
                 assumptions.push(format!(
                     "{prefix}the returned {} payload is derived deterministically from \
                      {}",
-                    returned.variant,
+                    returned.arm,
                     root_labels(&returned.derivation)
                 ));
 
@@ -1279,6 +1108,17 @@ fn result_replay_assumptions(proof: &ResultReplayProof) -> Vec<String> {
                         cited.push(label);
                     }
                 }
+            }
+
+            for exempt in retryable {
+                let prefix = path_prefix(path_count, &exempt.path);
+
+                assumptions.push(format!(
+                    "{prefix}the returned error class {} is declared retryable: a \
+                     nonterminal outcome by contract, so a later attempt may legitimately \
+                     observe another result",
+                    exempt.error
+                ));
             }
 
             assumptions
@@ -1392,6 +1232,10 @@ fn decision_label(decision: &verification::DecisionTaken) -> String {
         verification::DecisionTaken::Branch { location, .. } => {
             format!("the branch at step {location}")
         }
+
+        verification::DecisionTaken::Transaction { transaction, .. } => {
+            format!("the outcome of {transaction}")
+        }
     }
 }
 
@@ -1400,12 +1244,16 @@ fn decision_assumptions(prefix: &str, decisions: &[DecisionReplay]) -> Vec<Strin
     decisions
         .iter()
         .filter(|decision| {
-            // The inert-continuation admission is a derived structural
-            // fact, rendered as obligation evidence — an assumption
-            // line would misfile it as something an implementation
-            // must provide, and its arm may legitimately differ per
-            // attempt.
-            !matches!(decision.rule, DecisionRule::IdempotencyInertContinuation)
+            // The inert-continuation and outcome-divergence admissions
+            // are derived structural facts, rendered as obligation
+            // evidence — an assumption line would misfile them as
+            // something an implementation must provide, and the arm
+            // may legitimately differ per attempt.
+            !matches!(
+                decision.rule,
+                DecisionRule::IdempotencyInertContinuation
+                    | DecisionRule::OutcomeDivergenceAddsNoWork { .. }
+            )
         })
         .map(|decision| {
             let taken = match &decision.decision {
@@ -1416,6 +1264,12 @@ fn decision_assumptions(prefix: &str, decisions: &[DecisionReplay]) -> Vec<Strin
                 verification::DecisionTaken::Branch { location, arm } => {
                     format!("the branch at step {location} takes its {arm} arm on every attempt")
                 }
+
+                verification::DecisionTaken::Transaction {
+                    transaction,
+                    outcome,
+                    ..
+                } => format!("{transaction} is {outcome} on every attempt"),
             };
 
             let because = match &decision.rule {
@@ -1427,9 +1281,9 @@ fn decision_assumptions(prefix: &str, decisions: &[DecisionReplay]) -> Vec<Strin
                          whose result replay is proven"
                     ),
 
-                    ResultStabilityRule::ExternalTerminalResult { variant, .. } => format!(
+                    ResultStabilityRule::ExternalTerminalResult { arm, .. } => format!(
                         "{effect} declares its terminal result replay-stable over a \
-                         class-fixed interaction identity, and the observed {variant} is \
+                         class-fixed interaction identity, and the observed {arm} is \
                          terminal"
                     ),
                 },
@@ -1438,7 +1292,16 @@ fn decision_assumptions(prefix: &str, decisions: &[DecisionReplay]) -> Vec<Strin
                     format!("the condition is deterministic over {}", root_labels(roots))
                 }
 
-                DecisionRule::IdempotencyInertContinuation => unreachable!("filtered above"),
+                DecisionRule::ResolvedCommit { transaction, key } => format!(
+                    "{transaction} commits are deduplicated by {}, so every attempt \
+                     resolves the one commit",
+                    root_labels(key)
+                ),
+
+                DecisionRule::IdempotencyInertContinuation
+                | DecisionRule::OutcomeDivergenceAddsNoWork { .. } => {
+                    unreachable!("filtered above")
+                }
             };
 
             format!("{prefix}{taken}: {because}")
@@ -1489,9 +1352,9 @@ fn root_rule_label(root: &StableRoot) -> Option<String> {
         verification::StabilityRule::ReplayStableExternalResult {
             result,
             effect,
-            variant,
+            arm,
         } => Some(format!(
-            "the {variant} of result {result} is observed equally by every attempt: \
+            "the {arm} of result {result} is observed equally by every attempt: \
              {effect} declares its terminal result replay-stable over a class-fixed \
              interaction identity"
         )),

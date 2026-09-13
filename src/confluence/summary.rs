@@ -15,13 +15,12 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::analyzer::verification::{
-    IdempotencyVerdict, OrderingVerdict, RecoverabilityVerdict, ResultReplayVerdict,
-    SerializationVerdict, VerificationReport,
+    IdempotencyVerdict, RecoverabilityVerdict, ResultReplayVerdict, TransactionOrderingVerdict,
+    TransactionSerializabilityVerdict, VerificationReport,
 };
 use crate::spec::{
     DeliverySemantics, ErrorDisposition, ExternalIdempotency, ExternalResultReplay, Id, Input,
-    Model, Operation,
-    RequestIdentity, ResultReplayRequirement, RetrySemantics, ValueRef,
+    Model, Operation, RequestIdentity, ResultReplayRequirement, RetrySemantics, ValueRef,
 };
 
 use super::fingerprint::SemanticHash;
@@ -43,8 +42,11 @@ pub struct OperationSummary {
     pub input_contracts: BTreeMap<Id, InputContract>,
     pub outward_effects: Vec<OutwardEffectContract>,
 
-    pub serialization: Vec<SummaryRequirement>,
-    pub ordering: Vec<SummaryRequirement>,
+    /// The transaction families, one line per requirement of every
+    /// inline transaction of the program, in program order.
+    pub transaction_serializability: Vec<SummaryRequirement>,
+    pub transaction_ordering: Vec<SummaryRequirement>,
+
     pub idempotency: Vec<SummaryRequirement>,
     pub result_replay: Vec<SummaryRequirement>,
     pub recoverability: Vec<SummaryRequirement>,
@@ -61,8 +63,10 @@ pub enum InputContract {
         schema: Id,
         identity: RequestIdentity,
         result_ok: Id,
-        result_err: Id,
-        err_disposition: ErrorDisposition,
+
+        /// The declared error classes, each with its payload schema
+        /// and disposition.
+        result_errors: BTreeMap<Id, ErrorClassContract>,
     },
 
     Subscription {
@@ -74,9 +78,15 @@ pub enum InputContract {
     /// intrinsic — durable re-drive until successful consumption,
     /// overlapping attempts admitted — so no delivery or
     /// acknowledgement fact exists to summarize.
-    Outbox {
-        outbox: Id,
-    },
+    Outbox { outbox: Id },
+}
+
+/// One error class of a request result contract, as a caller sees it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ErrorClassContract {
+    pub schema: Id,
+    pub disposition: ErrorDisposition,
 }
 
 /// One outward effect contract the operation's program declares.
@@ -161,7 +171,6 @@ fn derive_one(
         service: operation.service.clone(),
         description: operation.description.clone(),
         inputs: operation.inputs.clone(),
-        invocation_lock: operation.invocation_lock.clone(),
     });
 
     // JSON serializes `Some(program)` exactly as `program`, so this
@@ -178,8 +187,20 @@ fn derive_one(
                     schema: request.schema.clone(),
                     identity: request.identity.clone(),
                     result_ok: request.result.ok.clone(),
-                    result_err: request.result.err.schema.clone(),
-                    err_disposition: request.result.err.disposition,
+                    result_errors: request
+                        .result
+                        .errors
+                        .iter()
+                        .map(|(class, declared)| {
+                            (
+                                class.clone(),
+                                ErrorClassContract {
+                                    schema: declared.schema.clone(),
+                                    disposition: declared.disposition,
+                                },
+                            )
+                        })
+                        .collect(),
                 },
 
                 Input::Subscription(subscription) => InputContract::Subscription {
@@ -237,59 +258,72 @@ fn derive_one(
                 schema: write.schema.clone(),
             },
         })
-        .chain(operation.program.outbox_write_declarations().into_iter().map(
-            |(transaction_id, write)| OutwardEffectContract::WritesOutbox {
-                effect: write.effect_id.clone(),
-                transaction: transaction_id.clone(),
-                outbox: write.effect.outbox.clone(),
-                schema: write.effect.schema.clone(),
-            },
-        ))
+        .chain(
+            operation
+                .program
+                .outbox_write_declarations()
+                .into_iter()
+                .map(
+                    |(transaction_id, write)| OutwardEffectContract::WritesOutbox {
+                        effect: write.effect_id.clone(),
+                        transaction: transaction_id.clone(),
+                        outbox: write.effect.outbox.clone(),
+                        schema: write.effect.schema.clone(),
+                    },
+                ),
+        )
         .collect();
 
-    let serialization = operation
-        .requirements
-        .serialization
-        .iter()
-        .enumerate()
-        .map(|(index, requirement)| {
-            let check = verification
-                .serialization
-                .iter()
-                .find(|check| &check.operation == id && check.requirement == index);
+    let mut transaction_serializability = Vec::new();
+    let mut transaction_ordering = Vec::new();
 
-            SummaryRequirement {
-                key: value_ref_label(&requirement.key),
+    for (_, transaction) in operation.program.transactions() {
+        for (index, requirement) in transaction.requirements.serializability.iter().enumerate() {
+            let check = verification
+                .transaction_serializability
+                .iter()
+                .find(|check| {
+                    &check.operation == id
+                        && check.transaction == transaction.id
+                        && check.requirement == index
+                });
+
+            transaction_serializability.push(SummaryRequirement {
+                key: format!(
+                    "{} SerializableBy({})",
+                    transaction.id,
+                    value_ref_label(&requirement.key)
+                ),
                 proven: matches!(
                     check.map(|check| &check.verdict),
-                    Some(SerializationVerdict::Proven { .. })
+                    Some(TransactionSerializabilityVerdict::Proven { .. })
                 ),
                 obstacle: obstacle(check.and_then(|check| check.diagnostic())),
-            }
-        })
-        .collect();
+            });
+        }
 
-    let ordering = operation
-        .requirements
-        .ordering
-        .iter()
-        .enumerate()
-        .map(|(index, requirement)| {
-            let check = verification
-                .ordering
-                .iter()
-                .find(|check| &check.operation == id && check.requirement == index);
+        for (index, requirement) in transaction.requirements.ordering.iter().enumerate() {
+            let check = verification.transaction_ordering.iter().find(|check| {
+                &check.operation == id
+                    && check.transaction == transaction.id
+                    && check.requirement == index
+            });
 
-            SummaryRequirement {
-                key: value_ref_label(&requirement.key),
+            transaction_ordering.push(SummaryRequirement {
+                key: format!(
+                    "{} OrderedBy({}, {})",
+                    transaction.id,
+                    value_ref_label(&requirement.key),
+                    value_ref_label(&requirement.position)
+                ),
                 proven: matches!(
                     check.map(|check| &check.verdict),
-                    Some(OrderingVerdict::Proven { .. })
+                    Some(TransactionOrderingVerdict::Proven { .. })
                 ),
                 obstacle: obstacle(check.and_then(|check| check.diagnostic())),
-            }
-        })
-        .collect();
+            });
+        }
+    }
 
     let idempotency = operation
         .requirements
@@ -363,8 +397,8 @@ fn derive_one(
         &program_hash,
         &input_contracts,
         &outward_effects,
-        &serialization,
-        &ordering,
+        &transaction_serializability,
+        &transaction_ordering,
         &idempotency,
         &result_replay,
         &recoverability,
@@ -376,8 +410,8 @@ fn derive_one(
         program_hash,
         input_contracts,
         outward_effects,
-        serialization,
-        ordering,
+        transaction_serializability,
+        transaction_ordering,
         idempotency,
         result_replay,
         recoverability,

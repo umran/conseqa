@@ -10,19 +10,18 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::spec::{
-    Effect, Id, Input, MessageSelector, Model, Operation, TopicRuntime,
-    OperationStep, Revision, Schema, StateMachineSubject, TransactionStep, TransitionSideEffect,
-    TypeRef, ValueSource,
+    Effect, Id, Input, MessageSelector, Model, Operation, OperationStep, Revision, Schema,
+    StateMachineSubject, TopicRuntime, TransactionStep, TransitionSideEffect, TypeRef, ValueSource,
 };
 
 use super::fingerprint::SemanticHash;
 use super::graph_query::GraphQuery;
 use super::patch::{Mutation, PatchId, RequirementSubmission, SpecPatch};
-use super::symbol::{RequirementFamily, SymbolKey};
+use super::symbol::SymbolKey;
 use super::task::{TaskId, TaskState};
 use super::workspace::{
-    DraftOperation, OperationInterfaceDraft, ProposalStatus, PromptObligationStatus,
-    RequirementOrigin, RequirementProposal, RequirementRef, WorkspaceState,
+    DraftOperation, PromptObligationStatus, ProposalStatus, RequirementOrigin, RequirementProposal,
+    RequirementRef, WorkspaceState,
 };
 
 /// One commit submission. The read-set is server-owned and never part
@@ -293,9 +292,9 @@ pub fn skeleton_diagnostics(workspace: &WorkspaceState) -> Vec<DraftDiagnostic> 
     for (data_model, declaration) in &workspace.data_models {
         for outbox in declaration.outboxes.keys() {
             let consumed = workspace.operations.values().any(|draft| {
-                draft.inputs.values().any(|input| {
-                    matches!(input, Input::Outbox(declared) if &declared.outbox == outbox)
-                })
+                draft.inputs.values().any(
+                    |input| matches!(input, Input::Outbox(declared) if &declared.outbox == outbox),
+                )
             });
 
             if !consumed {
@@ -366,7 +365,6 @@ fn apply_mutation(
                     draft.service = value.service.clone();
                     draft.description = value.description.clone();
                     draft.inputs = value.inputs.clone();
-                    draft.invocation_lock = value.invocation_lock.clone();
                     draft.recompute_stage();
                 }
 
@@ -393,7 +391,10 @@ fn apply_mutation(
         }
 
         Mutation::PutTopicRuntime { topic, value } => {
-            workspace.runtime.topics.insert(topic.clone(), value.clone());
+            workspace
+                .runtime
+                .topics
+                .insert(topic.clone(), value.clone());
         }
 
         Mutation::PutSubscriptionRuntime {
@@ -591,7 +592,28 @@ fn apply_proposals(
         let family = submission.requirement.family();
         let fingerprint = requirement_fingerprint(&submission.requirement);
 
-        let existing = declared_fingerprints(draft, family)
+        // A transaction-family proposal lands on an inline transaction
+        // of the program, which must exist before the proposal can be
+        // judged against what it declares.
+        if let Some(transaction) = submission.requirement.transaction()
+            && draft
+                .program
+                .as_ref()
+                .and_then(|program| program.transaction(transaction))
+                .is_none()
+        {
+            diagnostics.push(DraftDiagnostic::new(
+                Some(SymbolKey::OperationRequirements(operation.clone())),
+                format!(
+                    "a {family} proposal for {operation} names transaction {transaction}, \
+                     which its program does not declare; synthesize the program first"
+                ),
+            ));
+
+            continue;
+        }
+
+        let existing = declared_fingerprints(draft, &submission.requirement)
             .into_iter()
             .position(|declared| declared == fingerprint);
 
@@ -600,6 +622,7 @@ fn apply_proposals(
                 reference: RequirementRef {
                     operation: operation.clone(),
                     family,
+                    transaction: submission.requirement.transaction().cloned(),
                     index,
                 },
             }
@@ -616,6 +639,7 @@ fn apply_proposals(
                 let reference = RequirementRef {
                     operation: operation.clone(),
                     family,
+                    transaction: submission.requirement.transaction().cloned(),
                     index,
                 };
 
@@ -662,37 +686,62 @@ fn requirement_fingerprint(requirement: &super::workspace::ProposedRequirement) 
     use super::workspace::ProposedRequirement;
 
     match requirement {
-        ProposedRequirement::Serialization(requirement) => SemanticHash::of(requirement),
-        ProposedRequirement::Ordering(requirement) => SemanticHash::of(requirement),
+        ProposedRequirement::TransactionSerializability { requirement, .. } => {
+            SemanticHash::of(requirement)
+        }
+        ProposedRequirement::TransactionOrdering { requirement, .. } => {
+            SemanticHash::of(requirement)
+        }
         ProposedRequirement::Idempotency(requirement) => SemanticHash::of(requirement),
         ProposedRequirement::Recoverability(requirement) => SemanticHash::of(requirement),
     }
 }
 
-fn declared_fingerprints(draft: &DraftOperation, family: RequirementFamily) -> Vec<SemanticHash> {
-    match family {
-        RequirementFamily::Serialization => draft
-            .requirements
-            .serialization
-            .iter()
-            .map(SemanticHash::of)
-            .collect(),
+/// The fingerprints already declared in the proposal's family — on
+/// the operation, or on the transaction the proposal names.
+fn declared_fingerprints(
+    draft: &DraftOperation,
+    proposal: &super::workspace::ProposedRequirement,
+) -> Vec<SemanticHash> {
+    use super::workspace::ProposedRequirement;
 
-        RequirementFamily::Ordering => draft
-            .requirements
-            .ordering
-            .iter()
-            .map(SemanticHash::of)
-            .collect(),
+    match proposal {
+        ProposedRequirement::TransactionSerializability { transaction, .. } => draft
+            .program
+            .as_ref()
+            .and_then(|program| program.transaction(transaction))
+            .map(|transaction| {
+                transaction
+                    .requirements
+                    .serializability
+                    .iter()
+                    .map(SemanticHash::of)
+                    .collect()
+            })
+            .unwrap_or_default(),
 
-        RequirementFamily::Idempotency | RequirementFamily::ResultReplay => draft
+        ProposedRequirement::TransactionOrdering { transaction, .. } => draft
+            .program
+            .as_ref()
+            .and_then(|program| program.transaction(transaction))
+            .map(|transaction| {
+                transaction
+                    .requirements
+                    .ordering
+                    .iter()
+                    .map(SemanticHash::of)
+                    .collect()
+            })
+            .unwrap_or_default(),
+
+        ProposedRequirement::Idempotency(_) => draft
             .requirements
             .idempotency
             .iter()
             .map(SemanticHash::of)
             .collect(),
 
-        RequirementFamily::Recoverability => draft
+        ProposedRequirement::Recoverability(_) => draft
             .requirements
             .recoverability
             .iter()
@@ -701,6 +750,9 @@ fn declared_fingerprints(draft: &DraftOperation, family: RequirementFamily) -> V
     }
 }
 
+/// Lands a proposal on the draft: the operation's requirement list,
+/// or the named transaction's. The caller has checked the transaction
+/// exists.
 fn adopt_requirement(
     draft: &mut DraftOperation,
     requirement: &super::workspace::ProposedRequirement,
@@ -708,14 +760,35 @@ fn adopt_requirement(
     use super::workspace::ProposedRequirement;
 
     match requirement {
-        ProposedRequirement::Serialization(requirement) => {
-            draft.requirements.serialization.push(requirement.clone());
-            draft.requirements.serialization.len() - 1
+        ProposedRequirement::TransactionSerializability {
+            transaction,
+            requirement,
+        } => {
+            let declared = draft
+                .program
+                .as_mut()
+                .and_then(|program| program.transaction_mut(transaction))
+                .expect("checked by the caller");
+
+            declared
+                .requirements
+                .serializability
+                .push(requirement.clone());
+            declared.requirements.serializability.len() - 1
         }
 
-        ProposedRequirement::Ordering(requirement) => {
-            draft.requirements.ordering.push(requirement.clone());
-            draft.requirements.ordering.len() - 1
+        ProposedRequirement::TransactionOrdering {
+            transaction,
+            requirement,
+        } => {
+            let declared = draft
+                .program
+                .as_mut()
+                .and_then(|program| program.transaction_mut(transaction))
+                .expect("checked by the caller");
+
+            declared.requirements.ordering.push(requirement.clone());
+            declared.requirements.ordering.len() - 1
         }
 
         ProposedRequirement::Idempotency(requirement) => {
@@ -777,8 +850,6 @@ fn check_patch(candidate: &WorkspaceState, patch: &SpecPatch) -> Vec<DraftDiagno
                 for (input_id, input) in &value.inputs {
                     check_input(candidate, operation, input_id, input, &mut diagnostics);
                 }
-
-                check_invocation_lock(operation, value, &mut diagnostics);
             }
 
             Mutation::ReplaceOperationProgram { operation, program } => {
@@ -845,7 +916,8 @@ fn check_patch(candidate: &WorkspaceState, patch: &SpecPatch) -> Vec<DraftDiagno
             continue;
         };
 
-        for diagnostic in crate::analyzer::validation::program_local_diagnostics(&model, operation) {
+        for diagnostic in crate::analyzer::validation::program_local_diagnostics(&model, operation)
+        {
             diagnostics.push(DraftDiagnostic::new(
                 Some(SymbolKey::OperationProgram(operation.clone())),
                 diagnostic.message,
@@ -871,7 +943,6 @@ fn probe_model(candidate: &WorkspaceState, operation: &Id) -> Option<Model> {
         service: draft.service.clone(),
         description: draft.description.clone(),
         inputs: draft.inputs.clone(),
-        invocation_lock: draft.invocation_lock.clone(),
         program,
         requirements: draft.requirements.clone(),
     };
@@ -890,62 +961,6 @@ fn probe_model(candidate: &WorkspaceState, operation: &Id) -> Option<Model> {
         operations,
         runtime: (!candidate.runtime.is_empty()).then(|| candidate.runtime.clone()),
     })
-}
-
-/// The structural half of the invocation-lock rules, judged at the
-/// gate so a broken declaration is fixed in-session: the key must
-/// source an input the interface itself declares, and that input must
-/// be the interface's only one — every invocation acquires the lock,
-/// and an invocation triggered by another input carries no value for
-/// the key. Path resolution is whole-model validation's job.
-fn check_invocation_lock(
-    operation: &Id,
-    value: &OperationInterfaceDraft,
-    diagnostics: &mut Vec<DraftDiagnostic>,
-) {
-    let Some(lock) = &value.invocation_lock else {
-        return;
-    };
-
-    let key = SymbolKey::OperationInterface(operation.clone());
-
-    match &lock.key.source {
-        crate::spec::ValueSource::Input(input) => {
-            if !value.inputs.contains_key(input) {
-                diagnostics.push(DraftDiagnostic::new(
-                    Some(key),
-                    format!(
-                        "the invocation lock of {operation} keys on {input}, which \
-                         the interface does not declare"
-                    ),
-                ));
-
-                return;
-            }
-
-            for other in value.inputs.keys().filter(|id| *id != input) {
-                diagnostics.push(DraftDiagnostic::new(
-                    Some(key.clone()),
-                    format!(
-                        "{operation} admits invocations through {other}, which carry \
-                         no value for its invocation lock's key; key the lock on the \
-                         operation's only input, or remove the lock"
-                    ),
-                ));
-            }
-        }
-
-        other => diagnostics.push(DraftDiagnostic::new(
-            Some(key),
-            format!(
-                "the invocation lock of {operation} keys on {}:{}, and only an \
-                 input payload exists at operation entry where the key is \
-                 evaluated",
-                other.kind_name(),
-                other.id()
-            ),
-        )),
-    }
 }
 
 fn check_schema(
@@ -1047,6 +1062,67 @@ fn check_state_machine(
                 }
             }
         }
+
+        // A transition-scoped admission names an outbox of the data
+        // model owning the subject, and a schema it admits.
+        for (effect_id, effect) in &transition.effects {
+            let write = effect.outbox_write();
+
+            require_schema(candidate, &write.schema, diagnostics, || {
+                format!("transition {transition_id} of {id}")
+            });
+
+            match find_outbox(candidate, &write.outbox) {
+                None => diagnostics.push(DraftDiagnostic::new(
+                    Some(SymbolKey::Transition {
+                        machine: id.clone(),
+                        transition: transition_id.clone(),
+                    }),
+                    format!(
+                        "transition {transition_id} of {id} admits {effect_id} to outbox {}, \
+                         which no data model declares",
+                        write.outbox
+                    ),
+                )),
+
+                Some((owner, outbox)) => {
+                    let subject_owner = candidate
+                        .data_models
+                        .iter()
+                        .find(|(_, data_model)| data_model.objects.contains_key(object))
+                        .map(|(owner, _)| owner);
+
+                    if let Some(subject_owner) = subject_owner
+                        && subject_owner != owner
+                    {
+                        diagnostics.push(DraftDiagnostic::new(
+                            Some(SymbolKey::Transition {
+                                machine: id.clone(),
+                                transition: transition_id.clone(),
+                            }),
+                            format!(
+                                "transition {transition_id} of {id} admits {effect_id} to \
+                                 outbox {} of {owner}, but its subject {object} belongs to \
+                                 {subject_owner}; an admission is atomic only within the \
+                                 subject's data model",
+                                write.outbox
+                            ),
+                        ));
+                    }
+
+                    if !outbox.messages.contains(&write.schema) {
+                        diagnostics.push(DraftDiagnostic::new(
+                            Some(SymbolKey::Schema(write.schema.clone())),
+                            format!(
+                                "transition {transition_id} of {id} admits {}, which outbox \
+                                 {} does not admit",
+                                write.schema, write.outbox
+                            ),
+                        ));
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -1059,11 +1135,12 @@ fn check_input(
 ) {
     match input {
         Input::Request(request) => {
-            for schema in [
-                &request.schema,
-                &request.result.ok,
-                &request.result.err.schema,
-            ] {
+            let error_schemas = request.result.errors.values().map(|class| &class.schema);
+
+            for schema in [&request.schema, &request.result.ok]
+                .into_iter()
+                .chain(error_schemas)
+            {
                 require_schema(candidate, schema, diagnostics, || {
                     format!("input {input_id} of {operation}")
                 });
@@ -1205,7 +1282,9 @@ fn check_program(
 
             Effect::External(external) => {
                 if let Some(result) = &external.result {
-                    for schema in [&result.ok, &result.err.schema] {
+                    let error_schemas = result.errors.values().map(|class| &class.schema);
+
+                    for schema in std::iter::once(&result.ok).chain(error_schemas) {
                         require_schema(candidate, schema, diagnostics, || {
                             format!("effect {site} of {operation}")
                         });
@@ -1237,8 +1316,43 @@ fn check_program(
 
     for (location, step) in program.steps_with_locations() {
         match step {
-            OperationStep::Transaction(transaction) => {
+            OperationStep::Transaction(execute) => {
+                let transaction = &execute.transaction;
+
                 transaction_ids.push(transaction.id.clone());
+
+                // Requirement keys and positions are roots like any
+                // other: an input they name must be one the operation
+                // declares.
+                let requirement_roots = transaction
+                    .requirements
+                    .serializability
+                    .iter()
+                    .map(|requirement| &requirement.key)
+                    .chain(
+                        transaction
+                            .requirements
+                            .ordering
+                            .iter()
+                            .flat_map(|requirement| [&requirement.key, &requirement.position]),
+                    );
+
+                for root in requirement_roots {
+                    if let ValueSource::Input(input) = &root.source
+                        && !draft.inputs.contains_key(input)
+                    {
+                        diagnostics.push(DraftDiagnostic::new(
+                            Some(SymbolKey::Input {
+                                operation: operation.clone(),
+                                input: input.clone(),
+                            }),
+                            format!(
+                                "a requirement of transaction {} of {operation} is keyed from input {input}, which the operation does not declare",
+                                transaction.id
+                            ),
+                        ));
+                    }
+                }
 
                 if let Some(data_model_id) = &transaction.data_model {
                     let data_model = candidate.data_models.get(data_model_id);
@@ -1263,6 +1377,12 @@ fn check_program(
                             TransactionStep::Transition(transition) => {
                                 Some(&transition.subject.object)
                             }
+                            TransactionStep::ValidateVersion(validate) => {
+                                Some(&validate.target.object)
+                            }
+                            TransactionStep::BumpVersion(bump) => Some(&bump.target.object),
+                            TransactionStep::AdvanceCursor(advance) => Some(&advance.target.object),
+                            TransactionStep::Fence(fence) => Some(&fence.target.object),
                             _ => None,
                         };
 
@@ -1344,6 +1464,35 @@ fn check_program(
 
                                         for intent in transition.effect_intents.values() {
                                             binding_ids.push(intent.bind.clone());
+                                        }
+
+                                        let declared_admissions: Vec<&Id> =
+                                            declared.effects.keys().collect();
+                                        let supplied_admissions: Vec<&Id> =
+                                            transition.effects.keys().collect();
+
+                                        if declared_admissions != supplied_admissions {
+                                            diagnostics.push(DraftDiagnostic::new(
+                                                Some(SymbolKey::Transition {
+                                                    machine: transition.machine.clone(),
+                                                    transition: transition.transition.clone(),
+                                                }),
+                                                format!(
+                                                    "transaction {} of {operation} supplies message derivations for [{}], but transition {} declares outbox effects [{}]",
+                                                    transaction.id,
+                                                    supplied_admissions
+                                                        .iter()
+                                                        .map(|id| id.to_string())
+                                                        .collect::<Vec<_>>()
+                                                        .join(", "),
+                                                    transition.transition,
+                                                    declared_admissions
+                                                        .iter()
+                                                        .map(|id| id.to_string())
+                                                        .collect::<Vec<_>>()
+                                                        .join(", "),
+                                                ),
+                                            ));
                                         }
                                     }
                                 },
@@ -1603,7 +1752,12 @@ fn check_subscription_runtime(
         diagnostics,
     );
 
-    check_pool(candidate, subject.clone(), &value.dispatch.pool, diagnostics);
+    check_pool(
+        candidate,
+        subject.clone(),
+        &value.dispatch.pool,
+        diagnostics,
+    );
 
     // The scope invariant, checked here rather than left to
     // whole-model validation: a violation committed during fan-out
@@ -1815,10 +1969,7 @@ fn check_boundary(
     if !expected.matches(declared) {
         diagnostics.push(DraftDiagnostic::new(
             Some(subject),
-            format!(
-                "{input} of {operation} is not a {} input",
-                expected.label()
-            ),
+            format!("{input} of {operation} is not a {} input", expected.label()),
         ));
     }
 }
@@ -1848,20 +1999,25 @@ fn check_requirement_roots(
 
     let mut roots: Vec<&crate::spec::ValueRef> = Vec::new();
 
-    for requirement in &draft.requirements.serialization {
-        roots.push(&requirement.key);
-    }
-
-    for requirement in &draft.requirements.ordering {
-        roots.push(&requirement.key);
-    }
-
     for requirement in &draft.requirements.idempotency {
         roots.extend(requirement.key.components.iter());
     }
 
     for requirement in &draft.requirements.recoverability {
         roots.extend(requirement.key.components.iter());
+    }
+
+    if let Some(program) = &draft.program {
+        for (_, transaction) in program.transactions() {
+            for requirement in &transaction.requirements.serializability {
+                roots.push(&requirement.key);
+            }
+
+            for requirement in &transaction.requirements.ordering {
+                roots.push(&requirement.key);
+                roots.push(&requirement.position);
+            }
+        }
     }
 
     for input in super::patch::input_roots(&roots) {
@@ -1888,7 +2044,10 @@ fn require_schema(
     if !candidate.schemas.contains_key(schema) {
         diagnostics.push(DraftDiagnostic::new(
             Some(SymbolKey::Schema(schema.clone())),
-            format!("{} references schema {schema}, which is not declared", context()),
+            format!(
+                "{} references schema {schema}, which is not declared",
+                context()
+            ),
         ));
     }
 }
@@ -1902,7 +2061,10 @@ fn require_topic(
     if !candidate.topics.contains_key(topic) {
         diagnostics.push(DraftDiagnostic::new(
             Some(SymbolKey::Topic(topic.clone())),
-            format!("{} references topic {topic}, which is not declared", context()),
+            format!(
+                "{} references topic {topic}, which is not declared",
+                context()
+            ),
         ));
     }
 }

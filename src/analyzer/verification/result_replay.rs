@@ -33,6 +33,13 @@
 //! one — a differing observation is a violation at strictly shorter
 //! causal distance — and uses a downstream requirement only for what
 //! its local check provides.
+//!
+//! A path returning an error class the request contract declares
+//! `retryable` is exempt: a retryable error conclusively ends one
+//! attempt without terminally resolving the logical request, so a
+//! later attempt observing a different — typically successful —
+//! result is exactly what the disposition admits. Terminal and
+//! unspecified error classes are held to the obligation like `ok`.
 
 use std::collections::BTreeSet;
 
@@ -40,7 +47,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::analyzer::{Diagnostic, DiagnosticCode, Evidence, Severity, VerificationCode};
 use crate::spec::{
-    Derivation, Id, IdempotencyKey, Model, Operation, ResultReplayRequirement, ResultVariant,
+    Derivation, ErrorDisposition, Id, IdempotencyKey, Input, Model, Operation, ResultArm,
+    ResultOutcome, ResultReplayRequirement,
 };
 
 use super::ProofScope;
@@ -108,8 +116,24 @@ pub enum ResultReplayProof {
 
     /// Every path returning a result for the triggering input replays
     /// its decisions, so each class reaches one terminal, whose payload
-    /// is replay-deterministic over the cited roots.
-    ClassFixedResult { returns: Vec<ReturnedResult> },
+    /// is replay-deterministic over the cited roots — except paths
+    /// returning a retryable error class, which the contract itself
+    /// declares nonterminal.
+    ClassFixedResult {
+        returns: Vec<ReturnedResult>,
+
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        retryable: Vec<RetryableReturn>,
+    },
+}
+
+/// A returning path exempt from the obligation: it returns an error
+/// class declared `retryable`, a nonterminal outcome by contract.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RetryableReturn {
+    pub path: PathRef,
+    pub error: Id,
 }
 
 impl ResultReplayProof {
@@ -127,7 +151,7 @@ impl ResultReplayProof {
 #[serde(deny_unknown_fields)]
 pub struct ReturnedResult {
     pub path: PathRef,
-    pub variant: ResultVariant,
+    pub arm: ResultArm,
 
     /// Why every attempt in a class reaching this terminal took the
     /// same arms.
@@ -290,11 +314,34 @@ fn check_requirement(
         });
     }
 
+    let contract = match operation.inputs.get(input) {
+        Some(Input::Request(request)) => Some(&request.result),
+        _ => None,
+    };
+
     let mut obstacles = Vec::new();
     let mut returns = Vec::new();
+    let mut retryable = Vec::new();
 
     for (path, outcome) in sites {
         let reference = path.reference();
+
+        // A retryable error class is nonterminal by contract: the
+        // attempt ended, the logical request did not resolve, and a
+        // later attempt may legitimately observe another outcome.
+        if let ResultOutcome::Err { error, .. } = outcome
+            && contract
+                .and_then(|contract| contract.error(error))
+                .is_some_and(|class| class.disposition == ErrorDisposition::Retryable)
+        {
+            retryable.push(RetryableReturn {
+                path: reference,
+                error: error.clone(),
+            });
+
+            continue;
+        }
+
         let trace = analysis.trace(path);
 
         let before = obstacles.len();
@@ -337,7 +384,7 @@ fn check_requirement(
         if obstacles.len() == before {
             returns.push(ReturnedResult {
                 path: reference,
-                variant: outcome.variant(),
+                arm: outcome.arm(),
                 decisions: trace.stable_decisions(),
                 derivation,
             });
@@ -345,7 +392,7 @@ fn check_requirement(
     }
 
     if obstacles.is_empty() {
-        ResultReplayVerdict::proven(ResultReplayProof::ClassFixedResult { returns })
+        ResultReplayVerdict::proven(ResultReplayProof::ClassFixedResult { returns, retryable })
     } else {
         ResultReplayVerdict::Unproven {
             obstacles: super::idempotency::dedupe(obstacles, ResultReplayObstacle::site),
@@ -366,8 +413,11 @@ impl ResultReplayObstacle {
                 *path = PathRef::default();
 
                 match decision {
-                    DecisionTaken::Match { arm, .. } => *arm = ResultVariant::Ok,
+                    DecisionTaken::Match { arm, .. } => *arm = ResultArm::Ok,
                     DecisionTaken::Branch { arm, .. } => *arm = crate::spec::Arm::Then,
+                    DecisionTaken::Transaction { outcome, .. } => {
+                        *outcome = crate::spec::TransactionOutcome::Committed
+                    }
                 }
             }
 

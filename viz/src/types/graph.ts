@@ -1,4 +1,4 @@
-// Mirror of `src/bin/viz/graph.rs`: the derived system graph.
+// Mirror of `src/viz/graph.rs`: the derived system graph.
 
 import type { Id } from "./model";
 
@@ -25,9 +25,12 @@ export interface ServiceNode {
   operations: Id[];
 }
 
+/** How many requirements of each family the operation declares — the
+ *  transaction families summed over every inline transaction of its
+ *  program. */
 export interface RequirementBadges {
-  serialization: number;
-  ordering: number;
+  transaction_serializability: number;
+  transaction_ordering: number;
   idempotency: number;
   recoverability: number;
 }
@@ -52,9 +55,6 @@ export interface RuntimeView {
 export interface ExecutionPoolNode {
   id: Id;
   member_concurrency: string;
-  /** The declared execution-handoff guarantee, absent when the pool
-   *  declares none. */
-  execution_handoff?: string;
   /** Boundaries assigned to this pool — the shared execution
    *  population made visible. */
   assigned: { operation: Id; input: Id }[];
@@ -177,6 +177,10 @@ export type Edge = EdgeBase &
       }
     | { kind: "client"; operation: Id; input: Id; schema: Id }
     | {
+        /** A transactional outbox write: admission is atomic with the
+         *  named transaction's commit — a `write_outbox` step, or a
+         *  transition-scoped admission conditioned on the transition
+         *  applying. */
         kind: "outbox_write";
         operation: Id;
         effect: Id;
@@ -184,6 +188,9 @@ export type Edge = EdgeBase &
         /** The inline transaction whose commit admits the message;
          *  null only for the structurally invalid direct-site shape. */
         transaction: Id | null;
+        /** Set when the admission is scoped to a state-machine
+         *  transition rather than declared as a transaction step. */
+        via_transition: TransitionKey | null;
         /** Program steps whose transaction stages the write. */
         executed_at: string[];
       }

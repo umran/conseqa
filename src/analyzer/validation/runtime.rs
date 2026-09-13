@@ -20,10 +20,11 @@
 //! half a pair cannot be written at all.
 //!
 //! It deliberately checks nothing about whether the declared topology
-//! *proves* anything. Whether a grouping domain and a serial pool
-//! discharge a serialization requirement is verification's judgment;
-//! here a runtime model is valid whenever its references resolve, its
-//! keys are well-formed, and its transport semantics have one scope.
+//! *proves* anything — and under DSL v4 no transaction property is
+//! ever proven from it: the runtime describes placement, transport,
+//! grouping, precedence, and capacity, and a runtime model is valid
+//! whenever its references resolve, its keys are well-formed, and its
+//! transport semantics have one scope.
 
 use std::collections::{BTreeMap, BTreeSet};
 

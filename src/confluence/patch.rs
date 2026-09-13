@@ -21,8 +21,8 @@ use uuid::Uuid;
 use crate::spec::{
     DataModel, Effect, ExecutionPool, Id, Input, OperationBlock, OperationRequirements,
     OperationStep, OutboxPartitioning, OutboxRuntime, Router, Schema, Service, StateMachine,
-    StorageLayout, SubscriptionRuntime, Topic, TopicRuntime, TransactionStep,
-    TransitionSideEffect, ValueRef, ValueSource,
+    StorageLayout, SubscriptionRuntime, Topic, TopicRuntime, TransactionStep, TransitionSideEffect,
+    ValueRef, ValueSource,
 };
 
 use super::symbol::SymbolKey;
@@ -231,11 +231,8 @@ impl Mutation {
 impl SpecPatch {
     /// The symbols this patch overwrites, in canonical order.
     pub fn write_targets(&self) -> Vec<SymbolKey> {
-        let mut targets: Vec<SymbolKey> = self
-            .mutations
-            .iter()
-            .map(Mutation::write_target)
-            .collect();
+        let mut targets: Vec<SymbolKey> =
+            self.mutations.iter().map(Mutation::write_target).collect();
 
         targets.sort();
         targets.dedup();
@@ -321,7 +318,10 @@ fn collect_references(mutation: &Mutation, out: &mut Vec<SymbolKey>) {
             // The machine's subject names an object id whose data
             // model the DSL leaves implicit; resolution is the
             // validator's concern, so the subject is not an external
-            // reference here. Side-effect contracts are.
+            // reference here. Side-effect contracts are, and so is the
+            // schema a transition-scoped admission writes — its outbox
+            // resolves through the implicit data model, like the
+            // subject.
             for transition in value.transitions.values() {
                 for side_effect in transition.side_effects.values() {
                     match side_effect {
@@ -337,6 +337,10 @@ fn collect_references(mutation: &Mutation, out: &mut Vec<SymbolKey>) {
                             out.push(SymbolKey::Schema(request.schema.clone()));
                         }
                     }
+                }
+
+                for effect in transition.effects.values() {
+                    out.push(SymbolKey::Schema(effect.outbox_write().schema.clone()));
                 }
             }
         }
@@ -438,7 +442,10 @@ fn collect_input_refs(input: &Input, out: &mut Vec<SymbolKey>) {
         Input::Request(request) => {
             out.push(SymbolKey::Schema(request.schema.clone()));
             out.push(SymbolKey::Schema(request.result.ok.clone()));
-            out.push(SymbolKey::Schema(request.result.err.schema.clone()));
+
+            for class in request.result.errors.values() {
+                out.push(SymbolKey::Schema(class.schema.clone()));
+            }
         }
 
         Input::Subscription(subscription) => {
@@ -482,7 +489,10 @@ fn collect_program_refs(operation: &Id, program: &OperationBlock, into: &mut Vec
         Effect::External(external) => {
             if let Some(result) = &external.result {
                 out.push(SymbolKey::Schema(result.ok.clone()));
-                out.push(SymbolKey::Schema(result.err.schema.clone()));
+
+                for class in result.errors.values() {
+                    out.push(SymbolKey::Schema(class.schema.clone()));
+                }
             }
         }
 
@@ -497,15 +507,57 @@ fn collect_program_refs(operation: &Id, program: &OperationBlock, into: &mut Vec
 
     for (_, step) in program.steps_with_locations() {
         match step {
-            OperationStep::Transaction(transaction) => {
+            OperationStep::Transaction(execute) => {
+                let transaction = &execute.transaction;
+
                 for inner in &transaction.steps {
                     match inner {
                         TransactionStep::Read(read) => {
-                            push_object_ref(transaction.data_model.as_ref(), &read.target.object, out);
+                            push_object_ref(
+                                transaction.data_model.as_ref(),
+                                &read.target.object,
+                                out,
+                            );
+                        }
+
+                        TransactionStep::ValidateVersion(validate) => {
+                            push_object_ref(
+                                transaction.data_model.as_ref(),
+                                &validate.target.object,
+                                out,
+                            );
+                        }
+
+                        TransactionStep::BumpVersion(bump) => {
+                            push_object_ref(
+                                transaction.data_model.as_ref(),
+                                &bump.target.object,
+                                out,
+                            );
+                        }
+
+                        TransactionStep::AdvanceCursor(advance) => {
+                            push_object_ref(
+                                transaction.data_model.as_ref(),
+                                &advance.target.object,
+                                out,
+                            );
+                        }
+
+                        TransactionStep::Fence(fence) => {
+                            push_object_ref(
+                                transaction.data_model.as_ref(),
+                                &fence.target.object,
+                                out,
+                            );
                         }
 
                         TransactionStep::Write(write) => {
-                            push_object_ref(transaction.data_model.as_ref(), &write.target.object, out);
+                            push_object_ref(
+                                transaction.data_model.as_ref(),
+                                &write.target.object,
+                                out,
+                            );
                         }
 
                         TransactionStep::Insert(insert) => {
@@ -513,11 +565,19 @@ fn collect_program_refs(operation: &Id, program: &OperationBlock, into: &mut Vec
                         }
 
                         TransactionStep::Delete(delete) => {
-                            push_object_ref(transaction.data_model.as_ref(), &delete.target.object, out);
+                            push_object_ref(
+                                transaction.data_model.as_ref(),
+                                &delete.target.object,
+                                out,
+                            );
                         }
 
                         TransactionStep::Lock(lock) => {
-                            push_object_ref(transaction.data_model.as_ref(), &lock.target.object, out);
+                            push_object_ref(
+                                transaction.data_model.as_ref(),
+                                &lock.target.object,
+                                out,
+                            );
                         }
 
                         TransactionStep::Transition(transition) => {

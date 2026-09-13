@@ -76,6 +76,11 @@ struct ValueContext<'a> {
 
     /// Set when the reference appears inside a transaction body.
     transaction: Option<TransactionScope<'a>>,
+
+    /// The error class each enclosing `match_result` error arm
+    /// selects, by result binding: what an `effect_result_err`
+    /// reference resolves its schema through.
+    errors: Option<&'a BTreeMap<Id, Id>>,
 }
 
 impl<'a> ValueContext<'a> {
@@ -83,6 +88,7 @@ impl<'a> ValueContext<'a> {
         Self {
             scope: ValueScope::Operation(operation),
             transaction: None,
+            errors: None,
         }
     }
 
@@ -90,6 +96,14 @@ impl<'a> ValueContext<'a> {
         Self {
             scope: ValueScope::Transition(transition),
             transaction: None,
+            errors: None,
+        }
+    }
+
+    fn with_errors(self, errors: &'a BTreeMap<Id, Id>) -> Self {
+        Self {
+            errors: Some(errors),
+            ..self
         }
     }
 
@@ -101,6 +115,61 @@ impl<'a> ValueContext<'a> {
                 step,
             }),
             ..self
+        }
+    }
+
+    /// The error class selected for a result binding at this point,
+    /// if the reference sits inside one of its error arms.
+    fn error_class(&self, result: &Id) -> Option<&'a Id> {
+        self.errors.and_then(|errors| errors.get(result))
+    }
+}
+
+/// Walks a block depth first with the error-class scope in force at
+/// each step: the class each enclosing error arm selects for its
+/// result binding.
+fn walk_scoped<'a, V>(
+    block: &'a OperationBlock,
+    parent: &StepLocation,
+    arm: Option<Arm>,
+    scope: &BTreeMap<Id, Id>,
+    visit: &mut V,
+) where
+    V: FnMut(&StepLocation, &'a OperationStep, &BTreeMap<Id, Id>),
+{
+    for (index, step) in block.steps.iter().enumerate() {
+        let location = OperationBlock::location(parent, arm.clone(), index);
+
+        visit(&location, step, scope);
+
+        match step {
+            OperationStep::Transaction(execute) => {
+                if let Some(rejected) = &execute.rejected {
+                    walk_scoped(rejected, &location, Some(Arm::Rejected), scope, visit);
+                }
+            }
+
+            OperationStep::MatchResult(matched) => {
+                walk_scoped(&matched.ok, &location, Some(Arm::Ok), scope, visit);
+
+                for (error, arm_block) in &matched.errors {
+                    let mut inner = scope.clone();
+
+                    inner.insert(matched.result.clone(), error.clone());
+
+                    walk_scoped(arm_block, &location, Some(Arm::err(error)), &inner, visit);
+                }
+            }
+
+            OperationStep::Branch(branch) => {
+                walk_scoped(&branch.then, &location, Some(Arm::Then), scope, visit);
+
+                if let Some(otherwise) = &branch.otherwise {
+                    walk_scoped(otherwise, &location, Some(Arm::Otherwise), scope, visit);
+                }
+            }
+
+            _ => {}
         }
     }
 }
@@ -167,8 +236,8 @@ impl<'a> ReferenceIndex<'a> {
         for (operation_id, operation) in &model.operations {
             for (_, step) in operation.program.steps_with_locations() {
                 match step {
-                    OperationStep::Transaction(transaction) => {
-                        for inner in &transaction.steps {
+                    OperationStep::Transaction(execute) => {
+                        for inner in &execute.transaction.steps {
                             match inner {
                                 TransactionStep::Transition(transition) => {
                                     transition_appliers
@@ -193,8 +262,7 @@ impl<'a> ReferenceIndex<'a> {
                                 }
 
                                 TransactionStep::WriteOutbox(write) => {
-                                    outbox_write_contracts
-                                        .insert(&write.effect_id, &write.effect);
+                                    outbox_write_contracts.insert(&write.effect_id, &write.effect);
                                 }
 
                                 _ => {}
@@ -380,17 +448,27 @@ pub fn validate(model: &Model) -> Vec<ValidationError> {
 
     errors.extend(validate_request_identity_shape(model));
 
-    errors.extend(validate_invocation_locks(model));
+    errors.extend(validate_object_versions(model));
 
     errors.extend(validate_state_machines(model));
 
+    errors.extend(validate_transition_effects(model, &index));
+
     errors.extend(validate_transactions(model, &index));
 
+    errors.extend(validate_version_protocol(model, &index));
+
+    errors.extend(validate_managed_fields(model, &index));
+
     errors.extend(validate_result_bindings(model, &index));
+
+    errors.extend(validate_match_arms(model, &index));
 
     errors.extend(validate_programs(model, &index));
 
     errors.extend(validate_field_paths(model, &index));
+
+    errors.extend(validate_ordering_positions(model, &index));
 
     runtime::validate_runtime(model, &index, &mut errors);
 
@@ -451,6 +529,11 @@ pub fn program_local_diagnostics(
         });
     }
 
+    // The version protocol is judged from the program and the data
+    // objects it touches — shared symbols the probe carries — so a
+    // missing bump or a direct version write is fixed in-session too.
+    errors.extend(validate_version_protocol(model, &index));
+
     errors
         .into_iter()
         .filter(is_program_local_error)
@@ -491,6 +574,16 @@ fn is_program_local_error(error: &ValidationError) -> bool {
         | ExternalIdempotencyRequiresIdentity { .. }
         | ExternalReplayStabilityRequiresIdentity { .. }
         | ExternalResultReplayWithoutResult { .. }
+        | TransactionRequirementKeyUnavailable { .. }
+        | TransactionOrderingPositionUnavailable { .. }
+        | MissingTransactionRejectedArm { .. }
+        | UnexpectedTransactionRejectedArm { .. }
+        | UnknownResultErrorClass { .. }
+        | DirectWriteToVersionField { .. }
+        | MissingVersionBump { .. }
+        | DuplicateVersionBump { .. }
+        | VersionValidationWithoutObservedVersion { .. }
+        | VersionProtocolOnUnversionedObject { .. }
         | InvalidReferenceOwner { .. } => true,
 
         UnknownReference { expected, .. } | InvalidReferenceKind { expected, .. } => {
@@ -822,37 +915,6 @@ fn validate_request_identity_shape(model: &Model) -> Vec<ValidationError> {
     errors
 }
 
-/// Every invocation acquires the operation's entry lock, and an
-/// invocation is triggered by exactly one input, so the lock key —
-/// which sources one input — is evaluable for all of them only when
-/// that input is the operation's only one. The reference pass has
-/// already established that the source is an in-scope input; this
-/// judges coverage.
-fn validate_invocation_locks(model: &Model) -> Vec<ValidationError> {
-    let mut errors = Vec::new();
-
-    for (operation_id, operation) in &model.operations {
-        let Some(lock) = &operation.invocation_lock else {
-            continue;
-        };
-
-        let ValueSource::Input(source) = &lock.key.source else {
-            continue;
-        };
-
-        for input_id in operation.inputs.keys() {
-            if input_id != source {
-                errors.push(ValidationError::InvocationLockKeyNotEvaluable {
-                    operation: operation_id.clone(),
-                    input: input_id.clone(),
-                });
-            }
-        }
-    }
-
-    errors
-}
-
 fn validate_state_machines(model: &Model) -> Vec<ValidationError> {
     let mut errors = Vec::new();
 
@@ -953,14 +1015,51 @@ fn validate_transactions(model: &Model, index: &ReferenceIndex<'_>) -> Vec<Valid
                             transition,
                             &mut errors,
                         );
+
+                        validate_transition_effect_applications(
+                            model,
+                            &transaction.id,
+                            transition,
+                            &mut errors,
+                        );
                     }
 
                     TransactionStep::WriteOutbox(write) => {
-                        validate_transaction_outbox(
-                            model,
+                        validate_transaction_outbox(model, index, transaction, write, &mut errors);
+                    }
+
+                    TransactionStep::ValidateVersion(validate) => {
+                        validate_transaction_object(
                             index,
                             transaction,
-                            write,
+                            &validate.target.object,
+                            &mut errors,
+                        );
+                    }
+
+                    TransactionStep::BumpVersion(bump) => {
+                        validate_transaction_object(
+                            index,
+                            transaction,
+                            &bump.target.object,
+                            &mut errors,
+                        );
+                    }
+
+                    TransactionStep::AdvanceCursor(advance) => {
+                        validate_transaction_object(
+                            index,
+                            transaction,
+                            &advance.target.object,
+                            &mut errors,
+                        );
+                    }
+
+                    TransactionStep::Fence(fence) => {
+                        validate_transaction_object(
+                            index,
+                            transaction,
+                            &fence.target.object,
                             &mut errors,
                         );
                     }
@@ -973,6 +1072,692 @@ fn validate_transactions(model: &Model, index: &ReferenceIndex<'_>) -> Vec<Valid
     }
 
     errors
+}
+
+/// Applying a transition admits one message per declared outbox
+/// effect, so the step must supply exactly one derivation for each of
+/// them — no more, no fewer.
+fn validate_transition_effect_applications(
+    model: &Model,
+    transaction_id: &Id,
+    transition: &StateTransition,
+    errors: &mut Vec<ValidationError>,
+) {
+    let Some(declaration) = model
+        .state_machines
+        .get(&transition.machine)
+        .and_then(|machine| machine.transitions.get(&transition.transition))
+    else {
+        return;
+    };
+
+    let declared: BTreeSet<&Id> = declaration.effects.keys().collect();
+    let provided: BTreeSet<&Id> = transition.effects.keys().collect();
+
+    if declared == provided {
+        return;
+    }
+
+    errors.push(ValidationError::InvalidTransitionOutboxDerivation {
+        transaction: transaction_id.clone(),
+        transition: transition.transition.clone(),
+        missing: declared
+            .difference(&provided)
+            .map(|effect| (*effect).clone())
+            .collect(),
+        unexpected: provided
+            .difference(&declared)
+            .map(|effect| (*effect).clone())
+            .collect(),
+    });
+}
+
+/// The structural placement of transition-scoped outbox admissions
+/// (§15): the outbox belongs to the data model that owns the machine's
+/// subject object, and admits the written schema. References were
+/// resolved by the reference pass.
+fn validate_transition_effects(model: &Model, index: &ReferenceIndex<'_>) -> Vec<ValidationError> {
+    let mut errors = Vec::new();
+
+    for (machine_id, machine) in &model.state_machines {
+        let StateMachineSubject::Object { object, .. } = &machine.subject;
+
+        let subject_owner = index.get(object).and_then(|info| info.owner);
+
+        for (transition_id, transition) in &machine.transitions {
+            for (effect_id, effect) in &transition.effects {
+                let write = effect.outbox_write();
+
+                let Some((owner, outbox)) = model.outbox(&write.outbox) else {
+                    continue;
+                };
+
+                if let Some(subject_owner) = subject_owner
+                    && subject_owner != owner
+                {
+                    errors.push(ValidationError::TransitionOutboxOutsideDataModel {
+                        machine: machine_id.clone(),
+                        transition: transition_id.clone(),
+                        effect: effect_id.clone(),
+                        outbox: write.outbox.clone(),
+                        data_model: subject_owner.clone(),
+                    });
+                }
+
+                if !outbox.messages.contains(&write.schema) {
+                    errors.push(ValidationError::InvalidTransitionOutboxSchema {
+                        machine: machine_id.clone(),
+                        transition: transition_id.clone(),
+                        effect: effect_id.clone(),
+                        outbox: write.outbox.clone(),
+                        schema: write.schema.clone(),
+                    });
+                }
+            }
+        }
+    }
+
+    errors
+}
+
+// Object versions and managed fields
+
+/// A declared version field is a non-optional `int` outside the
+/// object's identity (§24).
+fn validate_object_versions(model: &Model) -> Vec<ValidationError> {
+    let mut errors = Vec::new();
+
+    for data_model in model.data_models.values() {
+        for (object_id, object) in &data_model.objects {
+            let Some(version) = &object.version else {
+                continue;
+            };
+
+            let defect = if object
+                .identity
+                .iter()
+                .any(|field| paths_related(field, &version.field))
+            {
+                Some(VersionFieldDefect::IdentityField)
+            } else {
+                match schema_field_type(model, &object.schema, &version.field.0) {
+                    None => Some(VersionFieldDefect::Unresolved),
+                    Some((_, true)) => Some(VersionFieldDefect::Optional),
+                    Some((TypeRef::Scalar(ScalarType::Int), false)) => None,
+                    Some((ty, false)) => Some(VersionFieldDefect::NotInt {
+                        found: type_label(&ty),
+                    }),
+                }
+            };
+
+            if let Some(defect) = defect {
+                errors.push(ValidationError::InvalidObjectVersionField {
+                    object: object_id.clone(),
+                    field: version.field.clone(),
+                    defect,
+                });
+            }
+        }
+    }
+
+    errors
+}
+
+/// The declared version field of an object, resolved through the
+/// global namespace; `None` for an unversioned or unknown object.
+fn version_field<'a>(
+    model: &'a Model,
+    index: &ReferenceIndex<'_>,
+    object: &Id,
+) -> Option<&'a FieldPath> {
+    let owner = index.get(object)?.owner?;
+
+    model
+        .data_models
+        .get(owner)?
+        .objects
+        .get(object)?
+        .version
+        .as_ref()
+        .map(|version| &version.field)
+}
+
+/// Whether one path is the other or nests within it.
+fn paths_related(first: &FieldPath, second: &FieldPath) -> bool {
+    first.0.starts_with(&second.0) || second.0.starts_with(&first.0)
+}
+
+/// The version protocol of every transaction (§25–§27): no direct
+/// write of a version field, a bump beside every write or transition
+/// of a versioned instance, at most one bump per instance, a
+/// validation against an observed version, and no protocol step on an
+/// unversioned object.
+fn validate_version_protocol(model: &Model, index: &ReferenceIndex<'_>) -> Vec<ValidationError> {
+    let mut errors = Vec::new();
+
+    for operation in model.operations.values() {
+        for (_, transaction) in operation.program.transactions() {
+            let bumps: Vec<&ObjectSelector> = transaction
+                .steps
+                .iter()
+                .filter_map(|step| match step {
+                    TransactionStep::BumpVersion(bump) => Some(&bump.target),
+                    _ => None,
+                })
+                .collect();
+
+            let mut seen_bumps: Vec<&ObjectSelector> = Vec::new();
+
+            for (step, inner) in transaction.steps.iter().enumerate() {
+                match inner {
+                    TransactionStep::Write(write) => {
+                        let Some(version) = version_field(model, index, &write.target.object)
+                        else {
+                            continue;
+                        };
+
+                        if write
+                            .fields
+                            .iter()
+                            .any(|field| paths_related(field, version))
+                        {
+                            errors.push(ValidationError::DirectWriteToVersionField {
+                                transaction: transaction.id.clone(),
+                                step,
+                                object: write.target.object.clone(),
+                                field: version.clone(),
+                            });
+                        }
+
+                        if !bumps.iter().any(|selector| **selector == write.target) {
+                            errors.push(ValidationError::MissingVersionBump {
+                                transaction: transaction.id.clone(),
+                                step,
+                                object: write.target.object.clone(),
+                            });
+                        }
+                    }
+
+                    TransactionStep::Transition(transition) => {
+                        if version_field(model, index, &transition.subject.object).is_some()
+                            && !bumps
+                                .iter()
+                                .any(|selector| **selector == transition.subject)
+                        {
+                            errors.push(ValidationError::MissingVersionBump {
+                                transaction: transaction.id.clone(),
+                                step,
+                                object: transition.subject.object.clone(),
+                            });
+                        }
+                    }
+
+                    TransactionStep::BumpVersion(bump) => {
+                        if version_field(model, index, &bump.target.object).is_none() {
+                            errors.push(ValidationError::VersionProtocolOnUnversionedObject {
+                                transaction: transaction.id.clone(),
+                                step,
+                                object: bump.target.object.clone(),
+                            });
+                        } else if seen_bumps.contains(&&bump.target) {
+                            errors.push(ValidationError::DuplicateVersionBump {
+                                transaction: transaction.id.clone(),
+                                step,
+                                object: bump.target.object.clone(),
+                            });
+                        } else {
+                            seen_bumps.push(&bump.target);
+                        }
+                    }
+
+                    TransactionStep::ValidateVersion(validate) => {
+                        match version_field(model, index, &validate.target.object) {
+                            None => errors.push(ValidationError::VersionProtocolOnUnversionedObject {
+                                transaction: transaction.id.clone(),
+                                step,
+                                object: validate.target.object.clone(),
+                            }),
+
+                            Some(version) => {
+                                if !crate::analyzer::verification::transaction_conflicts::observes_version(
+                                    transaction,
+                                    step,
+                                    &validate.target,
+                                    version,
+                                    &validate.expected,
+                                ) {
+                                    errors.push(
+                                        ValidationError::VersionValidationWithoutObservedVersion {
+                                            transaction: transaction.id.clone(),
+                                            step,
+                                            object: validate.target.object.clone(),
+                                        },
+                                    );
+                                }
+                            }
+                        }
+                    }
+
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    errors
+}
+
+/// The model-wide index of managed monotonic fields (§34): one role
+/// per field, the type each role requires, and no ordinary write to
+/// any of them.
+fn validate_managed_fields(model: &Model, index: &ReferenceIndex<'_>) -> Vec<ValidationError> {
+    let mut errors = Vec::new();
+    let mut roles: BTreeMap<(Id, FieldPath), ManagedRole> = BTreeMap::new();
+    let mut conflicts: BTreeSet<(Id, FieldPath, ManagedRole)> = BTreeSet::new();
+
+    for data_model in model.data_models.values() {
+        for (object_id, object) in &data_model.objects {
+            if let Some(version) = &object.version {
+                roles.insert(
+                    (object_id.clone(), version.field.clone()),
+                    ManagedRole::Version,
+                );
+            }
+        }
+    }
+
+    let mut claim = |object: &Id, field: &FieldPath, role: ManagedRole| {
+        let key = (object.clone(), field.clone());
+
+        match roles.get(&key) {
+            Some(existing) if *existing != role => {
+                if conflicts.insert((object.clone(), field.clone(), role)) {
+                    errors.push(ValidationError::ManagedFieldRoleConflict {
+                        object: object.clone(),
+                        field: field.clone(),
+                        first: *existing,
+                        second: role,
+                    });
+                }
+            }
+
+            Some(_) => {}
+
+            None => {
+                roles.insert(key, role);
+            }
+        }
+    };
+
+    for operation in model.operations.values() {
+        for (_, transaction) in operation.program.transactions() {
+            for inner in &transaction.steps {
+                match inner {
+                    TransactionStep::AdvanceCursor(advance) => claim(
+                        &advance.target.object,
+                        &advance.field,
+                        ManagedRole::Cursor { rule: advance.rule },
+                    ),
+
+                    TransactionStep::Fence(fence) => {
+                        claim(&fence.target.object, &fence.field, ManagedRole::Fence)
+                    }
+
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    // Field types per role; the version role is judged by
+    // `validate_object_versions`.
+    for ((object, field), role) in &roles {
+        if *role == ManagedRole::Version {
+            continue;
+        }
+
+        let Some(info) = index.get(object) else {
+            continue;
+        };
+
+        let Some(schema) = info
+            .owner
+            .and_then(|owner| model.data_models.get(owner))
+            .and_then(|data_model| data_model.objects.get(object))
+            .map(|object| &object.schema)
+        else {
+            continue;
+        };
+
+        let defect = match schema_field_type(model, schema, &field.0) {
+            None => Some(ManagedFieldDefect::Unresolved),
+            Some((_, true)) => Some(ManagedFieldDefect::Optional),
+            Some((ty, false)) => match (role, &ty) {
+                (
+                    ManagedRole::Cursor {
+                        rule: CursorAdvanceRule::Successor,
+                    },
+                    TypeRef::Scalar(ScalarType::Int),
+                ) => None,
+
+                (
+                    ManagedRole::Cursor {
+                        rule: CursorAdvanceRule::Successor,
+                    },
+                    _,
+                ) => Some(ManagedFieldDefect::NotInt {
+                    found: type_label(&ty),
+                }),
+
+                (_, TypeRef::Scalar(ScalarType::Int))
+                | (_, TypeRef::Scalar(ScalarType::Decimal))
+                | (_, TypeRef::Scalar(ScalarType::Timestamp)) => None,
+
+                _ => Some(ManagedFieldDefect::NotOrderedScalar {
+                    found: type_label(&ty),
+                }),
+            },
+        };
+
+        if let Some(defect) = defect {
+            errors.push(ValidationError::InvalidManagedFieldType {
+                object: object.clone(),
+                field: field.clone(),
+                role: *role,
+                defect,
+            });
+        }
+    }
+
+    // The value driving each cursor or fence has the field's type, and
+    // no ordinary write names a managed field.
+    for (operation_id, operation) in &model.operations {
+        walk_scoped(
+            &operation.program,
+            &StepLocation::root(),
+            None,
+            &BTreeMap::new(),
+            &mut |_, step, scope| {
+                let OperationStep::Transaction(execute) = step else {
+                    return;
+                };
+
+                let transaction = &execute.transaction;
+
+                for (step_index, inner) in transaction.steps.iter().enumerate() {
+                    let context = ValueContext::operation(operation_id)
+                        .with_errors(scope)
+                        .in_transaction(&transaction.id, transaction, step_index);
+
+                    let (object, field, value, role) = match inner {
+                        TransactionStep::AdvanceCursor(advance) => (
+                            &advance.target.object,
+                            &advance.field,
+                            &advance.incoming,
+                            ManagedRole::Cursor { rule: advance.rule },
+                        ),
+
+                        TransactionStep::Fence(fence) => (
+                            &fence.target.object,
+                            &fence.field,
+                            &fence.token,
+                            ManagedRole::Fence,
+                        ),
+
+                        TransactionStep::Write(write) => {
+                            for written in &write.fields {
+                                for ((managed_object, managed_field), role) in &roles {
+                                    if managed_object == &write.target.object
+                                        && *role != ManagedRole::Version
+                                        && paths_related(written, managed_field)
+                                    {
+                                        errors.push(ValidationError::DirectWriteToManagedField {
+                                            transaction: transaction.id.clone(),
+                                            step: step_index,
+                                            object: write.target.object.clone(),
+                                            field: managed_field.clone(),
+                                            role: *role,
+                                        });
+                                    }
+                                }
+                            }
+
+                            continue;
+                        }
+
+                        _ => continue,
+                    };
+
+                    let Some(schema) = index
+                        .get(object)
+                        .and_then(|info| info.owner)
+                        .and_then(|owner| model.data_models.get(owner))
+                        .and_then(|data_model| data_model.objects.get(object))
+                        .map(|object| object.schema.clone())
+                    else {
+                        continue;
+                    };
+
+                    let Some((expected, false)) = schema_field_type(model, &schema, &field.0)
+                    else {
+                        continue;
+                    };
+
+                    let Some(types) = value_ref_types(model, index, context, value) else {
+                        continue;
+                    };
+
+                    for (found, optional) in types {
+                        if optional || found != expected {
+                            errors.push(ValidationError::InvalidManagedFieldType {
+                                object: object.clone(),
+                                field: field.clone(),
+                                role,
+                                defect: ManagedFieldDefect::ValueTypeMismatch {
+                                    expected: type_label(&expected),
+                                    found: if optional {
+                                        format!("optional {}", type_label(&found))
+                                    } else {
+                                        type_label(&found)
+                                    },
+                                },
+                            });
+
+                            break;
+                        }
+                    }
+                }
+            },
+        );
+    }
+
+    errors
+}
+
+/// Every ordering position resolves to a non-optional ordered scalar
+/// (§9): `int`, `decimal`, or `timestamp`, in every schema its source
+/// admits.
+fn validate_ordering_positions(model: &Model, index: &ReferenceIndex<'_>) -> Vec<ValidationError> {
+    let mut errors = Vec::new();
+
+    for (operation_id, operation) in &model.operations {
+        walk_scoped(
+            &operation.program,
+            &StepLocation::root(),
+            None,
+            &BTreeMap::new(),
+            &mut |_, step, scope| {
+                let OperationStep::Transaction(execute) = step else {
+                    return;
+                };
+
+                let transaction = &execute.transaction;
+                let context = ValueContext::operation(operation_id).with_errors(scope);
+
+                for (requirement, declared) in transaction.requirements.ordering.iter().enumerate()
+                {
+                    let Some(types) = value_ref_types(model, index, context, &declared.position)
+                    else {
+                        continue;
+                    };
+
+                    let defect = types.iter().find_map(|(ty, optional)| {
+                        if *optional {
+                            Some(format!("optional {}", type_label(ty)))
+                        } else if matches!(
+                            ty,
+                            TypeRef::Scalar(
+                                ScalarType::Int | ScalarType::Decimal | ScalarType::Timestamp
+                            )
+                        ) {
+                            None
+                        } else {
+                            Some(type_label(ty))
+                        }
+                    });
+
+                    if let Some(found) = defect {
+                        errors.push(
+                            ValidationError::TransactionOrderingPositionNotOrderedScalar {
+                                operation: operation_id.clone(),
+                                transaction: transaction.id.clone(),
+                                requirement,
+                                position: declared.position.clone(),
+                                found,
+                            },
+                        );
+                    }
+                }
+            },
+        );
+    }
+
+    errors
+}
+
+/// Every `match_result` has exactly one arm per error class its
+/// result's contract declares (§61), and every `return` names a
+/// declared class (§60) — the latter judged by the reference pass.
+fn validate_match_arms(model: &Model, index: &ReferenceIndex<'_>) -> Vec<ValidationError> {
+    let mut errors = Vec::new();
+
+    for (operation_id, operation) in &model.operations {
+        for (location, step) in operation.program.steps_with_locations() {
+            let OperationStep::MatchResult(matched) = step else {
+                continue;
+            };
+
+            let Some(contract) = index
+                .binding_effect(&matched.result)
+                .and_then(|effect| effect_result_type(model, index, effect))
+            else {
+                continue;
+            };
+
+            for error in contract.errors.keys() {
+                if !matched.errors.contains_key(error) {
+                    errors.push(ValidationError::MissingResultErrorArm {
+                        operation: operation_id.clone(),
+                        location: location.clone(),
+                        result: matched.result.clone(),
+                        error: error.clone(),
+                    });
+                }
+            }
+
+            for error in matched.errors.keys() {
+                if !contract.errors.contains_key(error) {
+                    errors.push(ValidationError::UnexpectedResultErrorArm {
+                        operation: operation_id.clone(),
+                        location: location.clone(),
+                        result: matched.result.clone(),
+                        error: error.clone(),
+                    });
+                }
+            }
+        }
+    }
+
+    errors
+}
+
+/// The declared type at the end of a path, and whether any segment on
+/// the way is optional. Fragments walk to their source exactly as
+/// resolution does. `None` when the path does not resolve.
+fn schema_field_type(
+    model: &Model,
+    schema_id: &Id,
+    components: &[String],
+) -> Option<(TypeRef, bool)> {
+    if components.is_empty() {
+        return None;
+    }
+
+    match model.schemas.get(schema_id)? {
+        Schema::Canonical(schema) => {
+            let field = schema.fields.get(&components[0])?;
+
+            if components.len() == 1 {
+                return Some((field.ty.clone(), field.optional));
+            }
+
+            let TypeRef::Schema(inner) = &field.ty else {
+                // V1 does not define traversal through collections.
+                return None;
+            };
+
+            let (ty, optional) = schema_field_type(model, inner, &components[1..])?;
+
+            Some((ty, field.optional || optional))
+        }
+
+        Schema::Fragment(fragment) => {
+            let mapped = fragment.mapping.get(&components[0])?;
+
+            let mut source_path = mapped.0.clone();
+            source_path.extend_from_slice(&components[1..]);
+
+            schema_field_type(model, &fragment.source, &source_path)
+        }
+    }
+}
+
+/// The type a value reference resolves to in every schema its source
+/// admits, with whether any segment is optional. `None` when the
+/// source or the path does not resolve; the reference and path passes
+/// report that.
+fn value_ref_types(
+    model: &Model,
+    index: &ReferenceIndex<'_>,
+    context: ValueContext<'_>,
+    value: &ValueRef,
+) -> Option<Vec<(TypeRef, bool)>> {
+    let schemas = value_ref_schemas(model, index, context, value)?;
+
+    schemas
+        .iter()
+        .map(|schema| schema_field_type(model, schema, &value.path.0))
+        .collect()
+}
+
+/// A type as a diagnostic names it.
+fn type_label(ty: &TypeRef) -> String {
+    match ty {
+        TypeRef::Scalar(scalar) => match scalar {
+            ScalarType::String => "string",
+            ScalarType::Bool => "bool",
+            ScalarType::Int => "int",
+            ScalarType::Float => "float",
+            ScalarType::Decimal => "decimal",
+            ScalarType::Uuid => "uuid",
+            ScalarType::Timestamp => "timestamp",
+        }
+        .to_string(),
+
+        TypeRef::Schema(schema) => schema.to_string(),
+
+        TypeRef::List(inner) => format!("[{}]", type_label(inner)),
+    }
 }
 
 /// The transactional placement rules of an outbox write: the
@@ -1143,39 +1928,6 @@ fn validate_field_paths(model: &Model, index: &ReferenceIndex<'_>) -> Vec<Valida
             }
         }
 
-        if let Some(lock) = &operation.invocation_lock {
-            validate_value_ref_path(
-                model,
-                index,
-                operation_id,
-                ValueContext::operation(operation_id),
-                &lock.key,
-                &mut errors,
-            );
-        }
-
-        for requirement in &operation.requirements.serialization {
-            validate_value_ref_path(
-                model,
-                index,
-                operation_id,
-                ValueContext::operation(operation_id),
-                &requirement.key,
-                &mut errors,
-            );
-        }
-
-        for requirement in &operation.requirements.ordering {
-            validate_value_ref_path(
-                model,
-                index,
-                operation_id,
-                ValueContext::operation(operation_id),
-                &requirement.key,
-                &mut errors,
-            );
-        }
-
         for requirement in &operation.requirements.idempotency {
             validate_idempotency_key_paths(
                 model,
@@ -1198,10 +1950,9 @@ fn validate_field_paths(model: &Model, index: &ReferenceIndex<'_>) -> Vec<Valida
             );
         }
 
-        for (_, transaction) in operation.program.transactions() {
-            validate_transaction_paths(model, index, operation_id, transaction, &mut errors);
-        }
-
+        // Transactions are validated where the program walk reaches
+        // them, so the error-class scope of an enclosing match arm is
+        // in force.
         validate_program_paths(model, index, operation_id, &operation.program, &mut errors);
     }
 
@@ -1215,6 +1966,17 @@ fn validate_field_paths(model: &Model, index: &ReferenceIndex<'_>) -> Vec<Valida
                     effect_id,
                     ValueContext::transition(transition_id),
                     effect,
+                    &mut errors,
+                );
+            }
+
+            for (effect_id, effect) in &transition.effects {
+                validate_propagation_paths(
+                    model,
+                    index,
+                    effect_id,
+                    ValueContext::transition(transition_id),
+                    &effect.outbox_write().idempotency_key_propagation,
                     &mut errors,
                 );
             }
@@ -1326,19 +2088,12 @@ fn validate_value_ref_path(
             validate_schema_path(model, subject, schema, &value.path, errors);
         }
 
-        ValueSource::EffectResultOk(result_id) | ValueSource::EffectResultErr(result_id) => {
-            let variant = match &value.source {
-                ValueSource::EffectResultOk(_) => ResultVariant::Ok,
-                _ => ResultVariant::Err,
-            };
-
+        ValueSource::EffectResultOk(_) | ValueSource::EffectResultErr(_) => {
             // A binding on a resultless effect is reported by the
-            // result-binding pass; there is no schema to resolve here.
-            let Some(schema) = index
-                .binding_effect(result_id)
-                .and_then(|effect| effect_result_type(model, index, effect))
-                .map(|result| result.schema(variant).clone())
-            else {
+            // result-binding pass, and an error reference outside an
+            // error arm by the definite-availability pass; there is no
+            // schema to resolve in either case.
+            let Some(schema) = effect_result_schema(model, index, context, value) else {
                 return;
             };
 
@@ -1394,6 +2149,30 @@ fn validate_value_ref_path(
     }
 }
 
+/// The payload schema an effect-result reference resolves against:
+/// the contract's `ok` schema, or the schema of the error class the
+/// enclosing error arm selects for the binding.
+fn effect_result_schema(
+    model: &Model,
+    index: &ReferenceIndex<'_>,
+    context: ValueContext<'_>,
+    value: &ValueRef,
+) -> Option<Id> {
+    let (result_id, arm) = match &value.source {
+        ValueSource::EffectResultOk(result_id) => (result_id, ResultArm::Ok),
+
+        ValueSource::EffectResultErr(result_id) => {
+            (result_id, ResultArm::err(context.error_class(result_id)?))
+        }
+
+        _ => return None,
+    };
+
+    index
+        .binding_effect(result_id)
+        .and_then(|effect| effect_result_type(model, index, effect))
+        .and_then(|result| result.schema_of(&arm).cloned())
+}
 
 /// A `present` condition whose complete resolved path contains no
 /// optional segment: vacuously true against every schema the root can
@@ -1417,33 +2196,43 @@ pub fn redundant_presence_checks(model: &Model) -> Vec<RedundantPresence> {
     let mut redundant = Vec::new();
 
     for (operation_id, operation) in &model.operations {
-        for (location, step) in operation.program.steps_with_locations() {
-            let OperationStep::Branch(branch) = step else {
-                continue;
-            };
-
-            for root in presence_roots(&branch.condition) {
-                let Some(schemas) = presence_root_schemas(model, &index, root) else {
-                    continue;
+        walk_scoped(
+            &operation.program,
+            &StepLocation::root(),
+            None,
+            &BTreeMap::new(),
+            &mut |location, step, scope| {
+                let OperationStep::Branch(branch) = step else {
+                    return;
                 };
 
-                let verdicts: Vec<Option<bool>> = schemas
-                    .iter()
-                    .map(|schema| path_has_optional_segment(model, schema, &root.path.0))
-                    .collect();
+                let context = ValueContext::operation(operation_id).with_errors(scope);
 
-                // Unresolvable paths are the reference pass's errors,
-                // not redundancy; a note about a broken model helps
-                // nobody.
-                if !verdicts.is_empty() && verdicts.iter().all(|verdict| *verdict == Some(false)) {
-                    redundant.push(RedundantPresence {
-                        operation: operation_id.clone(),
-                        location: location.clone(),
-                        root: root.clone(),
-                    });
+                for root in presence_roots(&branch.condition) {
+                    let Some(schemas) = value_ref_schemas(model, &index, context, root) else {
+                        continue;
+                    };
+
+                    let verdicts: Vec<Option<bool>> = schemas
+                        .iter()
+                        .map(|schema| path_has_optional_segment(model, schema, &root.path.0))
+                        .collect();
+
+                    // Unresolvable paths are the reference pass's
+                    // errors, not redundancy; a note about a broken
+                    // model helps nobody.
+                    if !verdicts.is_empty()
+                        && verdicts.iter().all(|verdict| *verdict == Some(false))
+                    {
+                        redundant.push(RedundantPresence {
+                            operation: operation_id.clone(),
+                            location: location.clone(),
+                            root: root.clone(),
+                        });
+                    }
                 }
-            }
-        }
+            },
+        );
     }
 
     redundant
@@ -1460,14 +2249,15 @@ fn presence_roots(condition: &Condition) -> Vec<&ValueRef> {
     }
 }
 
-/// The schemas a program-level value reference resolves its path
-/// against — the same dispatch `validate_value_ref_path` performs,
-/// returning the schemas instead of validating. `None` when the
-/// source has no schema to resolve (a resultless binding, a
-/// transaction read, which is never legal at a branch anyway).
-fn presence_root_schemas(
+/// The schemas a value reference resolves its path against — the same
+/// dispatch `validate_value_ref_path` performs, returning the schemas
+/// instead of validating. `None` when the source has no schema to
+/// resolve: a resultless binding, an error reference outside its arm,
+/// or a transaction read outside its transaction.
+fn value_ref_schemas(
     model: &Model,
     index: &ReferenceIndex<'_>,
+    context: ValueContext<'_>,
     value: &ValueRef,
 ) -> Option<Vec<Id>> {
     match &value.source {
@@ -1502,18 +2292,8 @@ fn presence_root_schemas(
             Some(vec![index.output_schema(output_id)?.clone()])
         }
 
-        ValueSource::EffectResultOk(result_id) | ValueSource::EffectResultErr(result_id) => {
-            let variant = match &value.source {
-                ValueSource::EffectResultOk(_) => ResultVariant::Ok,
-                _ => ResultVariant::Err,
-            };
-
-            let schema = index
-                .binding_effect(result_id)
-                .and_then(|effect| effect_result_type(model, index, effect))
-                .map(|result| result.schema(variant).clone())?;
-
-            Some(vec![schema])
+        ValueSource::EffectResultOk(_) | ValueSource::EffectResultErr(_) => {
+            Some(vec![effect_result_schema(model, index, context, value)?])
         }
 
         ValueSource::StateMachineSubject(machine_id) => {
@@ -1527,7 +2307,17 @@ fn presence_root_schemas(
             Some(vec![data_model.objects.get(object)?.schema.clone()])
         }
 
-        ValueSource::TransactionRead(_) => None,
+        ValueSource::TransactionRead(read_id) => {
+            let scope = context.transaction?;
+            let (_, read) = scope.read(read_id)?;
+
+            let info = index.get(&read.target.object)?;
+            let data_model = model.data_models.get(info.owner?)?;
+
+            Some(vec![
+                data_model.objects.get(&read.target.object)?.schema.clone(),
+            ])
+        }
     }
 }
 
@@ -1731,9 +2521,10 @@ fn validate_transaction_paths(
     index: &ReferenceIndex<'_>,
     operation_id: &Id,
     transaction: &Transaction,
+    scope: &BTreeMap<Id, Id>,
     errors: &mut Vec<ValidationError>,
 ) {
-    let operation = ValueContext::operation(operation_id);
+    let operation = ValueContext::operation(operation_id).with_errors(scope);
     let transaction_id = &transaction.id;
 
     // The commit key is evaluated for the invocation before the body
@@ -1745,6 +2536,38 @@ fn validate_transaction_paths(
             transaction_id,
             operation,
             &key.components,
+            errors,
+        );
+    }
+
+    // So are the requirement keys and positions.
+    for requirement in &transaction.requirements.serializability {
+        validate_value_ref_path(
+            model,
+            index,
+            transaction_id,
+            operation,
+            &requirement.key,
+            errors,
+        );
+    }
+
+    for requirement in &transaction.requirements.ordering {
+        validate_value_ref_path(
+            model,
+            index,
+            transaction_id,
+            operation,
+            &requirement.key,
+            errors,
+        );
+
+        validate_value_ref_path(
+            model,
+            index,
+            transaction_id,
+            operation,
+            &requirement.position,
             errors,
         );
     }
@@ -1874,6 +2697,106 @@ fn validate_transaction_paths(
                         errors,
                     );
                 }
+
+                for application in transition.effects.values() {
+                    validate_derivation_paths(
+                        model,
+                        index,
+                        transaction_id,
+                        context,
+                        &application.values,
+                        errors,
+                    );
+                }
+            }
+
+            TransactionStep::ValidateVersion(validate) => {
+                validate_selector_paths(
+                    model,
+                    index,
+                    transaction_id,
+                    context,
+                    &validate.target,
+                    errors,
+                );
+
+                validate_value_ref_path(
+                    model,
+                    index,
+                    transaction_id,
+                    context,
+                    &validate.expected,
+                    errors,
+                );
+            }
+
+            TransactionStep::BumpVersion(bump) => {
+                validate_selector_paths(
+                    model,
+                    index,
+                    transaction_id,
+                    context,
+                    &bump.target,
+                    errors,
+                );
+            }
+
+            TransactionStep::AdvanceCursor(advance) => {
+                validate_selector_paths(
+                    model,
+                    index,
+                    transaction_id,
+                    context,
+                    &advance.target,
+                    errors,
+                );
+
+                validate_object_path(
+                    model,
+                    index,
+                    transaction_id,
+                    &advance.target.object,
+                    &advance.field,
+                    errors,
+                );
+
+                validate_value_ref_path(
+                    model,
+                    index,
+                    transaction_id,
+                    context,
+                    &advance.incoming,
+                    errors,
+                );
+            }
+
+            TransactionStep::Fence(fence) => {
+                validate_selector_paths(
+                    model,
+                    index,
+                    transaction_id,
+                    context,
+                    &fence.target,
+                    errors,
+                );
+
+                validate_object_path(
+                    model,
+                    index,
+                    transaction_id,
+                    &fence.target.object,
+                    &fence.field,
+                    errors,
+                );
+
+                validate_value_ref_path(
+                    model,
+                    index,
+                    transaction_id,
+                    context,
+                    &fence.token,
+                    errors,
+                );
             }
 
             TransactionStep::EstablishEffectIntent(step) => {
@@ -2201,6 +3124,52 @@ fn validate_state_machine_references(
                     errors,
                 );
             }
+
+            // A transition-scoped admission names its outbox and schema
+            // by its own codes, so a broken declaration reads as what
+            // it is rather than as a generic unknown reference.
+            for (effect_id, effect) in &transition.effects {
+                let write = effect.outbox_write();
+
+                if !matches!(index.get(&write.outbox), Some(info) if info.kind == ReferenceKind::Outbox)
+                {
+                    errors.push(ValidationError::UnknownTransitionOutbox {
+                        machine: machine_id.clone(),
+                        transition: transition_id.clone(),
+                        effect: effect_id.clone(),
+                        outbox: write.outbox.clone(),
+                    });
+                }
+
+                if !matches!(index.get(&write.schema), Some(info) if info.kind == ReferenceKind::Schema)
+                {
+                    errors.push(ValidationError::InvalidTransitionOutboxSchema {
+                        machine: machine_id.clone(),
+                        transition: transition_id.clone(),
+                        effect: effect_id.clone(),
+                        outbox: write.outbox.clone(),
+                        schema: write.schema.clone(),
+                    });
+                }
+
+                for propagation in &write.idempotency_key_propagation {
+                    validate_idempotency_key_references(
+                        index,
+                        effect_id,
+                        ValueContext::transition(transition_id),
+                        &propagation.source.components,
+                        errors,
+                    );
+
+                    validate_idempotency_key_references(
+                        index,
+                        effect_id,
+                        ValueContext::transition(transition_id),
+                        &propagation.target.components,
+                        errors,
+                    );
+                }
+            }
         }
     }
 }
@@ -2223,47 +3192,7 @@ fn validate_operation_references(
             validate_input_references(index, input_id, input, errors);
         }
 
-        // An invocation lock's key is confined to a stricter source
-        // vocabulary than a general value reference: it is evaluated
-        // at operation entry, where only an input payload exists.
-        if let Some(lock) = &operation.invocation_lock {
-            match &lock.key.source {
-                ValueSource::Input(_) => validate_value_ref_reference(
-                    index,
-                    operation_id,
-                    ValueContext::operation(operation_id),
-                    &lock.key,
-                    errors,
-                ),
-
-                other => errors.push(ValidationError::InvocationLockKeyNotFromInput {
-                    operation: operation_id.clone(),
-                    source: other.id().clone(),
-                }),
-            }
-        }
-
         validate_program_references(model, index, operation_id, &operation.program, errors);
-
-        for requirement in &operation.requirements.serialization {
-            validate_value_ref_reference(
-                index,
-                operation_id,
-                ValueContext::operation(operation_id),
-                &requirement.key,
-                errors,
-            );
-        }
-
-        for requirement in &operation.requirements.ordering {
-            validate_value_ref_reference(
-                index,
-                operation_id,
-                ValueContext::operation(operation_id),
-                &requirement.key,
-                errors,
-            );
-        }
 
         for requirement in &operation.requirements.idempotency {
             validate_idempotency_key_references(
@@ -2340,7 +3269,11 @@ fn validate_external_guarantee_placement(
 ) {
     let keyed = matches!(external.identity, ExternalIdentity::Keyed { .. });
 
-    if matches!(external.idempotency, ExternalIdempotency::IdenticalPerIdentity) && !keyed {
+    if matches!(
+        external.idempotency,
+        ExternalIdempotency::IdenticalPerIdentity
+    ) && !keyed
+    {
         errors.push(ValidationError::ExternalIdempotencyRequiresIdentity {
             effect: effect_id.clone(),
         });
@@ -2414,13 +3347,9 @@ fn validate_result_type_references(
 ) {
     expect_reference(index, subject, &result.ok, ReferenceKind::Schema, errors);
 
-    expect_reference(
-        index,
-        subject,
-        &result.err.schema,
-        ReferenceKind::Schema,
-        errors,
-    );
+    for class in result.errors.values() {
+        expect_reference(index, subject, &class.schema, ReferenceKind::Schema, errors);
+    }
 }
 
 fn validate_input_references(
@@ -2501,6 +3430,39 @@ fn validate_transaction_references(
         );
     }
 
+    // So are the requirement keys and positions. A transaction-read
+    // source is the one that cannot exist at entry; the
+    // definite-availability pass reports it under the requirement's
+    // own code, so here only the read's existence is checked.
+    let requirement_reference = |value: &ValueRef, errors: &mut Vec<ValidationError>| {
+        if let ValueSource::TransactionRead(read) = &value.source {
+            expect_reference(
+                index,
+                transaction_id,
+                read,
+                ReferenceKind::TransactionRead,
+                errors,
+            );
+        } else {
+            validate_value_ref_reference(
+                index,
+                transaction_id,
+                ValueContext::operation(operation_id),
+                value,
+                errors,
+            );
+        }
+    };
+
+    for requirement in &transaction.requirements.serializability {
+        requirement_reference(&requirement.key, errors);
+    }
+
+    for requirement in &transaction.requirements.ordering {
+        requirement_reference(&requirement.key, errors);
+        requirement_reference(&requirement.position, errors);
+    }
+
     for (step_index, step) in transaction.steps.iter().enumerate() {
         let context = ValueContext::operation(operation_id).in_transaction(
             transaction_id,
@@ -2511,6 +3473,52 @@ fn validate_transaction_references(
         match step {
             TransactionStep::Read(read) => {
                 validate_selector_references(index, transaction_id, context, &read.target, errors);
+            }
+
+            TransactionStep::ValidateVersion(validate) => {
+                validate_selector_references(
+                    index,
+                    transaction_id,
+                    context,
+                    &validate.target,
+                    errors,
+                );
+
+                validate_value_ref_reference(
+                    index,
+                    transaction_id,
+                    context,
+                    &validate.expected,
+                    errors,
+                );
+            }
+
+            TransactionStep::BumpVersion(bump) => {
+                validate_selector_references(index, transaction_id, context, &bump.target, errors);
+            }
+
+            TransactionStep::AdvanceCursor(advance) => {
+                validate_selector_references(
+                    index,
+                    transaction_id,
+                    context,
+                    &advance.target,
+                    errors,
+                );
+
+                validate_value_ref_reference(
+                    index,
+                    transaction_id,
+                    context,
+                    &advance.incoming,
+                    errors,
+                );
+            }
+
+            TransactionStep::Fence(fence) => {
+                validate_selector_references(index, transaction_id, context, &fence.target, errors);
+
+                validate_value_ref_reference(index, transaction_id, context, &fence.token, errors);
             }
 
             TransactionStep::Write(write) => {
@@ -2592,15 +3600,26 @@ fn validate_transaction_references(
                     errors,
                 );
 
-                // Side-effect instances are constructed when this step
-                // applies the transition, so their derivations are
-                // evaluated in the enclosing transaction context.
+                // Side-effect instances and admitted messages are
+                // constructed when this step applies the transition,
+                // so their derivations are evaluated in the enclosing
+                // transaction context.
                 for intent in transition.effect_intents.values() {
                     validate_derivation_references(
                         index,
                         transaction_id,
                         context,
                         &intent.values,
+                        errors,
+                    );
+                }
+
+                for application in transition.effects.values() {
+                    validate_derivation_references(
+                        index,
+                        transaction_id,
+                        context,
+                        &application.values,
                         errors,
                     );
                 }
@@ -2696,10 +3715,16 @@ fn validate_program_references(
 ) {
     let context = ValueContext::operation(operation_id);
 
-    for (_, step) in program.steps_with_locations() {
+    for (location, step) in program.steps_with_locations() {
         match step {
-            OperationStep::Transaction(step) => {
-                validate_transaction_references(model, index, operation_id, step, errors);
+            OperationStep::Transaction(execute) => {
+                validate_transaction_references(
+                    model,
+                    index,
+                    operation_id,
+                    &execute.transaction,
+                    errors,
+                );
             }
 
             OperationStep::ExecuteEffect(step) => {
@@ -2826,6 +3851,21 @@ fn validate_program_references(
                     errors,
                 ) {
                     validate_request_input_kind(model, index, operation_id, &step.request, errors);
+
+                    // A returned error names a class of the request's
+                    // contract (§60).
+                    if let ResultOutcome::Err { error, .. } = &step.outcome
+                        && let Some(Input::Request(request)) =
+                            find_input(model, index, &step.request)
+                        && !request.result.errors.contains_key(error)
+                    {
+                        errors.push(ValidationError::UnknownResultErrorClass {
+                            operation: operation_id.clone(),
+                            location: location.clone(),
+                            request: step.request.clone(),
+                            error: error.clone(),
+                        });
+                    }
                 }
 
                 validate_derivation_references(
@@ -3213,6 +4253,10 @@ fn visit_declarations<'a>(
             for effect_id in transition.side_effects.keys() {
                 visit(effect_id, ReferenceKind::Effect, Some(transition_id));
             }
+
+            for effect_id in transition.effects.keys() {
+                visit(effect_id, ReferenceKind::Effect, Some(transition_id));
+            }
         }
     }
 
@@ -3228,7 +4272,9 @@ fn visit_declarations<'a>(
 
         for (_, step) in operation.program.steps_with_locations() {
             match step {
-                OperationStep::Transaction(transaction) => {
+                OperationStep::Transaction(execute) => {
+                    let transaction = &execute.transaction;
+
                     visit(
                         &transaction.id,
                         ReferenceKind::Transaction,
@@ -3278,11 +4324,7 @@ fn visit_declarations<'a>(
                             }
 
                             TransactionStep::WriteOutbox(write) => {
-                                visit(
-                                    &write.effect_id,
-                                    ReferenceKind::Effect,
-                                    Some(operation_id),
-                                );
+                                visit(&write.effect_id, ReferenceKind::Effect, Some(operation_id));
                             }
 
                             _ => {}
@@ -3580,13 +4622,21 @@ fn effect_schema<'a>(
                     continue;
                 };
 
-                let effect = transition.side_effects.get(effect_id)?;
+                if let Some(effect) = transition.side_effects.get(effect_id) {
+                    return match effect {
+                        TransitionSideEffect::Publication(effect) => Some(&effect.schema),
 
-                return match effect {
-                    TransitionSideEffect::Publication(effect) => Some(&effect.schema),
+                        TransitionSideEffect::Request(effect) => Some(&effect.schema),
+                    };
+                }
 
-                    TransitionSideEffect::Request(effect) => Some(&effect.schema),
-                };
+                // A transition-scoped admission declares a typed
+                // message payload, exactly as a `write_outbox` site
+                // does.
+                return transition
+                    .effects
+                    .get(effect_id)
+                    .map(|effect| &effect.outbox_write().schema);
             }
 
             None
@@ -3637,6 +4687,7 @@ fn effect_result_type<'a>(
                     continue;
                 };
 
+                // An outbox admission has no synchronous result.
                 return match transition.side_effects.get(effect_id)? {
                     TransitionSideEffect::Publication(_) => None,
                     TransitionSideEffect::Request(request) => request_result(request),
@@ -3713,15 +4764,13 @@ fn validate_result_bindings(model: &Model, index: &ReferenceIndex<'_>) -> Vec<Va
 
                             Some((first_effect, first_contract)) => {
                                 if contract != first_contract {
-                                    errors.push(
-                                        ValidationError::RaceResultContractMismatch {
-                                            operation: operation_id.clone(),
-                                            location: location.clone(),
-                                            bind: bind.clone(),
-                                            first: first_effect.clone(),
-                                            second: effect.clone(),
-                                        },
-                                    );
+                                    errors.push(ValidationError::RaceResultContractMismatch {
+                                        operation: operation_id.clone(),
+                                        location: location.clone(),
+                                        bind: bind.clone(),
+                                        first: first_effect.clone(),
+                                        second: effect.clone(),
+                                    });
                                 }
                             }
                         }
@@ -3758,15 +4807,15 @@ fn validate_result_bindings(model: &Model, index: &ReferenceIndex<'_>) -> Vec<Va
 /// What is definitely available at one program point: the transaction
 /// artifacts every path reaching it has established or recovered, the
 /// result bindings every path has bound, the async handles every path
-/// has launched, and the result variants the enclosing match arms have
-/// selected.
+/// has launched, and the result arms the enclosing match arms have
+/// selected — the `ok` arm, or one error class per result.
 #[derive(Debug, Clone, Default)]
 struct Availability {
     artifacts: BTreeSet<Id>,
     bound: BTreeSet<Id>,
     handles: BTreeSet<Id>,
     ok: BTreeSet<Id>,
-    err: BTreeSet<Id>,
+    err: BTreeMap<Id, Id>,
 }
 
 impl Availability {
@@ -3781,8 +4830,50 @@ impl Availability {
             bound: both(&self.bound, &other.bound),
             handles: both(&self.handles, &other.handles),
             ok: both(&self.ok, &other.ok),
-            err: both(&self.err, &other.err),
+            err: self
+                .err
+                .iter()
+                .filter(|(result, class)| other.err.get(*result) == Some(*class))
+                .map(|(result, class)| (result.clone(), class.clone()))
+                .collect(),
         }
+    }
+}
+
+/// Why a value is not available at a transaction's entry, judged
+/// against the definite-availability state there. `None` when it is.
+fn entry_unavailability(state: &Availability, root: &ValueRef) -> Option<EntryUnavailability> {
+    match &root.source {
+        ValueSource::TransactionRead(read) => {
+            Some(EntryUnavailability::TransactionRead { read: read.clone() })
+        }
+
+        ValueSource::TransactionOutput(artifact) if !state.artifacts.contains(artifact) => {
+            Some(EntryUnavailability::ArtifactNotAvailable {
+                artifact: artifact.clone(),
+            })
+        }
+
+        ValueSource::EffectResultOk(result) | ValueSource::EffectResultErr(result) => {
+            let selected = match &root.source {
+                ValueSource::EffectResultOk(_) => state.ok.contains(result),
+                _ => state.err.contains_key(result),
+            };
+
+            if selected {
+                None
+            } else if state.bound.contains(result) {
+                Some(EntryUnavailability::ResultPayloadOutOfScope {
+                    result: result.clone(),
+                })
+            } else {
+                Some(EntryUnavailability::ResultNotBound {
+                    result: result.clone(),
+                })
+            }
+        }
+
+        _ => None,
     }
 }
 
@@ -3826,7 +4917,7 @@ impl<'a> ProgramValidator<'a> {
         mut state: Availability,
     ) -> Fallthrough {
         for (index, step) in block.steps.iter().enumerate() {
-            let location = OperationBlock::location(parent, arm, index);
+            let location = OperationBlock::location(parent, arm.clone(), index);
 
             match self.step(step, &location, state) {
                 Some(next) => state = next,
@@ -3857,7 +4948,9 @@ impl<'a> ProgramValidator<'a> {
         mut state: Availability,
     ) -> Fallthrough {
         match step {
-            OperationStep::Transaction(body) => {
+            OperationStep::Transaction(execute) => {
+                let body = &execute.transaction;
+
                 let consumer = ProgramUse::Transaction {
                     transaction: body.id.clone(),
                 };
@@ -3867,6 +4960,52 @@ impl<'a> ProgramValidator<'a> {
                 if let IdempotencyGuarantee::DeduplicatedBy { key } = &body.idempotency {
                     for root in &key.components {
                         self.require(&state, root, location, &consumer);
+                    }
+                }
+
+                // So are the requirement keys and positions: they
+                // identify the domain the obligation is about before
+                // the transaction executes, and are reported under
+                // their own codes.
+                for (index, requirement) in body.requirements.serializability.iter().enumerate() {
+                    if let Some(reason) = entry_unavailability(&state, &requirement.key) {
+                        self.errors
+                            .push(ValidationError::TransactionRequirementKeyUnavailable {
+                                operation: self.operation_id.clone(),
+                                location: location.clone(),
+                                transaction: body.id.clone(),
+                                family: TransactionRequirementFamily::Serializability,
+                                requirement: index,
+                                key: requirement.key.clone(),
+                                reason,
+                            });
+                    }
+                }
+
+                for (index, requirement) in body.requirements.ordering.iter().enumerate() {
+                    if let Some(reason) = entry_unavailability(&state, &requirement.key) {
+                        self.errors
+                            .push(ValidationError::TransactionRequirementKeyUnavailable {
+                                operation: self.operation_id.clone(),
+                                location: location.clone(),
+                                transaction: body.id.clone(),
+                                family: TransactionRequirementFamily::Ordering,
+                                requirement: index,
+                                key: requirement.key.clone(),
+                                reason,
+                            });
+                    }
+
+                    if let Some(reason) = entry_unavailability(&state, &requirement.position) {
+                        self.errors
+                            .push(ValidationError::TransactionOrderingPositionUnavailable {
+                                operation: self.operation_id.clone(),
+                                location: location.clone(),
+                                transaction: body.id.clone(),
+                                requirement: index,
+                                position: requirement.position.clone(),
+                                reason,
+                            });
                     }
                 }
 
@@ -3901,11 +5040,54 @@ impl<'a> ProgramValidator<'a> {
                     }
                 }
 
-                for artifact in established_by(body) {
-                    state.artifacts.insert(artifact.clone());
+                // A body with a commit guard needs its rejection block,
+                // and a body without one must not carry a block that
+                // control can never enter (§12).
+                let rejecting = body.steps.iter().position(TransactionStep::rejects);
+
+                match (&execute.rejected, rejecting) {
+                    (None, Some(step)) => {
+                        self.errors
+                            .push(ValidationError::MissingTransactionRejectedArm {
+                                operation: self.operation_id.clone(),
+                                location: location.clone(),
+                                transaction: body.id.clone(),
+                                step,
+                            });
+                    }
+
+                    (Some(_), None) => {
+                        self.errors
+                            .push(ValidationError::UnexpectedTransactionRejectedArm {
+                                operation: self.operation_id.clone(),
+                                location: location.clone(),
+                                transaction: body.id.clone(),
+                            });
+                    }
+
+                    _ => {}
                 }
 
-                Some(state)
+                // The committed continuation carries what the body
+                // establishes; the rejected one carries nothing of it
+                // (§13), and what falls through the rejection block
+                // rejoins after the step with only what both
+                // continuations guarantee.
+                let mut committed = state.clone();
+
+                for artifact in established_by(body) {
+                    committed.artifacts.insert(artifact.clone());
+                }
+
+                match &execute.rejected {
+                    Some(block) => {
+                        let rejected = self.block(block, location, Some(Arm::Rejected), state);
+
+                        join(Some(committed), rejected)
+                    }
+
+                    None => Some(committed),
+                }
             }
 
             OperationStep::ExecuteEffect(step) => {
@@ -3936,11 +5118,12 @@ impl<'a> ProgramValidator<'a> {
                 };
 
                 if !step.effect.permits_direct_async() {
-                    self.errors.push(ValidationError::EffectKindNotAsyncCapable {
-                        operation: self.operation_id.clone(),
-                        location: location.clone(),
-                        effect: step.effect_id.clone(),
-                    });
+                    self.errors
+                        .push(ValidationError::EffectKindNotAsyncCapable {
+                            operation: self.operation_id.clone(),
+                            location: location.clone(),
+                            effect: step.effect_id.clone(),
+                        });
                 }
 
                 // The instance is fully determined at launch: the
@@ -4079,28 +5262,41 @@ impl<'a> ProgramValidator<'a> {
                 // already selected must not strip that outer selection
                 // at its join.
                 let outer_ok = state.ok.contains(&step.result);
-                let outer_err = state.err.contains(&step.result);
+                let outer_err = state.err.get(&step.result).cloned();
 
                 let mut ok = state.clone();
 
                 ok.ok.insert(step.result.clone());
 
-                let mut err = state;
+                let mut fallthrough = self.block(&step.ok, location, Some(Arm::Ok), ok);
 
-                err.err.insert(step.result.clone());
+                // One arm per error class, each selecting its class for
+                // the binding within its own extent.
+                for (error, block) in &step.errors {
+                    let mut selected = state.clone();
 
-                let ok = self.block(&step.ok, location, Some(Arm::Ok), ok);
-                let err = self.block(&step.err, location, Some(Arm::Err), err);
+                    selected.err.insert(step.result.clone(), error.clone());
 
-                // Variant payloads are arm-local: neither survives the
-                // join, even when the other arm always terminates.
-                join(ok, err).map(|mut state| {
+                    let arm = self.block(block, location, Some(Arm::err(error)), selected);
+
+                    fallthrough = join(fallthrough, arm);
+                }
+
+                // Arm payloads are arm-local: none survives the join,
+                // even when every other arm always terminates.
+                fallthrough.map(|mut state| {
                     if !outer_ok {
                         state.ok.remove(&step.result);
                     }
 
-                    if !outer_err {
-                        state.err.remove(&step.result);
+                    match &outer_err {
+                        Some(class) => {
+                            state.err.insert(step.result.clone(), class.clone());
+                        }
+
+                        None => {
+                            state.err.remove(&step.result);
+                        }
                     }
 
                     state
@@ -4193,11 +5389,13 @@ impl<'a> ProgramValidator<'a> {
 
             ValueSource::EffectResultOk(result) | ValueSource::EffectResultErr(result) => {
                 let (variant, selected) = match &root.source {
-                    ValueSource::EffectResultOk(_) => (ResultVariant::Ok, &state.ok),
-                    _ => (ResultVariant::Err, &state.err),
+                    ValueSource::EffectResultOk(_) => {
+                        (ResultVariant::Ok, state.ok.contains(result))
+                    }
+                    _ => (ResultVariant::Err, state.err.contains_key(result)),
                 };
 
-                if selected.contains(result) {
+                if selected {
                     return;
                 }
 
@@ -4253,6 +5451,13 @@ fn transition_declaration_roots<'a>(model: &'a Model, step: &StateTransition) ->
         };
 
         for propagation in propagations {
+            roots.extend(propagation.source.components.iter());
+            roots.extend(propagation.target.components.iter());
+        }
+    }
+
+    for effect in transition.effects.values() {
+        for propagation in &effect.outbox_write().idempotency_key_propagation {
             roots.extend(propagation.source.components.iter());
             roots.extend(propagation.target.components.iter());
         }
@@ -4325,8 +5530,11 @@ fn validate_programs(model: &Model, _index: &ReferenceIndex<'_>) -> Vec<Validati
     errors
 }
 
-/// Field paths of the references the program makes at operation level:
-/// effect instance derivations, branch conditions, and return outcomes.
+/// Field paths of the references the program makes: transaction
+/// bodies, effect instance derivations, branch conditions, and return
+/// outcomes — each under the error-class scope of the arms enclosing
+/// it, which is what an `effect_result_err` reference resolves
+/// through.
 fn validate_program_paths(
     model: &Model,
     index: &ReferenceIndex<'_>,
@@ -4334,58 +5542,89 @@ fn validate_program_paths(
     program: &OperationBlock,
     errors: &mut Vec<ValidationError>,
 ) {
-    let context = ValueContext::operation(operation_id);
+    walk_scoped(
+        program,
+        &StepLocation::root(),
+        None,
+        &BTreeMap::new(),
+        &mut |_, step, scope| {
+            let context = ValueContext::operation(operation_id).with_errors(scope);
 
-    for (_, step) in program.steps_with_locations() {
-        match step {
-            OperationStep::ExecuteEffect(step) => {
-                // The contract's own field paths — propagation
-                // components, an external deduplication key — are
-                // evaluated in the operation context immediately
-                // before the step, like the instance derivation.
-                validate_effect_paths(model, index, &step.effect_id, context, &step.effect, errors);
-
-                validate_derivation_paths(
-                    model,
-                    index,
-                    operation_id,
-                    context,
-                    &step.values,
-                    errors,
-                );
-            }
-
-            OperationStep::ExecuteEffectAsync(step) => {
-                validate_effect_paths(model, index, &step.effect_id, context, &step.effect, errors);
-
-                validate_derivation_paths(
-                    model,
-                    index,
-                    operation_id,
-                    context,
-                    &step.values,
-                    errors,
-                );
-            }
-
-            OperationStep::Branch(step) => {
-                for root in step.condition.roots() {
-                    validate_value_ref_path(model, index, operation_id, context, root, errors);
+            match step {
+                OperationStep::Transaction(execute) => {
+                    validate_transaction_paths(
+                        model,
+                        index,
+                        operation_id,
+                        &execute.transaction,
+                        scope,
+                        errors,
+                    );
                 }
-            }
 
-            OperationStep::Return(step) => {
-                validate_derivation_paths(
-                    model,
-                    index,
-                    operation_id,
-                    context,
-                    step.outcome.values(),
-                    errors,
-                );
-            }
+                OperationStep::ExecuteEffect(step) => {
+                    // The contract's own field paths — propagation
+                    // components, an external deduplication key — are
+                    // evaluated in the operation context immediately
+                    // before the step, like the instance derivation.
+                    validate_effect_paths(
+                        model,
+                        index,
+                        &step.effect_id,
+                        context,
+                        &step.effect,
+                        errors,
+                    );
 
-            _ => {}
-        }
-    }
+                    validate_derivation_paths(
+                        model,
+                        index,
+                        operation_id,
+                        context,
+                        &step.values,
+                        errors,
+                    );
+                }
+
+                OperationStep::ExecuteEffectAsync(step) => {
+                    validate_effect_paths(
+                        model,
+                        index,
+                        &step.effect_id,
+                        context,
+                        &step.effect,
+                        errors,
+                    );
+
+                    validate_derivation_paths(
+                        model,
+                        index,
+                        operation_id,
+                        context,
+                        &step.values,
+                        errors,
+                    );
+                }
+
+                OperationStep::Branch(step) => {
+                    for root in step.condition.roots() {
+                        validate_value_ref_path(model, index, operation_id, context, root, errors);
+                    }
+                }
+
+                OperationStep::Return(step) => {
+                    validate_derivation_paths(
+                        model,
+                        index,
+                        operation_id,
+                        context,
+                        step.outcome.values(),
+                        errors,
+                    );
+                }
+
+                _ => {}
+            }
+        },
+    );
 }

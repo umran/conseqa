@@ -34,7 +34,8 @@ the JSON shapes of symbols, queries, and patches.";
 /// be safe; repair about the single obstacle.
 pub fn focus(kind: TaskKind) -> &'static str {
     match kind {
-        TaskKind::Decompose => "\
+        TaskKind::Decompose => {
+            "\
 ## Your task: decomposition
 
 Propose the shared architecture skeleton for this application: services, \
@@ -54,9 +55,11 @@ discharge. Do not declare any of it here, and do not shape an \
 interface around a topology you are imagining.
 
 Commit one `submit_patch` that creates all planned operation interfaces \
-and the prompt obligations.",
+and the prompt obligations."
+        }
 
-        TaskKind::TopologySynthesis => "\
+        TaskKind::TopologySynthesis => {
+            "\
 ## Your task: runtime topology
 
 You own the runtime topology (L1), and nothing else: transport \
@@ -65,54 +68,63 @@ delivery, partitioning, ordering, and dispatch, execution pools and \
 their member concurrency, request routers, and storage layouts. The L0 \
 application model is settled and not yours to change.
 
-Sometimes no topology can discharge a requirement, because the \
-application model does not carry what a proof would need — a message \
-schema with no field bearing the serialization key, so no grouping key \
-can group by it; a topic carrying a schema that cannot be grouped at \
-all, when a topic-scoped grouping must cover every message. Do not \
-approximate around that with a key that is not the one the requirement \
-names. File a `dependency_request` against the L0 symbol, say what it \
-needs and why, and leave the requirement unproven for now.
+You author the realization once, after the application model and its \
+requirements have settled: an execution pool and a router for every \
+request boundary, a transport declaration and a dispatch for every \
+subscription and outbox input, a storage layout for every data \
+object. L1 describes placement, transport, grouping, precedence, and \
+runtime capacity; it proves no transaction property. Transaction \
+serializability and ordering are discharged only from the L0 \
+transaction primitives — declared isolation, shared and exclusive \
+locks, object versions with `validate_version` and `bump_version`, \
+ordered cursors, fences — because no transport or topology fact \
+survives redelivery, timeout, worker replacement, or reordering after \
+failure. No obligation is aimed at you, and none should be aimed at \
+the topology: if `requirement_report` shows an unproven \
+serializability or ordering obligation, its remedy is `application` \
+and belongs to the program authors. What this layer does discharge are \
+the delivery facts the replay families consume: `at_least_once` \
+delivery is the retry driver behind guaranteed completion, \
+`at_most_once` delivery bounds a class to one attempt.
 
-Your objective names the obligations the runtime has to discharge. \
-Read each one's `requirement_report`: its structured obstacle names \
-the exact missing fact. Topology serialization and ordering proofs \
-need four facts together: a grouping/partition/routing domain keyed \
-by the requirement key, `consistent_hash` member assignment, \
-`execution_handoff: exclusive_ownership` on the pool, and \
-`member_concurrency` bounded(1). The handoff fact is the one that \
-carries exclusivity across worker replacement and rebalance — \
-affinity holds per stable epoch only and bounded(1) binds each member \
-separately, so without it same-key invocations may overlap between a \
-stale owner and its successor and nothing is proven. Declare it only \
-where the runtime genuinely fences or drains the old owner; a polling \
-lease alone is not that. A transport ordering on top of the four is \
-what proves same-key invocations take effect in order. Serialization \
-needs no ordering fact at all: declare `ordering: none` where the \
-transport genuinely orders nothing rather than claiming an order to \
-reach a grouping key. Serialization (never ordering) can also be \
-proven with no topology at all by an L0 `invocation_lock` on the \
-operation's interface; that is an L0 declaration, so where it is the \
-honest architecture, file a `dependency_request` for it rather than \
-inventing topology.
+Sometimes the application model does not carry what a realization \
+needs — a message schema with no field a transport could group by, or \
+a topic carrying a schema that cannot be grouped at all when a \
+topic-scoped grouping must cover every message. Do not approximate \
+around that with a key the messages do not carry. File a \
+`dependency_request` against the L0 symbol, say what it needs and why, \
+and declare what you can.
+
+Declare transport grouping and ordering where the transport genuinely \
+provides them — as facts an external scenario reads for load and skew \
+— and `ordering: none` where it orders nothing, never to reach a \
+proof.
 
 Grouping and ordering are independent facts sharing one exclusive \
 scope — declare them either on the topic runtime, covering every \
 subscription of it, or on each subscription runtime, never both.
 
-L1 is optional, and an unproven requirement is an acceptable outcome. \
-Never invent topology to make a proof pass: if the architecture \
-genuinely does not constrain execution that way, leave it unproven and \
-say so. Commit one `submit_patch` for the whole layer.",
+L1 is optional, and an honest partial realization is an acceptable \
+outcome. Never invent topology: declare the placement and transport \
+the architecture genuinely has, and nothing it does not. Commit one \
+`submit_patch` for the whole layer."
+        }
 
-        TaskKind::OperationSynthesis => "\
+        TaskKind::OperationSynthesis => {
+            "\
 ## Your task: operation synthesis
 
 Synthesize this operation's program: inline transactions, bindings, \
 effects, branches/matches, returns or completion. Reason about causal \
 behavior, state access, and control flow — not about proof \
 obligations, which come later, and not about runtime topology, which is \
-the coordinator's. An operation declares no concurrency of its own: \
+the coordinator's. A transaction that applies a transition, validates \
+a version, advances a cursor, or fences can reject at commit and must \
+carry a `rejected` block saying what control does then; one that \
+cannot reject must not. A write or transition of a versioned object \
+must be accompanied by a `bump_version` of the same instance, and a \
+`match_result` needs one arm per error class of the matched result's \
+contract. An operation declares no concurrency of its own: \
 where its invocations execute and how many run at once are facts about \
 the execution resource, declared in L1. If a shared symbol (a schema \
 field, a callee contract, a topic, a transition, an execution pool) \
@@ -122,23 +134,33 @@ Peer operations are being synthesized concurrently: read a peer's \
 (`callers`, `consumers`, broad searches) unless their answer is truly \
 load-bearing — their tracked results change as peers commit, and a \
 changed answer invalidates this session. Commit one scoped \
-`submit_patch`.",
+`submit_patch`."
+        }
 
-        TaskKind::RequirementDiscovery => "\
+        TaskKind::RequirementDiscovery => {
+            "\
 ## Your task: requirement discovery
 
 Given this operation's behavior, trigger semantics, effects, and role \
 in the system, propose the correctness obligations correct execution \
-reasonably requires: serialization, ordering, idempotency, result \
-replay, and recoverability requirements. Tie each to its origin — an \
-explicit prompt obligation, a strongly implied requirement, or a \
-recommendation. Do not rewrite the program. Prefer the context below \
-and `proof_summary`/`interface` reads over whole-set queries — peers \
-run concurrently and a changed tracked result invalidates this \
-session. Submit each proposal as a `propose_requirements` mutation \
-through `submit_patch` (see `dsl_reference` for the shape).",
+reasonably requires: transaction serializability (`SerializableBy(K)`) \
+and transaction ordering (`OrderedBy(K, P)`) on the inline \
+transactions whose state histories must be consistent, and \
+idempotency, result replay, and recoverability on the operation. A \
+transaction requirement names the transaction it constrains; its key \
+and position must be available when the transaction begins, and a \
+position must be a non-optional int, decimal, or timestamp. Tie each \
+to its origin — an explicit prompt obligation, a strongly implied \
+requirement, or a recommendation. Do not rewrite the program. Prefer \
+the context below and `proof_summary`/`interface` reads over \
+whole-set queries — peers run concurrently and a changed tracked \
+result invalidates this session. Submit each proposal as a \
+`propose_requirements` mutation through `submit_patch` (see \
+`dsl_reference` for the shape)."
+        }
 
-        TaskKind::RequirementRepair => "\
+        TaskKind::RequirementRepair => {
+            "\
 ## Your task: requirement repair
 
 Your objective names every unproven requirement of this operation and \
@@ -150,9 +172,11 @@ another — never by deleting or weakening a requirement. Prefer the \
 context below over whole-set queries; peers repair concurrently. If \
 the fix needs a downstream or shared change, file a \
 `dependency_request`. Commit one scoped `submit_patch`, or report \
-unresolved.",
+unresolved."
+        }
 
-        TaskKind::SharedDependencyRepair => "\
+        TaskKind::SharedDependencyRepair => {
+            "\
 ## Your task: shared dependency repair
 
 Another worker needed a change to a symbol it was not authorized to \
@@ -163,15 +187,18 @@ operations that depend on it. Commit one scoped `submit_patch`.
 Judge the request; do not just execute it. If the change is wrong, \
 unnecessary, or would break a dependent operation, commit nothing and \
 say why. Committing nothing is a real outcome, recorded as a declined \
-request, and it is the right one when the requester was mistaken.",
+request, and it is the right one when the requester was mistaken."
+        }
 
-        TaskKind::DependencyReview => "\
+        TaskKind::DependencyReview => {
+            "\
 ## Your task: dependency review
 
 A public contract you depend on changed. Determine whether this \
 operation still holds against the new contract. If it does, report \
 resolved with no patch. If it does not, either commit a scoped fix or \
-file a `dependency_request` for the shared change required.",
+file a `dependency_request` for the shared change required."
+        }
     }
 }
 

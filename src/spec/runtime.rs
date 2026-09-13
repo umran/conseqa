@@ -22,17 +22,31 @@
 //!
 //! Two boundaries are deliberate and load-bearing:
 //!
-//! - A semantic layer is not a correctness layer. `SerializedBy(K)`,
-//!   transaction isolation, and explicit locks are all L0 despite
-//!   being implemented by infrastructure; topic transport ordering and
-//!   member concurrency are L1 despite being invisible to a caller.
-//!   Correctness relevance does not determine layer.
+//! - A semantic layer is not a correctness layer. Transaction
+//!   serializability and ordering requirements, transaction isolation,
+//!   object versions, cursors, fences, and explicit locks are all L0
+//!   despite being implemented by infrastructure; topic transport
+//!   ordering and member concurrency are L1 despite being invisible to
+//!   a caller. Correctness relevance does not determine layer.
 //! - A routing key is a *semantic* value derived from an L0
 //!   invocation. It names a routing domain, never an execution-pool
 //!   member, worker, process, shard, host, or storage partition.
 //!   [`MemberAssignment`] — and only it — maps routing domains onto
 //!   the runtime topology, so a domain keeps its identity across
 //!   rebalances.
+//!
+//! And one rule governs what L1 may ever prove:
+//!
+//! > L1 describes placement, transport, grouping, precedence, and
+//! > runtime capacity. It does not provide transaction consistency
+//! > guarantees.
+//!
+//! Transport grouping and precedence describe how work ordinarily
+//! arrives; member assignment and member concurrency describe where and
+//! how much of it executes. None of them survives redelivery, timeout,
+//! worker replacement, stale workers, or reordering after failure, so
+//! no serializability or ordering proof consumes them. Those proofs
+//! rest on the L0 transaction primitives alone.
 
 use std::collections::BTreeMap;
 use std::num::NonZeroU32;
@@ -198,8 +212,6 @@ pub enum OrderingSemantics {
     /// be interpreted over.
     WithinGroup,
 }
-
-
 
 // ---------------------------------------------------------------------
 // Subscription transport and dispatch
@@ -463,12 +475,13 @@ pub struct OutboxDispatch {
 /// to [`ExecutionPool`] members.
 ///
 /// Routing does not imply attempt exclusivity: after redelivery or
-/// ownership uncertainty, attempts for one logical message may
-/// overlap on different members unless
-/// [`ExecutionPool::execution_handoff`] establishes otherwise. An
-/// ordinary polling message lease is not that fact — lease expiry may
-/// permit redelivery without the old attempt having terminated, so a
-/// lease alone is never invocation fencing.
+/// ownership uncertainty, attempts for one logical message may overlap
+/// on different members. An ordinary polling message lease is not a
+/// fact against that — lease expiry may permit redelivery without the
+/// old attempt having terminated — and no L1 declaration is: the
+/// state-level guard against a stale attempt is a transaction
+/// [`Fence`](super::Fence), [`AdvanceCursor`](super::AdvanceCursor),
+/// or [`ValidateVersion`](super::ValidateVersion) step.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OutboxRouting {
@@ -586,14 +599,17 @@ pub struct RequestRouting {
 /// How a semantic routing domain is assigned to a member of an
 /// execution pool.
 ///
-/// An assignment describes assignment and affinity only. It asserts
-/// nothing about execution overlap between a previous owner and its
-/// successor across worker replacement, failure recovery, scaling,
-/// membership change, partition reassignment, or ownership rebalance
-/// — that continuity is a separate fact, declared (or not) by
-/// [`ExecutionPool::execution_handoff`]. Splitting the two keeps
-/// `consistent_hash` from silently carrying a much stronger
-/// distributed-systems guarantee than its declaration visibly states.
+/// An assignment is a placement fact and nothing more. It describes
+/// where invocations of a domain ordinarily execute — for locality,
+/// cache affinity, and load — and asserts nothing about execution
+/// overlap between a previous owner and its successor across worker
+/// replacement, failure recovery, scaling, membership change,
+/// partition reassignment, or ownership rebalance. No correctness
+/// proof consumes it: a stale owner overlapping its successor is
+/// consistent with every declaration here, which is exactly why
+/// transaction consistency is proven from transaction primitives
+/// (locks, versions, cursors, fences, isolation) and never from
+/// `consistent_hash`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum MemberAssignment {
@@ -611,7 +627,6 @@ pub enum MemberAssignment {
     /// Each invocation goes to the next member in rotation,
     /// irrespective of which routing domain it belongs to.
     ///
-    /// No correctness proof consumes this, and it belongs here anyway.
     /// The analyzer is not L1's only reader: an external scenario
     /// evaluates the same declarations for hot members, routing skew
     /// and contention, and there this is decisive. Under a skewed key
@@ -624,9 +639,7 @@ pub enum MemberAssignment {
     /// It is also a *known arbitrary* assignment, which is not the same
     /// statement as declaring no routing at all. Omitting the routing
     /// block says nothing is known about member affinity; this says
-    /// affinity is known not to exist, so a serialization or ordering
-    /// requirement over the boundary is refused with a reason rather
-    /// than for want of a declaration nobody has made.
+    /// affinity is known not to exist.
     ///
     /// A routing key declared alongside it still names domains, and
     /// those domains still have their own identity; this assignment
@@ -655,50 +668,18 @@ pub enum MemberAssignment {
 #[serde(deny_unknown_fields)]
 pub struct ExecutionPool {
     pub member_concurrency: MemberConcurrency,
-
-    /// Whether exclusive execution ownership of a routing domain
-    /// survives ownership and member transitions. Absent means no
-    /// usable fact about execution overlap across such transitions —
-    /// epistemic absence, not an assertion that overlap occurs.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub execution_handoff: Option<ExecutionHandoff>,
-}
-
-/// The continuity of exclusive execution authority across
-/// assignment and member transitions — a fact about the pool's
-/// runtime, deliberately separate from [`MemberAssignment`], which
-/// describes assignment and affinity only.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ExecutionHandoff {
-    /// When execution authority for a routing domain transfers from
-    /// one pool member or member incarnation to another, the runtime
-    /// preserves exclusive execution ownership of that domain across
-    /// the transition: an invocation executing under the old authority
-    /// cannot overlap one executing under the successor's.
-    ///
-    /// This covers domain reassignment (`A -> B`) and member
-    /// replacement (`A -> A'`) alike, and it concerns execution
-    /// authority, not control-plane membership or agreement. None of
-    /// the following alone establishes it: membership lease expiry, a
-    /// worker declared unhealthy, a new member started, a recomputed
-    /// consistent-hash ring, consensus on a new owner. A conforming
-    /// realization must actually prevent the stale owner's execution
-    /// from overlapping the successor's — draining, generation
-    /// fencing, and coordinated handoff are conforming mechanisms;
-    /// Conseqa models the resulting guarantee, not the mechanism.
-    ///
-    /// It does not bound member concurrency: a pool may preserve
-    /// exclusive handoff while each member runs many invocations at
-    /// once.
-    ExclusiveOwnership,
 }
 
 /// How many invocations one member of a pool may execute at once.
 ///
 /// This is the model's only runtime execution-concurrency primitive.
 /// Routing determines where work executes; this determines how much
-/// may execute there concurrently.
+/// may execute there concurrently. It is a capacity fact: an external
+/// scenario reads it for throughput and contention, and nothing else
+/// does. In particular, `bounded(1)` proves no transaction property —
+/// a member that runs one invocation at a time still overlaps with
+/// every other member, with its own replacement, and with a stale
+/// incarnation of itself.
 ///
 /// Unlike routing, member concurrency has genuine semantic value in
 /// distinguishing an unknown resource from an explicitly unconstrained
@@ -718,13 +699,6 @@ pub enum MemberConcurrency {
 
     /// No finite member-level execution bound may be assumed.
     Unbounded,
-}
-
-impl MemberConcurrency {
-    /// Whether one member executes at most one invocation at a time.
-    pub fn is_serial(self) -> bool {
-        matches!(self, Self::Bounded(bound) if bound.get() == 1)
-    }
 }
 
 // ---------------------------------------------------------------------

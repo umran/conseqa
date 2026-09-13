@@ -1,22 +1,19 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
-    num::NonZeroU32,
     path::{Path, PathBuf},
 };
 
 use conseqa::{
     analyzer::{
-        DiagnosticCode, Severity, VerificationCode, report, validation,
+        DiagnosticCode, Severity, VerificationCode, validation,
         verification::{
             self, ArtifactReplay, ConsumerCollapse, DecisionGap, DecisionRule, EffectRetrySafety,
             EffectSafety, GoverningKeyDefect, IdempotencyObstacle, IdempotencyProof,
-            IdempotencyVerdict, KeyIdentity, PathRef, PayloadIdentityGap, RecoverabilityNote,
+            IdempotencyVerdict, PathRef, PayloadIdentityGap, ProofScope, RecoverabilityNote,
             RecoverabilityObstacle, RecoverabilityProof, RecoverabilityVerdict, ReplayGap,
-            InvocationLockKeyFact, Resolution, ResultGap, ResultReplayObstacle,
-            ResultReplayProof, ResultReplayVerdict,
-            ProofScope, RemedyLayer, RetryDriver, SerializationObstacle, SerializationProof,
-            SerializationVerdict, StabilityGap, StabilityRule, StableRoot, TransactionResolution,
+            Resolution, ResultGap, ResultReplayObstacle, ResultReplayProof, ResultReplayVerdict,
+            RetryDriver, StabilityGap, StabilityRule, StableRoot, TransactionResolution,
             canonical_value_path,
         },
     },
@@ -24,18 +21,15 @@ use conseqa::{
     spec::{
         Arm, AsyncJoin, Branch, CompletionRequirement, Condition, Derivation, Effect,
         ErrorDisposition, ErrorResultType, EstablishTransactionOutput, ExecuteEffect,
-        ExecuteEffectAsync, ExternalEffect, ExternalIdempotency, ExternalIdentity,
-        ExecutionHandoff, ExternalIdentityKey, ExternalResultReplay, FieldPath, Id,
-        IdempotencyGuarantee, IdempotencyKey, IdempotencyRequirement, Input, InvocationLock,
-        JoinAll,
-        MemberAssignment,
-        MemberConcurrency, Literal, MatchResult, MessageIdentity, MessageSelector, Model,
-        ObjectSelector, OperationBlock, OperationInputRef, OperationStep, Race,
-        RecoverabilityRequirement, RequestIdentity, RequestInput, RequestRouting, ResultOutcome,
-        ResultReplayRequirement, ResultType, ResultVariant, Return, Router, RuntimeModel, Schema,
-        SchemaFragment, SelectorPredicate, SelectorValue, SerializationRequirement,
-        OrderingSemantics, SubscriptionInput, SubscriptionRoutingKey, TopicRuntime, Transaction,
-        TransactionIsolation, TransactionStep, ValueRef, ValueSource, Write,
+        ExecuteEffectAsync, ExecuteTransaction, ExternalEffect, ExternalIdempotency,
+        ExternalIdentity, ExternalIdentityKey, ExternalResultReplay, FieldPath, Id,
+        IdempotencyGuarantee, IdempotencyKey, IdempotencyRequirement, Input, JoinAll, Literal,
+        MatchResult, MessageIdentity, MessageSelector, Model, ObjectSelector, OperationBlock,
+        OperationStep, Race, RecoverabilityRequirement, RequestIdentity, RequestInput, ResultArm,
+        ResultOutcome, ResultReplayRequirement, ResultType, Return, RuntimeModel, Schema,
+        SchemaFragment, SelectorPredicate, SelectorValue, SubscriptionInput, TopicRuntime,
+        Transaction, TransactionIsolation, TransactionOrderingRequirement, TransactionStep,
+        ValueRef, ValueSource, Write,
     },
 };
 
@@ -93,10 +87,13 @@ fn return_ok(request: &str, values: Derivation) -> OperationStep {
     })
 }
 
-fn return_err(request: &str, values: Derivation) -> OperationStep {
+fn return_err(request: &str, error: &str, values: Derivation) -> OperationStep {
     OperationStep::Return(Return {
         request: id(request),
-        outcome: ResultOutcome::Err { values },
+        outcome: ResultOutcome::Err {
+            error: id(error),
+            values,
+        },
     })
 }
 
@@ -202,14 +199,6 @@ fn runtime_mut(model: &mut Model) -> &mut RuntimeModel {
         .expect("the fixture declares a runtime model")
 }
 
-/// The grouping key mapping of a topic-scoped grouping declaration.
-fn grouping_key_mut<'a>(model: &'a mut Model, topic: &str) -> &'a mut conseqa::spec::GroupingKey {
-    topic_runtime_mut(model, topic)
-        .grouping
-        .as_mut()
-        .unwrap_or_else(|| panic!("`{topic}` declares no grouping"))
-}
-
 fn topic_runtime_mut<'a>(model: &'a mut Model, topic: &str) -> &'a mut TopicRuntime {
     runtime_mut(model)
         .topics
@@ -227,1035 +216,6 @@ fn subscription_runtime_mut<'a>(
         .get_mut(&id(operation))
         .and_then(|inputs| inputs.get_mut(&id(input)))
         .unwrap_or_else(|| panic!("`{operation}`/`{input}` declares no runtime"))
-}
-
-fn pool_mut<'a>(model: &'a mut Model, pool: &str) -> &'a mut conseqa::spec::ExecutionPool {
-    runtime_mut(model)
-        .execution_pools
-        .get_mut(&id(pool))
-        .unwrap_or_else(|| panic!("`{pool}` is not declared"))
-}
-
-fn bounded(value: u32) -> MemberConcurrency {
-    MemberConcurrency::Bounded(NonZeroU32::new(value).expect("non-zero"))
-}
-
-/// Declares the two pool facts every topology proof needs: serial
-/// members and exclusive execution handoff.
-fn make_pool_proof_capable(model: &mut Model, pool: &str) {
-    let pool = pool_mut(model, pool);
-    pool.member_concurrency = bounded(1);
-    pool.execution_handoff = Some(ExecutionHandoff::ExclusiveOwnership);
-}
-
-/// Declares an operation-entry invocation lock keyed from one of the
-/// operation's inputs.
-fn set_invocation_lock(model: &mut Model, operation: &str, input: &str, components: &[&str]) {
-    model
-        .operations
-        .get_mut(&id(operation))
-        .unwrap()
-        .invocation_lock = Some(InvocationLock {
-        key: input_key(input, components),
-    });
-}
-
-/// Declares a router for one request boundary, replacing any existing
-/// one.
-fn put_router(
-    model: &mut Model,
-    router: &str,
-    operation: &str,
-    input: &str,
-    pool: &str,
-    routing: Option<RequestRouting>,
-) {
-    let runtime = runtime_mut(model);
-
-    runtime
-        .routers
-        .retain(|_, existing| existing.boundary.operation != id(operation));
-
-    runtime.routers.insert(
-        id(router),
-        Router {
-            boundary: OperationInputRef {
-                operation: id(operation),
-                input: id(input),
-            },
-            pool: id(pool),
-            routing,
-        },
-    );
-}
-
-fn consistent_hash(key: &[&[&str]]) -> RequestRouting {
-    RequestRouting {
-        key: key.iter().map(|component| path(component)).collect(),
-        member_assignment: MemberAssignment::ConsistentHash,
-    }
-}
-
-fn serialization_verdict(
-    model: &Model,
-    operation: &str,
-    requirement: usize,
-) -> SerializationVerdict {
-    let report = verification::verify(model);
-
-    report
-        .serialization
-        .iter()
-        .find(|check| check.operation == id(operation) && check.requirement == requirement)
-        .unwrap_or_else(|| panic!("no serialization check for `{operation}` #{requirement}"))
-        .verdict
-        .clone()
-}
-
-fn obstacles(verdict: &SerializationVerdict) -> &[SerializationObstacle] {
-    match verdict {
-        SerializationVerdict::Unproven { obstacles } => obstacles,
-        SerializationVerdict::Proven { proof, .. } => {
-            panic!("expected an unproven verdict, found proof {proof:?}")
-        }
-    }
-}
-
-#[test]
-fn flash_checkout_serialization_requirements_are_proven() {
-    let model = load_flash_checkout();
-
-    let report = verification::verify(&model);
-
-    // reserve_inventory, charge_payment, and apply_payment each
-    // declare one serialization requirement.
-    assert_eq!(report.serialization.len(), 3);
-
-    assert!(
-        report
-            .serialization
-            .iter()
-            .all(|check| matches!(check.verdict, SerializationVerdict::Proven { .. })),
-        "expected every serialization requirement proven:\n{report:#?}"
-    );
-
-    // The fixture's honest gaps: reserve_inventory's recoverability,
-    // reserve_inventory's idempotency, charge_payment's idempotency
-    // (the not_deduplicated card charge), and create_order's
-    // idempotency through its cascade into reserve_inventory.
-    assert!(!report.all_proven());
-    assert_eq!(report.diagnostics().len(), 4);
-}
-
-#[test]
-fn the_subscription_proof_states_its_facts_and_is_runtime_dependent() {
-    let model = load_flash_checkout();
-
-    let verdict = serialization_verdict(&model, "operation.reserve_inventory", 0);
-
-    let SerializationVerdict::Proven {
-        proof:
-            SerializationProof::SubscriptionRouted {
-                input,
-                topic,
-                pool,
-                message_keys,
-                member_assignment,
-                ..
-            },
-        scope,
-    } = verdict
-    else {
-        panic!("expected a subscription-routed proof, found {verdict:?}");
-    };
-
-    assert_eq!(input, id("input.reserve_inventory.created"));
-    assert_eq!(topic, id("topic.order_events"));
-    assert_eq!(pool, id("pool.order_workers"));
-    assert_eq!(member_assignment, MemberAssignment::ConsistentHash);
-
-    // The whole argument came from declared runtime topology, so the
-    // proof is conditional on that realization.
-    assert_eq!(scope, ProofScope::RuntimeDependent);
-
-    // The subscription admits only OrderCreated, and the topic keys it
-    // by the same field the requirement uses.
-    assert_eq!(message_keys.len(), 1);
-    assert_eq!(message_keys[0].schema, id("schema.OrderCreated"));
-    assert_eq!(message_keys[0].grouping_key, path(&["order_id"]));
-    assert_eq!(message_keys[0].identity, KeyIdentity::SamePath);
-}
-
-#[test]
-fn a_router_with_a_matching_key_and_a_serial_pool_proves_request_serialization() {
-    let mut model = load_flash_checkout();
-
-    model
-        .operations
-        .get_mut(&id("operation.transfer_stock"))
-        .unwrap()
-        .requirements
-        .serialization
-        .push(SerializationRequirement {
-            key: input_key("input.transfer_stock.request", &["sku"]),
-        });
-
-    make_pool_proof_capable(&mut model, "pool.inventory_api");
-
-    put_router(
-        &mut model,
-        "router.transfer_stock",
-        "operation.transfer_stock",
-        "input.transfer_stock.request",
-        "pool.inventory_api",
-        Some(consistent_hash(&[&["sku"]])),
-    );
-
-    assert!(validation::validate(&model).is_empty());
-
-    let verdict = serialization_verdict(&model, "operation.transfer_stock", 0);
-
-    let SerializationVerdict::Proven {
-        proof:
-            SerializationProof::RequestRouted {
-                input,
-                router,
-                pool,
-                routing_key,
-                member_assignment,
-                execution_handoff,
-            },
-        scope,
-    } = verdict
-    else {
-        panic!("expected a request-routed proof, found {verdict:?}");
-    };
-
-    assert_eq!(input, id("input.transfer_stock.request"));
-    assert_eq!(router, id("router.transfer_stock"));
-    assert_eq!(pool, id("pool.inventory_api"));
-    assert_eq!(member_assignment, MemberAssignment::ConsistentHash);
-    assert_eq!(execution_handoff, ExecutionHandoff::ExclusiveOwnership);
-    assert_eq!(scope, ProofScope::RuntimeDependent);
-
-    assert_eq!(routing_key.len(), 1);
-    assert_eq!(routing_key[0].path, path(&["sku"]));
-    assert_eq!(routing_key[0].identity, KeyIdentity::SamePath);
-}
-
-#[test]
-fn a_routing_key_wider_than_the_requirement_key_proves_nothing() {
-    // Routing by (sku, source_warehouse_id) partitions same-sku
-    // invocations across routing domains, so equal serialization keys
-    // need not share an owning member.
-    let mut model = load_flash_checkout();
-
-    model
-        .operations
-        .get_mut(&id("operation.transfer_stock"))
-        .unwrap()
-        .requirements
-        .serialization
-        .push(SerializationRequirement {
-            key: input_key("input.transfer_stock.request", &["sku"]),
-        });
-
-    make_pool_proof_capable(&mut model, "pool.inventory_api");
-
-    put_router(
-        &mut model,
-        "router.transfer_stock",
-        "operation.transfer_stock",
-        "input.transfer_stock.request",
-        "pool.inventory_api",
-        Some(consistent_hash(&[&["sku"], &["source_warehouse_id"]])),
-    );
-
-    assert!(validation::validate(&model).is_empty());
-
-    let verdict = serialization_verdict(&model, "operation.transfer_stock", 0);
-
-    assert_eq!(
-        obstacles(&verdict),
-        &[
-            SerializationObstacle::RoutingKeyNotEquivalent {
-                input: id("input.transfer_stock.request"),
-                router: id("router.transfer_stock"),
-                component: path(&["source_warehouse_id"]),
-            },
-            SerializationObstacle::RoutingKeyWiderThanRequirement {
-                input: id("input.transfer_stock.request"),
-                router: id("router.transfer_stock"),
-                key: vec![path(&["sku"]), path(&["source_warehouse_id"])],
-            },
-        ]
-    );
-}
-
-#[test]
-fn an_empty_routing_key_never_proves_vacuously() {
-    // Validation rejects an empty routing key, and verification must
-    // stay conservative over the invalid model rather than concluding
-    // that every invocation shares a domain because no component
-    // separates them.
-    let mut model = load_flash_checkout();
-
-    model
-        .operations
-        .get_mut(&id("operation.transfer_stock"))
-        .unwrap()
-        .requirements
-        .serialization
-        .push(SerializationRequirement {
-            key: input_key("input.transfer_stock.request", &["sku"]),
-        });
-
-    make_pool_proof_capable(&mut model, "pool.inventory_api");
-
-    put_router(
-        &mut model,
-        "router.transfer_stock",
-        "operation.transfer_stock",
-        "input.transfer_stock.request",
-        "pool.inventory_api",
-        Some(RequestRouting {
-            key: Vec::new(),
-            member_assignment: MemberAssignment::ConsistentHash,
-        }),
-    );
-
-    assert!(!validation::validate(&model).is_empty());
-
-    let verdict = serialization_verdict(&model, "operation.transfer_stock", 0);
-
-    assert!(
-        matches!(verdict, SerializationVerdict::Unproven { .. }),
-        "{verdict:?}"
-    );
-}
-
-/// A serialization requirement blocked only by absent topology is
-/// routed to the L1 author. This is the common case after the two-layer
-/// split: the program is correct and no edit to it can help.
-#[test]
-fn an_obligation_missing_only_runtime_facts_reports_a_runtime_remedy() {
-    let mut model = load_flash_checkout();
-
-    model
-        .operations
-        .get_mut(&id("operation.transfer_stock"))
-        .unwrap()
-        .requirements
-        .serialization
-        .push(SerializationRequirement {
-            key: input_key("input.transfer_stock.request", &["sku"]),
-        });
-
-    runtime_mut(&mut model)
-        .routers
-        .remove(&id("router.transfer_stock"));
-
-    let report = verification::verify(&model);
-
-    let check = report
-        .serialization
-        .iter()
-        .find(|check| {
-            check.operation == id("operation.transfer_stock") && check.requirement == 0
-        })
-        .expect("the added requirement is checked");
-
-    assert_eq!(check.remedy(), Some(RemedyLayer::Runtime));
-
-    let obligations = report::obligations(&model, &report);
-
-    let obligation = obligations
-        .obligations
-        .iter()
-        .find(|obligation| obligation.id == "oblig.operation.transfer_stock.serialization.0")
-        .expect("the obligation is reported");
-
-    assert_eq!(obligation.remedy, Some(RemedyLayer::Runtime));
-}
-
-/// A key no input carries selects a population no routing declaration
-/// can address, so the fix is L0 however the topology is written.
-#[test]
-fn a_key_not_sourced_from_an_input_reports_an_application_remedy() {
-    let mut model = load_flash_checkout();
-
-    model
-        .operations
-        .get_mut(&id("operation.apply_payment"))
-        .unwrap()
-        .requirements
-        .serialization = vec![SerializationRequirement {
-        key: ValueRef {
-            source: ValueSource::StateMachineSubject(id("machine.order_lifecycle")),
-            path: path(&["order_id"]),
-        },
-    }];
-
-    let report = verification::verify(&model);
-
-    let check = report
-        .serialization
-        .iter()
-        .find(|check| {
-            check.operation == id("operation.apply_payment") && check.requirement == 0
-        })
-        .expect("the added requirement is checked");
-
-    assert_eq!(
-        obstacles(&check.verdict)
-            .iter()
-            .map(SerializationObstacle::layer)
-            .collect::<Vec<_>>(),
-        vec![RemedyLayer::Application],
-    );
-
-    assert_eq!(check.remedy(), Some(RemedyLayer::Application));
-}
-
-/// Obstacles are conjunctive, so one application obstacle keeps the
-/// whole obligation on the application side: topology work alone cannot
-/// close it.
-#[test]
-fn a_mixed_obstacle_set_reports_the_application_remedy() {
-    assert_eq!(
-        RemedyLayer::joined([RemedyLayer::Runtime, RemedyLayer::Runtime]),
-        Some(RemedyLayer::Runtime),
-    );
-
-    assert_eq!(
-        RemedyLayer::joined([RemedyLayer::Runtime, RemedyLayer::Application]),
-        Some(RemedyLayer::Application),
-    );
-
-    assert_eq!(RemedyLayer::joined([]), None);
-}
-
-/// A proven obligation is waiting on nothing.
-#[test]
-fn a_proven_obligation_reports_no_remedy() {
-    let model = load_flash_checkout();
-    let report = verification::verify(&model);
-
-    for check in &report.serialization {
-        assert!(matches!(check.verdict, SerializationVerdict::Proven { .. }));
-        assert_eq!(check.remedy(), None);
-    }
-}
-
-#[test]
-fn a_request_boundary_with_no_router_has_no_runtime_fact_at_all() {
-    let mut model = load_flash_checkout();
-
-    model
-        .operations
-        .get_mut(&id("operation.transfer_stock"))
-        .unwrap()
-        .requirements
-        .serialization
-        .push(SerializationRequirement {
-            key: input_key("input.transfer_stock.request", &["sku"]),
-        });
-
-    runtime_mut(&mut model)
-        .routers
-        .remove(&id("router.transfer_stock"));
-
-    assert!(validation::validate(&model).is_empty());
-
-    let verdict = serialization_verdict(&model, "operation.transfer_stock", 0);
-
-    assert_eq!(
-        obstacles(&verdict),
-        &[SerializationObstacle::NoRouter {
-            input: id("input.transfer_stock.request"),
-        }]
-    );
-
-    let report = verification::verify(&model);
-
-    // The added serialization gap, plus the fixture's four standing
-    // gaps.
-    assert_eq!(report.diagnostics().len(), 5);
-}
-
-#[test]
-fn pool_assignment_without_routing_yields_no_member_affinity() {
-    // The router names the pool and nothing else: the analyzer learns
-    // the execution population and no relationship between keys and
-    // members. There is no `unspecified` routing variant to declare —
-    // absence is the whole statement.
-    let mut model = load_flash_checkout();
-
-    model
-        .operations
-        .get_mut(&id("operation.transfer_stock"))
-        .unwrap()
-        .requirements
-        .serialization
-        .push(SerializationRequirement {
-            key: input_key("input.transfer_stock.request", &["sku"]),
-        });
-
-    make_pool_proof_capable(&mut model, "pool.inventory_api");
-
-    assert!(validation::validate(&model).is_empty());
-
-    let verdict = serialization_verdict(&model, "operation.transfer_stock", 0);
-
-    assert_eq!(
-        obstacles(&verdict),
-        &[SerializationObstacle::RoutingAbsent {
-            input: id("input.transfer_stock.request"),
-            pool: id("pool.inventory_api"),
-        }]
-    );
-}
-
-#[test]
-fn member_concurrency_above_one_defeats_both_routed_proofs() {
-    let mut model = load_flash_checkout();
-
-    pool_mut(&mut model, "pool.order_workers").member_concurrency = bounded(2);
-
-    let verdict = serialization_verdict(&model, "operation.reserve_inventory", 0);
-
-    // The routing leg holds; only the concurrency bound is missing.
-    assert_eq!(
-        obstacles(&verdict),
-        &[SerializationObstacle::MemberConcurrencyNotSerial {
-            input: id("input.reserve_inventory.created"),
-            pool: id("pool.order_workers"),
-            declared: bounded(2),
-        }]
-    );
-}
-
-#[test]
-fn an_undeclared_pool_is_an_obstacle_not_a_panic() {
-    let mut model = load_flash_checkout();
-
-    subscription_runtime_mut(
-        &mut model,
-        "operation.reserve_inventory",
-        "input.reserve_inventory.created",
-    )
-    .dispatch
-    .pool = id("pool.missing");
-
-    // The model no longer validates; verification stays total.
-    assert!(!validation::validate(&model).is_empty());
-
-    let verdict = serialization_verdict(&model, "operation.reserve_inventory", 0);
-
-    assert_eq!(
-        obstacles(&verdict),
-        &[SerializationObstacle::PoolUndeclared {
-            input: id("input.reserve_inventory.created"),
-            pool: id("pool.missing"),
-        }]
-    );
-}
-
-#[test]
-fn dispatch_without_routing_defeats_the_subscription_route() {
-    let mut model = load_flash_checkout();
-
-    subscription_runtime_mut(
-        &mut model,
-        "operation.reserve_inventory",
-        "input.reserve_inventory.created",
-    )
-    .dispatch
-    .routing = None;
-
-    assert!(validation::validate(&model).is_empty());
-
-    let verdict = serialization_verdict(&model, "operation.reserve_inventory", 0);
-
-    assert_eq!(
-        obstacles(&verdict),
-        &[SerializationObstacle::RoutingAbsent {
-            input: id("input.reserve_inventory.created"),
-            pool: id("pool.order_workers"),
-        }]
-    );
-}
-
-#[test]
-fn a_subscription_without_a_runtime_has_no_dispatch_fact() {
-    let mut model = load_flash_checkout();
-
-    runtime_mut(&mut model)
-        .subscriptions
-        .remove(&id("operation.reserve_inventory"));
-
-    assert!(validation::validate(&model).is_empty());
-
-    let verdict = serialization_verdict(&model, "operation.reserve_inventory", 0);
-
-    assert_eq!(
-        obstacles(&verdict),
-        &[SerializationObstacle::NoSubscriptionRuntime {
-            input: id("input.reserve_inventory.created"),
-        }]
-    );
-}
-
-#[test]
-fn removing_the_runtime_leaves_l0_valid_and_its_obligations_unproven() {
-    // Acceptance: dropping L1 may make requirements unproven, but does
-    // not structurally invalidate otherwise valid L0.
-    let mut model = load_flash_checkout();
-
-    model.runtime = None;
-
-    assert!(
-        validation::validate(&model).is_empty(),
-        "an L0-only model stays structurally valid"
-    );
-
-    let report = verification::verify(&model);
-
-    assert!(
-        report
-            .serialization
-            .iter()
-            .all(|check| matches!(check.verdict, SerializationVerdict::Unproven { .. })),
-        "no serialization requirement survives without runtime facts:\n{report:#?}"
-    );
-}
-
-#[test]
-fn a_shared_pool_alone_establishes_no_shared_routing_domain() {
-    // reserve_inventory and apply_payment already share
-    // pool.order_workers in the fixture. Each proof cites its own
-    // routing declaration; neither borrows the other's.
-    let model = load_flash_checkout();
-
-    for operation in ["operation.reserve_inventory", "operation.apply_payment"] {
-        let verdict = serialization_verdict(&model, operation, 0);
-
-        let SerializationVerdict::Proven {
-            proof: SerializationProof::SubscriptionRouted { input, pool, .. },
-            ..
-        } = &verdict
-        else {
-            panic!("expected a subscription-routed proof for {operation}, found {verdict:?}");
-        };
-
-        assert_eq!(pool, &id("pool.order_workers"));
-        assert!(input.0.starts_with("input."));
-    }
-
-    // Dropping one boundary's routing leaves the other's proof intact:
-    // nothing was inherited through the shared pool.
-    let mut model = load_flash_checkout();
-
-    subscription_runtime_mut(
-        &mut model,
-        "operation.apply_payment",
-        "input.apply_payment.captured",
-    )
-    .dispatch
-    .routing = None;
-
-    assert!(matches!(
-        serialization_verdict(&model, "operation.reserve_inventory", 0),
-        SerializationVerdict::Proven { .. }
-    ));
-
-    assert!(matches!(
-        serialization_verdict(&model, "operation.apply_payment", 0),
-        SerializationVerdict::Unproven { .. }
-    ));
-}
-
-#[test]
-fn a_storage_partition_key_proves_no_execution_affinity() {
-    // A partition key and a routing key may name the same field. They
-    // remain different facts, and the analyzer never substitutes one
-    // for the other: the fixture partitions object.order by order_id,
-    // which establishes nothing about where invocations execute.
-    let mut model = load_flash_checkout();
-
-    model
-        .operations
-        .get_mut(&id("operation.transfer_stock"))
-        .unwrap()
-        .requirements
-        .serialization
-        .push(SerializationRequirement {
-            key: input_key("input.transfer_stock.request", &["sku"]),
-        });
-
-    make_pool_proof_capable(&mut model, "pool.inventory_api");
-
-    // A layout keyed exactly like the requirement.
-    runtime_mut(&mut model).storage_layouts.insert(
-        id("layout.transfer"),
-        conseqa::spec::StorageLayout {
-            object: conseqa::spec::DataObjectRef {
-                data_model: id("data.inventory"),
-                object: id("object.stock"),
-            },
-            partition_key: vec![path(&["sku"])],
-        },
-    );
-
-    // Two layouts for one object: drop the fixture's own so the model
-    // stays valid.
-    runtime_mut(&mut model)
-        .storage_layouts
-        .remove(&id("layout.stock"));
-
-    assert!(validation::validate(&model).is_empty());
-
-    let verdict = serialization_verdict(&model, "operation.transfer_stock", 0);
-
-    assert_eq!(
-        obstacles(&verdict),
-        &[SerializationObstacle::RoutingAbsent {
-            input: id("input.transfer_stock.request"),
-            pool: id("pool.inventory_api"),
-        }]
-    );
-}
-
-#[test]
-fn a_proof_states_affinity_and_handoff_as_separate_facts() {
-    // The ownership leg is two declared facts, and the proof cites
-    // them separately: consistent_hash asserts stable-epoch affinity
-    // only, and the pool's exclusive_ownership execution handoff is
-    // what carries exclusivity across member and ownership
-    // transitions. An implementation that rebalances without
-    // preserving it is non-conforming.
-    let model = load_flash_checkout();
-
-    let verification = verification::verify(&model);
-    let report = conseqa::analyzer::report::obligations(&model, &verification);
-
-    let obligation = report
-        .obligations
-        .iter()
-        .find(|obligation| obligation.id.contains("reserve_inventory.serialization"))
-        .expect("reserve_inventory declares a serialization obligation");
-
-    assert_eq!(
-        obligation.scope,
-        Some(conseqa::analyzer::verification::ProofScope::RuntimeDependent)
-    );
-
-    assert!(
-        obligation.assumptions.iter().any(|assumption| {
-            assumption.contains("consistent_hash")
-                && assumption.contains("stable ownership epoch")
-                && !assumption.contains("transfers that ownership")
-        }),
-        "{:#?}",
-        obligation.assumptions
-    );
-
-    assert!(
-        obligation.assumptions.iter().any(|assumption| {
-            assumption.contains("exclusive_ownership execution handoff")
-                && assumption.contains("stale owner cannot overlap its successor")
-        }),
-        "{:#?}",
-        obligation.assumptions
-    );
-
-    assert!(
-        obligation
-            .assumptions
-            .iter()
-            .any(|assumption| assumption.contains("one simultaneously active invocation")),
-        "{:#?}",
-        obligation.assumptions
-    );
-}
-
-#[test]
-fn serialization_key_diverging_from_topic_key_is_unproven() {
-    let mut model = load_flash_checkout();
-
-    model
-        .operations
-        .get_mut(&id("operation.reserve_inventory"))
-        .unwrap()
-        .requirements
-        .serialization
-        .push(SerializationRequirement {
-            key: input_key("input.reserve_inventory.created", &["warehouse_id"]),
-        });
-
-    assert!(validation::validate(&model).is_empty());
-
-    // Requirement 0 (order_id) is still proven.
-    assert!(matches!(
-        serialization_verdict(&model, "operation.reserve_inventory", 0),
-        SerializationVerdict::Proven { .. }
-    ));
-
-    // Requirement 1 (warehouse_id) does not coincide with the topic
-    // key domain.
-    let verdict = serialization_verdict(&model, "operation.reserve_inventory", 1);
-
-    assert_eq!(
-        obstacles(&verdict),
-        &[SerializationObstacle::KeyIdentityUnestablished {
-            input: id("input.reserve_inventory.created"),
-            topic: id("topic.order_events"),
-            schema: id("schema.OrderCreated"),
-            grouping_key: path(&["order_id"]),
-        }]
-    );
-}
-
-#[test]
-fn round_robin_assignment_proves_neither_serialization_nor_ordering() {
-    // The ownership leg, exercised rather than merely guarded. Every
-    // other fact is in place — a keyed grouping matching the
-    // requirement key, grouping_key routing, a pool bounded to one
-    // invocation per member — and the proof still fails, because
-    // rotation puts same-key deliveries on different members.
-    let mut model = load_flash_checkout();
-
-    subscription_runtime_mut(
-        &mut model,
-        "operation.apply_payment",
-        "input.apply_payment.captured",
-    )
-    .dispatch
-    .routing = Some(conseqa::spec::SubscriptionRouting {
-        key: SubscriptionRoutingKey::GroupingKey,
-        member_assignment: MemberAssignment::RoundRobin,
-    });
-
-    // A known-arbitrary assignment is a legitimate declaration, not a
-    // malformed one: the model stays valid.
-    assert!(
-        validation::validate(&model).is_empty(),
-        "{:#?}",
-        validation::validate(&model)
-    );
-
-    let verdict = serialization_verdict(&model, "operation.apply_payment", 0);
-
-    assert!(
-        matches!(
-            obstacles(&verdict),
-            [SerializationObstacle::MemberAssignmentNotExclusive {
-                declared: MemberAssignment::RoundRobin,
-                ..
-            }]
-        ),
-        "{verdict:?}"
-    );
-
-    let verdict = ordering_verdict(&model, "operation.apply_payment", 0);
-
-    assert!(
-        matches!(
-            &verdict,
-            verification::OrderingVerdict::Unproven { obstacles }
-                if obstacles.iter().any(|obstacle| matches!(
-                    obstacle,
-                    verification::OrderingObstacle::MemberAssignmentNotExclusive {
-                        declared: MemberAssignment::RoundRobin,
-                        ..
-                    }
-                ))
-        ),
-        "{verdict:?}"
-    );
-}
-
-#[test]
-fn round_robin_is_a_stronger_statement_than_declaring_no_routing() {
-    // The distinction the refactor spec deferred: unknown member
-    // behaviour versus known arbitrary member behaviour. Neither
-    // proves, but they are different facts and the obstacles say so.
-    let mut model = load_flash_checkout();
-
-    subscription_runtime_mut(
-        &mut model,
-        "operation.apply_payment",
-        "input.apply_payment.captured",
-    )
-    .dispatch
-    .routing = None;
-
-    let absent = serialization_verdict(&model, "operation.apply_payment", 0);
-
-    assert!(
-        matches!(
-            obstacles(&absent),
-            [SerializationObstacle::RoutingAbsent { .. }]
-        ),
-        "{absent:?}"
-    );
-
-    subscription_runtime_mut(
-        &mut model,
-        "operation.apply_payment",
-        "input.apply_payment.captured",
-    )
-    .dispatch
-    .routing = Some(conseqa::spec::SubscriptionRouting {
-        key: SubscriptionRoutingKey::GroupingKey,
-        member_assignment: MemberAssignment::RoundRobin,
-    });
-
-    let declared = serialization_verdict(&model, "operation.apply_payment", 0);
-
-    assert!(
-        matches!(
-            obstacles(&declared),
-            [SerializationObstacle::MemberAssignmentNotExclusive { .. }]
-        ),
-        "{declared:?}"
-    );
-
-    assert_ne!(obstacles(&absent), obstacles(&declared));
-}
-
-#[test]
-fn two_routers_on_one_boundary_prove_nothing() {
-    // Regression. `router_for` took the first match, so a boundary
-    // routed two ways proved from whichever router sorted first — while
-    // the other sent the same invocations to an unbounded pool with no
-    // affinity. Verification stays sound over a model validation
-    // refuses.
-    let mut model = load_flash_checkout();
-
-    model
-        .operations
-        .get_mut(&id("operation.transfer_stock"))
-        .unwrap()
-        .requirements
-        .serialization
-        .push(SerializationRequirement {
-            key: input_key("input.transfer_stock.request", &["sku"]),
-        });
-
-    make_pool_proof_capable(&mut model, "pool.inventory_api");
-
-    put_router(
-        &mut model,
-        "router.aaa_transfer_stock",
-        "operation.transfer_stock",
-        "input.transfer_stock.request",
-        "pool.inventory_api",
-        Some(consistent_hash(&[&["sku"]])),
-    );
-
-    runtime_mut(&mut model).routers.insert(
-        id("router.zzz_transfer_stock_fallback"),
-        conseqa::spec::Router {
-            boundary: OperationInputRef {
-                operation: id("operation.transfer_stock"),
-                input: id("input.transfer_stock.request"),
-            },
-            pool: id("pool.checkout_api"),
-            routing: None,
-        },
-    );
-
-    assert!(!validation::validate(&model).is_empty());
-
-    let verdict = serialization_verdict(&model, "operation.transfer_stock", 0);
-
-    assert!(
-        matches!(
-            obstacles(&verdict),
-            [SerializationObstacle::AmbiguousRouter { .. }]
-        ),
-        "{verdict:?}"
-    );
-}
-
-#[test]
-fn declaring_transport_semantics_at_both_scopes_proves_nothing() {
-    // Regression. `effective_grouping` reads the winning scope, so a
-    // contradicting subscription declaration was dropped and the
-    // topic's half proved on its own.
-    let mut model = load_flash_checkout();
-
-    let subscription = subscription_runtime_mut(
-        &mut model,
-        "operation.apply_payment",
-        "input.apply_payment.captured",
-    );
-
-    // The topic groups by order_id; this says event_id, under which
-    // same-order_id deliveries land in different groups.
-    subscription.grouping = Some(conseqa::spec::GroupingKey {
-        mapping: [(id("schema.PaymentCaptured"), vec![path(&["event_id"])])]
-            .into_iter()
-            .collect(),
-    });
-
-    subscription.ordering = Some(OrderingSemantics::Global);
-
-    assert!(!validation::validate(&model).is_empty());
-
-    let verdict = serialization_verdict(&model, "operation.apply_payment", 0);
-
-    assert!(
-        matches!(
-            obstacles(&verdict),
-            [SerializationObstacle::TransportSemanticsAtBothScopes { .. }]
-        ),
-        "{verdict:?}"
-    );
-
-    // Ordering consumes the same grouping evidence, so it refuses for
-    // the same reason rather than reading the topic's half.
-    let verdict = ordering_verdict(&model, "operation.apply_payment", 0);
-
-    assert!(
-        matches!(
-            &verdict,
-            verification::OrderingVerdict::Unproven { obstacles }
-                if obstacles.iter().any(|obstacle| matches!(
-                    obstacle,
-                    verification::OrderingObstacle::TransportSemanticsAtBothScopes { .. }
-                ))
-        ),
-        "{verdict:?}"
-    );
-}
-
-#[test]
-fn an_explicit_ordering_none_claims_its_scope() {
-    // Regression. `ordering: none` used to serialize identically to
-    // omission, so an explicit negative at the subscription scope read
-    // as "declares nothing" and silently inherited the topic's
-    // precedence — proving an ordering requirement the author had just
-    // declared they had no basis for.
-    let mut model = load_flash_checkout();
-
-    subscription_runtime_mut(
-        &mut model,
-        "operation.apply_payment",
-        "input.apply_payment.captured",
-    )
-    .ordering = Some(OrderingSemantics::None);
-
-    let errors = validation::validate(&model);
-
-    assert!(
-        errors.iter().any(|error| matches!(
-            error,
-            conseqa::analyzer::ValidationError::TransportSemanticsAtBothScopes { .. }
-        )),
-        "an explicit `none` is a declaration and claims the scope: {errors:#?}"
-    );
 }
 
 #[test]
@@ -1276,661 +236,12 @@ fn a_transport_without_grouping_is_rejected_before_verification() {
         "{errors:#?}"
     );
 
-    // Verification stays total over the invalid model.
-    let verdict = serialization_verdict(&model, "operation.reserve_inventory", 0);
-
-    assert_eq!(
-        obstacles(&verdict),
-        &[SerializationObstacle::NoGroupingDomain {
-            input: id("input.reserve_inventory.created"),
-            topic: id("topic.order_events"),
-        }]
-    );
-}
-
-#[test]
-fn serialization_consumes_grouping_and_never_ordering() {
-    // The point of separating the two facts. An unordered transport
-    // that still groups by key — an ordinary queue with consistent-hash
-    // workers — serializes; the model no longer has to claim an
-    // ordering guarantee it does not have in order to say so.
-    let mut model = load_flash_checkout();
-
-    topic_runtime_mut(&mut model, "topic.order_events").ordering = Some(OrderingSemantics::None);
-
-    assert!(
-        validation::validate(&model).is_empty(),
-        "grouping without ordering is a valid declaration"
-    );
-
-    assert!(
-        matches!(
-            serialization_verdict(&model, "operation.reserve_inventory", 0),
-            SerializationVerdict::Proven {
-                proof: SerializationProof::SubscriptionRouted { .. },
-                ..
-            }
-        ),
-        "serialization rests on the grouping alone"
-    );
-
-    // Ordering correctly does not follow: nothing orders anything.
-    let verdict = ordering_verdict(&model, "operation.reserve_inventory", 0);
-
-    assert!(
-        matches!(
-            &verdict,
-            verification::OrderingVerdict::Unproven { obstacles }
-                if matches!(&obstacles[..], [verification::OrderingObstacle::NoTransportPrecedence { .. }])
-        ),
-        "{verdict:?}"
-    );
-}
-
-#[test]
-fn a_key_not_sourced_from_an_input_selects_no_population() {
-    let mut model = load_flash_checkout();
-
-    model
-        .operations
-        .get_mut(&id("operation.apply_payment"))
-        .unwrap()
-        .requirements
-        .serialization = vec![SerializationRequirement {
-        key: ValueRef {
-            source: ValueSource::StateMachineSubject(id("machine.order_lifecycle")),
-            path: path(&["order_id"]),
-        },
-    }];
-
-    assert!(validation::validate(&model).is_empty());
-
-    let verdict = serialization_verdict(&model, "operation.apply_payment", 0);
-
-    assert_eq!(
-        obstacles(&verdict),
-        &[SerializationObstacle::KeyNotFromInput {
-            source: ValueSource::StateMachineSubject(id("machine.order_lifecycle")),
-        }]
-    );
-}
-
-#[test]
-fn empty_message_selection_is_vacuously_proven_without_any_runtime_fact() {
-    let mut model = load_flash_checkout();
-
-    subscription_mut(
-        &mut model,
-        "operation.reserve_inventory",
-        "input.reserve_inventory.created",
-    )
-    .messages = MessageSelector::Only(BTreeSet::new());
-
-    let verdict = serialization_verdict(&model, "operation.reserve_inventory", 0);
-
-    assert_eq!(
-        verdict,
-        SerializationVerdict::Proven {
-            proof: SerializationProof::NoAdmittedInvocations {
-                input: id("input.reserve_inventory.created"),
-            },
-            scope: ProofScope::L0Only,
-        }
-    );
-}
-
-#[test]
-fn fragment_aliasing_establishes_key_identity() {
-    let mut model = load_flash_checkout();
-
-    // A fragment view of OrderCreated in which `ref` aliases
-    // `order_id` under a different name.
-    let mut mapping = BTreeMap::new();
-
-    for field in [
-        "order_id",
-        "event_id",
-        "warehouse_id",
-        "sku",
-        "quantity",
-        "amount",
-    ] {
-        mapping.insert(field.to_owned(), path(&[field]));
-    }
-
-    mapping.insert("ref".to_owned(), path(&["order_id"]));
-
-    model.schemas.insert(
-        id("schema.OrderCreatedView"),
-        Schema::Fragment(SchemaFragment {
-            source: id("schema.OrderCreated"),
-            mapping,
-        }),
-    );
-
-    model
-        .topics
-        .get_mut(&id("topic.order_events"))
-        .unwrap()
-        .messages
-        .insert(id("schema.OrderCreatedView"));
-
-    // The grouping keys the fragment schema by its aliased name.
-    grouping_key_mut(&mut model, "topic.order_events")
-        .mapping
-        .insert(id("schema.OrderCreatedView"), vec![path(&["ref"])]);
-
-    let subscription = subscription_mut(
-        &mut model,
-        "operation.reserve_inventory",
-        "input.reserve_inventory.created",
-    );
-
-    subscription.messages = MessageSelector::Only(BTreeSet::from([id("schema.OrderCreatedView")]));
-
-    assert!(
-        validation::validate(&model).is_empty(),
-        "the fragment mutation should keep the model valid"
-    );
-
-    // The requirement key is `order_id`; the topic keys the admitted
-    // schema by `ref`. Both expand to OrderCreated.order_id.
-    let verdict = serialization_verdict(&model, "operation.reserve_inventory", 0);
-
-    let SerializationVerdict::Proven {
-        proof: SerializationProof::SubscriptionRouted { message_keys, .. },
-        ..
-    } = verdict
-    else {
-        panic!("expected a subscription-routed proof, found {verdict:?}");
-    };
-
-    assert_eq!(message_keys.len(), 1);
-    assert_eq!(message_keys[0].schema, id("schema.OrderCreatedView"));
-    assert_eq!(message_keys[0].grouping_key, path(&["ref"]));
-    assert_eq!(
-        message_keys[0].identity,
-        KeyIdentity::SameCanonicalValue {
-            schema: id("schema.OrderCreated"),
-            path: path(&["order_id"]),
-        }
-    );
-}
-
-#[test]
-fn missing_topic_key_mapping_is_an_obstacle_not_a_panic() {
-    let mut model = load_flash_checkout();
-
-    grouping_key_mut(&mut model, "topic.order_events")
-        .mapping
-        .remove(&id("schema.OrderCreated"));
-
-    // The model no longer validates; verification must stay total and
-    // conservative.
-    assert!(!validation::validate(&model).is_empty());
-
-    let verdict = serialization_verdict(&model, "operation.reserve_inventory", 0);
-
-    assert_eq!(
-        obstacles(&verdict),
-        &[
-            SerializationObstacle::GroupingKeyMappingMissing {
-                input: id("input.reserve_inventory.created"),
-                topic: id("topic.order_events"),
-                schema: id("schema.OrderCreated"),
-            },
-        ]
-    );
-}
-
-#[test]
-fn dangling_key_input_is_unproven_not_a_panic() {
-    let mut model = load_flash_checkout();
-
-    model
-        .operations
-        .get_mut(&id("operation.reserve_inventory"))
-        .unwrap()
-        .requirements
-        .serialization = vec![SerializationRequirement {
-        key: input_key("input.missing", &["order_id"]),
-    }];
-
-    let verdict = serialization_verdict(&model, "operation.reserve_inventory", 0);
-
-    assert_eq!(
-        obstacles(&verdict),
-        &[SerializationObstacle::KeyNotFromInput {
-            source: ValueSource::Input(id("input.missing")),
-        }]
-    );
-}
-
-#[test]
-fn absent_execution_handoff_defeats_the_subscription_topology_proof() {
-    // consistent_hash asserts stable-epoch affinity only, and
-    // bounded(1) binds each member separately: neither says a stale
-    // invocation of a former owner cannot coexist with work on its
-    // replacement. Without the declared handoff fact the four-legged
-    // argument loses its bridge, and nothing is proven.
-    let mut model = load_flash_checkout();
-
-    pool_mut(&mut model, "pool.order_workers").execution_handoff = None;
-
-    let verdict = serialization_verdict(&model, "operation.reserve_inventory", 0);
-
-    assert_eq!(
-        obstacles(&verdict),
-        &[SerializationObstacle::ExecutionHandoffNotExclusive {
-            input: id("input.reserve_inventory.created"),
-            pool: id("pool.order_workers"),
-            declared: None,
-        }]
-    );
-}
-
-#[test]
-fn absent_execution_handoff_defeats_the_request_topology_proof() {
-    let mut model = load_flash_checkout();
-
-    model
-        .operations
-        .get_mut(&id("operation.transfer_stock"))
-        .unwrap()
-        .requirements
-        .serialization
-        .push(SerializationRequirement {
-            key: input_key("input.transfer_stock.request", &["sku"]),
-        });
-
-    // Serial members, matching routing key — and no handoff fact.
-    pool_mut(&mut model, "pool.inventory_api").member_concurrency = bounded(1);
-
-    put_router(
-        &mut model,
-        "router.transfer_stock",
-        "operation.transfer_stock",
-        "input.transfer_stock.request",
-        "pool.inventory_api",
-        Some(consistent_hash(&[&["sku"]])),
-    );
-
-    assert!(validation::validate(&model).is_empty());
-
-    let verdict = serialization_verdict(&model, "operation.transfer_stock", 0);
-
-    assert_eq!(
-        obstacles(&verdict),
-        &[SerializationObstacle::ExecutionHandoffNotExclusive {
-            input: id("input.transfer_stock.request"),
-            pool: id("pool.inventory_api"),
-            declared: None,
-        }]
-    );
-}
-
-#[test]
-fn absent_execution_handoff_defeats_the_ordering_proof() {
-    // Ordering is strictly stronger than serialization, so no leg of
-    // the serialization argument may be missing from an ordering
-    // proof: an earlier invocation still running on a stale owner
-    // loses the precedence in the overlap.
-    let mut model = load_flash_checkout();
-
-    pool_mut(&mut model, "pool.order_workers").execution_handoff = None;
-
-    let verdict = ordering_verdict(&model, "operation.apply_payment", 0);
-
-    assert!(
-        matches!(
-            &verdict,
-            verification::OrderingVerdict::Unproven { obstacles }
-                if matches!(
-                    &obstacles[..],
-                    [verification::OrderingObstacle::ExecutionHandoffNotExclusive {
-                        pool,
-                        declared: None,
-                        ..
-                    }] if pool == &id("pool.order_workers")
-                )
-        ),
-        "{verdict:?}"
-    );
-}
-
-#[test]
-fn an_invocation_lock_keyed_like_the_requirement_proves_serialization_without_topology() {
-    // Route A: the fixture's transfer router names a pool and nothing
-    // else, and the pool is unbounded — no topology route exists. The
-    // lock proves anyway, from the L0 declaration alone.
-    let mut model = load_flash_checkout();
-
-    model
-        .operations
-        .get_mut(&id("operation.transfer_stock"))
-        .unwrap()
-        .requirements
-        .serialization
-        .push(SerializationRequirement {
-            key: input_key("input.transfer_stock.request", &["sku"]),
-        });
-
-    set_invocation_lock(
-        &mut model,
-        "operation.transfer_stock",
-        "input.transfer_stock.request",
-        &["sku"],
-    );
-
-    assert!(validation::validate(&model).is_empty());
-
-    let verdict = serialization_verdict(&model, "operation.transfer_stock", 0);
-
-    let SerializationVerdict::Proven {
-        proof:
-            SerializationProof::InvocationLocked {
-                input,
-                key,
-                key_identities,
-            },
-        scope,
-    } = verdict
-    else {
-        panic!("expected an invocation-locked proof, found {verdict:?}");
-    };
-
-    assert_eq!(input, id("input.transfer_stock.request"));
-    assert_eq!(key, input_key("input.transfer_stock.request", &["sku"]));
-    assert_eq!(scope, ProofScope::L0Only);
-
-    assert_eq!(
-        key_identities,
-        vec![InvocationLockKeyFact {
-            schema: id("schema.TransferStockRequest"),
-            identity: KeyIdentity::SamePath,
-        }]
-    );
-}
-
-#[test]
-fn an_invocation_lock_outranks_a_capable_topology_with_the_l0_scope() {
-    // Both routes hold for reserve_inventory once the lock is
-    // declared. Route A is judged first because its proof survives
-    // any change of runtime realization, so the verdict is L0-only
-    // where the fixture's own proof was runtime-dependent.
-    let mut model = load_flash_checkout();
-
-    set_invocation_lock(
-        &mut model,
-        "operation.reserve_inventory",
-        "input.reserve_inventory.created",
-        &["order_id"],
-    );
-
-    assert!(validation::validate(&model).is_empty());
-
-    let verdict = serialization_verdict(&model, "operation.reserve_inventory", 0);
-
-    assert!(
-        matches!(
-            &verdict,
-            SerializationVerdict::Proven {
-                proof: SerializationProof::InvocationLocked { .. },
-                scope: ProofScope::L0Only,
-            }
-        ),
-        "{verdict:?}"
-    );
-}
-
-#[test]
-fn a_lock_keyed_from_another_source_is_declined_and_topology_still_proves() {
-    // The lock keys on another operation's input. Validation rejects
-    // the shape; verification independently declines route A — and
-    // the fixture's topology route still proves, because the two
-    // routes are independent.
-    let mut model = load_flash_checkout();
-
-    set_invocation_lock(
-        &mut model,
-        "operation.reserve_inventory",
-        "input.create_order.request",
-        &["order_id"],
-    );
-
-    assert!(!validation::validate(&model).is_empty());
-
-    let verdict = serialization_verdict(&model, "operation.reserve_inventory", 0);
-
-    assert!(
-        matches!(
-            &verdict,
-            SerializationVerdict::Proven {
-                proof: SerializationProof::SubscriptionRouted { .. },
-                scope: ProofScope::RuntimeDependent,
-            }
-        ),
-        "{verdict:?}"
-    );
-}
-
-#[test]
-fn a_lock_key_not_carrying_the_requirement_key_contributes_its_obstacle() {
-    // A lock keyed by a different field of the same input serializes
-    // the wrong population classes. Its obstacle leads the unproven
-    // verdict, and the topology route's own gaps follow.
-    let mut model = load_flash_checkout();
-
-    model
-        .operations
-        .get_mut(&id("operation.transfer_stock"))
-        .unwrap()
-        .requirements
-        .serialization
-        .push(SerializationRequirement {
-            key: input_key("input.transfer_stock.request", &["sku"]),
-        });
-
-    set_invocation_lock(
-        &mut model,
-        "operation.transfer_stock",
-        "input.transfer_stock.request",
-        &["quantity"],
-    );
-
-    assert!(validation::validate(&model).is_empty());
-
-    let verdict = serialization_verdict(&model, "operation.transfer_stock", 0);
-
-    assert_eq!(
-        obstacles(&verdict),
-        &[
-            SerializationObstacle::InvocationLockKeyNotEquivalent {
-                input: id("input.transfer_stock.request"),
-                schema: id("schema.TransferStockRequest"),
-                lock_key: path(&["quantity"]),
-            },
-            SerializationObstacle::RoutingAbsent {
-                input: id("input.transfer_stock.request"),
-                pool: id("pool.inventory_api"),
-            },
-            SerializationObstacle::MemberConcurrencyNotSerial {
-                input: id("input.transfer_stock.request"),
-                pool: id("pool.inventory_api"),
-                declared: MemberConcurrency::Unbounded,
-            },
-            SerializationObstacle::ExecutionHandoffNotExclusive {
-                input: id("input.transfer_stock.request"),
-                pool: id("pool.inventory_api"),
-                declared: None,
-            },
-        ]
-    );
-}
-
-#[test]
-fn an_invocation_lock_contributes_nothing_to_ordering() {
-    // The same lock that proves apply_payment's serialization L0-only
-    // leaves its ordering requirement exactly where the broken
-    // topology leaves it: lock acquisition makes no FIFO guarantee,
-    // so there is no precedence for it to preserve.
-    let mut model = load_flash_checkout();
-
-    pool_mut(&mut model, "pool.order_workers").execution_handoff = None;
-
-    set_invocation_lock(
-        &mut model,
-        "operation.apply_payment",
-        "input.apply_payment.captured",
-        &["order_id"],
-    );
-
-    assert!(validation::validate(&model).is_empty());
-
-    let serialization = serialization_verdict(&model, "operation.apply_payment", 0);
-
-    assert!(
-        matches!(
-            &serialization,
-            SerializationVerdict::Proven {
-                proof: SerializationProof::InvocationLocked { .. },
-                scope: ProofScope::L0Only,
-            }
-        ),
-        "{serialization:?}"
-    );
-
-    let ordering = ordering_verdict(&model, "operation.apply_payment", 0);
-
-    assert!(
-        matches!(
-            &ordering,
-            verification::OrderingVerdict::Unproven { obstacles }
-                if matches!(
-                    &obstacles[..],
-                    [verification::OrderingObstacle::ExecutionHandoffNotExclusive { .. }]
-                )
-        ),
-        "{ordering:?}"
-    );
-}
-
-#[test]
-fn an_empty_population_outranks_a_declared_lock() {
-    // Vacuous serialization needs no fact at all — not even the lock —
-    // and the proof says so.
-    let mut model = load_flash_checkout();
-
-    subscription_mut(
-        &mut model,
-        "operation.reserve_inventory",
-        "input.reserve_inventory.created",
-    )
-    .messages = MessageSelector::Only(BTreeSet::new());
-
-    set_invocation_lock(
-        &mut model,
-        "operation.reserve_inventory",
-        "input.reserve_inventory.created",
-        &["order_id"],
-    );
-
-    let verdict = serialization_verdict(&model, "operation.reserve_inventory", 0);
-
-    assert!(
-        matches!(
-            &verdict,
-            SerializationVerdict::Proven {
-                proof: SerializationProof::NoAdmittedInvocations { .. },
-                ..
-            }
-        ),
-        "{verdict:?}"
-    );
-}
-
-#[test]
-fn fragment_aliasing_establishes_lock_key_identity() {
-    // The lock key and the requirement key differ as paths but expand
-    // to the same canonical value through a declared fragment mapping
-    // — the same §4 identity the routed proofs consume.
-    let mut model = load_flash_checkout();
-
-    let mut mapping = BTreeMap::new();
-
-    for field in [
-        "order_id",
-        "event_id",
-        "warehouse_id",
-        "sku",
-        "quantity",
-        "amount",
-    ] {
-        mapping.insert(field.to_owned(), path(&[field]));
-    }
-
-    mapping.insert("ref".to_owned(), path(&["order_id"]));
-
-    model.schemas.insert(
-        id("schema.OrderCreatedView"),
-        Schema::Fragment(SchemaFragment {
-            source: id("schema.OrderCreated"),
-            mapping,
-        }),
-    );
-
-    model
-        .topics
-        .get_mut(&id("topic.order_events"))
-        .unwrap()
-        .messages
-        .insert(id("schema.OrderCreatedView"));
-
-    grouping_key_mut(&mut model, "topic.order_events")
-        .mapping
-        .insert(id("schema.OrderCreatedView"), vec![path(&["ref"])]);
-
-    let subscription = subscription_mut(
-        &mut model,
-        "operation.reserve_inventory",
-        "input.reserve_inventory.created",
-    );
-
-    subscription.messages = MessageSelector::Only(BTreeSet::from([id("schema.OrderCreatedView")]));
-
-    set_invocation_lock(
-        &mut model,
-        "operation.reserve_inventory",
-        "input.reserve_inventory.created",
-        &["ref"],
-    );
-
-    assert!(validation::validate(&model).is_empty());
-
-    // The requirement key stays `order_id`; the lock keys on `ref`.
-    // Both expand to OrderCreated.order_id.
-    let verdict = serialization_verdict(&model, "operation.reserve_inventory", 0);
-
-    let SerializationVerdict::Proven {
-        proof: SerializationProof::InvocationLocked { key_identities, .. },
-        scope,
-    } = verdict
-    else {
-        panic!("expected an invocation-locked proof, found {verdict:?}");
-    };
-
-    assert_eq!(scope, ProofScope::L0Only);
-
-    assert_eq!(
-        key_identities,
-        vec![InvocationLockKeyFact {
-            schema: id("schema.OrderCreatedView"),
-            identity: KeyIdentity::SameCanonicalValue {
-                schema: id("schema.OrderCreated"),
-                path: path(&["order_id"]),
-            },
-        }]
-    );
+    // Verification stays total over the invalid model, and no
+    // transaction proof consumed the grouping in the first place.
+    let report = verification::verify(&model);
+
+    assert_eq!(report.transaction_serializability.len(), 2);
+    assert_eq!(report.transaction_ordering.len(), 1);
 }
 
 #[test]
@@ -1967,18 +278,30 @@ fn canonical_value_path_expands_fragment_chains() {
 fn verification_report_round_trips_through_json() {
     let mut model = load_flash_checkout();
 
-    // Make one requirement unproven so both verdict shapes serialize.
-    model
-        .operations
-        .get_mut(&id("operation.reserve_inventory"))
-        .unwrap()
-        .requirements
-        .serialization
-        .push(SerializationRequirement {
-            key: input_key("input.reserve_inventory.created", &["warehouse_id"]),
-        });
+    // The fixture already carries a proven and an unproven
+    // serializability verdict; add an unproven ordering requirement so
+    // both ordering verdict shapes serialize too.
+    transaction_mut(
+        &mut model,
+        "operation.reserve_inventory",
+        "tx.reserve_inventory",
+    )
+    .requirements
+    .ordering
+    .push(TransactionOrderingRequirement {
+        key: input_key("input.reserve_inventory.created", &["order_id"]),
+        position: input_key("input.reserve_inventory.created", &["quantity"]),
+    });
 
     let report = verification::verify(&model);
+
+    assert!(
+        report
+            .transaction_ordering
+            .iter()
+            .any(|check| check.transaction == id("tx.reserve_inventory")),
+        "the added ordering requirement is checked"
+    );
 
     let json = serde_json::to_string(&report).expect("report should serialize");
 
@@ -1987,7 +310,6 @@ fn verification_report_round_trips_through_json() {
 
     assert_eq!(report, restored);
 }
-
 
 /// Declares the full provider-side boundary contract on an external
 /// effect: keyed interaction identity over the given input components,
@@ -2037,7 +359,7 @@ fn result_replay_verdict(
 /// The single returning path of a proven result-replay verdict.
 fn single_return(verdict: &ResultReplayVerdict) -> &verification::ReturnedResult {
     let ResultReplayVerdict::Proven {
-        proof: ResultReplayProof::ClassFixedResult { returns },
+        proof: ResultReplayProof::ClassFixedResult { returns, .. },
         ..
     } = verdict
     else {
@@ -2060,9 +382,13 @@ fn unavailable_result_root(verdict: &ResultReplayVerdict) -> (&Vec<ReplayGap>, &
         panic!("expected an unproven verdict, found {verdict:?}");
     };
 
-    let ResultReplayObstacle::ResultDerivationRootUnstable { roots, .. } = &obstacles[0] else {
-        panic!("expected an unstable result root, found {:?}", obstacles[0]);
-    };
+    let roots = obstacles
+        .iter()
+        .find_map(|obstacle| match obstacle {
+            ResultReplayObstacle::ResultDerivationRootUnstable { roots, .. } => Some(roots),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("expected an unstable result root, found {obstacles:?}"));
 
     let StabilityGap::ArtifactUnavailable {
         recovery,
@@ -2080,10 +406,32 @@ fn create_order_transaction(model: &mut Model) -> &mut Transaction {
     transaction_mut(model, "operation.create_order", "tx.create_order.new")
 }
 
+/// Declares an unversioned ledger object beside the versioned order,
+/// for shapes whose write must not carry a version bump: a bump is a
+/// state-dependent mutation, so a naturally replayable body cannot
+/// contain one.
+fn declare_order_ledger(model: &mut Model) {
+    model
+        .data_models
+        .get_mut(&id("data.checkout"))
+        .expect("the checkout data model exists")
+        .objects
+        .insert(
+            id("object.order_ledger"),
+            conseqa::spec::DataObject {
+                schema: id("schema.OrderRecord"),
+                identity: vec![path(&["order_id"])],
+                version: None,
+            },
+        );
+}
+
 /// Replaces create_order's transaction body with a naturally
 /// replayable shape: a key-derived write and an output establishment,
 /// with no keyed commit.
 fn make_create_order_natural(model: &mut Model) {
+    declare_order_ledger(model);
+
     let transaction = create_order_transaction(model);
 
     transaction.idempotency = IdempotencyGuarantee::Unspecified;
@@ -2091,7 +439,7 @@ fn make_create_order_natural(model: &mut Model) {
     transaction.steps = vec![
         TransactionStep::Write(Write {
             target: ObjectSelector {
-                object: id("object.order"),
+                object: id("object.order_ledger"),
                 predicate: SelectorPredicate::Eq {
                     field: path(&["order_id"]),
                     value: SelectorValue::Value(input_key(
@@ -2137,7 +485,7 @@ fn flash_checkout_result_replay_is_proven_by_recovery() {
 
     // One path, no decisions, returning ok from the recovered output.
     assert_eq!(returned.path, PathRef::default());
-    assert_eq!(returned.variant, ResultVariant::Ok);
+    assert_eq!(returned.arm, ResultArm::Ok);
     assert!(returned.decisions.is_empty());
 
     assert_eq!(
@@ -2364,25 +712,29 @@ fn chained_artifact_recovery_is_class_fixed() {
 
     operation.program.steps.insert(
         1,
-        OperationStep::Transaction(Transaction {
-            id: id("tx.create_order.receipt"),
-            data_model: None,
-            isolation: TransactionIsolation::Unspecified,
-            idempotency: IdempotencyGuarantee::DeduplicatedBy {
-                key: IdempotencyKey {
-                    components: vec![output_ref("output.create_order", &["order_id"])],
+        OperationStep::Transaction(ExecuteTransaction {
+            transaction: Transaction {
+                requirements: Default::default(),
+                id: id("tx.create_order.receipt"),
+                data_model: None,
+                isolation: TransactionIsolation::Unspecified,
+                idempotency: IdempotencyGuarantee::DeduplicatedBy {
+                    key: IdempotencyKey {
+                        components: vec![output_ref("output.create_order", &["order_id"])],
+                    },
                 },
+                steps: vec![TransactionStep::EstablishTransactionOutput(
+                    EstablishTransactionOutput {
+                        bind: id("output.create_order.receipt"),
+                        schema: id("schema.CreateOrderResponse"),
+                        values: deterministic(vec![input_key(
+                            "input.create_order.request",
+                            &["order_id"],
+                        )]),
+                    },
+                )],
             },
-            steps: vec![TransactionStep::EstablishTransactionOutput(
-                EstablishTransactionOutput {
-                    bind: id("output.create_order.receipt"),
-                    schema: id("schema.CreateOrderResponse"),
-                    values: deterministic(vec![input_key(
-                        "input.create_order.request",
-                        &["order_id"],
-                    )]),
-                },
-            )],
+            rejected: None,
         }),
     );
 
@@ -2632,7 +984,7 @@ fn a_branch_over_stable_roots_replays() {
     let verdict = result_replay_verdict(&model, "operation.create_order", 0);
 
     let ResultReplayVerdict::Proven {
-        proof: ResultReplayProof::ClassFixedResult { returns },
+        proof: ResultReplayProof::ClassFixedResult { returns, .. },
         ..
     } = &verdict
     else {
@@ -2757,12 +1109,16 @@ fn forward_transfer_to_create_order(model: &mut Model) {
                     path: path(&["order_id"]),
                 }]),
             )]),
-            err: block(vec![return_err(
-                "input.transfer_stock.request",
-                deterministic(vec![ValueRef {
-                    source: ValueSource::EffectResultErr(id("result.transfer_stock.forward")),
-                    path: path(&["reason"]),
-                }]),
+            errors: BTreeMap::from([(
+                id("rejected"),
+                block(vec![return_err(
+                    "input.transfer_stock.request",
+                    "rejected",
+                    deterministic(vec![ValueRef {
+                        source: ValueSource::EffectResultErr(id("result.transfer_stock.forward")),
+                        path: path(&["reason"]),
+                    }]),
+                )]),
             )]),
         }),
     ];
@@ -2790,7 +1146,7 @@ fn a_match_on_a_consistent_request_result_replays() {
     let verdict = result_replay_verdict(&model, "operation.transfer_stock", 0);
 
     let ResultReplayVerdict::Proven {
-        proof: ResultReplayProof::ClassFixedResult { returns },
+        proof: ResultReplayProof::ClassFixedResult { returns, .. },
         ..
     } = &verdict
     else {
@@ -2798,8 +1154,8 @@ fn a_match_on_a_consistent_request_result_replays() {
     };
 
     assert_eq!(returns.len(), 2);
-    assert_eq!(returns[0].variant, ResultVariant::Ok);
-    assert_eq!(returns[1].variant, ResultVariant::Err);
+    assert_eq!(returns[0].arm, ResultArm::Ok);
+    assert_eq!(returns[1].arm, ResultArm::err(&id("rejected")));
 
     for returned in returns {
         assert!(matches!(
@@ -2937,12 +1293,16 @@ fn cyclic_result_dependencies_prove_coinductively() {
                     path: path(&["order_id"]),
                 }]),
             )]),
-            err: block(vec![return_err(
-                "input.transfer_stock.request",
-                deterministic(vec![ValueRef {
-                    source: ValueSource::EffectResultErr(id("result.transfer_stock.cancel")),
-                    path: path(&["reason"]),
-                }]),
+            errors: BTreeMap::from([(
+                id("not_pending"),
+                block(vec![return_err(
+                    "input.transfer_stock.request",
+                    "rejected",
+                    deterministic(vec![ValueRef {
+                        source: ValueSource::EffectResultErr(id("result.transfer_stock.cancel")),
+                        path: path(&["reason"]),
+                    }]),
+                )]),
             )]),
         }),
     ];
@@ -2980,12 +1340,16 @@ fn cyclic_result_dependencies_prove_coinductively() {
                     path: path(&["accepted"]),
                 }]),
             )]),
-            err: block(vec![return_err(
-                "input.cancel_order.request",
-                deterministic(vec![ValueRef {
-                    source: ValueSource::EffectResultErr(id("result.cancel_order.transfer")),
-                    path: path(&["reason"]),
-                }]),
+            errors: BTreeMap::from([(
+                id("rejected"),
+                block(vec![return_err(
+                    "input.cancel_order.request",
+                    "not_pending",
+                    deterministic(vec![ValueRef {
+                        source: ValueSource::EffectResultErr(id("result.cancel_order.transfer")),
+                        path: path(&["reason"]),
+                    }]),
+                )]),
             )]),
         }),
     ];
@@ -3638,7 +2002,7 @@ fn flash_checkout_idempotency_verdicts() {
             [
                 IdempotencyObstacle::ExternalApplicationsDistinguishable { effect, .. },
                 IdempotencyObstacle::PathDecisionUnstable {
-                    decision: verification::DecisionTaken::Match { result, arm: ResultVariant::Ok, .. },
+                    decision: verification::DecisionTaken::Match { result, arm: ResultArm::Ok, .. },
                     gap: DecisionGap::ResultUnstable {
                         gap: ResultGap::ExternalResultNotReplayStable { .. },
                         ..
@@ -3712,7 +2076,7 @@ fn declared_external_deduplication_completes_the_charge_proof() {
                     [
                         IdempotencyObstacle::PathDecisionUnstable {
                             decision: verification::DecisionTaken::Match {
-                                arm: ResultVariant::Err,
+                                arm: ResultArm::Err { .. },
                                 ..
                             },
                             gap: DecisionGap::ResultUnstable {
@@ -3793,7 +2157,13 @@ fn a_terminal_error_disposition_completes_the_branching_charge_proof() {
 
     declare_external(card, "input.charge_payment.reserved", &[&["event_id"]]);
 
-    card.result.as_mut().unwrap().err.disposition = ErrorDisposition::Terminal;
+    card.result
+        .as_mut()
+        .unwrap()
+        .errors
+        .get_mut(&id("declined"))
+        .unwrap()
+        .disposition = ErrorDisposition::Terminal;
 
     assert!(validation::validate(&model).is_empty());
 
@@ -3814,7 +2184,10 @@ fn a_terminal_error_disposition_completes_the_branching_charge_proof() {
 
     assert_eq!(paths.len(), 2);
 
-    for (path, variant) in paths.iter().zip([ResultVariant::Ok, ResultVariant::Err]) {
+    for (path, variant) in paths
+        .iter()
+        .zip([ResultArm::Ok, ResultArm::err(&id("declined"))])
+    {
         assert!(
             matches!(
                 &path.decisions[..],
@@ -3822,7 +2195,7 @@ fn a_terminal_error_disposition_completes_the_branching_charge_proof() {
                     decision: verification::DecisionTaken::Match { arm, .. },
                     rule: DecisionRule::StableResult {
                         rule: verification::ResultStabilityRule::ExternalTerminalResult {
-                            variant: cited,
+                            arm: cited,
                             identity_key,
                         },
                         ..
@@ -3860,10 +2233,13 @@ fn charge_transfer_externally(model: &mut Model, disposition: ErrorDisposition) 
                 result_replay: ExternalResultReplay::ReplayStable,
                 result: Some(ResultType {
                     ok: id("schema.ChargeAccepted"),
-                    err: ErrorResultType {
-                        schema: id("schema.ChargeDeclined"),
-                        disposition,
-                    },
+                    errors: BTreeMap::from([(
+                        id("declined"),
+                        ErrorResultType {
+                            schema: id("schema.ChargeDeclined"),
+                            disposition,
+                        },
+                    )]),
                 }),
             }),
             deterministic(vec![input_key("input.transfer_stock.request", &["sku"])]),
@@ -3878,12 +2254,16 @@ fn charge_transfer_externally(model: &mut Model, disposition: ErrorDisposition) 
                     path: path(&["authorization_id"]),
                 }]),
             )]),
-            err: block(vec![return_err(
-                "input.transfer_stock.request",
-                deterministic(vec![ValueRef {
-                    source: ValueSource::EffectResultErr(id("result.transfer_stock.charge")),
-                    path: path(&["reason"]),
-                }]),
+            errors: BTreeMap::from([(
+                id("declined"),
+                block(vec![return_err(
+                    "input.transfer_stock.request",
+                    "rejected",
+                    deterministic(vec![ValueRef {
+                        source: ValueSource::EffectResultErr(id("result.transfer_stock.charge")),
+                        path: path(&["reason"]),
+                    }]),
+                )]),
             )]),
         }),
     ];
@@ -3915,7 +2295,7 @@ fn an_idempotent_external_terminal_result_proves_result_replay() {
     let verdict = result_replay_verdict(&model, "operation.transfer_stock", 0);
 
     let ResultReplayVerdict::Proven {
-        proof: ResultReplayProof::ClassFixedResult { returns },
+        proof: ResultReplayProof::ClassFixedResult { returns, .. },
         ..
     } = &verdict
     else {
@@ -3924,31 +2304,39 @@ fn an_idempotent_external_terminal_result_proves_result_replay() {
 
     assert_eq!(returns.len(), 2);
 
-    for (returned, variant) in returns.iter().zip([ResultVariant::Ok, ResultVariant::Err]) {
-        assert_eq!(returned.variant, variant);
+    // The request returns its own error class; the decision and the
+    // derivation cite the provider's.
+    for (returned, (returned_arm, external_arm)) in returns.iter().zip([
+        (ResultArm::Ok, ResultArm::Ok),
+        (
+            ResultArm::err(&id("rejected")),
+            ResultArm::err(&id("declined")),
+        ),
+    ]) {
+        assert_eq!(returned.arm, returned_arm);
 
         assert!(matches!(
             &returned.decisions[..],
             [verification::DecisionReplay {
                 rule: DecisionRule::StableResult {
                     rule: verification::ResultStabilityRule::ExternalTerminalResult {
-                        variant: cited,
+                        arm: cited,
                         ..
                     },
                     ..
                 },
                 ..
-            }] if *cited == variant
+            }] if *cited == external_arm
         ));
 
         assert!(matches!(
             &returned.derivation[..],
             [StableRoot {
-                rule: StabilityRule::ReplayStableExternalResult { result, effect, variant: cited },
+                rule: StabilityRule::ReplayStableExternalResult { result, effect, arm: cited },
                 ..
             }] if result == &id("result.transfer_stock.charge")
                 && effect == &id("effect.transfer_stock.charge")
-                && *cited == variant
+                && *cited == external_arm
         ));
     }
 }
@@ -3978,7 +2366,7 @@ fn a_retryable_external_error_is_not_terminal_result_evidence() {
             [
                 ResultReplayObstacle::PathDecisionUnstable {
                     decision: verification::DecisionTaken::Match {
-                        arm: ResultVariant::Err,
+                        arm: ResultArm::Err { .. },
                         ..
                     },
                     gap: DecisionGap::ResultUnstable {
@@ -4066,7 +2454,7 @@ fn an_undeduplicated_external_result_gains_no_stability() {
             obstacle,
             ResultReplayObstacle::PathDecisionUnstable {
                 decision: verification::DecisionTaken::Match {
-                    arm: ResultVariant::Ok,
+                    arm: ResultArm::Ok,
                     ..
                 },
                 gap: DecisionGap::ResultUnstable {
@@ -4485,6 +2873,20 @@ fn cyclic_publication_dependencies_prove_coinductively() {
             .collect(),
     );
 
+    // Every admitted message must carry the ordering position the
+    // cursor advances by.
+    let Some(Schema::Canonical(paid)) = model.schemas.get_mut(&id("schema.OrderPaid")) else {
+        panic!("OrderPaid is canonical");
+    };
+
+    paid.fields.insert(
+        "sequence".to_owned(),
+        conseqa::spec::Field {
+            ty: conseqa::spec::TypeRef::Scalar(conseqa::spec::ScalarType::Int),
+            optional: false,
+        },
+    );
+
     assert!(validation::validate(&model).is_empty());
 
     let check = verification::verify(&model)
@@ -4507,7 +2909,7 @@ fn cyclic_publication_dependencies_prove_coinductively() {
     );
 
     assert!(
-        paths[0].effects.iter().any(|effect| matches!(
+        paths.iter().flat_map(|path| path.effects.iter()).any(|effect| matches!(
             &effect.safety,
             EffectSafety::SameLogicalMessage { consumers, .. }
                 if consumers.iter().any(|consumer| matches!(
@@ -4606,10 +3008,13 @@ fn no_admitted_path_is_vacuously_idempotent() {
             identity: RequestIdentity::Unspecified,
             result: ResultType {
                 ok: id("schema.CancelOrderResponse"),
-                err: ErrorResultType {
-                    schema: id("schema.RequestRejected"),
-                    disposition: ErrorDisposition::Unspecified,
-                },
+                errors: BTreeMap::from([(
+                    id("rejected"),
+                    ErrorResultType {
+                        schema: id("schema.RequestRejected"),
+                        disposition: ErrorDisposition::Unspecified,
+                    },
+                )]),
             },
         }),
     );
@@ -4691,15 +3096,22 @@ fn an_unstable_branch_decision_defeats_idempotency() {
         panic!("expected apply_payment proven, found {verdict:?}");
     };
 
-    assert_eq!(paths.len(), 2);
+    // The then-arm forks again over the rejectable transaction, so
+    // three paths, each opened by the branch decision.
+    assert_eq!(paths.len(), 3);
 
-    assert!(matches!(
-        &paths[0].decisions[..],
-        [verification::DecisionReplay {
-            rule: DecisionRule::StableCondition { roots },
-            ..
-        }] if matches!(roots[0].rule, StabilityRule::IdentifiedPayload)
-    ));
+    for path in paths {
+        assert!(
+            matches!(
+                path.decisions.first(),
+                Some(verification::DecisionReplay {
+                    rule: DecisionRule::StableCondition { roots },
+                    ..
+                }) if matches!(roots[0].rule, StabilityRule::IdentifiedPayload)
+            ),
+            "{path:#?}"
+        );
+    }
 
     // Without the identity, same-key deliveries may carry different
     // amounts and a retry may take the other arm.
@@ -4709,19 +3121,21 @@ fn an_unstable_branch_decision_defeats_idempotency() {
 
     let verdict = idempotency_verdict(&model, "operation.apply_payment", 0);
 
+    let IdempotencyVerdict::Unproven { obstacles } = &verdict else {
+        panic!("expected apply_payment unproven, found {verdict:?}");
+    };
+
+    assert!(!obstacles.is_empty());
+
     assert!(
-        matches!(
-            &verdict,
-            IdempotencyVerdict::Unproven { obstacles }
-                if matches!(
-                    &obstacles[..],
-                    [IdempotencyObstacle::PathDecisionUnstable {
-                        gap: DecisionGap::ConditionRootsUnstable { .. },
-                        ..
-                    }]
-                )
-        ),
-        "{verdict:?}"
+        obstacles.iter().all(|obstacle| matches!(
+            obstacle,
+            IdempotencyObstacle::PathDecisionUnstable {
+                gap: DecisionGap::ConditionRootsUnstable { .. },
+                ..
+            }
+        )),
+        "{obstacles:#?}"
     );
 }
 
@@ -4774,433 +3188,6 @@ fn a_match_on_a_consistent_request_result_is_idempotent() {
             }]
         ));
     }
-}
-
-// ---------------------------------------------------------------------------
-// Ordering
-// ---------------------------------------------------------------------------
-
-fn ordering_verdict(
-    model: &Model,
-    operation: &str,
-    requirement: usize,
-) -> verification::OrderingVerdict {
-    verification::verify(model)
-        .ordering
-        .into_iter()
-        .find(|check| check.operation == id(operation) && check.requirement == requirement)
-        .unwrap_or_else(|| panic!("no ordering check for `{operation}` #{requirement}"))
-        .verdict
-}
-
-#[test]
-fn flash_checkout_ordering_verdicts() {
-    let model = load_flash_checkout();
-
-    let report = verification::verify(&model);
-
-    assert_eq!(report.ordering.len(), 3);
-
-    // apply_payment: the keyed topic runtime is the precedence,
-    // topic_key routing onto a serial member preserves it through
-    // order-preserving redelivery, and its proven idempotency
-    // requirement answers for duplicates.
-    let verdict = ordering_verdict(&model, "operation.apply_payment", 0);
-
-    let verification::OrderingVerdict::Proven {
-        proof:
-            verification::OrderingProof::RoutedOrder {
-                input,
-                topic,
-                pool,
-                precedence,
-                routing_key,
-                member_assignment,
-                duplicates,
-                ..
-            },
-        scope,
-    } = &verdict
-    else {
-        panic!("expected apply_payment proven, found {verdict:?}");
-    };
-
-    assert_eq!(input, &id("input.apply_payment.captured"));
-    assert_eq!(topic, &id("topic.order_events"));
-    assert_eq!(pool, &id("pool.order_workers"));
-    assert_eq!(*routing_key, SubscriptionRoutingKey::GroupingKey);
-    assert_eq!(*member_assignment, MemberAssignment::ConsistentHash);
-
-    // Precedence, routing, and member concurrency are all L1 facts.
-    assert_eq!(*scope, ProofScope::RuntimeDependent);
-
-    assert_eq!(*precedence, verification::PrecedenceSource::WithinGroup);
-
-    assert_eq!(
-        *duplicates,
-        verification::DuplicateHandling::OrderPreservingRedelivery {
-            idempotency: Some(verification::DuplicateCoverage {
-                requirement: 0,
-                proven: true,
-            }),
-        }
-    );
-
-    // reserve_inventory and charge_payment prove by the same facts; the
-    // proofs record that the requirements answering for duplicates are
-    // unproven — the gap is reported under idempotency, not here.
-    for operation in ["operation.reserve_inventory", "operation.charge_payment"] {
-        let verdict = ordering_verdict(&model, operation, 0);
-
-        assert!(
-            matches!(
-                &verdict,
-                verification::OrderingVerdict::Proven {
-                    proof: verification::OrderingProof::RoutedOrder {
-                        duplicates: verification::DuplicateHandling::OrderPreservingRedelivery {
-                            idempotency: Some(verification::DuplicateCoverage {
-                                requirement: 0,
-                                proven: false,
-                            }),
-                        },
-                        ..
-                    },
-                    ..
-                }
-            ),
-            "expected `{operation}` proven with unproven duplicate coverage, found {verdict:?}"
-        );
-    }
-}
-
-#[test]
-fn at_most_once_delivery_records_single_delivery() {
-    let mut model = load_flash_checkout();
-
-    subscription_runtime_mut(
-        &mut model,
-        "operation.reserve_inventory",
-        "input.reserve_inventory.created",
-    )
-    .delivery = conseqa::spec::DeliverySemantics::AtMostOnce;
-
-    let verdict = ordering_verdict(&model, "operation.reserve_inventory", 0);
-
-    assert!(
-        matches!(
-            &verdict,
-            verification::OrderingVerdict::Proven {
-                proof: verification::OrderingProof::RoutedOrder {
-                    duplicates: verification::DuplicateHandling::SingleDelivery,
-                    ..
-                },
-                ..
-            }
-        ),
-        "expected reserve_inventory proven by single delivery, found {verdict:?}"
-    );
-}
-
-#[test]
-fn request_routing_does_not_invent_request_ordering() {
-    // A router keyed exactly like the requirement, on a serial pool,
-    // establishes serialization — and still no ordering, because
-    // arrival order of unmodeled callers is not a logical precedence.
-    let mut model = load_flash_checkout();
-
-    let requirements = &mut model
-        .operations
-        .get_mut(&id("operation.create_order"))
-        .unwrap()
-        .requirements;
-
-    requirements.serialization.push(SerializationRequirement {
-        key: input_key("input.create_order.request", &["order_id"]),
-    });
-
-    requirements
-        .ordering
-        .push(conseqa::spec::OrderingRequirement {
-            key: input_key("input.create_order.request", &["order_id"]),
-        });
-
-    make_pool_proof_capable(&mut model, "pool.checkout_api");
-
-    assert!(validation::validate(&model).is_empty());
-
-    assert!(
-        matches!(
-            serialization_verdict(&model, "operation.create_order", 0),
-            SerializationVerdict::Proven {
-                proof: SerializationProof::RequestRouted { .. },
-                ..
-            }
-        ),
-        "the same facts do prove serialization"
-    );
-
-    let verdict = ordering_verdict(&model, "operation.create_order", 0);
-
-    assert!(
-        matches!(
-            &verdict,
-            verification::OrderingVerdict::Unproven { obstacles }
-                if matches!(&obstacles[..], [verification::OrderingObstacle::RequestInputHasNoPrecedenceSource { .. }])
-        ),
-        "{verdict:?}"
-    );
-}
-
-#[test]
-fn ordering_key_not_carrying_the_topic_key_inherits_no_precedence() {
-    let mut model = load_flash_checkout();
-
-    model
-        .operations
-        .get_mut(&id("operation.apply_payment"))
-        .unwrap()
-        .requirements
-        .ordering[0]
-        .key = input_key("input.apply_payment.captured", &["event_id"]);
-
-    let verdict = ordering_verdict(&model, "operation.apply_payment", 0);
-
-    assert!(
-        matches!(
-            &verdict,
-            verification::OrderingVerdict::Unproven { obstacles }
-                if matches!(
-                    &obstacles[..],
-                    [verification::OrderingObstacle::KeyIdentityUnestablished { schema, .. }]
-                        if schema == &id("schema.PaymentCaptured")
-                )
-        ),
-        "{verdict:?}"
-    );
-}
-
-#[test]
-fn member_concurrency_above_one_admits_overtaking() {
-    let mut model = load_flash_checkout();
-
-    pool_mut(&mut model, "pool.order_workers").member_concurrency =
-        MemberConcurrency::Unbounded;
-
-    let verdict = ordering_verdict(&model, "operation.apply_payment", 0);
-
-    assert!(
-        matches!(
-            &verdict,
-            verification::OrderingVerdict::Unproven { obstacles }
-                if matches!(&obstacles[..], [verification::OrderingObstacle::MemberConcurrencyNotSerial { .. }])
-        ),
-        "{verdict:?}"
-    );
-}
-
-#[test]
-fn dispatch_without_routing_preserves_no_order() {
-    let mut model = load_flash_checkout();
-
-    subscription_runtime_mut(
-        &mut model,
-        "operation.apply_payment",
-        "input.apply_payment.captured",
-    )
-    .dispatch
-    .routing = None;
-
-    let verdict = ordering_verdict(&model, "operation.apply_payment", 0);
-
-    assert!(
-        matches!(
-            &verdict,
-            verification::OrderingVerdict::Unproven { obstacles }
-                if matches!(&obstacles[..], [verification::OrderingObstacle::RoutingAbsent { .. }])
-        ),
-        "{verdict:?}"
-    );
-}
-
-#[test]
-fn a_global_transport_orders_any_key_the_grouping_keeps_together() {
-    // Global precedence plus a grouping that matches the requirement
-    // key composes soundly: the transport orders everything, and the
-    // grouping keeps same-key deliveries on one member so the order
-    // survives into execution. Separating the two facts is what made
-    // `global` usable — it no longer has to carry a key of its own.
-    let mut model = load_flash_checkout();
-
-    topic_runtime_mut(&mut model, "topic.order_events").ordering = Some(OrderingSemantics::Global);
-
-    assert!(validation::validate(&model).is_empty());
-
-    let verdict = ordering_verdict(&model, "operation.apply_payment", 0);
-
-    let verification::OrderingVerdict::Proven {
-        proof: verification::OrderingProof::RoutedOrder { precedence, .. },
-        ..
-    } = &verdict
-    else {
-        panic!("expected a proven ordering verdict, found {verdict:?}");
-    };
-
-    assert_eq!(*precedence, verification::PrecedenceSource::Global);
-}
-
-#[test]
-fn a_global_transport_still_needs_the_grouping_to_reach_execution() {
-    // The regression the pairing rule guarded: a precedence over one
-    // domain composed with routing over another proves nothing. Now
-    // that grouping is a separate fact, the guard is structural — the
-    // ordering proof consumes the same grouping identity serialization
-    // does, whichever precedence supplied the order.
-    let mut model = load_flash_checkout();
-
-    topic_runtime_mut(&mut model, "topic.order_events").ordering = Some(OrderingSemantics::Global);
-
-    model
-        .operations
-        .get_mut(&id("operation.reserve_inventory"))
-        .unwrap()
-        .requirements
-        .ordering = vec![conseqa::spec::OrderingRequirement {
-        key: input_key("input.reserve_inventory.created", &["quantity"]),
-    }];
-
-    assert!(validation::validate(&model).is_empty());
-
-    let verdict = ordering_verdict(&model, "operation.reserve_inventory", 0);
-
-    assert!(
-        matches!(
-            &verdict,
-            verification::OrderingVerdict::Unproven { obstacles }
-                if matches!(
-                    &obstacles[..],
-                    [verification::OrderingObstacle::KeyIdentityUnestablished { .. }]
-                )
-        ),
-        "a global order does not reach a key the grouping does not keep together: {verdict:?}"
-    );
-}
-
-#[test]
-fn a_transport_with_no_precedence_provides_none() {
-    let mut model = load_flash_checkout();
-
-    topic_runtime_mut(&mut model, "topic.order_events").ordering = Some(OrderingSemantics::None);
-
-    let verdict = ordering_verdict(&model, "operation.apply_payment", 0);
-
-    assert!(
-        matches!(
-            &verdict,
-            verification::OrderingVerdict::Unproven { obstacles }
-                if obstacles.iter().any(|obstacle| matches!(
-                    obstacle,
-                    verification::OrderingObstacle::NoTransportPrecedence { .. }
-                ))
-        ),
-        "{verdict:?}"
-    );
-}
-
-#[test]
-fn a_topic_with_no_declared_runtime_provides_no_precedence() {
-    // Absence of any transport declaration leaves both facts absent,
-    // and the topic in neither scope.
-    let mut model = load_flash_checkout();
-
-    runtime_mut(&mut model)
-        .topics
-        .remove(&id("topic.order_events"));
-
-    let verdict = ordering_verdict(&model, "operation.apply_payment", 0);
-
-    assert!(
-        matches!(
-            &verdict,
-            verification::OrderingVerdict::Unproven { obstacles }
-                if obstacles.iter().any(|obstacle| matches!(
-                    obstacle,
-                    verification::OrderingObstacle::NoTransportPrecedence { .. }
-                ))
-        ),
-        "{verdict:?}"
-    );
-}
-
-#[test]
-fn subscription_scoped_transport_semantics_prove_the_same_way() {
-    // The second declaration mode: the topic declares nothing, and each
-    // subscription states its own grouping and ordering. Two
-    // subscribers of one topic may group differently — the case a
-    // single topic-wide domain could not express.
-    let mut model = load_flash_checkout();
-
-    let topic = topic_runtime_mut(&mut model, "topic.order_events");
-
-    // Clearing the scope means declaring nothing — not declaring an
-    // explicit `none`, which would itself claim the topic scope.
-    topic.grouping = None;
-    topic.ordering = None;
-
-    let by_order_id = conseqa::spec::GroupingKey {
-        mapping: [
-            "schema.InventoryReserved",
-            "schema.OrderCancelled",
-            "schema.OrderCreated",
-            "schema.OrderPaid",
-            "schema.PaymentCaptured",
-            "schema.PaymentFailed",
-        ]
-        .into_iter()
-        .map(|schema| (id(schema), vec![path(&["order_id"])]))
-        .collect(),
-    };
-
-    for (operation, input) in [
-        ("operation.reserve_inventory", "input.reserve_inventory.created"),
-        ("operation.charge_payment", "input.charge_payment.reserved"),
-        ("operation.apply_payment", "input.apply_payment.captured"),
-    ] {
-        let subscription = subscription_runtime_mut(&mut model, operation, input);
-
-        subscription.grouping = Some(by_order_id.clone());
-        subscription.ordering = Some(OrderingSemantics::WithinGroup);
-    }
-
-    assert!(
-        validation::validate(&model).is_empty(),
-        "{:#?}",
-        validation::validate(&model)
-    );
-
-    // Every serialization and ordering obligation still proves, now
-    // citing the subscription scope rather than the topic.
-    let verdict = serialization_verdict(&model, "operation.reserve_inventory", 0);
-
-    let SerializationVerdict::Proven {
-        proof: SerializationProof::SubscriptionRouted { grouping_scope, .. },
-        ..
-    } = &verdict
-    else {
-        panic!("expected a subscription-routed proof, found {verdict:?}");
-    };
-
-    assert_eq!(
-        *grouping_scope,
-        verification::GroupingScope::Subscription {
-            operation: id("operation.reserve_inventory"),
-            input: id("input.reserve_inventory.created"),
-        }
-    );
-
-    assert!(matches!(
-        ordering_verdict(&model, "operation.apply_payment", 0),
-        verification::OrderingVerdict::Proven { .. }
-    ));
 }
 
 // ---------------------------------------------------------------------------
@@ -5418,6 +3405,24 @@ fn a_transition_established_output_without_recovery_defeats_result_replay() {
 
     assert_eq!(recovery, &vec![ReplayGap::NoKeyedCommit]);
     assert!(reconstruction.contains(&ReplayGap::ContainsTransition));
+
+    // The transition may reject, and without a keyed commit nothing
+    // fixes which outcome a retry observes: the commit/reject decision
+    // is an obstacle of its own, next to the unavailable output.
+    let ResultReplayVerdict::Unproven { obstacles } = &verdict else {
+        unreachable!();
+    };
+
+    assert!(
+        obstacles.iter().any(|obstacle| matches!(
+            obstacle,
+            ResultReplayObstacle::PathDecisionUnstable {
+                gap: DecisionGap::TransactionOutcomeUnstable { transaction, .. },
+                ..
+            } if transaction == &id("tx.cancel_order")
+        )),
+        "{obstacles:#?}"
+    );
 }
 
 // Asynchronous effect execution: launches are ordinary effect attempts,
@@ -5467,7 +3472,9 @@ fn hedge_charge_payment(model: &mut Model, synchronize: OperationStep) {
         card.result
             .as_mut()
             .expect("card charge declares a result")
-            .err
+            .errors
+            .get_mut(&id("declined"))
+            .unwrap()
             .disposition = ErrorDisposition::Terminal;
     }
 
@@ -5526,7 +3533,7 @@ fn async_launch_and_join_judge_like_the_synchronous_execution() {
             [
                 IdempotencyObstacle::ExternalApplicationsDistinguishable { effect, .. },
                 IdempotencyObstacle::PathDecisionUnstable {
-                    decision: verification::DecisionTaken::Match { result, arm: ResultVariant::Ok, .. },
+                    decision: verification::DecisionTaken::Match { result, arm: ResultArm::Ok, .. },
                     gap: DecisionGap::ResultUnstable {
                         gap: ResultGap::ExternalResultNotReplayStable { .. },
                         ..
@@ -5689,18 +3696,6 @@ fn load_transactional_outbox() -> Model {
     yaml::parse(&source).expect("transactional outbox fixture should parse")
 }
 
-/// Mutable access to the relay's declared outbox runtime.
-fn outbox_runtime_mut(model: &mut Model) -> &mut conseqa::spec::OutboxRuntime {
-    model
-        .runtime
-        .as_mut()
-        .expect("the fixture declares a runtime model")
-        .outboxes
-        .get_mut(&id("operation.publish_order_event"))
-        .and_then(|inputs| inputs.get_mut(&id("input.publish_order_event.outbox")))
-        .expect("the fixture declares the relay's outbox runtime")
-}
-
 /// Mutable access to the fixture's outbox declaration.
 fn outbox_mut(model: &mut Model) -> &mut conseqa::spec::Outbox {
     model
@@ -5824,224 +3819,11 @@ fn outbox_consumer_without_a_keyed_requirement_blocks_the_cascade() {
     );
 }
 
+/// The outbox runtime is a placement fact. Removing it changes no
+/// proof: nothing declared rests on partitioning, dispatch, or
+/// batching, and the relay's guarantees are L0 facts.
 #[test]
-fn outbox_ordering_records_intrinsic_redelivery_as_duplicate_handling() {
-    let model = load_transactional_outbox();
-
-    let report = verification::verify(&model);
-
-    let ordering = report
-        .ordering
-        .iter()
-        .find(|check| check.operation == id("operation.publish_order_event"))
-        .unwrap();
-
-    // Intrinsic durable re-drive admits duplicate attempts, so the
-    // proof can never rest on single delivery — the redelivery leg
-    // must name the idempotency requirement that answers for the
-    // repeated work.
-    assert!(
-        matches!(
-            &ordering.verdict,
-            verification::OrderingVerdict::Proven {
-                proof: verification::OrderingProof::OutboxRoutedOrder {
-                    duplicates: verification::DuplicateHandling::OrderPreservingRedelivery {
-                        idempotency: Some(coverage),
-                    },
-                    ..
-                },
-                ..
-            } if coverage.proven
-        ),
-        "{:#?}",
-        ordering.verdict
-    );
-}
-
-#[test]
-fn outbox_dispatch_without_routing_has_no_member_affinity() {
-    let mut model = load_transactional_outbox();
-
-    // Retire the routing block: the pool is still known, but no fact
-    // says which member owns a partition, so both the serialization
-    // and the ordering arguments lose their ownership leg.
-    outbox_runtime_mut(&mut model).dispatch.routing = None;
-
-    assert!(validation::validate(&model).is_empty());
-
-    model
-        .operations
-        .get_mut(&id("operation.publish_order_event"))
-        .unwrap()
-        .requirements
-        .serialization
-        .push(SerializationRequirement {
-            key: input_key("input.publish_order_event.outbox", &["tenant_id"]),
-        });
-
-    let report = verification::verify(&model);
-
-    let serialization = report
-        .serialization
-        .iter()
-        .find(|check| check.operation == id("operation.publish_order_event"))
-        .unwrap();
-
-    assert!(
-        matches!(
-            &serialization.verdict,
-            verification::SerializationVerdict::Unproven { obstacles }
-                if obstacles.iter().any(|obstacle| matches!(
-                    obstacle,
-                    SerializationObstacle::RoutingAbsent { .. }
-                ))
-        ),
-        "{:#?}",
-        serialization.verdict
-    );
-
-    let ordering = report
-        .ordering
-        .iter()
-        .find(|check| check.operation == id("operation.publish_order_event"))
-        .unwrap();
-
-    assert!(
-        matches!(
-            &ordering.verdict,
-            verification::OrderingVerdict::Unproven { obstacles }
-                if obstacles.iter().any(|obstacle| matches!(
-                    obstacle,
-                    verification::OrderingObstacle::RoutingAbsent { .. }
-                ))
-        ),
-        "{:#?}",
-        ordering.verdict
-    );
-}
-
-#[test]
-fn outbox_serialization_needs_an_unbatched_dispatch() {
-    let mut model = load_transactional_outbox();
-
-    model
-        .operations
-        .get_mut(&id("operation.publish_order_event"))
-        .unwrap()
-        .requirements
-        .serialization
-        .push(SerializationRequirement {
-            key: input_key("input.publish_order_event.outbox", &["tenant_id"]),
-        });
-
-    // With the declared batching stage, no serialization conclusion
-    // survives: batch-internal overlap is intentionally opaque.
-    let report = verification::verify(&model);
-
-    let batched = report
-        .serialization
-        .iter()
-        .find(|check| check.operation == id("operation.publish_order_event"))
-        .expect("the relay declares serialization");
-
-    let SerializationVerdict::Unproven { obstacles } = &batched.verdict else {
-        panic!("a batched dispatch must not prove serialization");
-    };
-
-    assert!(
-        obstacles.iter().any(|obstacle| matches!(
-            obstacle,
-            SerializationObstacle::BatchingOverlapOpaque { .. }
-        )),
-        "{obstacles:#?}"
-    );
-
-    // Without it, the keyed partition, one owning member, and the
-    // serial pool carry the proof.
-    outbox_runtime_mut(&mut model).dispatch.batching = None;
-
-    let report = verification::verify(&model);
-
-    let unbatched = report
-        .serialization
-        .iter()
-        .find(|check| check.operation == id("operation.publish_order_event"))
-        .unwrap();
-
-    assert!(
-        matches!(
-            &unbatched.verdict,
-            SerializationVerdict::Proven {
-                proof: SerializationProof::OutboxRouted { partition_keys, .. },
-                scope: ProofScope::RuntimeDependent,
-            } if partition_keys.iter().all(|fact| fact.identity == KeyIdentity::SamePath)
-        ),
-        "{:#?}",
-        unbatched.verdict
-    );
-}
-
-#[test]
-fn unspecified_batch_ordering_stops_the_outbox_ordering_proof() {
-    let mut model = load_transactional_outbox();
-
-    outbox_runtime_mut(&mut model)
-        .dispatch
-        .batching
-        .as_mut()
-        .unwrap()
-        .ordering = conseqa::spec::BatchOrderingPreservation::Unspecified;
-
-    let report = verification::verify(&model);
-
-    let ordering = report
-        .ordering
-        .iter()
-        .find(|check| check.operation == id("operation.publish_order_event"))
-        .expect("the relay declares ordering");
-
-    let verification::OrderingVerdict::Unproven { obstacles } = &ordering.verdict else {
-        panic!("an unspecified batch stage must not pass the order through");
-    };
-
-    assert!(
-        obstacles.iter().any(|obstacle| matches!(
-            obstacle,
-            verification::OrderingObstacle::BatchOrderingUnspecified { .. }
-        )),
-        "{obstacles:#?}"
-    );
-}
-
-#[test]
-fn outbox_ordering_none_is_no_precedence_source() {
-    let mut model = load_transactional_outbox();
-
-    outbox_runtime_mut(&mut model).ordering = conseqa::spec::OutboxOrdering::None;
-
-    let report = verification::verify(&model);
-
-    let ordering = report
-        .ordering
-        .iter()
-        .find(|check| check.operation == id("operation.publish_order_event"))
-        .unwrap();
-
-    let verification::OrderingVerdict::Unproven { obstacles } = &ordering.verdict else {
-        panic!("`ordering: none` declares no precedence to preserve");
-    };
-
-    assert!(
-        obstacles.iter().any(|obstacle| matches!(
-            obstacle,
-            verification::OrderingObstacle::NoOutboxPrecedence { .. }
-        )),
-        "{obstacles:#?}"
-    );
-}
-
-#[test]
-fn removing_the_outbox_runtime_leaves_its_obligations_unproven() {
+fn removing_the_outbox_runtime_changes_no_proof() {
     let mut model = load_transactional_outbox();
 
     model.runtime.as_mut().unwrap().outboxes.clear();
@@ -6049,26 +3831,6 @@ fn removing_the_outbox_runtime_leaves_its_obligations_unproven() {
     assert!(validation::validate(&model).is_empty());
 
     let report = verification::verify(&model);
-
-    // Ordering loses its precedence source and mechanism.
-    let ordering = report
-        .ordering
-        .iter()
-        .find(|check| check.operation == id("operation.publish_order_event"))
-        .unwrap();
-
-    assert!(
-        matches!(
-            &ordering.verdict,
-            verification::OrderingVerdict::Unproven { obstacles }
-                if obstacles.iter().any(|obstacle| matches!(
-                    obstacle,
-                    verification::OrderingObstacle::NoOutboxRuntime { .. }
-                ))
-        ),
-        "{:#?}",
-        ordering.verdict
-    );
 
     // Guaranteed completion keeps its retry driver: durable re-drive
     // is intrinsic to the outbox, not a runtime declaration.
@@ -6274,7 +4036,13 @@ fn result_replay_alone_does_not_discharge_duplicate_work() {
         };
         card.idempotency = ExternalIdempotency::Unspecified;
         card.result_replay = ExternalResultReplay::ReplayStable;
-        card.result.as_mut().unwrap().err.disposition = ErrorDisposition::Terminal;
+        card.result
+            .as_mut()
+            .unwrap()
+            .errors
+            .get_mut(&id("declined"))
+            .unwrap()
+            .disposition = ErrorDisposition::Terminal;
     }
 
     assert!(validation::validate(&model).is_empty());
@@ -6295,10 +4063,9 @@ fn result_replay_alone_does_not_discharge_duplicate_work() {
     );
 
     assert!(
-        !obstacles.iter().any(|obstacle| matches!(
-            obstacle,
-            IdempotencyObstacle::PathDecisionUnstable { .. }
-        )),
+        !obstacles
+            .iter()
+            .any(|obstacle| matches!(obstacle, IdempotencyObstacle::PathDecisionUnstable { .. })),
         "every decision replays under the fixed terminal result:\n{obstacles:#?}"
     );
 }
@@ -6395,10 +4162,10 @@ fn a_terminal_only_unspecified_gate_is_admitted_as_idempotency_inert() {
     };
 
     assert!(
-        paths.iter().flat_map(|path| path.decisions.iter()).any(|decision| matches!(
-            decision.rule,
-            DecisionRule::IdempotencyInertContinuation
-        )),
+        paths
+            .iter()
+            .flat_map(|path| path.decisions.iter())
+            .any(|decision| matches!(decision.rule, DecisionRule::IdempotencyInertContinuation)),
         "the admission is recorded on the proof:\n{paths:#?}"
     );
 }
@@ -6416,14 +4183,18 @@ fn an_effectful_continuation_refuses_the_inert_admission() {
 
     program.steps.insert(
         1,
-        OperationStep::Transaction(Transaction {
-            id: id("tx.apply_payment.mark"),
-            data_model: None,
-            isolation: TransactionIsolation::ReadCommitted,
-            idempotency: IdempotencyGuarantee::DeduplicatedBy {
-                key: ikey("input.apply_payment.captured", &[&["event_id"]]),
+        OperationStep::Transaction(ExecuteTransaction {
+            transaction: Transaction {
+                requirements: Default::default(),
+                id: id("tx.apply_payment.mark"),
+                data_model: None,
+                isolation: TransactionIsolation::ReadCommitted,
+                idempotency: IdempotencyGuarantee::DeduplicatedBy {
+                    key: ikey("input.apply_payment.captured", &[&["event_id"]]),
+                },
+                steps: vec![],
             },
-            steps: vec![],
+            rejected: None,
         }),
     );
 
@@ -6504,10 +4275,13 @@ fn the_inert_admission_never_reaches_result_replay() {
                 result_replay: ExternalResultReplay::Unstable,
                 result: Some(ResultType {
                     ok: id("schema.ChargeAccepted"),
-                    err: ErrorResultType {
-                        schema: id("schema.ChargeDeclined"),
-                        disposition: ErrorDisposition::Terminal,
-                    },
+                    errors: BTreeMap::from([(
+                        id("declined"),
+                        ErrorResultType {
+                            schema: id("schema.ChargeDeclined"),
+                            disposition: ErrorDisposition::Terminal,
+                        },
+                    )]),
                 }),
             }),
             deterministic(vec![input_key("input.transfer_stock.request", &["sku"])]),
@@ -6519,9 +4293,13 @@ fn the_inert_admission_never_reaches_result_replay() {
                 "input.transfer_stock.request",
                 deterministic(vec![]),
             )]),
-            err: block(vec![return_err(
-                "input.transfer_stock.request",
-                deterministic(vec![]),
+            errors: BTreeMap::from([(
+                id("declined"),
+                block(vec![return_err(
+                    "input.transfer_stock.request",
+                    "rejected",
+                    deterministic(vec![]),
+                )]),
             )]),
         }),
     ];
@@ -6550,10 +4328,9 @@ fn the_inert_admission_never_reaches_result_replay() {
     };
 
     assert!(
-        obstacles.iter().any(|obstacle| matches!(
-            obstacle,
-            ResultReplayObstacle::PathDecisionUnstable { .. }
-        )),
+        obstacles
+            .iter()
+            .any(|obstacle| matches!(obstacle, ResultReplayObstacle::PathDecisionUnstable { .. })),
         "{obstacles:#?}"
     );
 }

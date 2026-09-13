@@ -14,23 +14,28 @@ import {
   delivery,
   intrinsicRedrive,
   isolation,
-  executionHandoff,
   memberAssignment,
   memberConcurrency,
   noRuntimeDeclared,
+  orderingRequirement,
   outboxRouting,
   requestIdentity,
   requestRouting,
+  serializabilityRequirement,
   subscriptionRouting,
+  transactionRejection,
 } from "../lib/explain";
 import { pathText, shortId } from "../lib/ids";
-import { effectDef, effectSummary, locationLabel, operationTransactions, walkProgram, type StepHop } from "../lib/index";
+import {
+  effectDef, effectSummary, errArm, locationLabel, operationTransactions, stepRejects, walkProgram,
+  type Arm, type StepHop,
+} from "../lib/index";
 import { propertyMatchesRequirement, worstStatus } from "../lib/obligations";
 import { hashes } from "../lib/route";
-import { conditionText, predicateText } from "../lib/text";
-import { useApp, type DetailContext } from "../state/AppState";
+import { conditionText, predicateText, refString } from "../lib/text";
+import { requirementKey, useApp, type DetailContext } from "../state/AppState";
 import { Fact, FactBadge, IdLink, KeyComponents, Mono, Muted, RefText, SectionCard, StatusBadge, StatusChips, selectableRow } from "../panels/parts";
-import type { Effect, Id, Operation, OperationBlock, RequirementKind, TransactionStep, TransitionSideEffect } from "../types/model";
+import type { Effect, Id, Operation, OperationBlock, RequirementKind, ResultType, TransactionStep, TransitionSideEffect } from "../types/model";
 
 type EffectKind = (Effect | TransitionSideEffect)["kind"];
 
@@ -140,7 +145,8 @@ function TxStepRow({ step, index, txId, opId }: { step: TransactionStep; index: 
 
   // A binding step leads with the full bound name — emphasized the
   // same way program-level bindings are — and its note reads as the
-  // producer, after an arrow.
+  // producer, after an arrow. A commit guard — a step that can reject
+  // the whole transaction — is marked as one.
   let kind: string;
   let title: string;
   let bound = false;
@@ -166,9 +172,11 @@ function TxStepRow({ step, index, txId, opId }: { step: TransactionStep; index: 
     case "transition": {
       kind = "transition"; title = shortId(step.transition);
       const binds = Object.values(step.effect_intents).map((intent) => intent.bind);
-      note = binds.length
-        ? `${shortId(step.machine)} · binds ${binds.join(", ")}`
-        : shortId(step.machine);
+      const admissions = Object.keys(step.effects ?? {}).length;
+      const parts = [shortId(step.machine)];
+      if (binds.length) parts.push(`binds ${binds.join(", ")}`);
+      if (admissions) parts.push(`admits ${admissions} outbox message${admissions === 1 ? "" : "s"}`);
+      note = parts.join(" · ");
       break;
     }
     case "establish_effect_intent":
@@ -183,7 +191,24 @@ function TxStepRow({ step, index, txId, opId }: { step: TransactionStep; index: 
       kind = "write outbox"; title = shortId(step.effect.outbox);
       note = `admits ${shortId(step.effect.schema)} atomically with the commit · values: ${step.values.kind}`;
       break;
+    case "validate_version":
+      kind = "validate version"; title = shortId(step.target.object);
+      note = `expects ${refString(step.expected)} at commit · where ${predicateText(step.target.predicate)}`;
+      break;
+    case "bump_version":
+      kind = "bump version"; title = shortId(step.target.object);
+      note = `version + 1 atomically with the commit · where ${predicateText(step.target.predicate)}`;
+      break;
+    case "advance_cursor":
+      kind = "advance cursor"; title = `${shortId(step.target.object)}.${pathText(step.field)}`;
+      note = `← ${refString(step.incoming)} · ${step.rule} · where ${predicateText(step.target.predicate)}`;
+      break;
+    case "fence":
+      kind = "fence"; title = `${shortId(step.target.object)}.${pathText(step.field)}`;
+      note = `token ${refString(step.token)} · where ${predicateText(step.target.predicate)}`;
+      break;
   }
+  const guard = stepRejects(step);
 
   const activate = () => select(selKey, { id: txId, ctx: { txStep: { op: opId, tx: txId, index } } });
 
@@ -211,6 +236,7 @@ function TxStepRow({ step, index, txId, opId }: { step: TransactionStep; index: 
           {bound
             ? <Mono className="break-all rounded bg-kumo-tint px-1 py-px font-bold text-kumo-strong">{title}</Mono>
             : <Mono className="text-kumo-strong">{title}</Mono>}
+          {guard && <Badge variant="warning">commit guard</Badge>}
         </div>
         <div className="truncate text-xs text-kumo-subtle">{note}</div>
       </div>
@@ -231,11 +257,16 @@ function TxStepRow({ step, index, txId, opId }: { step: TransactionStep; index: 
   );
 }
 
-/** One arm of a decision: its label and its block, rendered recursively. */
-function DecisionArm({ opId, op, label, block, hops }: { opId: Id; op: Operation; label: string; block: OperationBlock | null; hops: StepHop[] }) {
+/** One arm of a decision — or the rejection block of a transaction
+ *  step: its label, as the checker spells it in a step location, and
+ *  its block, rendered recursively. */
+function DecisionArm({ opId, op, label, block, hops, tone = "outline" }: {
+  opId: Id; op: Operation; label: string; block: OperationBlock | null; hops: StepHop[];
+  tone?: "outline" | "warning";
+}) {
   return (
     <div className="min-w-0 space-y-2 rounded-md border border-kumo-hairline bg-kumo-elevated/30 p-2">
-      <Badge variant="outline">{label}</Badge>
+      <Badge variant={tone}>{label}</Badge>
       {block ? (
         block.steps.length ? (
           <ProgramBlock opId={opId} op={op} block={block} hops={hops} nested />
@@ -261,16 +292,18 @@ function ProgramBlock({ opId, op, block, hops, nested }: { opId: Id; op: Operati
   const nodes: { key: string; element: ReactElement }[] = block.steps.map((step, si) => {
     const ownHops: StepHop[] = [...hops, { step: si }];
     const location = locationLabel(ownHops);
-    const under = (arm: StepHop["arm"]): StepHop[] => [...hops, { step: si, arm }];
+    const under = (arm: Arm): StepHop[] => [...hops, { step: si, arm }];
 
     switch (step.kind) {
       case "transaction": {
+        const tx = step.transaction;
         const expanded = expandedTx.has(location);
+        const rejects = step.rejected !== undefined;
 
-        // The artifacts a successful execution establishes — the
+        // The artifacts a committed execution establishes — the
         // bindings later control consumes. Bound names lead: the flow
         // must say what each step binds without expanding it.
-        const established: ReactNode[] = step.steps.flatMap((inner, ti) => {
+        const established: ReactNode[] = tx.steps.flatMap((inner, ti) => {
           switch (inner.kind) {
             case "establish_effect_intent":
               return [
@@ -295,22 +328,33 @@ function ProgramBlock({ opId, op, block, hops, nested }: { opId: Id; op: Operati
         return {
           key: location,
           element: (
-            <StepCard selKey={`tx:${step.id}`} detailId={step.id} stripe={STEP_STRIPE.tx}>
+            <StepCard selKey={`tx:${tx.id}`} detailId={tx.id} stripe={STEP_STRIPE.tx}>
               <div className="flex items-center justify-between gap-2">
                 <Badge variant="neutral">transaction</Badge>
-                <StatusChips obKey={`${opId}/${step.id}`} />
+                <StatusChips obKey={`${opId}/${tx.id}`} />
               </div>
-              <StepTitle>{shortId(step.id)}</StepTitle>
+              <StepTitle>{shortId(tx.id)}</StepTitle>
               <div className="mt-1.5 flex flex-wrap items-center gap-1.5 text-xs text-kumo-subtle">
-                <FactBadge fact={commitGuarantee(step.idempotency)} />
-                {step.idempotency.kind === "deduplicated_by" && (
-                  <span>by <KeyComponents value={step.idempotency.key} /></span>
+                <FactBadge fact={commitGuarantee(tx.idempotency)} />
+                {tx.idempotency.kind === "deduplicated_by" && (
+                  <span>by <KeyComponents value={tx.idempotency.key} /></span>
                 )}
               </div>
               <div className="mt-1 flex flex-wrap items-center gap-1.5 text-xs text-kumo-subtle">
-                <FactBadge fact={isolation(step.isolation)} />
-                {step.data_model && <span>on {shortId(step.data_model)}</span>}
+                <FactBadge fact={isolation(tx.isolation)} />
+                {tx.data_model && <span>on {shortId(tx.data_model)}</span>}
+                <FactBadge fact={transactionRejection(rejects)} />
               </div>
+              {(tx.requirements.serializability.length > 0 || tx.requirements.ordering.length > 0) && (
+                <div className="mt-1 flex flex-wrap items-center gap-1.5 text-xs text-kumo-subtle">
+                  {tx.requirements.serializability.map((r, i) => (
+                    <FactBadge key={`s${i}`} fact={serializabilityRequirement(r.key)} />
+                  ))}
+                  {tx.requirements.ordering.map((r, i) => (
+                    <FactBadge key={`o${i}`} fact={orderingRequirement(r.key, r.position)} />
+                  ))}
+                </div>
+              )}
               {established.length > 0 && <Bindings>{established}</Bindings>}
               <Collapsible.Root open={expanded} onOpenChange={() => toggleTx(location)}>
                 <Collapsible.Trigger
@@ -318,16 +362,25 @@ function ProgramBlock({ opId, op, block, hops, nested }: { opId: Id; op: Operati
                   onClick={(e) => e.stopPropagation()}
                 >
                   <CaretRightIcon size={12} className={`transition-transform ${expanded ? "rotate-90" : ""}`} />
-                  {step.steps.length} step{step.steps.length === 1 ? "" : "s"}
+                  {tx.steps.length} step{tx.steps.length === 1 ? "" : "s"}
                 </Collapsible.Trigger>
                 <Collapsible.Panel>
                   <div className="mt-1.5 space-y-0.5 rounded-md border border-kumo-hairline bg-kumo-elevated/40 p-1">
-                    {step.steps.map((ts, ti) => (
-                      <TxStepRow key={ti} step={ts} index={ti} txId={step.id} opId={opId} />
+                    {tx.steps.map((ts, ti) => (
+                      <TxStepRow key={ti} step={ts} index={ti} txId={tx.id} opId={opId} />
                     ))}
                   </div>
                 </Collapsible.Panel>
               </Collapsible.Root>
+              {step.rejected && (
+                // The block control enters when a commit guard rejects:
+                // nothing committed, no artifact established. It is an
+                // arm of this step the way a decision's arms are, and
+                // its steps are located beneath it as `n.rejected.m`.
+                <div className="mt-2">
+                  <DecisionArm opId={opId} op={op} label="rejected" tone="warning" block={step.rejected} hops={under("rejected")} />
+                </div>
+              )}
             </StepCard>
           ),
         };
@@ -495,10 +548,18 @@ function ProgramBlock({ opId, op, block, hops, nested }: { opId: Id; op: Operati
                 <Badge variant="outline">step {location}</Badge>
               </div>
               <StepTitle>{step.result}</StepTitle>
+              {/* One arm per outcome the contract declares: ok, then an
+                  arm per error class, labelled as the checker locates
+                  its steps. */}
               <div className="mt-2 grid gap-2 sm:grid-cols-2">
                 <DecisionArm opId={opId} op={op} label="ok" block={step.ok} hops={under("ok")} />
-                <DecisionArm opId={opId} op={op} label="err" block={step.err} hops={under("err")} />
+                {Object.entries(step.errors).map(([error, arm]) => (
+                  <DecisionArm key={error} opId={opId} op={op} label={errArm(error)} block={arm} hops={under(errArm(error))} />
+                ))}
               </div>
+              {Object.keys(step.errors).length === 0 && (
+                <div className="mt-1 text-xs text-kumo-subtle">the contract declares no error class</div>
+              )}
             </StepCard>
           ),
         };
@@ -531,7 +592,9 @@ function ProgramBlock({ opId, op, block, hops, nested }: { opId: Id; op: Operati
             <StepCard selKey={`step:${location}`} detailId={opId} ctx={stepCtx(location)} stripe={STEP_STRIPE.terminal}>
               <div className="flex flex-wrap items-center gap-1.5">
                 <Badge variant="neutral">return</Badge>
-                <Badge variant={step.outcome.kind === "ok" ? "success" : "warning"}>{step.outcome.kind}</Badge>
+                <Badge variant={step.outcome.kind === "ok" ? "success" : "warning"}>
+                  {step.outcome.kind === "ok" ? "ok" : errArm(step.outcome.error)}
+                </Badge>
               </div>
               <StepTitle>{shortId(step.request)}</StepTitle>
               <div className="mt-1 text-xs text-kumo-subtle">
@@ -584,17 +647,52 @@ function ProgramBlock({ opId, op, block, hops, nested }: { opId: Id; op: Operati
 // Requirements and inputs
 // ---------------------------------------------------------------------------
 
+/** Every requirement the operation carries: the serializability and
+ *  ordering requirements each of its transactions declares — rows of
+ *  the transaction's own, in program order, as the checker enumerates
+ *  them — then the operation's idempotency and recoverability. A
+ *  transaction row's verdicts are the obligations anchored to that
+ *  transaction and its requirement index. */
 function RequirementsTable({ id, op }: { id: Id; op: Operation }) {
   const { obligations, selection, select } = useApp();
   const reqs = op.requirements;
 
-  const rows: { prop: RequirementKind; i: number; declares: ReactNode }[] = [];
-  reqs.serialization.forEach((r, i) => rows.push({ prop: "serialization", i, declares: <RefText value={r.key} /> }));
-  reqs.ordering.forEach((r, i) => rows.push({ prop: "ordering", i, declares: <RefText value={r.key} /> }));
+  const rows: { prop: RequirementKind; i: number; tx?: Id; label: string; declares: ReactNode }[] = [];
+  for (const tx of operationTransactions(op)) {
+    tx.requirements.serializability.forEach((r, i) =>
+      rows.push({
+        prop: "transaction_serializability",
+        i,
+        tx: tx.id,
+        label: "serializability",
+        declares: (
+          <>
+            <span className="text-xs text-kumo-subtle">key</span>
+            <RefText value={r.key} />
+          </>
+        ),
+      }));
+    tx.requirements.ordering.forEach((r, i) =>
+      rows.push({
+        prop: "transaction_ordering",
+        i,
+        tx: tx.id,
+        label: "ordering",
+        declares: (
+          <>
+            <span className="text-xs text-kumo-subtle">key</span>
+            <RefText value={r.key} />
+            <span className="text-xs text-kumo-subtle">position</span>
+            <RefText value={r.position} />
+          </>
+        ),
+      }));
+  }
   reqs.idempotency.forEach((r, i) =>
     rows.push({
       prop: "idempotency",
       i,
+      label: "idempotency",
       declares: (
         <>
           <KeyComponents value={r.key} />
@@ -606,6 +704,7 @@ function RequirementsTable({ id, op }: { id: Id; op: Operation }) {
     rows.push({
       prop: "recoverability",
       i,
+      label: "recoverability",
       declares: (
         <>
           <KeyComponents value={r.key} />
@@ -614,7 +713,7 @@ function RequirementsTable({ id, op }: { id: Id; op: Operation }) {
       ),
     }));
 
-  if (!rows.length) return <Muted>operation declares no requirements</Muted>;
+  if (!rows.length) return <Muted>the operation and its transactions declare no requirements</Muted>;
 
   return (
     <Table>
@@ -627,8 +726,12 @@ function RequirementsTable({ id, op }: { id: Id; op: Operation }) {
       </Table.Header>
       <Table.Body>
         {rows.map((row) => {
-          const key = `req:${row.prop}:${row.i}`;
-          const obs = (obligations.get(id) ?? []).filter(
+          const key = requirementKey(row.prop, row.i, row.tx);
+          const obs = row.tx !== undefined
+            ? (obligations.get(`${id}/${row.tx}`) ?? []).filter(
+                (ob) => ob.subject.kind === "transaction" && ob.subject.transaction === row.tx &&
+                  ob.subject.requirement === row.i && propertyMatchesRequirement(ob.property, row.prop))
+            : (obligations.get(id) ?? []).filter(
                 (ob) => ob.subject.kind === "operation" && ob.subject.requirement === row.i &&
                   propertyMatchesRequirement(ob.property, row.prop));
           const status = obs.length ? worstStatus(obs) : null;
@@ -636,10 +739,13 @@ function RequirementsTable({ id, op }: { id: Id; op: Operation }) {
             <Table.Row
               key={key}
               className={selectableRow(selection === key)}
-              onClick={() => select(key, { id, ctx: { req: { prop: row.prop, index: row.i } } })}
+              onClick={() => select(key, { id, ctx: { req: { prop: row.prop, index: row.i, transaction: row.tx } } })}
             >
               <Table.Cell className="whitespace-nowrap">
-                <span className="font-medium text-kumo-strong">{row.prop}</span>
+                <span className="font-medium text-kumo-strong">{row.label}</span>
+                {row.tx !== undefined && (
+                  <span className="ml-1.5 text-kumo-subtle">· <Mono>{row.tx}</Mono></span>
+                )}
                 <span className="ml-1.5 text-kumo-inactive">#{row.i}</span>
               </Table.Cell>
               <Table.Cell>
@@ -699,7 +805,6 @@ function Realization({ opId, inputId, kind }: { opId: Id; inputId: Id; kind: "re
           <Badge variant="neutral">{`batching: ${runtime.dispatch.batching.ordering}`}</Badge>
         )}
         {pool && <FactBadge fact={memberConcurrency(pool.member_concurrency)} />}
-        {pool && <FactBadge fact={executionHandoff(pool.execution_handoff)} />}
       </>
     );
   }
@@ -720,7 +825,6 @@ function Realization({ opId, inputId, kind }: { opId: Id; inputId: Id; kind: "re
         <FactBadge fact={requestRouting(router.routing?.key)} />
         {router.routing && <FactBadge fact={memberAssignment(router.routing.member_assignment)} />}
         {pool && <FactBadge fact={memberConcurrency(pool.member_concurrency)} />}
-        {pool && <FactBadge fact={executionHandoff(pool.execution_handoff)} />}
       </>
     );
   }
@@ -743,8 +847,28 @@ function Realization({ opId, inputId, kind }: { opId: Id; inputId: Id; kind: "re
         <FactBadge fact={memberAssignment(runtime.dispatch.routing.member_assignment)} />
       )}
       {pool && <FactBadge fact={memberConcurrency(pool.member_concurrency)} />}
-        {pool && <FactBadge fact={executionHandoff(pool.execution_handoff)} />}
     </>
+  );
+}
+
+/** A result contract inline: the ok schema, then every error class as
+ *  `class: schema [disposition]`. */
+function ResultContractInline({ result }: { result: ResultType }) {
+  const classes = Object.entries(result.errors);
+  return (
+    <span className="inline-flex flex-wrap items-center gap-1 text-xs text-kumo-subtle">
+      <Mono>Result&lt;</Mono>
+      <IdLink id={result.ok}>{shortId(result.ok)}</IdLink>
+      {classes.map(([cls, c]) => (
+        <span key={cls} className="inline-flex items-center gap-1">
+          <Mono>,</Mono>
+          <Mono className="text-kumo-strong">{cls}:</Mono>
+          <IdLink id={c.schema}>{shortId(c.schema)}</IdLink>
+          {c.disposition !== "unspecified" && <Mono>[{c.disposition}]</Mono>}
+        </span>
+      ))}
+      <Mono>&gt;</Mono>
+    </span>
   );
 }
 
@@ -799,16 +923,7 @@ function InputsTable({ opId, op }: { opId: Id; op: Operation }) {
                   {input.kind === "request" ? (
                     <>
                       <FactBadge fact={requestIdentity(input.identity)} />
-                      <span className="inline-flex flex-wrap items-center gap-1 text-xs text-kumo-subtle">
-                        <Mono>Result&lt;</Mono>
-                        <IdLink id={input.result.ok}>{shortId(input.result.ok)}</IdLink>
-                        <Mono>,</Mono>
-                        <IdLink id={input.result.err.schema}>{shortId(input.result.err.schema)}</IdLink>
-                        {input.result.err.disposition !== "unspecified" && (
-                          <Mono>{input.result.err.disposition}</Mono>
-                        )}
-                        <Mono>&gt;</Mono>
-                      </span>
+                      <ResultContractInline result={input.result} />
                     </>
                   ) : input.kind === "subscription" ? (
                     <>
@@ -861,9 +976,11 @@ export function OperationView({ id }: { id: string }) {
   }
 
   const reqs = op.requirements;
-  const requirementCount = reqs.serialization.length + reqs.ordering.length + reqs.idempotency.length + reqs.recoverability.length;
-  const inputCount = Object.keys(op.inputs).length;
   const transactions = operationTransactions(op);
+  const requirementCount =
+    transactions.reduce((n, tx) => n + tx.requirements.serializability.length + tx.requirements.ordering.length, 0) +
+    reqs.idempotency.length + reqs.recoverability.length;
+  const inputCount = Object.keys(op.inputs).length;
   const transactionCount = transactions.length;
   const stepCount = walkProgram(op.program).length;
   const machines = [...new Set(
@@ -896,7 +1013,7 @@ export function OperationView({ id }: { id: string }) {
           </dl>
         </header>
 
-        <SectionCard title="Requirements" count={requirementCount} hint="proof obligations on every invocation">
+        <SectionCard title="Requirements" count={requirementCount} hint="proof obligations on each transaction's committed history and on every invocation">
           <div className="overflow-x-auto">
             <RequirementsTable id={id} op={op} />
           </div>
@@ -911,7 +1028,7 @@ export function OperationView({ id }: { id: string }) {
         <SectionCard
           title="Program"
           count={stepCount}
-          hint="the operation's one causal control structure — a decision's arms are alternatives, and every path ends at a terminal"
+          hint="the operation's one causal control structure — a decision's arms and a transaction's rejected block are alternatives, and every path ends at a terminal"
           bodyClassName="@container space-y-4 p-4"
         >
           {op.program.steps.length ? (

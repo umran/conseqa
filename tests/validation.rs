@@ -9,18 +9,17 @@ use conseqa::{
     analyzer::validation::{self, ProgramUse, ReferenceKind, ValidationError},
     parser::yaml,
     spec::{
-        Arm, AsyncJoin, Branch, Condition, Derivation, Effect, EstablishTransactionOutput,
-        ExecuteEffect, ExecuteEffectAsync, ExecuteEffectIntentAsync, ExternalIdempotency,
-        ExternalIdentity, ExternalIdentityKey, ExternalResultReplay, FieldPath, Id,
-        IdempotencyGuarantee, Input, InvocationLock, JoinAll, Literal, MessageIdentity,
-        MessageSelector,
-        Model, OperationBlock, OperationStep, Race, RequestEffect, RequestIdentity, RequestTarget,
-        DataObjectRef, ExecutionPool, MemberAssignment, MemberConcurrency,
-        OperationInputRef,
-        RequestRouting, ResultOutcome, ResultVariant, RetrySemantics, Return, Router, RuntimeModel,
-        Schema, SchemaFragment, SelectorValue, StateTransition, StepHop, StepLocation,
-        StorageLayout, SubscriptionRoutingKey, OrderingSemantics, Transaction, TransactionIsolation,
-        TransactionStep, TransitionEffectIntent, ValueRef, ValueSource,
+        Arm, AsyncJoin, Branch, Condition, DataObjectRef, Derivation, Effect,
+        EstablishTransactionOutput, ExecuteEffect, ExecuteEffectAsync, ExecuteEffectIntentAsync,
+        ExecuteTransaction, ExecutionPool, ExternalIdempotency, ExternalIdentity,
+        ExternalIdentityKey, ExternalResultReplay, FieldPath, Id, IdempotencyGuarantee, Input,
+        JoinAll, Literal, MemberAssignment, MemberConcurrency, MessageIdentity, MessageSelector,
+        Model, OperationBlock, OperationInputRef, OperationStep, OrderingSemantics, Race,
+        RequestEffect, RequestIdentity, RequestRouting, RequestTarget, ResultOutcome,
+        ResultVariant, RetrySemantics, Return, Router, RuntimeModel, Schema, SchemaFragment,
+        SelectorValue, StateTransition, StepHop, StepLocation, StorageLayout,
+        SubscriptionRoutingKey, Transaction, TransactionIsolation, TransactionStep,
+        TransitionEffectIntent, ValueRef, ValueSource,
     },
 };
 
@@ -45,7 +44,7 @@ fn at(hops: &[(usize, Option<Arm>)]) -> StepLocation {
         hops.iter()
             .map(|(step, arm)| StepHop {
                 step: *step,
-                arm: *arm,
+                arm: arm.clone(),
             })
             .collect(),
     )
@@ -76,10 +75,13 @@ fn return_ok(request: &str, values: Derivation) -> OperationStep {
     })
 }
 
-fn return_err(request: &str, values: Derivation) -> OperationStep {
+fn return_err(request: &str, error: &str, values: Derivation) -> OperationStep {
     OperationStep::Return(Return {
         request: id(request),
-        outcome: ResultOutcome::Err { values },
+        outcome: ResultOutcome::Err {
+            error: id(error),
+            values,
+        },
     })
 }
 
@@ -203,12 +205,16 @@ fn rejects_duplicate_inline_transaction_ids() {
         .steps
         .insert(
             1,
-            OperationStep::Transaction(Transaction {
-                id: id("tx.transfer_stock"),
-                data_model: None,
-                isolation: TransactionIsolation::Unspecified,
-                idempotency: IdempotencyGuarantee::Unspecified,
-                steps: Vec::new(),
+            OperationStep::Transaction(ExecuteTransaction {
+                transaction: Transaction {
+                    requirements: Default::default(),
+                    id: id("tx.transfer_stock"),
+                    data_model: None,
+                    isolation: TransactionIsolation::Unspecified,
+                    idempotency: IdempotencyGuarantee::Unspecified,
+                    steps: Vec::new(),
+                },
+                rejected: None,
             }),
         );
 
@@ -368,7 +374,7 @@ fn rejects_publication_schema_not_carried_by_topic() {
 
     let transaction = transaction_mut(&mut model, "operation.cancel_order", "tx.cancel_order");
 
-    let TransactionStep::EstablishEffectIntent(establish) = &mut transaction.steps[1] else {
+    let TransactionStep::EstablishEffectIntent(establish) = &mut transaction.steps[4] else {
         panic!("expected the intent establishment");
     };
 
@@ -445,12 +451,17 @@ fn rejects_transaction_access_without_data_model() {
 
     let errors = validation::validate(&model);
 
+    // One error per accessing step: the read, the version validation,
+    // the transition, and the version bump each name the object.
     assert_eq!(
         errors,
-        vec![ValidationError::TransactionMissingDataModel {
-            transaction: id("tx.cancel_order"),
-            object: id("object.order"),
-        }]
+        vec![
+            ValidationError::TransactionMissingDataModel {
+                transaction: id("tx.cancel_order"),
+                object: id("object.order"),
+            };
+            4
+        ]
     );
 }
 
@@ -465,11 +476,14 @@ fn rejects_transaction_access_outside_declared_data_model() {
 
     assert_eq!(
         errors,
-        vec![ValidationError::TransactionObjectOutsideDataModel {
-            transaction: id("tx.cancel_order"),
-            data_model: id("data.inventory"),
-            object: id("object.order"),
-        }]
+        vec![
+            ValidationError::TransactionObjectOutsideDataModel {
+                transaction: id("tx.cancel_order"),
+                data_model: id("data.inventory"),
+                object: id("object.order"),
+            };
+            4
+        ]
     );
 }
 
@@ -482,7 +496,7 @@ fn rejects_state_transition_with_wrong_subject_object() {
     // succeed. The only defect is state-machine subject identity.
     let shadow_id = id("object.order_shadow");
 
-    let shadow = model
+    let mut shadow = model
         .data_models
         .get(&id("data.checkout"))
         .unwrap()
@@ -490,6 +504,10 @@ fn rejects_state_transition_with_wrong_subject_object() {
         .get(&id("object.order"))
         .unwrap()
         .clone();
+
+    // Unversioned, so the transition owes it no version bump and the
+    // subject mismatch is the only defect.
+    shadow.version = None;
 
     model
         .data_models
@@ -500,7 +518,7 @@ fn rejects_state_transition_with_wrong_subject_object() {
 
     let transaction = transaction_mut(&mut model, "operation.apply_payment", "tx.apply_payment");
 
-    let TransactionStep::Transition(transition) = &mut transaction.steps[1] else {
+    let TransactionStep::Transition(transition) = &mut transaction.steps[3] else {
         panic!("expected transition step");
     };
 
@@ -523,19 +541,18 @@ fn rejects_state_transition_with_wrong_subject_object() {
 fn rejects_invalid_value_ref_field_path() {
     let mut model = load_flash_checkout();
 
-    let operation = model
-        .operations
-        .get_mut(&id("operation.apply_payment"))
-        .unwrap();
-
-    operation.requirements.ordering[0].key.path = FieldPath(vec!["does_not_exist".to_owned()]);
+    transaction_mut(&mut model, "operation.apply_payment", "tx.apply_payment")
+        .requirements
+        .ordering[0]
+        .key
+        .path = FieldPath(vec!["does_not_exist".to_owned()]);
 
     let errors = validation::validate(&model);
 
     assert_eq!(
         errors,
         vec![ValidationError::InvalidFieldPath {
-            subject: id("operation.apply_payment"),
+            subject: id("tx.apply_payment"),
             schema: id("schema.PaymentCaptured"),
             path: FieldPath(vec!["does_not_exist".to_owned()]),
         }]
@@ -551,7 +568,9 @@ fn rejects_field_reference_into_untyped_external_effect() {
         .get_mut(&id("operation.charge_payment"))
         .unwrap();
 
-    operation.requirements.serialization[0].key.source =
+    // The card charge's values are unspecified, so the effect has no
+    // schema for a field reference to resolve against.
+    operation.requirements.idempotency[0].key.components[0].source =
         ValueSource::Effect(id("effect.charge_payment.card"));
 
     let errors = validation::validate(&model);
@@ -593,7 +612,7 @@ fn transition_effect_intents_coverage_is_independent_of_the_guarantee() {
 
     transaction.idempotency = IdempotencyGuarantee::Unspecified;
 
-    let TransactionStep::Transition(transition) = &mut transaction.steps[1] else {
+    let TransactionStep::Transition(transition) = &mut transaction.steps[3] else {
         panic!("expected the mark_paid transition step");
     };
 
@@ -694,7 +713,7 @@ fn rejects_transaction_read_used_outside_a_transaction() {
         .get_mut(&id("operation.reserve_inventory"))
         .unwrap();
 
-    operation.requirements.serialization[0].key.source =
+    operation.requirements.idempotency[0].key.components[0].source =
         ValueSource::TransactionRead(id("read.reserve_inventory.stock"));
 
     let errors = validation::validate(&model);
@@ -873,7 +892,7 @@ fn rejects_a_program_that_falls_through_without_a_terminal() {
         panic!("expected the card match");
     };
 
-    matched.err.steps.pop();
+    matched.errors.get_mut(&id("declined")).unwrap().steps.pop();
 
     let errors = validation::validate(&model);
 
@@ -1231,7 +1250,7 @@ fn rejects_invalid_field_path_in_execute_effect_values() {
 fn apply_payment_transition(model: &mut Model) -> &mut StateTransition {
     let transaction = transaction_mut(model, "operation.apply_payment", "tx.apply_payment");
 
-    let TransactionStep::Transition(transition) = &mut transaction.steps[1] else {
+    let TransactionStep::Transition(transition) = &mut transaction.steps[3] else {
         panic!("expected the mark_paid transition step");
     };
 
@@ -1274,7 +1293,7 @@ fn accepts_empty_effect_intents_for_transition_without_side_effects() {
         .transaction(&id("tx.cancel_order"))
         .unwrap();
 
-    let TransactionStep::Transition(transition) = &transaction.steps[0] else {
+    let TransactionStep::Transition(transition) = &transaction.steps[2] else {
         panic!("expected the cancel transition step");
     };
 
@@ -1343,7 +1362,7 @@ fn rejects_transition_intent_binding_owned_by_another_transition() {
     // side effect has no instance here for a binding to establish.
     let transaction = transaction_mut(&mut model, "operation.cancel_order", "tx.cancel_order");
 
-    let TransactionStep::Transition(transition) = &mut transaction.steps[0] else {
+    let TransactionStep::Transition(transition) = &mut transaction.steps[2] else {
         panic!("expected the cancel transition step");
     };
 
@@ -1461,9 +1480,8 @@ fn rejects_empty_request_identity() {
         panic!("create_order input should be a request");
     };
 
-    request.identity = RequestIdentity::Keyed(conseqa::spec::RequestIdentityKey {
-        fields: Vec::new(),
-    });
+    request.identity =
+        RequestIdentity::Keyed(conseqa::spec::RequestIdentityKey { fields: Vec::new() });
 
     let errors = validation::validate(&model);
 
@@ -1471,124 +1489,6 @@ fn rejects_empty_request_identity() {
         errors,
         vec![ValidationError::EmptyRequestIdentity {
             input: id("input.create_order.request"),
-        }]
-    );
-}
-
-/// The invocation lock's key is evaluated at operation entry, before
-/// any program step; only an input payload exists there.
-#[test]
-fn rejects_an_invocation_lock_keyed_from_a_non_input_source() {
-    let mut model = load_flash_checkout();
-
-    model
-        .operations
-        .get_mut(&id("operation.apply_payment"))
-        .unwrap()
-        .invocation_lock = Some(InvocationLock {
-        key: ValueRef {
-            source: ValueSource::StateMachineSubject(id("machine.order_lifecycle")),
-            path: path(&["order_id"]),
-        },
-    });
-
-    let errors = validation::validate(&model);
-
-    assert_eq!(
-        errors,
-        vec![ValidationError::InvocationLockKeyNotFromInput {
-            operation: id("operation.apply_payment"),
-            source: id("machine.order_lifecycle"),
-        }]
-    );
-}
-
-/// Every invocation acquires the lock, and an invocation triggered by
-/// another input carries no value for the key, so the key's source
-/// must be the operation's only input.
-#[test]
-fn rejects_an_invocation_lock_uncovered_by_a_second_input() {
-    let mut model = load_flash_checkout();
-
-    let operation = model
-        .operations
-        .get_mut(&id("operation.apply_payment"))
-        .unwrap();
-
-    operation.inputs.insert(
-        id("input.apply_payment.created"),
-        Input::Subscription(conseqa::spec::SubscriptionInput {
-            topic: id("topic.order_events"),
-            messages: MessageSelector::Only(
-                [id("schema.OrderCreated")].into_iter().collect(),
-            ),
-            acknowledge_on_success: None,
-        }),
-    );
-
-    operation.invocation_lock = Some(InvocationLock {
-        key: input_ref("input.apply_payment.captured", &["order_id"]),
-    });
-
-    let errors = validation::validate(&model);
-
-    assert_eq!(
-        errors,
-        vec![ValidationError::InvocationLockKeyNotEvaluable {
-            operation: id("operation.apply_payment"),
-            input: id("input.apply_payment.created"),
-        }]
-    );
-}
-
-/// The lock key's path is judged against every schema the input
-/// admits, like a requirement key's.
-#[test]
-fn rejects_an_invocation_lock_path_the_admitted_schema_lacks() {
-    let mut model = load_flash_checkout();
-
-    model
-        .operations
-        .get_mut(&id("operation.apply_payment"))
-        .unwrap()
-        .invocation_lock = Some(InvocationLock {
-        key: input_ref("input.apply_payment.captured", &["no_such_field"]),
-    });
-
-    let errors = validation::validate(&model);
-
-    assert_eq!(
-        errors,
-        vec![ValidationError::InvalidFieldPath {
-            subject: id("operation.apply_payment"),
-            schema: id("schema.PaymentCaptured"),
-            path: path(&["no_such_field"]),
-        }]
-    );
-}
-
-/// A lock keyed from an input of a different operation is out of
-/// scope, like any other value reference.
-#[test]
-fn rejects_an_invocation_lock_keyed_from_another_operations_input() {
-    let mut model = load_flash_checkout();
-
-    model
-        .operations
-        .get_mut(&id("operation.apply_payment"))
-        .unwrap()
-        .invocation_lock = Some(InvocationLock {
-        key: input_ref("input.create_order.request", &["order_id"]),
-    });
-
-    let errors = validation::validate(&model);
-
-    assert_eq!(
-        errors,
-        vec![ValidationError::ValueSourceOutOfScope {
-            subject: id("operation.apply_payment"),
-            source: id("input.create_order.request"),
-            owner: id("operation.create_order"),
         }]
     );
 }
@@ -1758,7 +1658,12 @@ fn rejects_request_result_schema_that_does_not_exist() {
         panic!("create_order input should be a request");
     };
 
-    request.result.err.schema = id("schema.missing");
+    request
+        .result
+        .errors
+        .get_mut(&id("rejected"))
+        .unwrap()
+        .schema = id("schema.missing");
 
     let errors = validation::validate(&model);
 
@@ -1950,7 +1855,12 @@ fn rejects_a_variant_payload_outside_its_arm() {
 
     // The failure publication reads the err payload; moving it into the
     // ok arm puts that reference out of scope.
-    let failed = matched.err.steps.remove(0);
+    let failed = matched
+        .errors
+        .get_mut(&id("declined"))
+        .unwrap()
+        .steps
+        .remove(0);
 
     matched.ok.steps.insert(0, failed);
 
@@ -1981,10 +1891,20 @@ fn rejects_a_variant_payload_after_the_join() {
     };
 
     // Both arms fall through; the failure publication follows the join.
-    let failed = matched.err.steps.remove(0);
+    let failed = matched
+        .errors
+        .get_mut(&id("declined"))
+        .unwrap()
+        .steps
+        .remove(0);
 
     matched.ok.steps.clear();
-    matched.err.steps.clear();
+    matched
+        .errors
+        .get_mut(&id("declined"))
+        .unwrap()
+        .steps
+        .clear();
 
     program.steps.push(failed);
     program.steps.push(OperationStep::Complete);
@@ -2092,6 +2012,7 @@ fn accepts_an_artifact_established_on_every_falling_through_path() {
         &mut model,
         Some(vec![return_err(
             "input.create_order.request",
+            "rejected",
             Derivation::Unspecified,
         )]),
     );
@@ -2203,7 +2124,9 @@ fn rejects_a_variant_field_path_that_does_not_resolve() {
         panic!("expected the card match");
     };
 
-    let OperationStep::ExecuteEffect(failed) = &mut matched.err.steps[0] else {
+    let OperationStep::ExecuteEffect(failed) =
+        &mut matched.errors.get_mut(&id("declined")).unwrap().steps[0]
+    else {
         panic!("expected the failure publication");
     };
 
@@ -2317,23 +2240,27 @@ fn rejects_a_condition_root_out_of_scope() {
 /// A second output for create_order: a new inline transaction whose
 /// binder's derivation reads the first output.
 fn receipt_transaction() -> OperationStep {
-    OperationStep::Transaction(Transaction {
-        id: id("tx.create_order.receipt"),
-        data_model: None,
-        isolation: TransactionIsolation::Unspecified,
-        idempotency: IdempotencyGuarantee::Unspecified,
-        steps: vec![TransactionStep::EstablishTransactionOutput(
-            EstablishTransactionOutput {
-                bind: id("output.create_order.receipt"),
-                schema: id("schema.CreateOrderResponse"),
-                values: Derivation::Deterministic {
-                    from: vec![ValueRef {
-                        source: ValueSource::TransactionOutput(id("output.create_order")),
-                        path: path(&["order_id"]),
-                    }],
+    OperationStep::Transaction(ExecuteTransaction {
+        transaction: Transaction {
+            requirements: Default::default(),
+            id: id("tx.create_order.receipt"),
+            data_model: None,
+            isolation: TransactionIsolation::Unspecified,
+            idempotency: IdempotencyGuarantee::Unspecified,
+            steps: vec![TransactionStep::EstablishTransactionOutput(
+                EstablishTransactionOutput {
+                    bind: id("output.create_order.receipt"),
+                    schema: id("schema.CreateOrderResponse"),
+                    values: Derivation::Deterministic {
+                        from: vec![ValueRef {
+                            source: ValueSource::TransactionOutput(id("output.create_order")),
+                            path: path(&["order_id"]),
+                        }],
+                    },
                 },
-            },
-        )],
+            )],
+        },
+        rejected: None,
     })
 }
 
@@ -2425,23 +2352,27 @@ fn accepts_a_variant_payload_in_a_transaction_used_inside_its_arm() {
 
     // A transaction reading the provider's ok payload, executed only
     // inside the ok arm.
-    let record = OperationStep::Transaction(Transaction {
-        id: id("tx.charge_payment.record"),
-        data_model: None,
-        isolation: TransactionIsolation::Unspecified,
-        idempotency: IdempotencyGuarantee::Unspecified,
-        steps: vec![TransactionStep::EstablishTransactionOutput(
-            EstablishTransactionOutput {
-                bind: id("output.charge_payment.authorization"),
-                schema: id("schema.ChargeAccepted"),
-                values: Derivation::Deterministic {
-                    from: vec![ValueRef {
-                        source: ValueSource::EffectResultOk(id("result.charge_payment.card")),
-                        path: path(&["authorization_id"]),
-                    }],
+    let record = OperationStep::Transaction(ExecuteTransaction {
+        transaction: Transaction {
+            requirements: Default::default(),
+            id: id("tx.charge_payment.record"),
+            data_model: None,
+            isolation: TransactionIsolation::Unspecified,
+            idempotency: IdempotencyGuarantee::Unspecified,
+            steps: vec![TransactionStep::EstablishTransactionOutput(
+                EstablishTransactionOutput {
+                    bind: id("output.charge_payment.authorization"),
+                    schema: id("schema.ChargeAccepted"),
+                    values: Derivation::Deterministic {
+                        from: vec![ValueRef {
+                            source: ValueSource::EffectResultOk(id("result.charge_payment.card")),
+                            path: path(&["authorization_id"]),
+                        }],
+                    },
                 },
-            },
-        )],
+            )],
+        },
+        rejected: None,
     });
 
     let OperationStep::MatchResult(matched) =
@@ -2466,7 +2397,7 @@ fn accepts_a_variant_payload_in_a_transaction_used_inside_its_arm() {
 
     matched.ok.steps.remove(0);
     matched.ok.steps.pop();
-    matched.err.steps.pop();
+    matched.errors.get_mut(&id("declined")).unwrap().steps.pop();
 
     program.steps.push(record);
     program.steps.push(OperationStep::Complete);
@@ -2500,20 +2431,27 @@ fn transition_application_evaluates_the_side_effects_declaration_roots() {
         .steps
         .insert(
             2,
-            OperationStep::Transaction(Transaction {
-                id: id("tx.apply_payment.receipt"),
-                data_model: None,
-                isolation: TransactionIsolation::Unspecified,
-                idempotency: IdempotencyGuarantee::Unspecified,
-                steps: vec![TransactionStep::EstablishTransactionOutput(
-                    EstablishTransactionOutput {
-                        bind: id("output.apply_payment.receipt"),
-                        schema: id("schema.OrderPaid"),
-                        values: Derivation::Deterministic {
-                            from: vec![input_ref("input.apply_payment.captured", &["order_id"])],
+            OperationStep::Transaction(ExecuteTransaction {
+                transaction: Transaction {
+                    requirements: Default::default(),
+                    id: id("tx.apply_payment.receipt"),
+                    data_model: None,
+                    isolation: TransactionIsolation::Unspecified,
+                    idempotency: IdempotencyGuarantee::Unspecified,
+                    steps: vec![TransactionStep::EstablishTransactionOutput(
+                        EstablishTransactionOutput {
+                            bind: id("output.apply_payment.receipt"),
+                            schema: id("schema.OrderPaid"),
+                            values: Derivation::Deterministic {
+                                from: vec![input_ref(
+                                    "input.apply_payment.captured",
+                                    &["order_id"],
+                                )],
+                            },
                         },
-                    },
-                )],
+                    )],
+                },
+                rejected: None,
             }),
         );
 
@@ -2597,7 +2535,7 @@ fn a_nested_match_keeps_the_enclosing_arms_variant_selection() {
         OperationStep::MatchResult(conseqa::spec::MatchResult {
             result: id("result.charge_payment.card"),
             ok: OperationBlock::default(),
-            err: OperationBlock::default(),
+            errors: BTreeMap::from([(id("declined"), OperationBlock::default())]),
         }),
     );
 
@@ -2633,7 +2571,9 @@ fn program_local_diagnostics_reproduce_the_validator_verbatim() {
 
     // Executing the intent before the transaction that establishes it is
     // a use-before-bind error — exactly one operation-local verdict.
-    program_mut(&mut model, "operation.create_order").steps.swap(0, 1);
+    program_mut(&mut model, "operation.create_order")
+        .steps
+        .swap(0, 1);
 
     let validator: Vec<String> = validation::validate(&model)
         .into_iter()
@@ -2669,7 +2609,9 @@ fn program_local_diagnostics_flag_a_dangling_effect_intent() {
     assert!(
         diagnostics.iter().any(|diagnostic| {
             diagnostic.message.contains("effect intent")
-                && diagnostic.message.contains("intent.create_order.publish_created")
+                && diagnostic
+                    .message
+                    .contains("intent.create_order.publish_created")
         }),
         "expected a dangling-effect-intent diagnostic, got:\n{diagnostics:#?}"
     );
@@ -2744,10 +2686,10 @@ fn program_local_diagnostics_do_not_fault_a_request_to_an_absent_operation() {
     let diagnostics = validation::program_local_diagnostics(&model, &id("operation.create_order"));
 
     assert!(
-        diagnostics
-            .iter()
-            .all(|diagnostic| !diagnostic.message.contains("operation.absent")
-                && !diagnostic.message.contains("input.absent")),
+        diagnostics.iter().all(
+            |diagnostic| !diagnostic.message.contains("operation.absent")
+                && !diagnostic.message.contains("input.absent")
+        ),
         "cross-operation references must be left to the gate's other checks:\n{diagnostics:#?}"
     );
 }
@@ -2762,7 +2704,10 @@ fn program_local_diagnostics_do_not_fault_a_request_to_an_absent_operation() {
 // ---------------------------------------------------------------------------
 
 fn runtime(model: &mut Model) -> &mut RuntimeModel {
-    model.runtime.as_mut().expect("the fixture declares a runtime")
+    model
+        .runtime
+        .as_mut()
+        .expect("the fixture declares a runtime")
 }
 
 #[test]
@@ -2831,13 +2776,11 @@ fn a_router_key_must_be_non_empty_and_resolve_against_the_request_schema() {
         member_assignment: MemberAssignment::ConsistentHash,
     });
 
-    assert!(
-        validation::validate(&model).iter().any(|error| matches!(
-            error,
-            ValidationError::InvalidFieldPath { subject, .. }
-                if subject == &id("router.create_order")
-        ))
-    );
+    assert!(validation::validate(&model).iter().any(|error| matches!(
+        error,
+        ValidationError::InvalidFieldPath { subject, .. }
+            if subject == &id("router.create_order")
+    )));
 }
 
 #[test]
@@ -2856,14 +2799,12 @@ fn one_request_boundary_admits_at_most_one_router() {
         },
     );
 
-    assert!(
-        validation::validate(&model).iter().any(|error| matches!(
-            error,
-            ValidationError::DuplicateRouterForBoundary { first, second, .. }
-                if first == &id("router.create_order")
-                    && second == &id("router.create_order_again")
-        ))
-    );
+    assert!(validation::validate(&model).iter().any(|error| matches!(
+        error,
+        ValidationError::DuplicateRouterForBoundary { first, second, .. }
+            if first == &id("router.create_order")
+                && second == &id("router.create_order_again")
+    )));
 }
 
 #[test]
@@ -2876,14 +2817,12 @@ fn routing_must_terminate_at_a_declared_pool() {
         .unwrap()
         .pool = id("pool.missing");
 
-    assert!(
-        validation::validate(&model).iter().any(|error| matches!(
-            error,
-            ValidationError::UnknownReference { reference, expected, .. }
-                if reference == &id("pool.missing")
-                    && *expected == ReferenceKind::ExecutionPool
-        ))
-    );
+    assert!(validation::validate(&model).iter().any(|error| matches!(
+        error,
+        ValidationError::UnknownReference { reference, expected, .. }
+            if reference == &id("pool.missing")
+                && *expected == ReferenceKind::ExecutionPool
+    )));
 }
 
 #[test]
@@ -2900,13 +2839,11 @@ fn grouping_key_routing_requires_a_grouping_domain() {
         .unwrap()
         .grouping = None;
 
-    assert!(
-        validation::validate(&model).iter().any(|error| matches!(
-            error,
-            ValidationError::RoutingWithoutGrouping { topic, .. }
-                if topic == &id("topic.order_events")
-        ))
-    );
+    assert!(validation::validate(&model).iter().any(|error| matches!(
+        error,
+        ValidationError::RoutingWithoutGrouping { topic, .. }
+            if topic == &id("topic.order_events")
+    )));
 }
 
 #[test]
@@ -2942,13 +2879,11 @@ fn within_group_requires_a_grouping_at_the_same_scope() {
     topic.grouping = None;
     topic.ordering = Some(OrderingSemantics::WithinGroup);
 
-    assert!(
-        validation::validate(&model).iter().any(|error| matches!(
-            error,
-            ValidationError::WithinGroupWithoutGrouping { subject }
-                if subject == &id("topic.order_events")
-        ))
-    );
+    assert!(validation::validate(&model).iter().any(|error| matches!(
+        error,
+        ValidationError::WithinGroupWithoutGrouping { subject }
+            if subject == &id("topic.order_events")
+    )));
 }
 
 #[test]
@@ -2966,14 +2901,12 @@ fn transport_semantics_may_not_be_declared_at_both_scopes() {
 
     subscription.ordering = Some(OrderingSemantics::Global);
 
-    assert!(
-        validation::validate(&model).iter().any(|error| matches!(
-            error,
-            ValidationError::TransportSemanticsAtBothScopes { topic, input, .. }
-                if topic == &id("topic.order_events")
-                    && input == &id("input.reserve_inventory.created")
-        ))
-    );
+    assert!(validation::validate(&model).iter().any(|error| matches!(
+        error,
+        ValidationError::TransportSemanticsAtBothScopes { topic, input, .. }
+            if topic == &id("topic.order_events")
+                && input == &id("input.reserve_inventory.created")
+    )));
 }
 
 /// A validation error against an L1 declaration is marked as one, so
@@ -3060,10 +2993,9 @@ fn grouping_and_ordering_are_each_present_or_absent() {
     let errors = validation::validate(&model);
 
     assert!(
-        errors.iter().all(|error| matches!(
-            error,
-            ValidationError::RoutingWithoutGrouping { .. }
-        )),
+        errors
+            .iter()
+            .all(|error| matches!(error, ValidationError::RoutingWithoutGrouping { .. })),
         "{errors:#?}"
     );
 }
@@ -3090,12 +3022,10 @@ fn a_storage_layout_must_name_an_object_and_carry_a_resolving_partition_key() {
         .unwrap()
         .partition_key = vec![path(&["not_a_field"])];
 
-    assert!(
-        validation::validate(&model).iter().any(|error| matches!(
-            error,
-            ValidationError::InvalidFieldPath { subject, .. } if subject == &id("layout.order")
-        ))
-    );
+    assert!(validation::validate(&model).iter().any(|error| matches!(
+        error,
+        ValidationError::InvalidFieldPath { subject, .. } if subject == &id("layout.order")
+    )));
 
     runtime(&mut model).storage_layouts.insert(
         id("layout.absent"),
@@ -3108,14 +3038,12 @@ fn a_storage_layout_must_name_an_object_and_carry_a_resolving_partition_key() {
         },
     );
 
-    assert!(
-        validation::validate(&model).iter().any(|error| matches!(
-            error,
-            ValidationError::UnknownReference { reference, expected, .. }
-                if reference == &id("object.missing")
-                    && *expected == ReferenceKind::DataObject
-        ))
-    );
+    assert!(validation::validate(&model).iter().any(|error| matches!(
+        error,
+        ValidationError::UnknownReference { reference, expected, .. }
+            if reference == &id("object.missing")
+                && *expected == ReferenceKind::DataObject
+    )));
 }
 
 #[test]
@@ -3133,13 +3061,11 @@ fn one_data_object_admits_at_most_one_storage_layout() {
         },
     );
 
-    assert!(
-        validation::validate(&model).iter().any(|error| matches!(
-            error,
-            ValidationError::DuplicateStorageLayoutForObject { first, second, .. }
-                if first == &id("layout.order") && second == &id("layout.order_again")
-        ))
-    );
+    assert!(validation::validate(&model).iter().any(|error| matches!(
+        error,
+        ValidationError::DuplicateStorageLayoutForObject { first, second, .. }
+            if first == &id("layout.order") && second == &id("layout.order_again")
+    )));
 }
 
 #[test]
@@ -3156,13 +3082,11 @@ fn l1_identifiers_share_the_one_global_namespace() {
         .execution_pools
         .insert(id("topic.order_events"), pool);
 
-    assert!(
-        validation::validate(&model).iter().any(|error| matches!(
-            error,
-            ValidationError::DuplicateId { id: duplicate, .. }
-                if duplicate == &id("topic.order_events")
-        ))
-    );
+    assert!(validation::validate(&model).iter().any(|error| matches!(
+        error,
+        ValidationError::DuplicateId { id: duplicate, .. }
+            if duplicate == &id("topic.order_events")
+    )));
 }
 
 #[test]
@@ -3191,13 +3115,11 @@ fn a_subscription_runtime_must_name_a_subscription_boundary() {
             },
         );
 
-    assert!(
-        validation::validate(&model).iter().any(|error| matches!(
-            error,
-            ValidationError::InvalidInputKind { input, .. }
-                if input == &id("input.create_order.request")
-        ))
-    );
+    assert!(validation::validate(&model).iter().any(|error| matches!(
+        error,
+        ValidationError::InvalidInputKind { input, .. }
+            if input == &id("input.create_order.request")
+    )));
 }
 
 #[test]
@@ -3275,11 +3197,13 @@ fn a_bounded_member_concurrency_of_zero_is_unrepresentable() {
         member_concurrency: MemberConcurrency::Bounded(
             std::num::NonZeroU32::new(1).expect("non-zero"),
         ),
-        execution_handoff: None,
     })
     .expect("serializes");
 
-    assert_eq!(json, r#"{"member_concurrency":{"kind":"bounded","value":1}}"#);
+    assert_eq!(
+        json,
+        r#"{"member_concurrency":{"kind":"bounded","value":1}}"#
+    );
 
     let zero: Result<ExecutionPool, _> =
         serde_json::from_str(r#"{"member_concurrency":{"kind":"bounded","value":0}}"#);
@@ -3665,7 +3589,9 @@ fn rejects_racing_incompatible_result_contracts() {
         .result
         .as_mut()
         .expect("card charge declares a result")
-        .err
+        .errors
+        .get_mut(&id("declined"))
+        .unwrap()
         .schema = id("schema.RequestRejected");
 
     program.steps.insert(
@@ -3849,7 +3775,10 @@ fn rejects_an_invalid_dedup_key_path_in_an_async_launch() {
 
     external.identity = ExternalIdentity::Keyed {
         key: ExternalIdentityKey {
-            components: vec![input_ref("input.charge_payment.reserved", &["no_such_field"])],
+            components: vec![input_ref(
+                "input.charge_payment.reserved",
+                &["no_such_field"],
+            )],
         },
     };
 
@@ -3903,15 +3832,17 @@ fn rejects_an_outbox_write_outside_a_transaction() {
 
     let write = detach_outbox_write(&mut model);
 
-    program_mut(&mut model, "operation.create_order").steps.insert(
-        1,
-        OperationStep::ExecuteEffect(ExecuteEffect {
-            effect_id: write.effect_id.clone(),
-            effect: Effect::OutboxWrite(write.effect),
-            values: write.values,
-            bind: None,
-        }),
-    );
+    program_mut(&mut model, "operation.create_order")
+        .steps
+        .insert(
+            1,
+            OperationStep::ExecuteEffect(ExecuteEffect {
+                effect_id: write.effect_id.clone(),
+                effect: Effect::OutboxWrite(write.effect),
+                values: write.values,
+                bind: None,
+            }),
+        );
 
     let errors = validation::validate(&model);
 
@@ -3930,15 +3861,17 @@ fn rejects_an_outbox_write_launched_asynchronously() {
 
     let write = detach_outbox_write(&mut model);
 
-    program_mut(&mut model, "operation.create_order").steps.insert(
-        1,
-        OperationStep::ExecuteEffectAsync(ExecuteEffectAsync {
-            handle: id("async.create_order.outbox"),
-            effect_id: write.effect_id.clone(),
-            effect: Effect::OutboxWrite(write.effect),
-            values: write.values,
-        }),
-    );
+    program_mut(&mut model, "operation.create_order")
+        .steps
+        .insert(
+            1,
+            OperationStep::ExecuteEffectAsync(ExecuteEffectAsync {
+                handle: id("async.create_order.outbox"),
+                effect_id: write.effect_id.clone(),
+                effect: Effect::OutboxWrite(write.effect),
+                values: write.values,
+            }),
+        );
 
     let errors = validation::validate(&model);
 
@@ -4139,7 +4072,8 @@ fn rejects_outbox_identity_defects() {
 
     // An unadmitted mapped schema, and an empty tuple for the admitted
     // one.
-    key.mapping.insert(id("schema.OrderProjection"), vec![path(&["event_id"])]);
+    key.mapping
+        .insert(id("schema.OrderProjection"), vec![path(&["event_id"])]);
     key.mapping.insert(id("schema.OrderCreated"), Vec::new());
 
     let errors = validation::validate(&model);
@@ -4245,7 +4179,8 @@ fn rejects_partition_mapping_defects() {
         panic!("the fixture partitions by key");
     };
 
-    key.mapping.insert(id("schema.CreateOrderResponse"), Vec::new());
+    key.mapping
+        .insert(id("schema.CreateOrderResponse"), Vec::new());
 
     let errors = validation::validate(&model);
 

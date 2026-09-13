@@ -19,7 +19,9 @@ import { CitedText, IdLink, StatusBadge } from "./parts";
  *  An unproven one records the dual — the layer the facts it is waiting
  *  on belong to — so a reader knows whether the next declaration is an
  *  application one or a topology one. Neither is an alarm; the status
- *  badge beside it carries that. */
+ *  badge beside it carries that. A transaction serializability or
+ *  ordering obligation is always L0: its proof rests on the transaction
+ *  primitives, and its obstacles are application declarations. */
 function layerNote(ob: Obligation): { label: string; hint: string } | null {
   if (ob.scope) {
     return ob.scope === "runtime_dependent"
@@ -41,14 +43,15 @@ function layerNote(ob: Obligation): { label: string; hint: string } | null {
       ? {
           label: "needs L1 fact",
           hint:
-            "Every remaining obstacle names a runtime fact — grouping, ordering, routing, member " +
-            "assignment, or pool concurrency. A routing hint, not a promise: declaring one is " +
-            "where to go next, not proof that it closes the argument.",
+            "Every remaining obstacle names a runtime fact — delivery, transport, routing, or " +
+            "pool topology. A routing hint, not a promise: declaring one is where to go next, " +
+            "not proof that it closes the argument.",
         }
       : {
           label: "needs L0 fact",
           hint:
-            "At least one obstacle names an application fact — the program, the interface, or the " +
+            "At least one obstacle names an application fact — the program, the transaction's " +
+            "isolation, locks, version protocol, cursors or fences, the interface, or the " +
             "requirement itself — so no runtime declaration alone can discharge this.",
         };
   }

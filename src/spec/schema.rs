@@ -330,7 +330,7 @@ impl ScalarType {
 /// `Display` joins with `.`, so diagnostics name `customer.id` — and
 /// the shorthand only lets a declaration be written the way it will
 /// be read. A component containing a `.` must use the sequence form.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(transparent)]
 pub struct FieldPath(pub Vec<String>);
 

@@ -12,7 +12,7 @@ import { worstStatus } from "../lib/obligations";
 import { hashes } from "../lib/route";
 import { useApp } from "../state/AppState";
 import { Fact, IdLink, Mono, SectionCard, StatusChips, selectableRow } from "../panels/parts";
-import type { Id, TransitionSideEffect } from "../types/model";
+import type { Id, TransitionEffect, TransitionSideEffect } from "../types/model";
 import { layoutMachine } from "./layoutMachine";
 
 const PAD = 56;
@@ -65,6 +65,29 @@ function SideEffectItem({ effectId, effect }: { effectId: Id; effect: Transition
   );
 }
 
+/** One transition-scoped outbox admission: admitted atomically with the
+ *  applying transaction's commit, and only when the transition applies,
+ *  so it is a commit artifact rather than an intent to execute later. */
+function AdmissionItem({ effectId, effect }: { effectId: Id; effect: TransitionEffect }) {
+  return (
+    <li className="flex items-start gap-2">
+      <Badge variant="purple">outbox write</Badge>
+      <div className="min-w-0 space-y-0.5">
+        <div>
+          <IdLink id={effectId}>{shortId(effectId)}</IdLink>
+        </div>
+        <div className="flex flex-wrap items-center gap-x-1.5 text-xs text-kumo-subtle">
+          <span>→ outbox</span>
+          <IdLink id={effect.outbox}>{shortId(effect.outbox)}</IdLink>
+          <span>· schema</span>
+          <IdLink id={effect.schema}>{shortId(effect.schema)}</IdLink>
+        </div>
+        <div className="text-xs text-kumo-subtle">admitted atomically with the applying transaction</div>
+      </div>
+    </li>
+  );
+}
+
 export function MachineView({ id, highlight }: { id: string; highlight: string | null }) {
   const { model, graph, selection, obligations, select, navigateTo } = useApp();
   const machine = model.state_machines[id];
@@ -111,6 +134,7 @@ export function MachineView({ id, highlight }: { id: string; highlight: string |
 
   const transitions = Object.entries(machine.transitions);
   const sideEffectCount = transitions.reduce((n, [, t]) => n + Object.keys(t.side_effects).length, 0);
+  const admissionCount = transitions.reduce((n, [, t]) => n + Object.keys(t.effects ?? {}).length, 0);
 
   return (
     <div className="h-full overflow-auto">
@@ -127,6 +151,7 @@ export function MachineView({ id, highlight }: { id: string; highlight: string |
             <Fact label="states">{machine.states.length}</Fact>
             <Fact label="transitions">{transitions.length}</Fact>
             <Fact label="side effects">{sideEffectCount}</Fact>
+            {admissionCount > 0 && <Fact label="outbox admissions">{admissionCount}</Fact>}
             {(obligations.get(id) ?? []).length > 0 && <Fact label="verdicts"><StatusChips obKey={id} /></Fact>}
           </dl>
         </header>
@@ -219,7 +244,7 @@ export function MachineView({ id, highlight }: { id: string; highlight: string |
         <SectionCard
           title="Transitions"
           count={transitions.length}
-          hint="each with its side effects and the transaction steps that take it"
+          hint="each a commit guard over the subject's state — a subject not in a from state rejects the taking transaction — with its side effects, its outbox admissions, and the transaction steps that take it"
         >
           <div className="overflow-x-auto">
             <Table>
@@ -238,6 +263,7 @@ export function MachineView({ id, highlight }: { id: string; highlight: string |
                   const key = `t:${tId}`;
                   const refs = graph.transition_refs[`${id}/${tId}`] ?? [];
                   const effects = Object.entries(t.side_effects);
+                  const admissions = Object.entries(t.effects ?? {});
                   return (
                     <Table.Row key={tId} className={selectableRow(selection === key)} onClick={() => chooseTransition(tId)}>
                       <Table.Cell className="whitespace-nowrap align-top">
@@ -250,9 +276,10 @@ export function MachineView({ id, highlight }: { id: string; highlight: string |
                       </Table.Cell>
                       <Table.Cell className="align-top"><Mono className="text-kumo-subtle">{shortId(t.to)}</Mono></Table.Cell>
                       <Table.Cell className="min-w-[280px] align-top">
-                        {effects.length ? (
+                        {effects.length || admissions.length ? (
                           <ul className="space-y-2">
                             {effects.map(([eid, e]) => <SideEffectItem key={eid} effectId={eid} effect={e} />)}
+                            {admissions.map(([eid, e]) => <AdmissionItem key={eid} effectId={eid} effect={e} />)}
                           </ul>
                         ) : (
                           <span className="text-xs text-kumo-inactive">none</span>

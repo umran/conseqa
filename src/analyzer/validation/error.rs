@@ -1,9 +1,151 @@
 use crate::analyzer::{
     Diagnostic, DiagnosticCode, Evidence, IdDeclaration, Severity, ValidationCode,
 };
-use crate::spec::{FieldPath, Id, ResultVariant, StepLocation};
+use crate::spec::{CursorAdvanceRule, FieldPath, Id, ResultVariant, StepLocation, ValueRef};
 
 use super::{InputKind, ReferenceKind};
+
+/// Which transaction requirement family a diagnostic concerns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransactionRequirementFamily {
+    Serializability,
+    Ordering,
+}
+
+impl std::fmt::Display for TransactionRequirementFamily {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Serializability => "serializability",
+            Self::Ordering => "ordering",
+        })
+    }
+}
+
+/// Why a value is not available when a transaction begins.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EntryUnavailability {
+    /// The value is a read performed inside the transaction itself.
+    TransactionRead { read: Id },
+
+    /// A transaction artifact no transaction on every reaching path
+    /// establishes.
+    ArtifactNotAvailable { artifact: Id },
+
+    /// A result binding no effect-executing step on every reaching
+    /// path binds.
+    ResultNotBound { result: Id },
+
+    /// A result payload referenced outside the match arm that selects
+    /// it.
+    ResultPayloadOutOfScope { result: Id },
+}
+
+impl std::fmt::Display for EntryUnavailability {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TransactionRead { read } => write!(
+                f,
+                "it is transaction read `{read}`, which is performed inside the transaction \
+                 and so does not exist when it begins"
+            ),
+
+            Self::ArtifactNotAvailable { artifact } => write!(
+                f,
+                "transaction artifact `{artifact}` is not established on every path reaching \
+                 the step"
+            ),
+
+            Self::ResultNotBound { result } => write!(
+                f,
+                "result `{result}` is not bound on every path reaching the step"
+            ),
+
+            Self::ResultPayloadOutOfScope { result } => write!(
+                f,
+                "the payload of result `{result}` is referenced outside the match arm that \
+                 selects it"
+            ),
+        }
+    }
+}
+
+/// The semantic role a managed monotonic field plays.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ManagedRole {
+    Version,
+    Cursor { rule: CursorAdvanceRule },
+    Fence,
+}
+
+impl std::fmt::Display for ManagedRole {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Version => f.write_str("version"),
+            Self::Cursor { rule } => write!(f, "cursor ({rule})"),
+            Self::Fence => f.write_str("fence"),
+        }
+    }
+}
+
+/// Why a declared version field is not a valid one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VersionFieldDefect {
+    Unresolved,
+    Optional,
+    NotInt { found: String },
+    IdentityField,
+}
+
+impl std::fmt::Display for VersionFieldDefect {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unresolved => f.write_str("it does not resolve against the object's schema"),
+            Self::Optional => f.write_str("it is optional, and a version token must always exist"),
+            Self::NotInt { found } => write!(f, "it is {found}, and a version token must be int"),
+            Self::IdentityField => {
+                f.write_str("it is part of the object's identity, which a version never is")
+            }
+        }
+    }
+}
+
+/// Why a managed field, or the value driving it, has the wrong type.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ManagedFieldDefect {
+    Unresolved,
+    Optional,
+    NotOrderedScalar { found: String },
+    NotInt { found: String },
+    ValueTypeMismatch { expected: String, found: String },
+}
+
+impl std::fmt::Display for ManagedFieldDefect {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unresolved => {
+                f.write_str("the field does not resolve against the object's schema")
+            }
+            Self::Optional => {
+                f.write_str("the field is optional, and a managed position must always exist")
+            }
+            Self::NotOrderedScalar { found } => write!(
+                f,
+                "the field is {found}, and a managed position must be an ordered scalar: int, \
+                 decimal, or timestamp"
+            ),
+            Self::NotInt { found } => {
+                write!(
+                    f,
+                    "the field is {found}, and a successor cursor must be int"
+                )
+            }
+            Self::ValueTypeMismatch { expected, found } => write!(
+                f,
+                "the incoming value is {found}, but the field is {expected}"
+            ),
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ValidationError {
@@ -102,21 +244,201 @@ pub enum ValidationError {
         input: Id,
     },
 
-    /// An invocation lock's key is not sourced from an input. The key
-    /// is evaluated at operation entry, before any program step
-    /// executes, and only an input payload exists there.
-    InvocationLockKeyNotFromInput {
+    /// A transaction requirement key is not available when the
+    /// transaction begins: it is a read the transaction itself
+    /// performs, or an artifact or result not definitely established
+    /// on every path reaching the step.
+    TransactionRequirementKeyUnavailable {
         operation: Id,
-        source: Id,
+        location: StepLocation,
+        transaction: Id,
+        family: TransactionRequirementFamily,
+        requirement: usize,
+        key: ValueRef,
+        reason: EntryUnavailability,
     },
 
-    /// The operation admits invocations through an input other than
-    /// its invocation lock key's source. Those invocations carry no
-    /// value for the key, so the entry lock cannot be evaluated for
-    /// them.
-    InvocationLockKeyNotEvaluable {
+    /// An ordering requirement's position is not available when the
+    /// transaction begins.
+    TransactionOrderingPositionUnavailable {
         operation: Id,
-        input: Id,
+        location: StepLocation,
+        transaction: Id,
+        requirement: usize,
+        position: ValueRef,
+        reason: EntryUnavailability,
+    },
+
+    /// An ordering requirement's position does not resolve to a
+    /// non-optional ordered scalar — `int`, `decimal`, or `timestamp`.
+    TransactionOrderingPositionNotOrderedScalar {
+        operation: Id,
+        transaction: Id,
+        requirement: usize,
+        position: ValueRef,
+        found: String,
+    },
+
+    /// A transaction containing a rejecting step — a transition, a
+    /// version validation, a cursor advance, or a fence — is executed
+    /// without a `rejected` block.
+    MissingTransactionRejectedArm {
+        operation: Id,
+        location: StepLocation,
+        transaction: Id,
+        step: usize,
+    },
+
+    /// A transaction with no rejecting step is executed with a
+    /// `rejected` block that control can never enter.
+    UnexpectedTransactionRejectedArm {
+        operation: Id,
+        location: StepLocation,
+        transaction: Id,
+    },
+
+    /// A transition-scoped outbox effect names an outbox no data model
+    /// declares.
+    UnknownTransitionOutbox {
+        machine: Id,
+        transition: Id,
+        effect: Id,
+        outbox: Id,
+    },
+
+    /// A transition-scoped outbox effect admits a schema that is not
+    /// declared, or that the outbox does not admit.
+    InvalidTransitionOutboxSchema {
+        machine: Id,
+        transition: Id,
+        effect: Id,
+        outbox: Id,
+        schema: Id,
+    },
+
+    /// A transition-scoped outbox effect targets an outbox outside the
+    /// data model that owns the machine's subject object, so the
+    /// admission could not be atomic with the transition.
+    TransitionOutboxOutsideDataModel {
+        machine: Id,
+        transition: Id,
+        effect: Id,
+        outbox: Id,
+        data_model: Id,
+    },
+
+    /// A `StateTransition` step's `effects` keys do not exactly match
+    /// the outbox effects declared by the applied transition, so some
+    /// admission has no message derivation or a derivation names no
+    /// declared admission.
+    InvalidTransitionOutboxDerivation {
+        transaction: Id,
+        transition: Id,
+        missing: Vec<Id>,
+        unexpected: Vec<Id>,
+    },
+
+    /// An object's declared version field is not a non-optional `int`
+    /// outside its identity.
+    InvalidObjectVersionField {
+        object: Id,
+        field: FieldPath,
+        defect: VersionFieldDefect,
+    },
+
+    /// An ordinary write names an object's version field, which only
+    /// the version protocol may assign.
+    DirectWriteToVersionField {
+        transaction: Id,
+        step: usize,
+        object: Id,
+        field: FieldPath,
+    },
+
+    /// A write or transition of a live versioned instance is not
+    /// accompanied by a `bump_version` of the same instance.
+    MissingVersionBump {
+        transaction: Id,
+        step: usize,
+        object: Id,
+    },
+
+    /// One transaction bumps one selected instance more than once.
+    DuplicateVersionBump {
+        transaction: Id,
+        step: usize,
+        object: Id,
+    },
+
+    /// A `validate_version` step's expected version is not a preceding
+    /// read of the same instance's declared version field.
+    VersionValidationWithoutObservedVersion {
+        transaction: Id,
+        step: usize,
+        object: Id,
+    },
+
+    /// A `validate_version` or `bump_version` step targets an object
+    /// that declares no version.
+    VersionProtocolOnUnversionedObject {
+        transaction: Id,
+        step: usize,
+        object: Id,
+    },
+
+    /// One field is used in two managed roles — a version, a cursor
+    /// under some rule, a fence — and a managed field has exactly one.
+    ManagedFieldRoleConflict {
+        object: Id,
+        field: FieldPath,
+        first: ManagedRole,
+        second: ManagedRole,
+    },
+
+    /// An ordinary write names a cursor or fence field, which only its
+    /// protocol step may assign.
+    DirectWriteToManagedField {
+        transaction: Id,
+        step: usize,
+        object: Id,
+        field: FieldPath,
+        role: ManagedRole,
+    },
+
+    /// A cursor or fence field, or the value driving it, is not of the
+    /// type its role requires.
+    InvalidManagedFieldType {
+        object: Id,
+        field: FieldPath,
+        role: ManagedRole,
+        defect: ManagedFieldDefect,
+    },
+
+    /// A `return` names an error class the request's result contract
+    /// does not declare.
+    UnknownResultErrorClass {
+        operation: Id,
+        location: StepLocation,
+        request: Id,
+        error: Id,
+    },
+
+    /// A `match_result` has no arm for an error class the matched
+    /// result's contract declares.
+    MissingResultErrorArm {
+        operation: Id,
+        location: StepLocation,
+        result: Id,
+        error: Id,
+    },
+
+    /// A `match_result` has an arm for an error class the matched
+    /// result's contract does not declare.
+    UnexpectedResultErrorArm {
+        operation: Id,
+        location: StepLocation,
+        result: Id,
+        error: Id,
     },
 
     /// A router declares a routing block whose key tuple is empty, so
@@ -321,18 +643,24 @@ pub enum ValidationError {
     /// keyed interaction identity: the guarantee is quantified over
     /// applications of one interaction, and no identity defines which
     /// applications those are.
-    ExternalIdempotencyRequiresIdentity { effect: Id },
+    ExternalIdempotencyRequiresIdentity {
+        effect: Id,
+    },
 
     /// An external effect declares `result_replay: replay_stable`
     /// without a keyed interaction identity: the fixed terminal result
     /// is a fact about one interaction, and no identity defines it.
-    ExternalReplayStabilityRequiresIdentity { effect: Id },
+    ExternalReplayStabilityRequiresIdentity {
+        effect: Id,
+    },
 
     /// An external effect declares a `result_replay` behaviour —
     /// `unstable` or `replay_stable` — while declaring no result
     /// contract: there is no modeled synchronous result whose replay
     /// behaviour could be described.
-    ExternalResultReplayWithoutResult { effect: Id },
+    ExternalResultReplayWithoutResult {
+        effect: Id,
+    },
 
     /// A `join_all` declares no handles; the barrier would wait on
     /// nothing.
@@ -1168,36 +1496,518 @@ impl From<ValidationError> for Diagnostic {
                 }
             }
 
-            ValidationError::InvocationLockKeyNotFromInput { operation, source } => Diagnostic {
-                code: DiagnosticCode::Validation(ValidationCode::InvocationLockKeyNotFromInput),
+            ValidationError::TransactionRequirementKeyUnavailable {
+                operation,
+                location,
+                transaction,
+                family,
+                requirement,
+                key,
+                reason,
+            } => Diagnostic {
+                code: DiagnosticCode::Validation(
+                    ValidationCode::TransactionRequirementKeyUnavailable,
+                ),
                 severity: Severity::Error,
-                subject: Some(operation.clone()),
+                subject: Some(transaction.clone()),
                 message: format!(
-                    "The invocation lock of `{operation}` keys on `{source}`, \
-                     which is not an input of the operation."
+                    "The key of {family} requirement {requirement} of `{transaction}` \
+                     (step `{location}` of `{operation}`), `{}.{}`, is not available when \
+                     the transaction begins: {reason}.",
+                    key.source.id(),
+                    key.path
                 ),
                 evidence: vec![Evidence {
-                    subject: Some(source),
-                    message: "The lock key is evaluated at operation entry, before \
-                              any program step executes, and only an input payload \
-                              exists there."
+                    subject: Some(transaction),
+                    message: "A transaction requirement key identifies the conflict domain \
+                              before the transaction executes, so it may derive only from an \
+                              input, a prior transaction output, or a synchronous result \
+                              already bound on every reaching path — never from a read the \
+                              transaction itself performs."
                         .to_string(),
                 }],
             },
 
-            ValidationError::InvocationLockKeyNotEvaluable { operation, input } => Diagnostic {
-                code: DiagnosticCode::Validation(ValidationCode::InvocationLockKeyNotEvaluable),
+            ValidationError::TransactionOrderingPositionUnavailable {
+                operation,
+                location,
+                transaction,
+                requirement,
+                position,
+                reason,
+            } => Diagnostic {
+                code: DiagnosticCode::Validation(
+                    ValidationCode::TransactionOrderingPositionUnavailable,
+                ),
+                severity: Severity::Error,
+                subject: Some(transaction.clone()),
+                message: format!(
+                    "The position of ordering requirement {requirement} of `{transaction}` \
+                     (step `{location}` of `{operation}`), `{}.{}`, is not available when \
+                     the transaction begins: {reason}.",
+                    position.source.id(),
+                    position.path
+                ),
+                evidence: vec![Evidence {
+                    subject: Some(transaction),
+                    message: "An ordering position is the transaction's logical precedence \
+                              within its domain, fixed before it executes: an input, a prior \
+                              transaction output, or a synchronous result already bound on \
+                              every reaching path."
+                        .to_string(),
+                }],
+            },
+
+            ValidationError::TransactionOrderingPositionNotOrderedScalar {
+                operation,
+                transaction,
+                requirement,
+                position,
+                found,
+            } => Diagnostic {
+                code: DiagnosticCode::Validation(
+                    ValidationCode::TransactionOrderingPositionNotOrderedScalar,
+                ),
+                severity: Severity::Error,
+                subject: Some(transaction.clone()),
+                message: format!(
+                    "The position of ordering requirement {requirement} of `{transaction}` \
+                     in `{operation}`, `{}.{}`, is {found}; an ordering position must be a \
+                     non-optional int, decimal, or timestamp.",
+                    position.source.id(),
+                    position.path
+                ),
+                evidence: vec![Evidence {
+                    subject: Some(transaction),
+                    message: "`float` is excluded because NaN and implementation-specific \
+                              comparison make it no total order; `uuid`, `bool`, structured \
+                              schemas, and lists are not positions."
+                        .to_string(),
+                }],
+            },
+
+            ValidationError::MissingTransactionRejectedArm {
+                operation,
+                location,
+                transaction,
+                step,
+            } => Diagnostic {
+                code: DiagnosticCode::Validation(ValidationCode::MissingTransactionRejectedArm),
+                severity: Severity::Error,
+                subject: Some(transaction.clone()),
+                message: format!(
+                    "Transaction `{transaction}` at step `{location}` of `{operation}` can \
+                     reject — its step {} is a commit guard — but the step declares no \
+                     `rejected` block.",
+                    step + 1
+                ),
+                evidence: vec![Evidence {
+                    subject: Some(transaction),
+                    message: "A transition, version validation, cursor advance, or fence may \
+                              conclusively fail at commit; the operation must say what \
+                              control does then. Declare `rejected` with the block control \
+                              enters when the transaction rejects."
+                        .to_string(),
+                }],
+            },
+
+            ValidationError::UnexpectedTransactionRejectedArm {
+                operation,
+                location,
+                transaction,
+            } => Diagnostic {
+                code: DiagnosticCode::Validation(
+                    ValidationCode::UnexpectedTransactionRejectedArm,
+                ),
+                severity: Severity::Error,
+                subject: Some(transaction.clone()),
+                message: format!(
+                    "Transaction `{transaction}` at step `{location}` of `{operation}` \
+                     declares a `rejected` block, but no step of its body can reject."
+                ),
+                evidence: vec![Evidence {
+                    subject: Some(transaction),
+                    message: "Only a transition, version validation, cursor advance, or \
+                              fence rejects; a transaction without one either commits or is \
+                              interrupted, and interruption never enters `rejected`. Remove \
+                              the block."
+                        .to_string(),
+                }],
+            },
+
+            ValidationError::UnknownTransitionOutbox {
+                machine,
+                transition,
+                effect,
+                outbox,
+            } => Diagnostic {
+                code: DiagnosticCode::Validation(ValidationCode::UnknownTransitionOutbox),
+                severity: Severity::Error,
+                subject: Some(transition.clone()),
+                message: format!(
+                    "Transition `{transition}` of `{machine}` admits `{effect}` to outbox \
+                     `{outbox}`, which no data model declares."
+                ),
+                evidence: vec![Evidence {
+                    subject: Some(outbox),
+                    message: "A transition-scoped outbox write names an outbox of the data \
+                              model that owns the machine's subject object."
+                        .to_string(),
+                }],
+            },
+
+            ValidationError::InvalidTransitionOutboxSchema {
+                machine,
+                transition,
+                effect,
+                outbox,
+                schema,
+            } => Diagnostic {
+                code: DiagnosticCode::Validation(ValidationCode::InvalidTransitionOutboxSchema),
+                severity: Severity::Error,
+                subject: Some(transition.clone()),
+                message: format!(
+                    "Transition `{transition}` of `{machine}` admits schema `{schema}` to \
+                     outbox `{outbox}` through `{effect}`, but that schema is not one the \
+                     outbox admits."
+                ),
+                evidence: vec![Evidence {
+                    subject: Some(schema),
+                    message: "The admitted schema must be declared and listed among the \
+                              outbox's messages."
+                        .to_string(),
+                }],
+            },
+
+            ValidationError::TransitionOutboxOutsideDataModel {
+                machine,
+                transition,
+                effect,
+                outbox,
+                data_model,
+            } => Diagnostic {
+                code: DiagnosticCode::Validation(
+                    ValidationCode::TransitionOutboxOutsideDataModel,
+                ),
+                severity: Severity::Error,
+                subject: Some(transition.clone()),
+                message: format!(
+                    "Transition `{transition}` of `{machine}` admits `{effect}` to outbox \
+                     `{outbox}`, which does not belong to `{data_model}`, the data model \
+                     that owns the machine's subject."
+                ),
+                evidence: vec![Evidence {
+                    subject: Some(outbox),
+                    message: "A transition-scoped admission is atomic with the transaction \
+                              that applies the transition, and that transaction's atomic \
+                              boundary is the subject's data model; Conseqa never infers a \
+                              distributed cross-data-model atomic commit."
+                        .to_string(),
+                }],
+            },
+
+            ValidationError::InvalidTransitionOutboxDerivation {
+                transaction,
+                transition,
+                missing,
+                unexpected,
+            } => {
+                let mut evidence = Vec::new();
+
+                for effect in &missing {
+                    evidence.push(Evidence {
+                        subject: Some(effect.clone()),
+                        message: format!(
+                            "The transition declares outbox effect `{effect}`, but the step \
+                             provides no message derivation for it."
+                        ),
+                    });
+                }
+
+                for effect in &unexpected {
+                    evidence.push(Evidence {
+                        subject: Some(effect.clone()),
+                        message: format!(
+                            "The step provides a derivation for `{effect}`, which is not an \
+                             outbox effect declared by transition `{transition}`."
+                        ),
+                    });
+                }
+
+                Diagnostic {
+                    code: DiagnosticCode::Validation(
+                        ValidationCode::InvalidTransitionOutboxDerivation,
+                    ),
+                    severity: Severity::Error,
+                    subject: Some(transaction.clone()),
+                    message: format!(
+                        "Transaction `{transaction}` applies transition `{transition}` with \
+                         `effects` that do not exactly match the transition's declared \
+                         outbox effects."
+                    ),
+                    evidence,
+                }
+            }
+
+            ValidationError::InvalidObjectVersionField {
+                object,
+                field,
+                defect,
+            } => Diagnostic {
+                code: DiagnosticCode::Validation(ValidationCode::InvalidObjectVersionField),
+                severity: Severity::Error,
+                subject: Some(object.clone()),
+                message: format!(
+                    "Data object `{object}` declares `{field}` as its version field, but \
+                     {defect}."
+                ),
+                evidence: vec![Evidence {
+                    subject: Some(object),
+                    message: "A version field is a non-optional int outside the object's \
+                              identity, managed by the version protocol alone."
+                        .to_string(),
+                }],
+            },
+
+            ValidationError::DirectWriteToVersionField {
+                transaction,
+                step,
+                object,
+                field,
+            } => Diagnostic {
+                code: DiagnosticCode::Validation(ValidationCode::DirectWriteToVersionField),
+                severity: Severity::Error,
+                subject: Some(transaction.clone()),
+                message: format!(
+                    "Step {} of transaction `{transaction}` writes `{field}` of `{object}`, \
+                     the object's version field.",
+                    step + 1
+                ),
+                evidence: vec![Evidence {
+                    subject: Some(object),
+                    message: "A version is never assigned through a derivation: `insert` \
+                              creates the initial version and `bump_version` advances it."
+                        .to_string(),
+                }],
+            },
+
+            ValidationError::MissingVersionBump {
+                transaction,
+                step,
+                object,
+            } => Diagnostic {
+                code: DiagnosticCode::Validation(ValidationCode::MissingVersionBump),
+                severity: Severity::Error,
+                subject: Some(transaction.clone()),
+                message: format!(
+                    "Step {} of transaction `{transaction}` mutates versioned object \
+                     `{object}` without a `bump_version` of the same selected instance.",
+                    step + 1
+                ),
+                evidence: vec![Evidence {
+                    subject: Some(object),
+                    message: "Every write or transition of a live versioned instance must be \
+                              accompanied by a `bump_version` whose selector is exactly the \
+                              mutation's, so a validating reader detects the mutation at \
+                              commit."
+                        .to_string(),
+                }],
+            },
+
+            ValidationError::DuplicateVersionBump {
+                transaction,
+                step,
+                object,
+            } => Diagnostic {
+                code: DiagnosticCode::Validation(ValidationCode::DuplicateVersionBump),
+                severity: Severity::Error,
+                subject: Some(transaction.clone()),
+                message: format!(
+                    "Step {} of transaction `{transaction}` bumps the version of an \
+                     `{object}` instance an earlier step already bumps.",
+                    step + 1
+                ),
+                evidence: vec![Evidence {
+                    subject: Some(object),
+                    message: "One transaction bumps one selected instance at most once: the \
+                              version advances by exactly one per successful commit."
+                        .to_string(),
+                }],
+            },
+
+            ValidationError::VersionValidationWithoutObservedVersion {
+                transaction,
+                step,
+                object,
+            } => Diagnostic {
+                code: DiagnosticCode::Validation(
+                    ValidationCode::VersionValidationWithoutObservedVersion,
+                ),
+                severity: Severity::Error,
+                subject: Some(transaction.clone()),
+                message: format!(
+                    "Step {} of transaction `{transaction}` validates the version of \
+                     `{object}` against a value that is not a preceding read of that \
+                     instance's version field.",
+                    step + 1
+                ),
+                evidence: vec![Evidence {
+                    subject: Some(object),
+                    message: "`expected` must be `transaction_read:<bind>.<version field>` of \
+                              an earlier read that selects the same instance and covers the \
+                              version field; only an observed version makes the validation a \
+                              commit guard."
+                        .to_string(),
+                }],
+            },
+
+            ValidationError::VersionProtocolOnUnversionedObject {
+                transaction,
+                step,
+                object,
+            } => Diagnostic {
+                code: DiagnosticCode::Validation(
+                    ValidationCode::VersionProtocolOnUnversionedObject,
+                ),
+                severity: Severity::Error,
+                subject: Some(transaction.clone()),
+                message: format!(
+                    "Step {} of transaction `{transaction}` applies the version protocol to \
+                     `{object}`, which declares no version.",
+                    step + 1
+                ),
+                evidence: vec![Evidence {
+                    subject: Some(object),
+                    message: "Declare `version` on the data object before validating or \
+                              bumping it."
+                        .to_string(),
+                }],
+            },
+
+            ValidationError::ManagedFieldRoleConflict {
+                object,
+                field,
+                first,
+                second,
+            } => Diagnostic {
+                code: DiagnosticCode::Validation(ValidationCode::ManagedFieldRoleConflict),
+                severity: Severity::Error,
+                subject: Some(object.clone()),
+                message: format!(
+                    "Field `{field}` of `{object}` is used as a {first} and as a {second}."
+                ),
+                evidence: vec![Evidence {
+                    subject: Some(object),
+                    message: "A managed field has exactly one semantic role: a version, a \
+                              cursor under one rule, or a fence."
+                        .to_string(),
+                }],
+            },
+
+            ValidationError::DirectWriteToManagedField {
+                transaction,
+                step,
+                object,
+                field,
+                role,
+            } => Diagnostic {
+                code: DiagnosticCode::Validation(ValidationCode::DirectWriteToManagedField),
+                severity: Severity::Error,
+                subject: Some(transaction.clone()),
+                message: format!(
+                    "Step {} of transaction `{transaction}` writes `{field}` of `{object}`, \
+                     a managed {role} field.",
+                    step + 1
+                ),
+                evidence: vec![Evidence {
+                    subject: Some(object),
+                    message: "A cursor advances only through `advance_cursor` and a fence \
+                              only through `fence`; an ordinary write would break the order \
+                              their proofs rest on. Insert initialization remains permitted."
+                        .to_string(),
+                }],
+            },
+
+            ValidationError::InvalidManagedFieldType {
+                object,
+                field,
+                role,
+                defect,
+            } => Diagnostic {
+                code: DiagnosticCode::Validation(ValidationCode::InvalidManagedFieldType),
+                severity: Severity::Error,
+                subject: Some(object.clone()),
+                message: format!(
+                    "Field `{field}` of `{object}` is used as a {role}, but {defect}."
+                ),
+                evidence: vec![Evidence {
+                    subject: Some(object),
+                    message: "A successor cursor is a non-optional int; a monotonic cursor or \
+                              a fence is a non-optional int, decimal, or timestamp; and the \
+                              value driving it has the field's type."
+                        .to_string(),
+                }],
+            },
+
+            ValidationError::UnknownResultErrorClass {
+                operation,
+                location,
+                request,
+                error,
+            } => Diagnostic {
+                code: DiagnosticCode::Validation(ValidationCode::UnknownResultErrorClass),
                 severity: Severity::Error,
                 subject: Some(operation.clone()),
                 message: format!(
-                    "`{operation}` admits invocations through `{input}`, which \
-                     carry no value for its invocation lock's key."
+                    "Program step `{location}` of `{operation}` returns error class \
+                     `{error}` for `{request}`, which declares no such class."
                 ),
                 evidence: vec![Evidence {
-                    subject: Some(input),
-                    message: "Every invocation acquires the lock at entry, so its \
-                              key must be evaluable from every input. Key the lock \
-                              on the operation's only input, or remove the lock."
+                    subject: Some(request),
+                    message: "A returned error names one of the classes in the request's \
+                              result contract; its derivation must match that class's \
+                              schema."
+                        .to_string(),
+                }],
+            },
+
+            ValidationError::MissingResultErrorArm {
+                operation,
+                location,
+                result,
+                error,
+            } => Diagnostic {
+                code: DiagnosticCode::Validation(ValidationCode::MissingResultErrorArm),
+                severity: Severity::Error,
+                subject: Some(operation.clone()),
+                message: format!(
+                    "Program step `{location}` of `{operation}` matches `{result}` without \
+                     an arm for its error class `{error}`."
+                ),
+                evidence: vec![Evidence {
+                    subject: Some(result),
+                    message: "Error arms are explicit and exhaustive over the result \
+                              contract's error classes."
+                        .to_string(),
+                }],
+            },
+
+            ValidationError::UnexpectedResultErrorArm {
+                operation,
+                location,
+                result,
+                error,
+            } => Diagnostic {
+                code: DiagnosticCode::Validation(ValidationCode::UnexpectedResultErrorArm),
+                severity: Severity::Error,
+                subject: Some(operation.clone()),
+                message: format!(
+                    "Program step `{location}` of `{operation}` matches `{result}` with an \
+                     arm for `{error}`, which is not an error class of its contract."
+                ),
+                evidence: vec![Evidence {
+                    subject: Some(result),
+                    message: "Only the classes the result contract declares have arms."
                         .to_string(),
                 }],
             },
