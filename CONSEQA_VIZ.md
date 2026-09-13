@@ -39,10 +39,12 @@ schemas, the runtime, and the boundary the model stops at; a service
 holds its operations; an operation its inline transactions; a data
 model its objects and outboxes; an object the machine that governs it;
 the runtime its pools, routers, and storage layouts. The **navigator**
-on the left is that tree — the page in view marked, its path kept
-open, a filter, and a status dot on every node for the worst verdict
-at or beneath it — and the **breadcrumbs** in the top bar are the path
-down the tree to the page, every step a link back up. An id in prose is
+on the left, always in view, is that tree — the page in view marked,
+its path kept open, a filter, and a status dot on every node for the
+worst verdict at or beneath it — and the **breadcrumbs** in the top bar
+are the path down the tree to the page, every step a link back up. The
+navigator's filter row, the top bar, and the headers of the panels on
+the right share one height, so their rule runs straight across. An id in prose is
 a link: one with a page opens it in the canvas, the way a link goes
 somewhere; a sub-element with no page of its own — a step, a binding,
 an input, a transition — opens in the **inspector** on the right, which
@@ -88,8 +90,8 @@ vertices, and a fit control in the canvas corner re-centres the graph.
 The camera never moves on its own: when a selection opens the inspector
 beside the canvas, the canvas keeps its scale and position and the
 panel simply covers part of the drawing; only a deliberate act — the
-fit control, a layer switch, toggling the navigator or the obligations
-panel — re-fits the drawing into the room that is left.
+fit control, a layer switch, toggling the obligations panel — re-fits
+the drawing into the room that is left.
 
 *Layout.* The graph is layered left to right along the flow of
 information: columns follow reachability, and everything that can happen
@@ -306,7 +308,7 @@ change to the topology would put back in question can be read off the
 declaration itself. Topics and inputs carry the same list, being where
 L1 facts attach to L0 entities.
 
-**Top bar.** The navigator toggle, model name and revision,
+**Top bar.** Model name and revision,
 breadcrumbs — the path down the model's hierarchy to the current page,
 every step a link — the id filter on the system view, and — when a report is loaded
 — an "Obligations" button carrying the report's tally that opens the

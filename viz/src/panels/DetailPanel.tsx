@@ -64,7 +64,9 @@ function Frame({
   }
   return (
     <div className="flex h-full flex-col">
-      <header className="flex shrink-0 items-center justify-between border-b border-kumo-hairline px-4 py-2">
+      {/* The header takes the top bar's height, so its rule runs
+          straight across from the bar. */}
+      <header className="box-content flex h-12 shrink-0 items-center justify-between border-b border-kumo-hairline px-4">
         <span className="uppercase tracking-wider">
           <Text variant="secondary" size="xs" as="span">
             {kind}

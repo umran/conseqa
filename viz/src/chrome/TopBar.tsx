@@ -4,7 +4,7 @@ import { Button } from "@cloudflare/kumo/components/button";
 import { Input } from "@cloudflare/kumo/components/input";
 import { Switch } from "@cloudflare/kumo/components/switch";
 import { Tooltip } from "@cloudflare/kumo/components/tooltip";
-import { ListChecksIcon, MoonIcon, SidebarSimpleIcon, SunIcon } from "@phosphor-icons/react";
+import { ListChecksIcon, MoonIcon, SunIcon } from "@phosphor-icons/react";
 import { Fragment } from "react";
 
 import { ancestry } from "../lib/navigation";
@@ -22,7 +22,7 @@ import { useApp } from "../state/AppState";
 export function TopBar() {
   const app = useApp();
   const {
-    data, model, index, report, reportIssue, route, search, obligationsOpen, navOpen, runtime, showRuntime,
+    data, model, index, report, reportIssue, route, search, obligationsOpen, runtime, showRuntime,
     transactionProofs, showConflicts, theme, themeControllable,
   } = app;
   const hasTransactionProofs = transactionProofs.serializability.length > 0;
@@ -45,21 +45,6 @@ export function TopBar() {
     // not have.
     <header className="@container shrink-0 border-b border-kumo-hairline bg-kumo-base">
       <div className="mx-auto flex h-12 max-w-[1240px] items-center gap-3 px-4 @md:gap-4 @md:px-6">
-        <Tooltip
-          content={navOpen ? "Hide the navigator" : "Show the navigator — the model as a tree of pages"}
-          render={
-            <Button
-              className="shrink-0"
-              variant={navOpen ? "secondary" : "ghost"}
-              size="sm"
-              shape="square"
-              icon={SidebarSimpleIcon}
-              aria-label="Toggle the navigator"
-              aria-pressed={navOpen}
-              onClick={() => app.setNavOpen(!navOpen)}
-            />
-          }
-        />
         {/* The model, not the tool: the document title already reads
             "<model> · conseqa", and a host embedding these views has a
             name of its own in its chrome. */}

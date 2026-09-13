@@ -37,22 +37,20 @@ export function App({ data, theme }: AppProps) {
  * The layout. The canvas in the middle shows one page at a time — the
  * system graph by default, else the entity the address bar names — and
  * is the primary focus. The navigator on the left is the model as a
- * tree of those pages; the inspector on the right is the detail of
- * whatever is selected on the page; the obligations panel lists the
- * report. Below the `xl` breakpoint the side panels overlay the canvas
- * rather than squeezing it.
+ * tree of those pages, always in view; the inspector on the right is
+ * the detail of whatever is selected on the page; the obligations panel
+ * lists the report. Below the `xl` breakpoint the two right-hand panels
+ * overlay the canvas rather than squeezing it.
  */
 function Shell() {
-  const { route, detail, obligationsOpen, navOpen, report } = useApp();
+  const { route, detail, obligationsOpen, report } = useApp();
   const showObligations = obligationsOpen && !!report;
 
   return (
     <div className="relative flex h-full bg-kumo-canvas text-kumo-default">
-      {navOpen && (
-        <aside className="absolute inset-y-0 left-0 z-10 w-[256px] shrink-0 border-r border-kumo-hairline bg-kumo-base shadow-xl xl:static xl:shadow-none">
-          <Navigator />
-        </aside>
-      )}
+      <aside className="w-[240px] shrink-0 border-r border-kumo-hairline bg-kumo-base">
+        <Navigator />
+      </aside>
       <main className="flex min-w-0 flex-1 flex-col">
         <TopBar />
         <div className="relative min-h-0 flex-1">

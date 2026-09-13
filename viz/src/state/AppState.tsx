@@ -84,9 +84,6 @@ interface AppState {
   expandedTx: ReadonlySet<string>;
   search: string;
   obligationsOpen: boolean;
-  /** Whether the navigator — the model as a tree of pages — is shown
-   *  beside the canvas. */
-  navOpen: boolean;
   /** Whether the L1 realization is drawn. L0 is always drawn: the
    *  application machine is the model, and the realization is a layer
    *  over it. */
@@ -112,7 +109,6 @@ interface AppState {
   toggleTx: (key: string) => void;
   setSearch: (value: string) => void;
   setObligationsOpen: (value: boolean) => void;
-  setNavOpen: (value: boolean) => void;
   setShowRuntime: (value: boolean) => void;
   setShowConflicts: (value: boolean) => void;
   setTheme: (value: Theme) => void;
@@ -125,26 +121,10 @@ interface AppState {
 const Context = createContext<AppState | null>(null);
 
 const THEME_KEY = "conseqa-viz-theme";
-const NAV_KEY = "conseqa-viz-nav";
 
 function initialTheme(): Theme {
   const stored = window.localStorage.getItem(THEME_KEY);
   return stored === "light" ? "light" : "dark";
-}
-
-/** The navigator starts open where there is room for it beside the
- *  canvas — the tree is how a reader learns what the model contains —
- *  and closed in a pane too narrow to hold both, where it would cover
- *  the drawing. A reader's own choice is remembered either way. */
-function initialNavOpen(): boolean {
-  try {
-    const stored = window.localStorage.getItem(NAV_KEY);
-    if (stored === "open") return true;
-    if (stored === "closed") return false;
-  } catch {
-    // Storage may be unavailable; fall through to the width rule.
-  }
-  return window.innerWidth >= 1280;
 }
 
 export interface AppStateProviderProps {
@@ -205,7 +185,6 @@ export function AppStateProvider({ data, theme: hostTheme, children }: AppStateP
   const [expandedTx, setExpandedTx] = useState<ReadonlySet<string>>(() => new Set());
   const [search, setSearch] = useState("");
   const [obligationsOpen, setObligationsOpenState] = useState(false);
-  const [navOpen, setNavOpenState] = useState(initialNavOpen);
   // Drawn by default wherever there is anything to draw: the hierarchy is
   // the model, and a layer hidden until asked for reads as an extra.
   const [showRuntime, setShowRuntimeState] = useState(runtime.declared);
@@ -241,14 +220,6 @@ export function AppStateProvider({ data, theme: hostTheme, children }: AppStateP
       setDetail((current) => (current ? { id: implied, ctx: {} } : current));
     }
   }, [key, implied, subject]);
-
-  useEffect(() => {
-    try {
-      window.localStorage.setItem(NAV_KEY, navOpen ? "open" : "closed");
-    } catch {
-      // Storage may be unavailable; the choice then lasts the session.
-    }
-  }, [navOpen]);
 
   // The document belongs to whoever owns the mode: a host that supplies
   // one has already dressed the page, and writing `data-mode` or the
@@ -300,16 +271,12 @@ export function AppStateProvider({ data, theme: hostTheme, children }: AppStateP
 
   const requestFit = useCallback(() => setFitRequest((n) => n + 1), []);
 
-  // The navigator and the obligations panel share the row with the
-  // canvas, so toggling either changes the canvas's width; a toggle is
-  // the reader's own act, so the drawing is re-fitted to the room left.
-  // (The inspector a selection opens is not: the canvas keeps its
-  // camera and the panel simply covers part of the drawing, so the
-  // click that made the selection moves nothing.)
-  const setNavOpen = useCallback((value: boolean) => {
-    setNavOpenState(value);
-    setFitRequest((n) => n + 1);
-  }, []);
+  // The obligations panel shares the row with the canvas, so toggling
+  // it changes the canvas's width; a toggle is the reader's own act, so
+  // the drawing is re-fitted to the room left. (The inspector a
+  // selection opens is not: the canvas keeps its camera and the panel
+  // simply covers part of the drawing, so the click that made the
+  // selection moves nothing.)
   const setObligationsOpen = useCallback((value: boolean) => {
     setObligationsOpenState(value);
     setFitRequest((n) => n + 1);
@@ -407,7 +374,6 @@ export function AppStateProvider({ data, theme: hostTheme, children }: AppStateP
       expandedTx,
       search,
       obligationsOpen,
-      navOpen,
       showRuntime,
       showConflicts,
       theme,
@@ -420,7 +386,6 @@ export function AppStateProvider({ data, theme: hostTheme, children }: AppStateP
       toggleTx,
       setSearch,
       setObligationsOpen,
-      setNavOpen,
       setShowRuntime,
       setShowConflicts,
       setTheme,
@@ -430,9 +395,9 @@ export function AppStateProvider({ data, theme: hostTheme, children }: AppStateP
     }),
     [
       data, report, reportIssue, index, knownIds, obligations, citations, runtime, transactionProofs, bindings, route,
-      selection, detail, expandedTx, search, obligationsOpen, navOpen, showRuntime, showConflicts, theme,
+      selection, detail, expandedTx, search, obligationsOpen, showRuntime, showConflicts, theme,
       themeControllable, fitRequest, select, openDetail, openEntity, closeDetail, toggleTx,
-      setTheme, setNavOpen, setObligationsOpen, setShowRuntime, setShowConflicts, requestFit, navigateTo, focusSubject,
+      setTheme, setObligationsOpen, setShowRuntime, setShowConflicts, requestFit, navigateTo, focusSubject,
     ],
   );
 

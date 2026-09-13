@@ -82,7 +82,7 @@ export function ObligationsPanel() {
 
   return (
     <div className="flex h-full flex-col">
-      <header className="flex shrink-0 items-center justify-between border-b border-kumo-hairline px-4 py-2">
+      <header className="box-content flex h-12 shrink-0 items-center justify-between border-b border-kumo-hairline px-4">
         <span className="flex items-center gap-2">
           <ListChecksIcon size={16} className="text-kumo-subtle" />
           <span className="uppercase tracking-wider">

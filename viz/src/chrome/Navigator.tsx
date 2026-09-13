@@ -1,7 +1,5 @@
-import { Button } from "@cloudflare/kumo/components/button";
 import { Input } from "@cloudflare/kumo/components/input";
-import { Text } from "@cloudflare/kumo/components/text";
-import { CaretRightIcon, GraphIcon, XIcon } from "@phosphor-icons/react";
+import { CaretRightIcon, GraphIcon } from "@phosphor-icons/react";
 import { useEffect, useMemo, useState } from "react";
 
 import {
@@ -36,7 +34,7 @@ const CAPTIONED: Partial<Record<PageKind, string>> = {
  * node is the worst verdict anchored to it or beneath it.
  */
 export function Navigator() {
-  const { model, graph, index, route, obligations, navigateTo, setNavOpen } = useApp();
+  const { model, graph, index, route, obligations, navigateTo } = useApp();
   const groups = useMemo(() => navigationTree(model, graph), [model, graph]);
   const path = useMemo(() => routePath(route, model, index), [route, model, index]);
   const current = path[path.length - 1];
@@ -175,16 +173,17 @@ export function Navigator() {
 
   return (
     <nav className="flex h-full flex-col" aria-label="Model navigator">
-      <header className="flex shrink-0 items-center justify-between border-b border-kumo-hairline px-3 py-2">
-        <span className="uppercase tracking-wider">
-          <Text variant="secondary" size="xs" as="span">
-            navigate
-          </Text>
-        </span>
-        <Button variant="ghost" size="xs" shape="square" icon={XIcon} aria-label="Hide the navigator" onClick={() => setNavOpen(false)} />
-      </header>
-      <div className="shrink-0 border-b border-kumo-hairline px-3 py-2">
-        <Input size="sm" placeholder="filter…" aria-label="Filter the navigator" value={query} onChange={(e) => setQuery(e.target.value)} />
+      {/* The filter sits in a row the height of the top bar, so the rule
+          under it runs straight across into the bar and the panels. */}
+      <div className="box-content flex h-12 shrink-0 items-center border-b border-kumo-hairline px-3">
+        <Input
+          size="sm"
+          className="w-full"
+          placeholder="filter…"
+          aria-label="Filter the navigator"
+          value={query}
+          onChange={(e) => setQuery(e.target.value)}
+        />
       </div>
       <div className="min-h-0 flex-1 overflow-y-auto px-2 py-2">
         <button
