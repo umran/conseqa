@@ -1036,10 +1036,7 @@ fn an_unconstrained_anti_dependency_into_an_insert_names_the_insert() {
             )
         });
 
-    assert!(
-        message.contains("inserts a matching instance"),
-        "{message}"
-    );
+    assert!(message.contains("inserts a matching instance"), "{message}");
     assert!(!message.contains("writes it"), "{message}");
 }
 
