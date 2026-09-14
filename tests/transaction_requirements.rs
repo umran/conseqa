@@ -1003,6 +1003,46 @@ fn removing_the_validation_leaves_the_anti_dependency_unconstrained() {
     );
 }
 
+#[test]
+fn an_unconstrained_anti_dependency_into_an_insert_names_the_insert() {
+    let mut model = load_flash_checkout();
+
+    // Without apply_payment's version validation, its anti-dependency
+    // onto create_order.new's insert of `object.order` is unconstrained
+    // too — a phantom-shaped conflict, not ordinary write skew, so the
+    // prose must say "inserts a matching instance" and not "writes it".
+    transaction_mut(&mut model, "operation.apply_payment", "tx.apply_payment")
+        .steps
+        .remove(1);
+
+    assert!(validation::validate(&model).is_empty());
+
+    let verdict = serializability(&model, "tx.apply_payment");
+
+    let message = serializability_obstacles(&verdict)
+        .iter()
+        .find_map(|obstacle| match obstacle {
+            TransactionSerializabilityObstacle::TransactionSerializabilityUnprotectedReadWriteDependency { dependency }
+                if dependency.target.transaction == id("tx.create_order.new") =>
+            {
+                Some(obstacle.evidence().message)
+            }
+            _ => None,
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "expected an unprotected read-write dependency onto \
+                 tx.create_order.new: {verdict:#?}"
+            )
+        });
+
+    assert!(
+        message.contains("inserts a matching instance"),
+        "{message}"
+    );
+    assert!(!message.contains("writes it"), "{message}");
+}
+
 // ---------------------------------------------------------------------
 // Serializable closure
 // ---------------------------------------------------------------------

@@ -36,8 +36,8 @@ use crate::analyzer::{Diagnostic, DiagnosticCode, Evidence, Severity, Verificati
 use crate::spec::{Id, Model, StepLocation, TransactionIsolation, ValueRef};
 
 use super::transaction_conflicts::{
-    CommitArtifact, CommitOrderEvidence, ConflictIndex, DependencyEvidence, DependencyGap,
-    DependencyKind, TransactionRef, isolation_label,
+    AccessMode, CommitArtifact, CommitOrderEvidence, ConflictIndex, DependencyEvidence,
+    DependencyGap, DependencyKind, TransactionRef, isolation_label,
 };
 use super::{ProofScope, RemedyLayer};
 
@@ -377,7 +377,7 @@ impl TransactionSerializabilityObstacle {
                 Evidence {
                     subject: Some(dependency.source.transaction.clone()),
                     message: format!(
-                        "{}: `{}` may read `{}` (step {}) before `{}` writes it (step {}), \
+                        "{}: `{}` may read `{}` (step {}) before `{}` {} (step {}), \
                          and neither strict locking nor version validation constrains \
                          the commit order — the anti-dependency behind write skew. {}",
                         capitalize(&dependency.kind.to_string()),
@@ -385,6 +385,7 @@ impl TransactionSerializabilityObstacle {
                         dependency.object,
                         dependency.source_step + 1,
                         dependency.target,
+                        write_phrase(dependency.target_mode),
                         dependency.target_step + 1,
                         gap_sentences(&dependency.gaps)
                     ),
@@ -577,6 +578,18 @@ pub fn evidence_sentence(dependency: &DependencyEvidence) -> String {
 
 fn value_ref_label(value: &ValueRef) -> String {
     format!("{}.{}", value.source.id(), value.path)
+}
+
+/// The verb phrase for how a write-capable access installs its
+/// conflicting change, so a phantom-shaped conflict (a predicate read
+/// racing a concurrent insert or delete) does not read as ordinary
+/// write skew.
+fn write_phrase(mode: AccessMode) -> &'static str {
+    match mode {
+        AccessMode::Insert => "inserts a matching instance",
+        AccessMode::Delete => "deletes the matching instance",
+        _ => "writes it",
+    }
 }
 
 fn capitalize(text: &str) -> String {
