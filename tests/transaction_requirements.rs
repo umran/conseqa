@@ -897,6 +897,46 @@ fn a_version_validation_needs_an_observed_version() {
 }
 
 #[test]
+fn a_version_validation_needs_an_identified_instance() {
+    let mut model = load_flash_checkout();
+
+    // Broaden cancel_order's version read and validation from the
+    // identified order (`order_id = …`) to every order. The validation
+    // then guards no single instance: a concurrent insert of a new
+    // matching order could not be told from the ones observed, so it is
+    // rejected rather than silently credited as a commit guard — the
+    // phantom write-skew hole this rule closes.
+    let all_orders = ObjectSelector {
+        object: id("object.order"),
+        predicate: SelectorPredicate::All,
+    };
+
+    let transaction = transaction_mut(&mut model, "operation.cancel_order", "tx.cancel_order");
+
+    let TransactionStep::Read(read) = &mut transaction.steps[0] else {
+        panic!("expected the order read");
+    };
+    read.target = all_orders.clone();
+
+    let TransactionStep::ValidateVersion(validate) = &mut transaction.steps[1] else {
+        panic!("expected the version validation");
+    };
+    validate.target = all_orders;
+
+    // The read still binds the version and still matches the validation
+    // target, so `observes_version` holds: the identity defect is the
+    // only one reported.
+    assert_eq!(
+        validation::validate(&model),
+        vec![ValidationError::VersionValidationWithoutIdentifiedInstance {
+            transaction: id("tx.cancel_order"),
+            step: 1,
+            object: id("object.order"),
+        }]
+    );
+}
+
+#[test]
 fn the_version_protocol_needs_a_versioned_object() {
     let mut model = load_flash_checkout();
 

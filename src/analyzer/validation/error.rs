@@ -378,6 +378,18 @@ pub enum ValidationError {
         object: Id,
     },
 
+    /// A `validate_version` step's selector does not pin every identity
+    /// field of its object, so it may select many instances. Version
+    /// validation guards one observed instance's version: a partial or
+    /// `all` selector cannot distinguish a concurrent insert of a new
+    /// matching instance from the ones it observed, so crediting it as a
+    /// commit guard would admit phantom write skew (§20, §24).
+    VersionValidationWithoutIdentifiedInstance {
+        transaction: Id,
+        step: usize,
+        object: Id,
+    },
+
     /// A `validate_version` or `bump_version` step targets an object
     /// that declares no version.
     VersionProtocolOnUnversionedObject {
@@ -1857,6 +1869,34 @@ impl From<ValidationError> for Diagnostic {
                               an earlier read that selects the same instance and covers the \
                               version field; only an observed version makes the validation a \
                               commit guard."
+                        .to_string(),
+                }],
+            },
+
+            ValidationError::VersionValidationWithoutIdentifiedInstance {
+                transaction,
+                step,
+                object,
+            } => Diagnostic {
+                code: DiagnosticCode::Validation(
+                    ValidationCode::VersionValidationWithoutIdentifiedInstance,
+                ),
+                severity: Severity::Error,
+                subject: Some(transaction.clone()),
+                message: format!(
+                    "Step {} of transaction `{transaction}` validates the version of \
+                     `{object}` through a selector that does not pin its full identity, \
+                     so it may select more than one instance.",
+                    step + 1
+                ),
+                evidence: vec![Evidence {
+                    subject: Some(object),
+                    message: "A `validate_version` guards one observed instance's version: \
+                              its selector must pin every identity field of the object, by a \
+                              literal or a reference. A partial or `all` selector cannot \
+                              distinguish a concurrent insert of a new matching instance from \
+                              the ones it observed, so it is not a sound commit guard against \
+                              write skew."
                         .to_string(),
                 }],
             },
