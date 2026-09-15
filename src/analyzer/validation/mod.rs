@@ -583,6 +583,7 @@ fn is_program_local_error(error: &ValidationError) -> bool {
         | MissingVersionBump { .. }
         | DuplicateVersionBump { .. }
         | VersionValidationWithoutObservedVersion { .. }
+        | VersionValidationWithoutIdentifiedInstance { .. }
         | VersionProtocolOnUnversionedObject { .. }
         | InvalidReferenceOwner { .. } => true,
 
@@ -1227,6 +1228,48 @@ fn paths_related(first: &FieldPath, second: &FieldPath) -> bool {
     first.0.starts_with(&second.0) || second.0.starts_with(&first.0)
 }
 
+/// The declared identity fields of an object, resolved through the
+/// global namespace; `None` for an unknown object.
+fn object_identity<'a>(
+    model: &'a Model,
+    index: &ReferenceIndex<'_>,
+    object: &Id,
+) -> Option<&'a [FieldPath]> {
+    let owner = index.get(object)?.owner?;
+
+    model
+        .data_models
+        .get(owner)?
+        .objects
+        .get(object)
+        .map(|object| object.identity.as_slice())
+}
+
+/// Whether a selector pins every identity field of its object, so it
+/// selects a single instance. An empty identity is treated as pinned
+/// (its own `EmptyObjectIdentity` defect is reported apart). A version
+/// validation needs this: it guards one observed instance's version,
+/// and a partial or `all` selector cannot tell a concurrent insert of a
+/// new matching instance from the ones it observed.
+fn selector_identifies_instance(identity: &[FieldPath], predicate: &SelectorPredicate) -> bool {
+    fn pinned_fields<'a>(predicate: &'a SelectorPredicate, into: &mut Vec<&'a FieldPath>) {
+        match predicate {
+            SelectorPredicate::All => {}
+            SelectorPredicate::Eq { field, .. } => into.push(field),
+            SelectorPredicate::And { predicates } => {
+                for inner in predicates {
+                    pinned_fields(inner, into);
+                }
+            }
+        }
+    }
+
+    let mut pinned = Vec::new();
+    pinned_fields(predicate, &mut pinned);
+
+    identity.iter().all(|field| pinned.contains(&field))
+}
+
 /// The version protocol of every transaction (§25–§27): no direct
 /// write of a version field, a bump beside every write or transition
 /// of a versioned instance, at most one bump per instance, a
@@ -1328,6 +1371,23 @@ fn validate_version_protocol(model: &Model, index: &ReferenceIndex<'_>) -> Vec<V
                                 ) {
                                     errors.push(
                                         ValidationError::VersionValidationWithoutObservedVersion {
+                                            transaction: transaction.id.clone(),
+                                            step,
+                                            object: validate.target.object.clone(),
+                                        },
+                                    );
+                                }
+
+                                if object_identity(model, index, &validate.target.object)
+                                    .is_some_and(|identity| {
+                                        !selector_identifies_instance(
+                                            identity,
+                                            &validate.target.predicate,
+                                        )
+                                    })
+                                {
+                                    errors.push(
+                                        ValidationError::VersionValidationWithoutIdentifiedInstance {
                                             transaction: transaction.id.clone(),
                                             step,
                                             object: validate.target.object.clone(),
