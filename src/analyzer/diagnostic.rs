@@ -168,6 +168,7 @@ pub enum ValidationCode {
     MissingVersionBump,
     DuplicateVersionBump,
     VersionValidationWithoutObservedVersion,
+    VersionValidationWithoutIdentifiedInstance,
     VersionProtocolOnUnversionedObject,
 
     // Managed monotonic fields.
