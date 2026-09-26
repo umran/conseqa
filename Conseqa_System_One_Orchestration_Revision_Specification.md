@@ -739,7 +739,10 @@ The version protocol carries one qualification. A guard *rejects*, and what an o
 
 A remedy returns nothing when inapplicable, and one that would change nothing is not a candidate. A remedy that would edit a symbol outside the task's scope — declaring a `version` on a shared data object, for instance — is not a candidate either.
 
-Ordering obstacles are not in the first catalogue, and nor is any operation family. They escalate.
+The catalogue also covers ordering and the operation families:
+
+- **Ordering.** An ordering proof rests on the closure being serializable, so the serializability obstacles an ordering verdict embeds (`OrderingMissingSerializability`) feed the routes above. `OrderingPositionMismatch` points the cursor or fence at the requirement's position. `OrderingMissingCursorOrFence` turns the ordinary write that records the position into an `advance_cursor` — only where exactly one written field's name carries the position's (`sequence` → `last_applied_sequence`), because which field records it is otherwise a judgment, and only where the transaction declares a `rejected` arm, for the reason the version protocol gives. Both rules are offered; `monotonic_after` leads (§18.5). A key-domain mismatch or a managed field written outside the protocol escalates.
+- **Idempotency, result replay, recoverability.** Replay route B: every transaction whose replay gaps name a missing or unstable keyed commit (`no_keyed_commit`, `commit_key_root_unstable` — found in the evidence of `TransactionNotRetrySafe`, `TransactionNotResolvable`, `ArtifactNotReplayAvailable` and `TransactionOutcomeUnstable` alike) is deduplicated by the requirement's governing key. A keyed commit edits no step, so it is also composed onto every other candidate. Unspecified derivations, unstable external boundaries and publication identity need facts outside the programs, and escalate.
 
 ## 18.3 Scope
 
@@ -753,11 +756,11 @@ Grouping serves the agent path as much as the builder: peers that share a closur
 
 ## 18.4 Evaluation
 
-The builder evaluates the empty candidate first (§15.2). With nothing unproven for its operation, it says so and ends the task. Its targets are the operation's unproven serializability requirements; whatever else is unproven is named in the hand-off or the commit summary, and left.
+The builder evaluates the empty candidate first (§15.2). With nothing unproven for its operation, it says so and ends the task. Its targets are every unproven requirement of the programs in scope; whatever a chosen candidate does not prove is named in the commit summary and offered again on the next pass.
 
 Candidates are evaluated concurrently through `evaluate_candidate`, bounded by `max_candidates`, with every serializability-constrained transaction of the program as a root.
 
-A candidate is *admissible* when it validates, every target is declared and proven under it, and it has no regression anywhere in the model.
+A candidate is *admissible* when it validates, proves at least one target, and has no regression anywhere in the model. Admissible candidates are ordered by how many targets they prove, most first, then by §18.5.
 
 Unlike discovery (§17.1), repair need not decide its task whole. The workflow re-enumerates what is unproven on every pass, so an obligation the builder leaves is offered again — to the builder, which abstains, and so to a session — and the regression check is what makes a partial repair safe. The cost is a pass of the fixpoint.
 
@@ -766,6 +769,10 @@ Unlike discovery (§17.1), repair need not decide its task whole. The workflow r
 Absent evidence, preference is deterministic: *least invasive first* — fewest transactions edited, then fewest steps added, then catalogue order.
 
 System One may reorder admissible candidates only on a stated domain fact, and an unstated fact reorders nothing. The first increment knows one: **heavy simultaneous demand for one record**. Under serializable isolation a conflicting execution is aborted and must be retried; under an exclusive lock it waits its turn. So when both routes are admissible and isolation leads, one Noul is asked — does the prompt state such demand — and at or above `act` the locks are submitted instead.
+
+The second is **every position applied, none skipped**. A `successor` cursor admits only the next position and holds a gap until the missing one arrives; `monotonic_after` admits any later one. Both order what they admit, so when both prove the same targets and `monotonic_after` leads, one Noul (`repair.gap_free`) is asked, and at or above `act` the successor cursor is submitted instead.
+
+A preference only reorders candidates that prove the same targets as the head.
 
 The question is asked only when its answer could change what is submitted. One admissible candidate means nothing is asked at all, and repair then runs without a decider.
 

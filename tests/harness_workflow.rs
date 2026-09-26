@@ -2928,6 +2928,177 @@ mod system_one {
             })
     }
 
+    /// `tenant_ledger`, and a copy with one breakage applied to
+    /// `apply_entry`'s transaction.
+    fn an_apply_with(
+        breakage: impl FnOnce(&mut conseqa::spec::Transaction),
+    ) -> (conseqa::spec::Model, conseqa::spec::Model) {
+        let authored = authored("tenant_ledger.yaml");
+
+        let mut broken = authored.clone();
+
+        breakage(
+            broken
+                .operations
+                .get_mut(&id("operation.apply_entry"))
+                .expect("the operation")
+                .program
+                .transaction_mut(&id("tx.apply_entry"))
+                .expect("the transaction"),
+        );
+
+        assert!(
+            !conseqa::analyzer::verification::verify(&broken).all_proven(),
+            "the breakage must un-prove something"
+        );
+
+        (authored, broken)
+    }
+
+    async fn repaired_program(
+        broken: &conseqa::spec::Model,
+        opinions: &Opinions,
+    ) -> (ConfluenceEngine, Seen, Vec<conseqa::harness::TaskRun>) {
+        repair(broken, "operation.apply_entry", opinions).await
+    }
+
+    fn apply_program(engine: &ConfluenceEngine) -> Option<conseqa::spec::OperationBlock> {
+        engine.head_snapshot().workspace.operations[&id("operation.apply_entry")]
+            .program
+            .clone()
+    }
+
+    /// Replay route B: a transaction that advances a cursor cannot be
+    /// replayed by re-execution, so its idempotency and recoverability
+    /// rest on its keyed commit. Taken away, the builder puts it back —
+    /// keyed by the governing key, as the author wrote it.
+    #[tokio::test]
+    async fn a_missing_keyed_commit_is_restored_by_the_governing_key() {
+        let (authored, broken) = an_apply_with(|transaction| {
+            transaction.idempotency = conseqa::spec::IdempotencyGuarantee::Unspecified;
+        });
+
+        let (engine, seen, runs) = repaired_program(&broken, &Opinions::default()).await;
+
+        assert!(repairs(&seen).is_empty(), "{:?}", repairs(&seen));
+        assert!(runs[0].committed(), "{:?}", runs[0]);
+        assert!(head_model_is_proven(&engine).await);
+
+        assert_eq!(
+            apply_program(&engine),
+            Some(
+                authored.operations[&id("operation.apply_entry")]
+                    .program
+                    .clone()
+            )
+        );
+    }
+
+    /// An ordering proof needs the cursor to consume the requirement's
+    /// own position. Pointed at another value, it is pointed back.
+    #[tokio::test]
+    async fn a_cursor_advanced_by_the_wrong_value_is_pointed_at_the_position() {
+        // The cursor's own current reading: the right type, the wrong
+        // position.
+        let (authored, broken) = an_apply_with(|transaction| {
+            for step in &mut transaction.steps {
+                if let conseqa::spec::TransactionStep::AdvanceCursor(advance) = step {
+                    advance.incoming = ValueRef {
+                        source: ValueSource::TransactionRead(id("read.apply_entry.ledger")),
+                        path: path("last_applied_sequence"),
+                    };
+                }
+            }
+        });
+
+        let (engine, seen, runs) = repaired_program(&broken, &Opinions::default()).await;
+
+        assert!(repairs(&seen).is_empty(), "{:?}", repairs(&seen));
+        assert!(runs[0].committed(), "{:?}", runs[0]);
+        assert!(head_model_is_proven(&engine).await);
+
+        assert_eq!(
+            apply_program(&engine),
+            Some(
+                authored.operations[&id("operation.apply_entry")]
+                    .program
+                    .clone()
+            )
+        );
+    }
+
+    /// A position recorded with an ordinary write orders nothing. The
+    /// builder turns the write into a cursor advance under both rules and
+    /// the analyzer proves both; which one the system needs is a fact of
+    /// the domain. Told that no entry may be skipped, it takes
+    /// `successor` — the author's program; told nothing, the permissive
+    /// `monotonic_after` stands.
+    #[tokio::test]
+    async fn a_position_written_plainly_becomes_a_cursor_under_the_stated_rule() {
+        let as_plain_write = |transaction: &mut conseqa::spec::Transaction| {
+            let position = transaction.requirements.ordering[0].position.clone();
+
+            for step in &mut transaction.steps {
+                if let conseqa::spec::TransactionStep::AdvanceCursor(advance) = step {
+                    *step = conseqa::spec::TransactionStep::Write(conseqa::spec::Write {
+                        target: advance.target.clone(),
+                        fields: [advance.field.clone()].into(),
+                        values: conseqa::spec::Derivation::Deterministic {
+                            from: vec![position.clone()],
+                        },
+                    });
+                }
+            }
+        };
+
+        for (gap_free, rule) in [
+            (0.91, conseqa::spec::CursorAdvanceRule::Successor),
+            (0.03, conseqa::spec::CursorAdvanceRule::MonotonicAfter),
+        ] {
+            let (authored, broken) = an_apply_with(as_plain_write);
+
+            let opinions = Opinions::default().stating("gap_free", gap_free);
+
+            let (engine, seen, runs) = repaired_program(&broken, &opinions).await;
+
+            assert!(repairs(&seen).is_empty(), "{:?}", repairs(&seen));
+            assert!(runs[0].committed(), "{:?}", runs[0]);
+            assert!(head_model_is_proven(&engine).await);
+
+            let program = apply_program(&engine).expect("a program");
+
+            let advance = program
+                .transaction(&id("tx.apply_entry"))
+                .expect("the transaction")
+                .steps
+                .iter()
+                .find_map(|step| match step {
+                    conseqa::spec::TransactionStep::AdvanceCursor(advance) => Some(advance.clone()),
+                    _ => None,
+                })
+                .expect("a cursor advance");
+
+            assert_eq!(advance.rule, rule);
+
+            if rule == conseqa::spec::CursorAdvanceRule::Successor {
+                assert_eq!(
+                    program,
+                    authored.operations[&id("operation.apply_entry")]
+                        .program
+                        .clone()
+                );
+            }
+
+            // The rule was the one thing asked.
+            assert!(
+                opinions
+                    .asked()
+                    .iter()
+                    .any(|request| request.questions.contains_key(&"gap_free".into()))
+            );
+        }
+    }
+
     /// `tenant_ledger` as its author wrote it, and with the exclusive
     /// lock that serializes postings taken out — which leaves the
     /// read-then-write of the tenant's sequence unprotected.

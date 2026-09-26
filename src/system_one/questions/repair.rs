@@ -55,3 +55,43 @@ pub fn contention() -> Question {
         }),
     )
 }
+
+pub const GAP_FREE: QuestionSpec = QuestionSpec {
+    id: "repair.gap_free",
+    version: 1,
+    decides: "whether a successor cursor is preferred to a monotonic one, both being proven",
+};
+
+/// Must every position be applied, in order, with none skipped?
+///
+/// A `successor` cursor admits only the next position, so a gap rejects
+/// until the missing one arrives; a `monotonic_after` cursor admits any
+/// later position and lets gaps through. Both order what they admit.
+/// Which the system needs is a fact about the domain — a ledger of
+/// sequenced entries needs every one, a high-water mark does not — and
+/// when the prompt states nothing, the permissive default stands.
+pub fn gap_free() -> Question {
+    Question::noul_with_criteria(
+        json!({
+            "question": "Does `prompt` require that the positions `work` applies — sequence \
+                         numbers, offsets, versions — are each applied, in order, with none \
+                         skipped?",
+            "focus": "Judge only what `prompt` states about every position being applied. A \
+                      prompt that only asks for updates to apply in order, or for stale \
+                      updates to be ignored, does not require it.",
+        }),
+        json!({
+            "what": "The prompt states that no position may be skipped: every entry, event or \
+                     sequence number must be applied, and a missing one must be waited for.",
+            "examples": [
+                "every ledger entry is applied exactly in sequence, with no gaps",
+                "events must be processed one after another without missing any",
+            ],
+        }),
+        json!({
+            "what": "The prompt allows a later position to supersede an earlier one, or states \
+                     nothing about skipped positions.",
+            "not_for": "Last-writer-wins updates, high-water marks, or snapshots.",
+        }),
+    )
+}
