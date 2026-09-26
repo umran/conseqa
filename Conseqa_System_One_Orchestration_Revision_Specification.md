@@ -671,7 +671,7 @@ Explicit obligations are found with the targeted search of §4.4, and only the u
 
 One request decides the task: everything code could not answer, asked together over one state — the prompt verbatim, the operation's description, trigger and work summaries, and the explicit obligations aimed at it.
 
-- `obligation_<i>` — Choice, per explicit obligation: which enumerated requirement guarantees what it asks for. Each option describes a guarantee, not a DSL construct, and one option is an explicit no-match.
+- `obligation_<i>_<requirement>` — Noul, per explicit obligation and enumerated requirement: does the obligation ask for what this requirement guarantees. The requirement is described as a guarantee, not a DSL construct. Which requirements an obligation needs is a *set* — "an order ships at most once" needs idempotency and serializability — so each pairing is its own judgment (version 2). Version 1 asked one Choice over the requirements plus a no-match, and against live Jev an obligation needing two requirements split its mass between them (0.55 / 0.43) and escalated.
 - `serializability_key_<t>` — Choice over a transaction's candidate keys, plus no-match; its instructions state the premise that this work must be serializable. Asked only where code found more than one candidate: with one there is nothing to judge.
 - `idempotency`, `recoverability`, `serializability_<t>`, `ordering_<t>` — Noul: does the prompt state this requirement. Asked only under a policy that adopts implied requirements (§17.4) — and asked even where no key was enumerated, because a stated requirement code cannot express is the session's to handle, not a requirement to drop.
 - `result_replay`, `guaranteed_completion` — Noul refinements, each stating its premise. Asked speculatively, because another question costs little and another request costs a round trip; read only where the requirement they refine is proposed.
@@ -684,8 +684,9 @@ The thresholds are provisional — `act` 0.8, `dismiss` 0.25, `select` 0.6 — u
 
 | Condition | Result |
 | --- | --- |
-| an obligation's Choice selects an enumerated requirement at or above `select` | `ExplicitPrompt { obligation }` |
-| it selects no-match, or nothing clearly | abstain: the obligation is real and must be mapped by someone |
+| an obligation's pairing with a requirement is at or above `act` | `ExplicitPrompt { obligation }` on that requirement — on every such requirement |
+| no pairing is at or above `act` | abstain: the obligation is real and must be mapped by someone |
+| any pairing falls between `dismiss` and `act` | abstain |
 | two obligations select the same requirement | both `ExplicitPrompt`: the requirement is proposed once per obligation, in order; the gate adopts the first and records each later one as a duplicate that maps its obligation to the adopted requirement |
 | the run's policy adopts implied requirements, and one is stated | `StronglyImplied`, citing the prompt as evidence |
 | stated, and nothing enumerated can express it | abstain |

@@ -1690,25 +1690,8 @@ mod system_one {
     }
 
     impl Opinions {
-        fn choosing(mut self, question: &'static str, option: &'static str, p: f64) -> Self {
-            self.choices.insert(question, (option, p));
-            self
-        }
-
         fn stating(mut self, question: &'static str, p: f64) -> Self {
             self.nouls.insert(question, p);
-            self
-        }
-
-        fn choosing_for(
-            mut self,
-            operation: &'static str,
-            question: &'static str,
-            option: &'static str,
-            p: f64,
-        ) -> Self {
-            self.scoped_choices
-                .insert((operation, question), (option, p));
             self
         }
 
@@ -1908,7 +1891,7 @@ mod system_one {
         let out_dir = scratch();
 
         let opinions = Opinions::default()
-            .choosing("obligation_0", "idempotency", 0.93)
+            .stating("obligation_0_idempotency", 0.93)
             .stating("result_replay", 0.91);
 
         let (workflow, engine, seen) = workflow_with(out_dir.clone(), success_script(), &opinions);
@@ -1940,7 +1923,7 @@ mod system_one {
         assert_eq!(asked[0].tags["builder"], "requirement_discovery");
         assert_eq!(
             asked[0].tags["spec.discovery.obligation"],
-            "discovery.obligation@1"
+            "discovery.obligation@2"
         );
 
         // Exactly what the scripted agent would have proposed: keyed by
@@ -1995,7 +1978,7 @@ mod system_one {
         let out_dir = scratch();
 
         let opinions = Opinions::default()
-            .choosing("obligation_0", "idempotency", 0.93)
+            .stating("obligation_0_idempotency", 0.93)
             .stating("result_replay", 0.55);
 
         let (workflow, engine, _) = workflow_with(out_dir.clone(), success_script(), &opinions);
@@ -2016,9 +1999,9 @@ mod system_one {
     async fn an_unplaceable_obligation_is_handed_to_the_agent_backend() {
         for opinions in [
             // Nothing enumerated fits.
-            Opinions::default().choosing("obligation_0", "none_of_these", 0.88),
+            Opinions::default(),
             // Something fits, but not clearly enough to act on.
-            Opinions::default().choosing("obligation_0", "idempotency", 0.41),
+            Opinions::default().stating("obligation_0_idempotency", 0.41),
         ] {
             let out_dir = scratch();
 
@@ -2039,7 +2022,8 @@ mod system_one {
 
             assert!(
                 handed[0].contains("Hand-off from the System One executor")
-                    && handed[0].contains("maps to no enumerated requirement"),
+                    && (handed[0].contains("maps to no enumerated requirement")
+                        || handed[0].contains("it is uncertain whether the obligation")),
                 "{}",
                 handed[0]
             );
@@ -2373,7 +2357,7 @@ mod system_one {
 
         let opinions = Opinions {
             rendezvous: Some(Arc::new(tokio::sync::Barrier::new(2))),
-            ..Opinions::default().choosing("obligation_0", "idempotency", 0.9)
+            ..Opinions::default().stating("obligation_0_idempotency", 0.9)
         };
 
         let (engine, seen, runs) =
@@ -2436,8 +2420,8 @@ mod system_one {
         }
 
         let opinions = Opinions::default()
-            .choosing("obligation_0", "idempotency", 0.9)
-            .choosing("obligation_1", "idempotency", 0.88);
+            .stating("obligation_0_idempotency", 0.9)
+            .stating("obligation_1_idempotency", 0.88);
 
         let (engine, seen) = discover(workspace, &posting, &opinions).await;
 
@@ -2463,6 +2447,64 @@ mod system_one {
                 "{obligation:?}"
             );
         }
+    }
+
+    /// One obligation can need several requirements: "a retried posting
+    /// never records a second entry, even racing another" asks for
+    /// idempotency by the request's id and for the posting transaction to
+    /// be serializable. Each pairing is its own judgment, so the
+    /// obligation maps to both — a single choice split them roughly
+    /// evenly and escalated, as the benchmark's Jev run showed.
+    #[tokio::test]
+    async fn an_obligation_that_needs_two_requirements_maps_to_both() {
+        let posting = id("operation.post_entry");
+
+        let (mut workspace, _) = undeclared("tenant_ledger.yaml", &posting);
+
+        workspace.prompt_obligations.insert(
+            PromptObligationId("obl.post-once-racing".to_string()),
+            PromptObligation {
+                source_span: None,
+                normalized_intent: "a retried posting never records a second entry, even \
+                                    racing another posting"
+                    .to_string(),
+                targets: vec![posting.clone()],
+                status: PromptObligationStatus::Unmapped,
+            },
+        );
+
+        let opinions = Opinions::default()
+            .stating("obligation_0_idempotency", 0.86)
+            .stating("obligation_0_serializability_0", 0.84);
+
+        let (engine, seen) = discover(workspace, &posting, &opinions).await;
+
+        assert!(discoveries(&seen).is_empty(), "{:?}", discoveries(&seen));
+
+        let head = engine.head_snapshot();
+
+        let draft = &head.workspace.operations[&posting];
+
+        assert_eq!(draft.requirements.idempotency.len(), 1);
+        assert_eq!(
+            draft.program.as_ref().expect("a program").transactions()[0]
+                .1
+                .requirements
+                .serializability
+                .len(),
+            1
+        );
+
+        let obligation =
+            &head.workspace.prompt_obligations[&PromptObligationId("obl.post-once-racing".into())];
+
+        assert!(
+            matches!(
+                &obligation.status,
+                PromptObligationStatus::Mapped { requirements } if requirements.len() == 2
+            ),
+            "{obligation:?}"
+        );
     }
 
     /// The claim the whole layer rests on: what a requirement is *keyed
@@ -3056,10 +3098,9 @@ mod system_one {
         );
 
         let opinions = Opinions::default()
-            .choosing_for(
+            .stating_for(
                 "operation.post_entry",
-                "obligation_0",
-                "serializability_0",
+                "obligation_0_serializability_0",
                 0.91,
             )
             .stating_for("operation.post_entry", "idempotency", 0.9)

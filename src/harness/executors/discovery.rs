@@ -649,18 +649,23 @@ fn questions(
             .tag(format!("spec.{}", spec.id), spec.tag())
     };
 
+    // Which requirements an obligation asks for is a set — "an order
+    // ships at most once" needs both idempotency and serializability —
+    // so each pairing is its own judgment, not one option of a choice.
     let options: Vec<(String, String)> = candidates(enumerated)
         .into_iter()
         .map(|(candidate, guarantees)| (candidate.option(), guarantees))
         .collect();
 
     for index in 0..enumerated.obligations.len() {
-        request = ask(
-            request,
-            format!("obligation_{index}"),
-            wording::OBLIGATION,
-            wording::obligation(index, &options),
-        );
+        for (option, guarantees) in &options {
+            request = ask(
+                request,
+                format!("obligation_{index}_{option}"),
+                wording::OBLIGATION,
+                wording::obligation(index, guarantees),
+            );
+        }
     }
 
     // A key is chosen only where code found more than one: with one
@@ -759,46 +764,61 @@ fn decide(
     // just adopted and maps the obligation to it.
     let mut also: Vec<(Candidate, RequirementOrigin)> = Vec::new();
 
-    // Explicit obligations first: each must map to one enumerated
-    // requirement, or the run cannot succeed without the session.
+    // Explicit obligations first: each must map to at least one
+    // enumerated requirement, or the run cannot succeed without the
+    // session. It maps to every requirement it clearly asks for; any
+    // pairing that is unclear either way is escalated, never guessed.
     for (index, (id, obligation)) in enumerated.obligations.iter().enumerate() {
-        let (choice, probabilities) = decision
-            .choice(&format!("obligation_{index}"))
-            .ok_or_else(|| Abstention::because("an obligation mapping went unanswered"))?;
+        let mut asked_for = Vec::new();
 
-        let probability = probabilities.get(choice).copied().unwrap_or(0.0);
+        for (candidate, _) in &candidates {
+            let question = format!("obligation_{index}_{}", candidate.option());
 
-        let mapped = candidates
-            .iter()
-            .find(|(candidate, _)| candidate.option() == choice)
-            .map(|(candidate, _)| candidate.clone());
+            let probability = decision
+                .noul(&question)
+                .ok_or_else(|| Abstention::because(format!("`{question}` went unanswered")))?;
 
-        let Some(candidate) = mapped.filter(|_| probability >= policy.select) else {
+            match policy.band(probability) {
+                Band::Stated => asked_for.push(candidate.clone()),
+                Band::NotStated => {}
+                Band::Uncertain => {
+                    return Err(Abstention::because(format!(
+                        "it is uncertain whether the obligation \"{}\" asks for {} ({probability:.2})",
+                        obligation.normalized_intent,
+                        candidate.option()
+                    )));
+                }
+            }
+        }
+
+        if asked_for.is_empty() {
             return Err(Abstention::because(format!(
                 "the obligation \"{}\" maps to no enumerated requirement",
                 obligation.normalized_intent
             ))
             .with_findings(vec![format!(
-                "its mapping chose `{choice}` at {probability:.2}, among: {}",
+                "none of {} is what it asks for",
                 candidates
                     .iter()
                     .map(|(candidate, _)| candidate.option())
                     .collect::<Vec<_>>()
                     .join(", ")
             )]));
-        };
+        }
 
-        let origin = RequirementOrigin::ExplicitPrompt {
-            obligation: id.clone(),
-        };
+        for candidate in asked_for {
+            let origin = RequirementOrigin::ExplicitPrompt {
+                obligation: id.clone(),
+            };
 
-        match origins.entry(candidate) {
-            std::collections::btree_map::Entry::Occupied(taken) => {
-                also.push((taken.key().clone(), origin));
-            }
+            match origins.entry(candidate) {
+                std::collections::btree_map::Entry::Occupied(taken) => {
+                    also.push((taken.key().clone(), origin));
+                }
 
-            std::collections::btree_map::Entry::Vacant(free) => {
-                free.insert(origin);
+                std::collections::btree_map::Entry::Vacant(free) => {
+                    free.insert(origin);
+                }
             }
         }
     }

@@ -65,8 +65,9 @@ pub const ORDERING: QuestionSpec = QuestionSpec {
 
 pub const OBLIGATION: QuestionSpec = QuestionSpec {
     id: "discovery.obligation",
-    version: 1,
-    decides: "which enumerated requirement an explicit prompt obligation maps to",
+    version: 2,
+    decides: "whether an explicit prompt obligation asks for what one enumerated requirement \
+              guarantees — asked once per requirement, because one obligation can need several",
 };
 
 /// The option a choice carries when its right answer may be missing
@@ -221,25 +222,23 @@ pub fn ordering(work: usize) -> Question {
 /// Which enumerated requirement expresses one explicit obligation?
 /// `obligation` indexes `obligations`; each candidate is `(option key,
 /// what the requirement would guarantee)`.
-pub fn obligation(obligation: usize, candidates: &[(String, String)]) -> Question {
-    Question::choice(
+pub fn obligation(obligation: usize, guarantees: &str) -> Question {
+    Question::noul_with_criteria(
         json!({
             "question": format!(
-                "Which requirement below guarantees what `obligations[{obligation}].intent` asks \
-                 for?"
+                "Does `obligations[{obligation}].intent` ask for what `requirement` guarantees?"
             ),
-            "focus": "Match what the obligation protects against, not the words it uses.",
+            "requirement": guarantees,
+            "focus": "Match what the obligation protects against, not the words it uses. An \
+                      obligation can ask for several guarantees at once; judge only this one.",
         }),
-        candidates
-            .iter()
-            .map(|(option, description)| (option.clone(), Json::String(description.clone())))
-            .chain([(
-                NONE_OF_THESE.to_string(),
-                Json::String(
-                    "None of the listed requirements guarantees what the obligation asks for."
-                        .to_string(),
-                ),
-            )]),
+        json!({
+            "what": "Without this guarantee, what the obligation forbids could happen.",
+        }),
+        json!({
+            "what": "What the obligation forbids is prevented, or not, regardless of this \
+                     guarantee.",
+        }),
     )
 }
 
