@@ -248,10 +248,14 @@ pub fn refund_score() -> Question {
 }
 
 /// Requests no server should answer, as raw bodies. Each is one the
-/// wire format's own reference says fails validation, so the hosted
-/// service refuses all three. The right response is an error: a server
-/// that answers anyway will also answer when it has merely failed.
-pub fn unaskable_requests(model: &str) -> [(&'static str, Json); 3] {
+/// hosted service refuses (checked live against jev-1.13.0). The right
+/// response is an error: a server that answers anyway will also answer
+/// when it has merely failed.
+///
+/// A score with a single level is not among them: the reference says
+/// it fails validation, but the hosted service answers it, and the
+/// hosted service is the reference implementation.
+pub fn unaskable_requests(model: &str) -> [(&'static str, Json); 2] {
     let state = message_state(DELIVERY);
 
     [
@@ -262,18 +266,6 @@ pub fn unaskable_requests(model: &str) -> [(&'static str, Json); 3] {
                 "questions": { "q": {
                     "type": "noul",
                     "instructions": "Does `message` mention a parcel?",
-                } },
-            }),
-        ),
-        (
-            "a score with a single level",
-            json!({
-                "state": state,
-                "model": model,
-                "questions": { "q": {
-                    "type": "score",
-                    "instructions": "How urgent is `message`?",
-                    "criteria": ["Not urgent."],
                 } },
             }),
         ),
