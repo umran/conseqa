@@ -11,6 +11,8 @@
 
 pub mod backend;
 pub mod backends;
+#[cfg(feature = "system-one")]
+pub mod executors;
 pub mod scheduler;
 pub mod supervisor;
 pub mod task_prompt;

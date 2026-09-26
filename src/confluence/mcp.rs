@@ -110,23 +110,25 @@ drafting, validation errors, or the verification verdict with exactly \
 which obligations are proven and which are not. Fix what it names — \
 narrowly, yourself, or with another request_design pass.
 
-An unproven obligation carries a `remedy` saying which layer the \
-missing facts belong to. `application` means the fix is in the L0 \
-model: transaction serializability and ordering are proven only from \
-transaction primitives — declared isolation, shared and exclusive \
-locks, object versions with validate_version and bump_version, \
-ordered cursors, fences — over the model-wide conflict closure of \
-the transaction, never from runtime topology. `runtime` means no \
-program change can help: the fix is the L1 runtime topology — \
-transport grouping and ordering, subscription delivery and dispatch, \
-outbox partitioning, ordering, and dispatch, execution pools and \
-their member concurrency, request routers, storage layouts. L1 \
-describes placement, transport, grouping, precedence, and capacity; \
-it provides no serializability or ordering guarantee, and only the replay \
-families consume its delivery facts. Author it after the programs \
-exist and verification has said what it has to discharge, not while \
-drafting the skeleton. Never invent topology to make a proof pass; \
-leaving a requirement unproven is a legitimate outcome.
+An unproven transaction serializability or ordering obligation \
+carries `remedy: application`, always: the fix is in the L0 model. \
+Those two families are proven only from transaction primitives — \
+declared isolation, shared and exclusive locks, object versions with \
+validate_version and bump_version, ordered cursors, fences — over the \
+model-wide conflict closure of the transaction, never from runtime \
+topology, so no L1 edit can discharge one. No obligation currently \
+carries `remedy: runtime`, and the replay families carry no remedy at \
+all. The L1 runtime topology — transport grouping and ordering, \
+subscription delivery and dispatch, outbox partitioning, ordering, \
+and dispatch, execution pools and their member concurrency, request \
+routers, storage layouts — describes placement, transport, grouping, \
+precedence, and capacity; it provides no serializability or ordering \
+guarantee, and only the replay families consume its delivery facts. \
+Author it once, after the programs exist and their requirements have \
+settled, because a complete specification needs a runtime \
+realization — not because any obligation is waiting on one. Never \
+invent topology to make a proof pass; leaving a requirement unproven \
+is a legitimate outcome.
 7. export_spec delivers the result: the canonical YAML, the \
 verification report, and a self-contained interactive HTML \
 visualization, written to a directory you choose — show these to the \
@@ -167,6 +169,12 @@ pub struct SearchSymbolsParams {
     /// Restrict operations to one service id.
     #[serde(default)]
     pub service: Option<String>,
+
+    /// Restrict prompt obligations to those targeting one operation
+    /// id. Prefer it to listing every obligation: mapping another
+    /// operation's obligation then cannot invalidate this session.
+    #[serde(default)]
+    pub targets: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -195,8 +203,9 @@ pub struct RequirementReportParams {
     #[serde(default)]
     pub operation: Option<String>,
 
-    /// Restrict to one requirement family: serialization, ordering,
-    /// idempotency, result_replay, recoverability.
+    /// Restrict to one requirement family: transaction_serializability,
+    /// transaction_ordering, idempotency, result_replay, recoverability.
+    /// Any other value is an error, never an empty report.
     #[serde(default)]
     pub family: Option<String>,
 }
@@ -601,7 +610,19 @@ fn json_error(value: serde_json::Value) -> Result<CallToolResult, McpError> {
 /// Engine failures surface as tool errors the model can read; they
 /// carry their own do-not-retry guidance where relevant.
 fn engine_error(error: EngineError) -> Result<CallToolResult, McpError> {
-    json_error(serde_json::json!({ "error": error.to_string() }))
+    match error {
+        // Structured, so a caller can correct itself from the accepted
+        // values without parsing prose.
+        EngineError::UnknownRequirementFamily { family, accepted } => {
+            json_error(serde_json::json!({
+                "error": "unknown_requirement_family",
+                "family": family,
+                "accepted": accepted,
+            }))
+        }
+
+        other => json_error(serde_json::json!({ "error": other.to_string() })),
+    }
 }
 
 /// Parses one tool argument, returning an in-band tool-result error on
@@ -778,6 +799,7 @@ impl ConseqaMcp {
             kind,
             prefix: params.prefix,
             service: params.service.map(|service| id_from(&service)),
+            targets: params.targets.map(|operation| id_from(&operation)),
         };
 
         match engine.search_symbols(task, &spec) {
@@ -2256,6 +2278,18 @@ mod tests {
     // and an unmatched topic falls back to the listing — so an agent
     // can always navigate to the semantics it needs without reading
     // crate source.
+
+    // The guidance states the contract as the provers implement it: a
+    // transaction obligation's remedy is always an application edit,
+    // and no agent is told to expect — or to route on — a `runtime` one.
+    #[test]
+    fn the_interactive_instructions_promise_no_runtime_remedy() {
+        let instructions = super::INTERACTIVE_INSTRUCTIONS;
+
+        assert!(instructions.contains("carries `remedy: application`, always"));
+        assert!(instructions.contains("No obligation currently carries `remedy: runtime`"));
+        assert!(!instructions.contains("`runtime` means"));
+    }
 
     #[test]
     fn the_guide_toc_lists_the_semantics_sections() {

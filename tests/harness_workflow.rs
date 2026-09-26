@@ -95,6 +95,7 @@ impl AgentBackend for ScriptedBackend {
                 version: None,
                 session,
             },
+            escalation: None,
         })
     }
 }
@@ -549,6 +550,21 @@ fn workflow_with_objective(
     max_iterations: u32,
     objective: Option<String>,
 ) -> (Workflow, ConfluenceEngine) {
+    workflow_over(out_dir, max_iterations, objective, |engine| {
+        Arc::new(ScriptedBackend {
+            engine: engine.clone(),
+            script,
+        })
+    })
+}
+
+/// The same harness over any backend, built once the engine exists.
+fn workflow_over(
+    out_dir: PathBuf,
+    max_iterations: u32,
+    objective: Option<String>,
+    backend: impl FnOnce(&ConfluenceEngine) -> Arc<dyn AgentBackend>,
+) -> (Workflow, ConfluenceEngine) {
     let mut run_meta = RunMetadata::new(RunId("workflow-test".to_string()));
     run_meta.prompt = Some("A ping service.".to_string());
     run_meta.policy = RunPolicy {
@@ -559,10 +575,7 @@ fn workflow_with_objective(
     let engine =
         ConfluenceEngine::in_memory(WorkspaceState::empty(run_meta)).expect("engine starts");
 
-    let backend = Arc::new(ScriptedBackend {
-        engine: engine.clone(),
-        script,
-    });
+    let backend = backend(&engine);
 
     let supervisor = Supervisor::new(
         engine.clone(),
@@ -652,11 +665,13 @@ async fn prompt_to_validated_model_with_all_requirements_proven() {
 
 /// The phase order the two-layer model requires: the fanout writes L0
 /// programs, requirement discovery says what must hold, and only then
-/// does a single agent author the runtime topology that discharges it.
+/// does a single agent author the runtime topology that realizes them.
 ///
-/// L1 cannot come earlier. It exists to make specific requirements
-/// provable, and before discovery has run there are none to aim at —
-/// which is why the decomposer no longer holds the grant.
+/// L1 cannot come earlier. It realizes the application model —
+/// placement, transport, grouping, capacity — and before L0 and its
+/// requirements have settled there is nothing settled to realize, which
+/// is why the decomposer no longer holds the grant. It discharges no
+/// obligation: every transaction obligation is proven from L0 alone.
 #[tokio::test]
 async fn the_runtime_topology_is_authored_after_l0_converges() {
     let out_dir = std::env::temp_dir().join(format!("conseqa-wf-{}", Uuid::new_v4()));
@@ -1429,6 +1444,7 @@ async fn attempt_exhaustion_is_reported_without_discarding_siblings() {
                     final_message: None,
                     usage: Default::default(),
                     backend: metadata,
+                    escalation: None,
                 });
             }
 
@@ -1450,6 +1466,7 @@ async fn attempt_exhaustion_is_reported_without_discarding_siblings() {
                 final_message: None,
                 usage: Default::default(),
                 backend: metadata,
+                escalation: None,
             })
         }
     }
@@ -1520,4 +1537,1509 @@ async fn attempt_exhaustion_is_reported_without_discarding_siblings() {
             .program
             .is_some()
     );
+}
+
+/// The in-process System One executor (§14–§17 of the System One
+/// orchestration revision), over the same workflow and the same gate.
+///
+/// The decider here is a fixed set of opinions, so what is tested is the
+/// builder — what it enumerates, what it asks, what it does with an
+/// answer, and above all when it declines to act — not any model.
+#[cfg(feature = "system-one")]
+mod system_one {
+    use std::sync::Mutex;
+
+    use conseqa::confluence::TaskKind;
+    use conseqa::harness::executors::SystemOneBackend;
+    use conseqa::spec::ResultReplayRequirement;
+    use conseqa::system_one::{
+        Answer, Decider, DeciderError, DeciderIdentity, Decision, DecisionRequest, Question,
+    };
+
+    use super::*;
+
+    const UNSTATED: f64 = 0.02;
+
+    /// A decider with fixed opinions. A Choice it has no opinion on
+    /// finds no match; a Noul it has no opinion on is not stated.
+    #[derive(Clone, Default)]
+    struct Opinions {
+        choices: BTreeMap<&'static str, (&'static str, f64)>,
+        nouls: BTreeMap<&'static str, f64>,
+
+        /// Opinions held about one operation only, keyed by `(operation,
+        /// question)`; they take precedence over the general ones.
+        scoped_choices: BTreeMap<(&'static str, &'static str), (&'static str, f64)>,
+        scoped_nouls: BTreeMap<(&'static str, &'static str), f64>,
+        unavailable: bool,
+        asked: Arc<Mutex<Vec<DecisionRequest>>>,
+
+        /// Holds every answer until this many requests are waiting, so
+        /// that tasks provably overlap.
+        rendezvous: Option<Arc<tokio::sync::Barrier>>,
+    }
+
+    impl Opinions {
+        fn choosing(mut self, question: &'static str, option: &'static str, p: f64) -> Self {
+            self.choices.insert(question, (option, p));
+            self
+        }
+
+        fn stating(mut self, question: &'static str, p: f64) -> Self {
+            self.nouls.insert(question, p);
+            self
+        }
+
+        fn choosing_for(
+            mut self,
+            operation: &'static str,
+            question: &'static str,
+            option: &'static str,
+            p: f64,
+        ) -> Self {
+            self.scoped_choices
+                .insert((operation, question), (option, p));
+            self
+        }
+
+        fn stating_for(mut self, operation: &'static str, question: &'static str, p: f64) -> Self {
+            self.scoped_nouls.insert((operation, question), p);
+            self
+        }
+
+        fn asked(&self) -> Vec<DecisionRequest> {
+            self.asked.lock().expect("not poisoned").clone()
+        }
+    }
+
+    #[async_trait]
+    impl Decider for Opinions {
+        fn identity(&self) -> DeciderIdentity {
+            DeciderIdentity {
+                backend: "opinions".to_string(),
+                model: "opinions-1".to_string(),
+                endpoint: None,
+                calibrated: Some(false),
+            }
+        }
+
+        async fn decide(&self, request: &DecisionRequest) -> Result<Decision, DeciderError> {
+            self.asked
+                .lock()
+                .expect("not poisoned")
+                .push(request.clone());
+
+            if let Some(rendezvous) = &self.rendezvous {
+                tokio::time::timeout(Duration::from_secs(5), rendezvous.wait())
+                    .await
+                    .expect("the tasks overlap");
+            }
+
+            if self.unavailable {
+                return Err(DeciderError::Unavailable {
+                    attempts: 1,
+                    last: "the opinions are out".to_string(),
+                });
+            }
+
+            let operation = request.tags.get("operation").cloned().unwrap_or_default();
+
+            let answers = request
+                .questions
+                .iter()
+                .map(|(id, question)| {
+                    let answer = match question {
+                        Question::Choice { criteria, .. } => {
+                            let (choice, p) = self
+                                .scoped_choices
+                                .iter()
+                                .find(|((about, asked), _)| {
+                                    *about == operation && *asked == id.0.as_str()
+                                })
+                                .map(|(_, opinion)| *opinion)
+                                .or_else(|| self.choices.get(id.0.as_str()).copied())
+                                .unwrap_or(("none_of_these", 0.9));
+
+                            assert!(
+                                criteria.contains_key(choice),
+                                "`{id}` does not offer `{choice}`: {:?}",
+                                criteria.keys().collect::<Vec<_>>()
+                            );
+
+                            let rest = (1.0 - p) / (criteria.len() - 1) as f64;
+
+                            Answer::Choice {
+                                choice: choice.to_string(),
+                                probabilities: criteria
+                                    .keys()
+                                    .map(|option| {
+                                        (option.clone(), if option == choice { p } else { rest })
+                                    })
+                                    .collect(),
+                                confidence: p,
+                            }
+                        }
+
+                        Question::Noul { .. } => Answer::Noul {
+                            noul: self
+                                .scoped_nouls
+                                .iter()
+                                .find(|((about, asked), _)| {
+                                    *about == operation && *asked == id.0.as_str()
+                                })
+                                .map(|(_, p)| *p)
+                                .or_else(|| self.nouls.get(id.0.as_str()).copied())
+                                .unwrap_or(UNSTATED),
+                        },
+
+                        Question::Score { .. } => panic!("discovery asks no score"),
+                    };
+
+                    assert_eq!(answer.conforms_to(question), Ok(()), "`{id}`");
+
+                    (id.clone(), answer)
+                })
+                .collect();
+
+            Ok(Decision {
+                identity: self.identity(),
+                answered_by: "opinions-1".to_string(),
+                answers,
+                usage: None,
+                latency: Duration::ZERO,
+                shadow: None,
+            })
+        }
+    }
+
+    /// What the agent backend was given, in order.
+    type Seen = Arc<Mutex<Vec<(TaskKind, String)>>>;
+
+    fn recording(script: ScriptFn, seen: Seen) -> ScriptFn {
+        Arc::new(move |engine, invocation| {
+            seen.lock()
+                .expect("not poisoned")
+                .push((invocation.kind, invocation.prompt.clone()));
+
+            script(engine, invocation)
+        })
+    }
+
+    fn discoveries(seen: &Seen) -> Vec<String> {
+        seen.lock()
+            .expect("not poisoned")
+            .iter()
+            .filter(|(kind, _)| *kind == TaskKind::RequirementDiscovery)
+            .map(|(_, prompt)| prompt.clone())
+            .collect()
+    }
+
+    /// The workflow with discovery attempted in process, over a scripted
+    /// agent backend that records what reaches it.
+    fn workflow_with(
+        out_dir: PathBuf,
+        script: ScriptFn,
+        opinions: &Opinions,
+    ) -> (Workflow, ConfluenceEngine, Seen) {
+        let seen = Seen::default();
+
+        let decider: Arc<dyn Decider> = Arc::new(opinions.clone());
+
+        let (workflow, engine) = workflow_over(out_dir, 8, None, |engine| {
+            Arc::new(SystemOneBackend::new(
+                engine.clone(),
+                decider,
+                [TaskKind::RequirementDiscovery],
+                Arc::new(ScriptedBackend {
+                    engine: engine.clone(),
+                    script: recording(script, seen.clone()),
+                }),
+            ))
+        });
+
+        (workflow, engine, seen)
+    }
+
+    fn scratch() -> PathBuf {
+        std::env::temp_dir().join(format!("conseqa-s1-{}", Uuid::new_v4()))
+    }
+
+    fn manifest_of(out_dir: &std::path::Path) -> serde_json::Value {
+        serde_json::from_str(
+            &std::fs::read_to_string(out_dir.join("confluence-manifest.json"))
+                .expect("manifest readable"),
+        )
+        .expect("manifest is json")
+    }
+
+    fn records<'a>(manifest: &'a serde_json::Value, kind: &str) -> Vec<&'a serde_json::Value> {
+        manifest["task_records"]
+            .as_array()
+            .expect("task records")
+            .iter()
+            .filter(|record| record["kind"] == kind)
+            .collect()
+    }
+
+    fn adopted_idempotency(
+        engine: &ConfluenceEngine,
+    ) -> Vec<conseqa::spec::IdempotencyRequirement> {
+        engine.head_snapshot().workspace.operations[&id("operation.ping")]
+            .requirements
+            .idempotency
+            .clone()
+    }
+
+    /// The point of the layer: an explicit obligation is mapped to the
+    /// requirement code enumerated, committed through the gate, and no
+    /// agent session is spent on it.
+    #[tokio::test]
+    async fn an_explicit_obligation_is_mapped_without_an_agent_session() {
+        let out_dir = scratch();
+
+        let opinions = Opinions::default()
+            .choosing("obligation_0", "idempotency", 0.93)
+            .stating("result_replay", 0.91);
+
+        let (workflow, engine, seen) = workflow_with(out_dir.clone(), success_script(), &opinions);
+
+        let report = workflow.run().await.expect("the workflow runs");
+
+        assert!(
+            matches!(report.status, RunStatus::Success { .. }),
+            "{:?}",
+            report.status
+        );
+
+        assert!(
+            discoveries(&seen).is_empty(),
+            "discovery never reached the agent backend"
+        );
+
+        // One request decided the task: everything code could not
+        // answer, asked together over one state.
+        let asked = opinions.asked();
+
+        assert_eq!(asked.len(), 1);
+
+        assert_eq!(asked[0].state["prompt"], "A ping service.");
+        assert_eq!(
+            asked[0].state["obligations"][0]["intent"],
+            "ping is idempotent by id"
+        );
+        assert_eq!(asked[0].tags["builder"], "requirement_discovery");
+        assert_eq!(
+            asked[0].tags["spec.discovery.obligation"],
+            "discovery.obligation@1"
+        );
+
+        // Exactly what the scripted agent would have proposed: keyed by
+        // the request's declared identity, replay consistent because the
+        // refinement was stated.
+        let adopted = adopted_idempotency(&engine);
+
+        assert_eq!(adopted.len(), 1);
+        assert_eq!(adopted[0].result, ResultReplayRequirement::ReplayConsistent);
+        assert_eq!(
+            adopted[0].key.components,
+            vec![ValueRef {
+                source: ValueSource::Input(id("input.ping.request")),
+                path: path("id"),
+            }]
+        );
+
+        let head = engine.head_snapshot();
+
+        assert!(matches!(
+            head.workspace.prompt_obligations[&PromptObligationId(OBLIGATION.to_string())].status,
+            PromptObligationStatus::Mapped { .. }
+        ));
+
+        let manifest = manifest_of(&out_dir);
+
+        assert_eq!(manifest["backend"], "system_one+scripted");
+
+        // The run says for itself who settled what (§13.1): discovery by
+        // the builder, in one attempt, and everything else by sessions.
+        assert_eq!(manifest["manifest_format"], 2);
+
+        let discovery = records(&manifest, "requirement_discovery");
+
+        assert_eq!(discovery.len(), 1);
+        assert_eq!(discovery[0]["executor"], "system_one");
+        assert_eq!(discovery[0]["operation"], "operation.ping");
+        assert_eq!(discovery[0]["attempts"], 1);
+        assert_eq!(discovery[0]["final_state"], "committed");
+        assert!(discovery[0].get("abstained").is_none());
+
+        assert_eq!(manifest["executors"]["system_one"]["tasks"], 1);
+        assert_eq!(records(&manifest, "decompose")[0]["executor"], "agent");
+
+        std::fs::remove_dir_all(&out_dir).ok();
+    }
+
+    /// A refinement that is not stated leaves the default: the builder
+    /// never strengthens a requirement on an uncertain answer.
+    #[tokio::test]
+    async fn an_unstated_refinement_leaves_the_default() {
+        let out_dir = scratch();
+
+        let opinions = Opinions::default()
+            .choosing("obligation_0", "idempotency", 0.93)
+            .stating("result_replay", 0.55);
+
+        let (workflow, engine, _) = workflow_with(out_dir.clone(), success_script(), &opinions);
+
+        workflow.run().await.expect("the workflow runs");
+
+        assert_eq!(
+            adopted_idempotency(&engine)[0].result,
+            ResultReplayRequirement::Unspecified
+        );
+
+        std::fs::remove_dir_all(&out_dir).ok();
+    }
+
+    /// An obligation the builder cannot place is never guessed at and
+    /// never dropped: the same task goes to the agent backend, told why.
+    #[tokio::test]
+    async fn an_unplaceable_obligation_is_handed_to_the_agent_backend() {
+        for opinions in [
+            // Nothing enumerated fits.
+            Opinions::default().choosing("obligation_0", "none_of_these", 0.88),
+            // Something fits, but not clearly enough to act on.
+            Opinions::default().choosing("obligation_0", "idempotency", 0.41),
+        ] {
+            let out_dir = scratch();
+
+            let (workflow, engine, seen) =
+                workflow_with(out_dir.clone(), success_script(), &opinions);
+
+            let report = workflow.run().await.expect("the workflow runs");
+
+            assert!(
+                matches!(report.status, RunStatus::Success { .. }),
+                "{:?}",
+                report.status
+            );
+
+            let handed = discoveries(&seen);
+
+            assert_eq!(handed.len(), 1, "the agent backend ran the task once");
+
+            assert!(
+                handed[0].contains("Hand-off from the System One executor")
+                    && handed[0].contains("maps to no enumerated requirement"),
+                "{}",
+                handed[0]
+            );
+
+            // The agent's proposal is the one adopted.
+            assert_eq!(
+                adopted_idempotency(&engine)[0].result,
+                ResultReplayRequirement::ReplayConsistent
+            );
+
+            std::fs::remove_dir_all(&out_dir).ok();
+        }
+    }
+
+    /// An unavailable decider costs the run nothing but the attempt.
+    #[tokio::test]
+    async fn an_unavailable_decider_costs_only_the_fallback() {
+        let out_dir = scratch();
+
+        let opinions = Opinions {
+            unavailable: true,
+            ..Default::default()
+        };
+
+        let (workflow, _, seen) = workflow_with(out_dir.clone(), success_script(), &opinions);
+
+        let report = workflow.run().await.expect("the workflow runs");
+
+        assert!(
+            matches!(report.status, RunStatus::Success { .. }),
+            "{:?}",
+            report.status
+        );
+
+        let handed = discoveries(&seen);
+
+        assert_eq!(handed.len(), 1);
+        assert!(
+            handed[0].contains("the decider gave no answer"),
+            "{}",
+            handed[0]
+        );
+
+        // The manifest records the abstention against the task the agent
+        // settled, so an escalation rate can be read off any run.
+        let manifest = manifest_of(&out_dir);
+
+        let discovery = records(&manifest, "requirement_discovery");
+
+        assert_eq!(discovery[0]["executor"], "agent");
+        assert_eq!(discovery[0]["backend"], "scripted");
+        assert!(
+            discovery[0]["abstained"]
+                .as_str()
+                .expect("an abstention")
+                .contains("the decider gave no answer"),
+            "{}",
+            discovery[0]
+        );
+
+        assert_eq!(manifest["executors"]["agent"]["abstentions_received"], 1);
+        assert!(manifest["executors"].get("system_one").is_none());
+
+        std::fs::remove_dir_all(&out_dir).ok();
+    }
+
+    /// With nothing stated there is nothing to propose, and the builder
+    /// says so itself rather than spending a session to learn it.
+    #[tokio::test]
+    async fn a_prompt_that_states_nothing_needs_no_session() {
+        let out_dir = scratch();
+
+        let opinions = Opinions::default();
+
+        let (workflow, engine, seen) =
+            workflow_with(out_dir.clone(), no_requirements_script(), &opinions);
+
+        let report = workflow.run().await.expect("the workflow runs");
+
+        assert!(
+            matches!(report.status, RunStatus::Success { .. }),
+            "{:?}",
+            report.status
+        );
+
+        assert!(discoveries(&seen).is_empty());
+        assert!(adopted_idempotency(&engine).is_empty());
+
+        std::fs::remove_dir_all(&out_dir).ok();
+    }
+
+    /// Under a policy that adopts implied requirements, one the prompt
+    /// states is proposed as strongly implied, citing the prompt.
+    #[tokio::test]
+    async fn a_stated_requirement_is_proposed_as_strongly_implied() {
+        let out_dir = scratch();
+
+        let opinions = Opinions::default().stating("idempotency", 0.94);
+
+        let (workflow, engine, seen) =
+            workflow_with(out_dir.clone(), no_requirements_script(), &opinions);
+
+        let report = workflow.run().await.expect("the workflow runs");
+
+        assert!(
+            matches!(report.status, RunStatus::Success { .. }),
+            "{:?}",
+            report.status
+        );
+
+        assert!(discoveries(&seen).is_empty());
+
+        let adopted = adopted_idempotency(&engine);
+
+        assert_eq!(adopted.len(), 1);
+        assert_eq!(adopted[0].result, ResultReplayRequirement::Unspecified);
+
+        let head = engine.head_snapshot();
+
+        assert!(
+            head.workspace
+                .requirement_proposals
+                .iter()
+                .any(|proposal| matches!(
+                    &proposal.origin,
+                    RequirementOrigin::StronglyImplied { evidence, .. } if !evidence.is_empty()
+                )),
+            "{:?}",
+            head.workspace.requirement_proposals
+        );
+
+        std::fs::remove_dir_all(&out_dir).ok();
+    }
+
+    /// A model a person authored and the checker proves, with everything
+    /// its author declared taken out — so discovery has it all to find.
+    fn undeclared(fixture: &str, operation: &Id) -> (WorkspaceState, conseqa::spec::Operation) {
+        let source = std::fs::read_to_string(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures")
+                .join(fixture),
+        )
+        .expect("fixture readable");
+
+        let authored = conseqa::parser::yaml::parse(&source).expect("fixture parses");
+
+        let mut stripped = authored.clone();
+
+        for operation in stripped.operations.values_mut() {
+            operation.requirements = Default::default();
+
+            let transactions: Vec<Id> = operation
+                .program
+                .transactions()
+                .into_iter()
+                .map(|(_, transaction)| transaction.id.clone())
+                .collect();
+
+            for transaction in transactions {
+                operation
+                    .program
+                    .transaction_mut(&transaction)
+                    .expect("just listed")
+                    .requirements = Default::default();
+            }
+        }
+
+        let mut run_meta = RunMetadata::new(RunId("discovery-test".to_string()));
+
+        run_meta.prompt = Some(
+            "Entries must be applied to each tenant's ledger exactly once and in sequence \
+             order, even when events are redelivered or the service restarts."
+                .to_string(),
+        );
+
+        run_meta.policy = RunPolicy {
+            strict_requirements: true,
+            adopt_recommended: false,
+        };
+
+        (
+            WorkspaceState::from_model(&stripped, run_meta),
+            authored.operations[operation].clone(),
+        )
+    }
+
+    /// Runs one discovery task for `operation` with the builder in front
+    /// of an agent backend that does nothing.
+    async fn discover(
+        workspace: WorkspaceState,
+        operation: &Id,
+        opinions: &Opinions,
+    ) -> (ConfluenceEngine, Seen) {
+        let (engine, seen, _) =
+            discover_all(workspace, std::slice::from_ref(operation), opinions).await;
+
+        (engine, seen)
+    }
+
+    /// The same for several operations at once, as the workflow's
+    /// discovery phase fans them out.
+    async fn discover_all(
+        workspace: WorkspaceState,
+        operations: &[Id],
+        opinions: &Opinions,
+    ) -> (ConfluenceEngine, Seen, Vec<conseqa::harness::TaskRun>) {
+        let tasks = operations
+            .iter()
+            .map(|operation| {
+                (
+                    TaskKind::RequirementDiscovery,
+                    conseqa::confluence::WriteScope::requirement_discovery(operation.clone()),
+                    operation.clone(),
+                )
+            })
+            .collect();
+
+        run_tasks(workspace, tasks, opinions).await
+    }
+
+    /// Runs operation-scoped tasks with every builder in front of an
+    /// agent backend that does nothing but record what reaches it.
+    async fn run_tasks(
+        workspace: WorkspaceState,
+        tasks: Vec<(TaskKind, conseqa::confluence::WriteScope, Id)>,
+        opinions: &Opinions,
+    ) -> (ConfluenceEngine, Seen, Vec<conseqa::harness::TaskRun>) {
+        let engine = ConfluenceEngine::in_memory(workspace).expect("engine starts");
+
+        let seen = Seen::default();
+
+        let idle: ScriptFn = Arc::new(|_, _| Box::pin(async {}));
+
+        let backend = Arc::new(SystemOneBackend::new(
+            engine.clone(),
+            Arc::new(opinions.clone()),
+            conseqa::harness::executors::BUILDABLE,
+            Arc::new(ScriptedBackend {
+                engine: engine.clone(),
+                script: recording(idle, seen.clone()),
+            }),
+        ));
+
+        let supervisor = Supervisor::new(
+            engine.clone(),
+            backend,
+            "http://127.0.0.1:0/mcp",
+            None,
+            scratch(),
+        );
+
+        let scheduler = Scheduler::new(
+            engine.clone(),
+            supervisor,
+            SchedulerPolicy {
+                max_attempts: 3,
+                max_concurrent_agents: tasks.len().max(1),
+                ..Default::default()
+            },
+        );
+
+        let prompt = engine
+            .head_snapshot()
+            .workspace
+            .run_meta
+            .prompt
+            .clone()
+            .expect("the run has a prompt");
+
+        let tasks = tasks
+            .into_iter()
+            .map(
+                |(kind, write_scope, operation)| conseqa::harness::LogicalTask {
+                    kind,
+                    objective: format!("Work on {operation}."),
+                    write_scope,
+                    bundle: conseqa::confluence::BundleSpec {
+                        operation: Some(operation),
+                        requirements: Vec::new(),
+                        include: Vec::new(),
+                    },
+                    prompt_evidence: vec![conseqa::confluence::PromptEvidence {
+                        source: conseqa::confluence::EvidenceRef("run.prompt".to_string()),
+                        excerpt: prompt.clone(),
+                    }],
+                    interactive: false,
+                },
+            )
+            .collect();
+
+        let runs = scheduler.run_many(tasks).await.expect("the tasks run");
+
+        (engine, seen, runs)
+    }
+
+    /// Discovery fans out one task per operation, and mapping an
+    /// obligation rewrites it. A task reads only the obligations aimed
+    /// at its own operation, so peers that overlap — held here until
+    /// both have read and asked — each commit at the first attempt
+    /// instead of the first to commit invalidating the rest.
+    #[tokio::test]
+    async fn peers_mapping_their_own_obligations_do_not_invalidate_each_other() {
+        let posting = id("operation.post_entry");
+        let applying = id("operation.apply_entry");
+
+        let (mut workspace, _) = undeclared("tenant_ledger.yaml", &posting);
+
+        for (obligation, intent, target) in [
+            (
+                "obl.post-once",
+                "a retried posting records one entry",
+                &posting,
+            ),
+            (
+                "obl.apply-once",
+                "a redelivered event is applied once",
+                &applying,
+            ),
+        ] {
+            workspace.prompt_obligations.insert(
+                PromptObligationId(obligation.to_string()),
+                PromptObligation {
+                    source_span: None,
+                    normalized_intent: intent.to_string(),
+                    targets: vec![target.clone()],
+                    status: PromptObligationStatus::Unmapped,
+                },
+            );
+        }
+
+        let opinions = Opinions {
+            rendezvous: Some(Arc::new(tokio::sync::Barrier::new(2))),
+            ..Opinions::default().choosing("obligation_0", "idempotency", 0.9)
+        };
+
+        let (engine, seen, runs) =
+            discover_all(workspace, &[posting.clone(), applying.clone()], &opinions).await;
+
+        assert!(discoveries(&seen).is_empty());
+
+        for run in &runs {
+            assert!(run.committed(), "{run:?}");
+            assert_eq!(run.attempts.len(), 1, "no attempt was invalidated: {run:?}");
+        }
+
+        // Each task was shown only the obligation aimed at its operation.
+        for request in opinions.asked() {
+            assert_eq!(
+                request.state["obligations"].as_array().map(Vec::len),
+                Some(1)
+            );
+        }
+
+        let head = engine.head_snapshot();
+
+        assert!(
+            head.workspace
+                .prompt_obligations
+                .values()
+                .all(|obligation| {
+                    matches!(obligation.status, PromptObligationStatus::Mapped { .. })
+                })
+        );
+    }
+
+    /// The claim the whole layer rests on: what a requirement is *keyed
+    /// by* is a fact about the program, so code finds it. Told only that
+    /// the four requirements are stated, the builder re-derives the keys,
+    /// positions and refinements a person declared by hand — for a
+    /// subscription whose identity comes from its topic, a transaction
+    /// keyed through its selectors, and an ordering read off its cursor.
+    #[tokio::test]
+    async fn enumeration_rederives_what_an_author_declared() {
+        let operation = id("operation.apply_entry");
+
+        let (workspace, authored) = undeclared("tenant_ledger.yaml", &operation);
+
+        let opinions = Opinions::default()
+            .stating("idempotency", 0.92)
+            .stating("recoverability", 0.9)
+            .stating("guaranteed_completion", 0.88)
+            .stating("serializability_0", 0.95)
+            .stating("ordering_0", 0.97);
+
+        let (engine, seen) = discover(workspace, &operation, &opinions).await;
+
+        assert!(discoveries(&seen).is_empty(), "{:?}", discoveries(&seen));
+
+        let head = engine.head_snapshot();
+        let draft = &head.workspace.operations[&operation];
+
+        assert_eq!(draft.requirements, authored.requirements);
+
+        let adopted = draft.program.as_ref().expect("a program").transactions();
+        let declared = authored.program.transactions();
+
+        assert_eq!(adopted.len(), 1);
+        assert_eq!(adopted[0].1.requirements, declared[0].1.requirements);
+
+        // What the model was shown of the transaction is words, never
+        // DSL: it is asked about the prompt, not about Conseqa.
+        let asked = opinions.asked();
+
+        assert_eq!(asked.len(), 1);
+
+        let does = asked[0].state["operation"]["work"][0]["does"]
+            .as_str()
+            .expect("a summary");
+
+        assert!(
+            does.contains("advances the `last_applied_sequence` position")
+                && does.contains("updates the `object.tenant_ledger` selected by `tenant_id`"),
+            "{does}"
+        );
+
+        // One candidate key: nothing to choose, so nothing was asked.
+        assert!(
+            !asked[0]
+                .questions
+                .contains_key(&"serializability_key_0".into())
+        );
+    }
+
+    /// The same for a request: its identity is declared on the input, and
+    /// its serializability key is the tenant its lock, read and write all
+    /// pin. Nothing is proposed for what the prompt does not state.
+    #[tokio::test]
+    async fn only_what_is_stated_is_proposed() {
+        let operation = id("operation.post_entry");
+
+        let (workspace, authored) = undeclared("tenant_ledger.yaml", &operation);
+
+        let opinions = Opinions::default().stating("serializability_0", 0.9);
+
+        let (engine, seen) = discover(workspace, &operation, &opinions).await;
+
+        assert!(discoveries(&seen).is_empty(), "{:?}", discoveries(&seen));
+
+        let head = engine.head_snapshot();
+        let draft = &head.workspace.operations[&operation];
+
+        assert_eq!(draft.requirements, Default::default());
+
+        assert_eq!(
+            draft.program.as_ref().expect("a program").transactions()[0]
+                .1
+                .requirements
+                .serializability,
+            authored.program.transactions()[0]
+                .1
+                .requirements
+                .serializability
+        );
+
+        // This transaction guards no position, so ordering was never a
+        // question.
+        assert!(
+            !opinions.asked()[0]
+                .questions
+                .contains_key(&"ordering_0".into())
+        );
+    }
+
+    /// A requirement the prompt states but code cannot express — here,
+    /// idempotency for an input that declares no identity — is the
+    /// session's to resolve. It is never dropped.
+    #[tokio::test]
+    async fn a_stated_requirement_nothing_can_express_is_escalated() {
+        let operation = id("operation.post_entry");
+
+        let (mut workspace, _) = undeclared("tenant_ledger.yaml", &operation);
+
+        for input in workspace
+            .operations
+            .get_mut(&operation)
+            .expect("the operation")
+            .inputs
+            .values_mut()
+        {
+            if let Input::Request(request) = input {
+                request.identity = RequestIdentity::Unspecified;
+            }
+        }
+
+        let opinions = Opinions::default().stating("idempotency", 0.93);
+
+        let (engine, seen) = discover(workspace, &operation, &opinions).await;
+
+        let handed = discoveries(&seen);
+
+        assert_eq!(handed.len(), 1);
+        assert!(
+            handed[0]
+                .contains("the prompt requires idempotency, and nothing enumerated can express it"),
+            "{}",
+            handed[0]
+        );
+
+        assert!(
+            engine
+                .head_snapshot()
+                .workspace
+                .requirement_proposals
+                .is_empty()
+        );
+    }
+
+    fn authored(fixture: &str) -> conseqa::spec::Model {
+        let source = std::fs::read_to_string(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures")
+                .join(fixture),
+        )
+        .expect("fixture readable");
+
+        conseqa::parser::yaml::parse(&source).expect("fixture parses")
+    }
+
+    fn workspace_of(model: &conseqa::spec::Model, prompt: &str) -> WorkspaceState {
+        let mut run_meta = RunMetadata::new(RunId("repair-test".to_string()));
+
+        run_meta.prompt = Some(prompt.to_string());
+
+        run_meta.policy = RunPolicy {
+            strict_requirements: true,
+            adopt_recommended: false,
+        };
+
+        WorkspaceState::from_model(model, run_meta)
+    }
+
+    fn serializability_proven(model: &conseqa::spec::Model, transaction: &str) -> bool {
+        conseqa::analyzer::verification::verify(model)
+            .transaction_serializability
+            .iter()
+            .filter(|check| check.transaction == id(transaction))
+            .all(|check| {
+                matches!(
+                    check.verdict,
+                    conseqa::analyzer::verification::TransactionSerializabilityVerdict::Proven { .. }
+                )
+            })
+    }
+
+    /// `tenant_ledger` as its author wrote it, and with the exclusive
+    /// lock that serializes postings taken out — which leaves the
+    /// read-then-write of the tenant's sequence unprotected.
+    fn a_posting_without_its_lock() -> (conseqa::spec::Model, conseqa::spec::Model) {
+        let authored = authored("tenant_ledger.yaml");
+
+        let mut broken = authored.clone();
+
+        broken
+            .operations
+            .get_mut(&id("operation.post_entry"))
+            .expect("the operation")
+            .program
+            .transaction_mut(&id("tx.post_entry"))
+            .expect("the transaction")
+            .steps
+            .retain(|step| !matches!(step, conseqa::spec::TransactionStep::Lock(_)));
+
+        assert!(serializability_proven(&authored, "tx.post_entry"));
+        assert!(
+            !serializability_proven(&broken, "tx.post_entry"),
+            "the fixture is only a test if removing the lock breaks the proof"
+        );
+
+        (authored, broken)
+    }
+
+    async fn repair(
+        broken: &conseqa::spec::Model,
+        operation: &str,
+        opinions: &Opinions,
+    ) -> (ConfluenceEngine, Seen, Vec<conseqa::harness::TaskRun>) {
+        run_tasks(
+            workspace_of(broken, "A ledger of entries per tenant."),
+            vec![(
+                TaskKind::RequirementRepair,
+                conseqa::confluence::WriteScope::requirement_repair(id(operation)),
+                id(operation),
+            )],
+            opinions,
+        )
+        .await
+    }
+
+    async fn head_model_is_proven(engine: &ConfluenceEngine) -> bool {
+        match engine.analysis_ready(engine.head_revision()).await {
+            conseqa::confluence::AnalysisState::Ready(analysis) => {
+                analysis.verification.all_proven()
+            }
+            other => panic!("the repaired head does not verify: {other:?}"),
+        }
+    }
+
+    fn repairs(seen: &Seen) -> Vec<String> {
+        seen.lock()
+            .expect("not poisoned")
+            .iter()
+            .filter(|(kind, _)| *kind == TaskKind::RequirementRepair)
+            .map(|(_, prompt)| prompt.clone())
+            .collect()
+    }
+
+    /// Generate and verify: code reads the analyzer's obstacles,
+    /// synthesizes the repairs they admit, and has the analyzer judge
+    /// each one. With nothing stated the least invasive proven repair is
+    /// committed — and no session, and no model, was needed to find it.
+    #[tokio::test]
+    async fn an_unproven_obligation_is_repaired_by_a_candidate_the_analyzer_admits() {
+        let (_, broken) = a_posting_without_its_lock();
+
+        let opinions = Opinions::default();
+
+        let (engine, seen, runs) = repair(&broken, "operation.post_entry", &opinions).await;
+
+        assert!(repairs(&seen).is_empty(), "{:?}", repairs(&seen));
+        assert!(runs[0].committed(), "{:?}", runs[0]);
+        assert_eq!(runs[0].attempts.len(), 1);
+
+        assert!(head_model_is_proven(&engine).await);
+
+        let head = engine.head_snapshot();
+
+        let transaction = head.workspace.operations[&id("operation.post_entry")]
+            .program
+            .as_ref()
+            .and_then(|program| program.transaction(&id("tx.post_entry")))
+            .expect("the transaction")
+            .clone();
+
+        assert_eq!(
+            transaction.isolation,
+            conseqa::spec::TransactionIsolation::Serializable
+        );
+
+        // Two repairs were proven, so the one fact that could choose
+        // between them was asked about — and only that.
+        let asked = opinions.asked();
+
+        assert_eq!(asked.len(), 1);
+        assert_eq!(
+            asked[0]
+                .questions
+                .keys()
+                .map(|id| id.0.as_str())
+                .collect::<Vec<_>>(),
+            vec!["contention"]
+        );
+        assert_eq!(asked[0].tags["builder"], "requirement_repair");
+    }
+
+    /// A System One judgment chooses among repairs that are all proven,
+    /// and only on a fact the prompt states. Told that postings pile onto
+    /// one tenant, the builder takes the lock route — and arrives at the
+    /// very program the fixture's author wrote.
+    #[tokio::test]
+    async fn stated_contention_prefers_the_lock_the_author_chose() {
+        let (authored, broken) = a_posting_without_its_lock();
+
+        let opinions = Opinions::default().stating("contention", 0.93);
+
+        let (engine, seen, runs) = repair(&broken, "operation.post_entry", &opinions).await;
+
+        assert!(repairs(&seen).is_empty(), "{:?}", repairs(&seen));
+        assert!(runs[0].committed(), "{:?}", runs[0]);
+
+        assert!(head_model_is_proven(&engine).await);
+
+        let head = engine.head_snapshot();
+
+        assert_eq!(
+            head.workspace.operations[&id("operation.post_entry")].program,
+            Some(
+                authored.operations[&id("operation.post_entry")]
+                    .program
+                    .clone()
+            )
+        );
+    }
+
+    /// The other two routes of the catalogue, each against a different
+    /// way of breaking the same authored transaction: an isolation that
+    /// was never declared, and a lock taken after the read it was meant
+    /// to protect. Each time the builder arrives back at the author's
+    /// program.
+    #[tokio::test]
+    async fn each_breakage_is_repaired_back_to_what_the_author_wrote() {
+        type Breakage = fn(&mut conseqa::spec::Transaction);
+
+        let undeclared_isolation: Breakage = |transaction| {
+            transaction.isolation = conseqa::spec::TransactionIsolation::Unspecified;
+        };
+
+        let late_lock: Breakage = |transaction| {
+            let lock = transaction.steps.remove(0);
+
+            assert!(matches!(lock, conseqa::spec::TransactionStep::Lock(_)));
+
+            transaction.steps.insert(1, lock);
+        };
+
+        for (breakage, contention) in [(undeclared_isolation, 0.02), (late_lock, 0.93)] {
+            let authored = authored("tenant_ledger.yaml");
+
+            let mut broken = authored.clone();
+
+            breakage(
+                broken
+                    .operations
+                    .get_mut(&id("operation.post_entry"))
+                    .expect("the operation")
+                    .program
+                    .transaction_mut(&id("tx.post_entry"))
+                    .expect("the transaction"),
+            );
+
+            assert!(conseqa::analyzer::validate(&broken).is_empty());
+            assert!(!serializability_proven(&broken, "tx.post_entry"));
+
+            let opinions = Opinions::default().stating("contention", contention);
+
+            let (engine, seen, runs) = repair(&broken, "operation.post_entry", &opinions).await;
+
+            assert!(repairs(&seen).is_empty(), "{:?}", repairs(&seen));
+            assert!(runs[0].committed(), "{:?}", runs[0]);
+            assert!(head_model_is_proven(&engine).await);
+
+            assert_eq!(
+                engine.head_snapshot().workspace.operations[&id("operation.post_entry")].program,
+                Some(
+                    authored.operations[&id("operation.post_entry")]
+                        .program
+                        .clone()
+                )
+            );
+        }
+    }
+
+    /// The whole pipeline, from stated obligations to a verified model,
+    /// with discovery and repair both settled in process.
+    ///
+    /// The adopted model is the authored ledger with every declared
+    /// requirement taken out, and with the lock that serializes postings
+    /// taken out too — so there is something to discover and, once it is
+    /// discovered, something to repair. The agent backend behind the
+    /// builders can do nothing at all: if either phase needed it, the run
+    /// could not succeed.
+    #[tokio::test]
+    async fn obligations_become_a_verified_model_without_a_session() {
+        let posting = id("operation.post_entry");
+
+        let (mut workspace, _) = undeclared("tenant_ledger.yaml", &posting);
+
+        workspace
+            .operations
+            .get_mut(&posting)
+            .expect("the operation")
+            .program
+            .as_mut()
+            .expect("a program")
+            .transaction_mut(&id("tx.post_entry"))
+            .expect("the transaction")
+            .steps
+            .retain(|step| !matches!(step, conseqa::spec::TransactionStep::Lock(_)));
+
+        workspace.prompt_obligations.insert(
+            PromptObligationId("obl.one-sequence-each".to_string()),
+            PromptObligation {
+                source_span: Some("in sequence order".to_string()),
+                normalized_intent: "two postings for one tenant never take the same sequence"
+                    .to_string(),
+                targets: vec![posting.clone()],
+                status: PromptObligationStatus::Unmapped,
+            },
+        );
+
+        let opinions = Opinions::default()
+            .choosing_for(
+                "operation.post_entry",
+                "obligation_0",
+                "serializability_0",
+                0.91,
+            )
+            .stating_for("operation.post_entry", "idempotency", 0.9)
+            .stating_for("operation.post_entry", "result_replay", 0.88);
+
+        let engine = ConfluenceEngine::in_memory(workspace).expect("engine starts");
+
+        let seen = Seen::default();
+
+        let idle: ScriptFn = Arc::new(|_, _| Box::pin(async {}));
+
+        let backend = Arc::new(SystemOneBackend::new(
+            engine.clone(),
+            Arc::new(opinions.clone()),
+            conseqa::harness::executors::BUILDABLE,
+            Arc::new(ScriptedBackend {
+                engine: engine.clone(),
+                script: recording(idle, seen.clone()),
+            }),
+        ));
+
+        let out_dir = scratch();
+
+        let supervisor = Supervisor::new(
+            engine.clone(),
+            backend,
+            "http://127.0.0.1:0/mcp",
+            None,
+            out_dir.join("work"),
+        );
+
+        let workflow = Workflow::new(
+            Scheduler::new(engine.clone(), supervisor, SchedulerPolicy::default()),
+            WorkflowConfig {
+                out_dir: out_dir.clone(),
+                analysis_timeout: Duration::from_secs(20),
+                max_iterations: 8,
+                objective: None,
+            },
+        );
+
+        let report = workflow.run().await.expect("the workflow runs");
+
+        assert!(
+            matches!(report.status, RunStatus::Success { .. }),
+            "{:?}",
+            report.status
+        );
+
+        // No session ran: the agent backend was never reached.
+        assert!(
+            seen.lock().expect("not poisoned").is_empty(),
+            "{:?}",
+            seen.lock()
+                .expect("not poisoned")
+                .iter()
+                .map(|(kind, _)| *kind)
+                .collect::<Vec<_>>()
+        );
+
+        // The obligation was mapped to a requirement keyed by the tenant
+        // the transaction's selectors pin, and the repair that proves it
+        // is in the exported model, which the standalone checker accepts.
+        let head = engine.head_snapshot();
+
+        assert!(matches!(
+            head.workspace.prompt_obligations
+                [&PromptObligationId("obl.one-sequence-each".to_string())]
+                .status,
+            PromptObligationStatus::Mapped { .. }
+        ));
+
+        let source =
+            std::fs::read_to_string(out_dir.join("conseqa.yaml")).expect("the model was exported");
+
+        let model = conseqa::parser::yaml::parse(&source).expect("the exported model parses");
+
+        assert!(conseqa::analyzer::validate(&model).is_empty());
+        assert!(conseqa::analyzer::verification::verify(&model).all_proven());
+
+        let transaction = model.operations[&posting]
+            .program
+            .transaction(&id("tx.post_entry"))
+            .expect("the transaction");
+
+        assert_eq!(
+            transaction.requirements.serializability[0].key,
+            ValueRef {
+                source: ValueSource::Input(id("input.post_entry.request")),
+                path: path("tenant_id"),
+            }
+        );
+
+        assert_eq!(model.operations[&posting].requirements.idempotency.len(), 1);
+
+        // The manifest tells the same story: both phases were the
+        // builders', and nothing was escalated.
+        let manifest = manifest_of(&out_dir);
+
+        assert_eq!(manifest["status"]["kind"], "success");
+        assert!(manifest["executors"].get("agent").is_none(), "{manifest}");
+
+        assert!(records(&manifest, "requirement_repair").iter().any(
+            |record| record["final_state"] == "committed" && record["executor"] == "system_one"
+        ));
+
+        std::fs::remove_dir_all(&out_dir).ok();
+    }
+
+    /// A preference is not a judgment the builder needs in order to act:
+    /// an unsure decider, or none at all, leaves the deterministic order
+    /// standing and the repair is committed all the same.
+    #[tokio::test]
+    async fn an_unsure_or_absent_decider_does_not_stop_a_repair() {
+        for opinions in [
+            Opinions::default().stating("contention", 0.55),
+            Opinions {
+                unavailable: true,
+                ..Default::default()
+            },
+        ] {
+            let (_, broken) = a_posting_without_its_lock();
+
+            let (engine, seen, runs) = repair(&broken, "operation.post_entry", &opinions).await;
+
+            assert!(repairs(&seen).is_empty(), "{:?}", repairs(&seen));
+            assert!(runs[0].committed(), "{:?}", runs[0]);
+            assert!(head_model_is_proven(&engine).await);
+        }
+    }
+
+    /// `flash_checkout` as authored, and with `apply_payment`'s version
+    /// guard taken out. Its conflict closure spans three operations, so
+    /// neither isolation nor a lock in this program alone can prove it.
+    fn a_payment_without_its_version_guard() -> (conseqa::spec::Model, conseqa::spec::Model) {
+        let authored = authored("flash_checkout.yaml");
+
+        let mut broken = authored.clone();
+
+        broken
+            .operations
+            .get_mut(&id("operation.apply_payment"))
+            .expect("the operation")
+            .program
+            .transaction_mut(&id("tx.apply_payment"))
+            .expect("the transaction")
+            .steps
+            .retain(|step| !matches!(step, conseqa::spec::TransactionStep::ValidateVersion(_)));
+
+        assert!(conseqa::analyzer::validate(&broken).is_empty());
+        assert!(serializability_proven(&authored, "tx.apply_payment"));
+        assert!(!serializability_proven(&broken, "tx.apply_payment"));
+
+        (authored, broken)
+    }
+
+    /// Several routes are tried and the analyzer settles which one
+    /// works. Here only the version protocol can: the object is
+    /// versioned, the transaction already says what a rejection does, and
+    /// the one missing step is the guard — which lands where the author
+    /// had put it.
+    #[tokio::test]
+    async fn the_analyzer_picks_the_route_that_proves_across_operations() {
+        let (authored, broken) = a_payment_without_its_version_guard();
+
+        let opinions = Opinions::default();
+
+        let (engine, seen, runs) = repair(&broken, "operation.apply_payment", &opinions).await;
+
+        assert!(repairs(&seen).is_empty(), "{:?}", repairs(&seen));
+        assert!(runs[0].committed(), "{:?}", runs[0]);
+
+        // The fixture leaves other operations' obligations unproven on
+        // purpose, so the claim is not that everything is proven. It is
+        // that the repaired head stands exactly where the authored model
+        // stands — including this transaction's ordering requirement,
+        // which the builder did not target and which rests on the same
+        // closure.
+        let conseqa::confluence::AnalysisState::Ready(analysis) =
+            engine.analysis_ready(engine.head_revision()).await
+        else {
+            panic!("the repaired head does not verify");
+        };
+
+        assert_eq!(
+            conseqa::confluence::standing(&analysis.verification),
+            conseqa::confluence::standing(&conseqa::analyzer::verification::verify(&authored))
+        );
+
+        let head = engine.head_snapshot();
+
+        assert_eq!(
+            head.workspace.operations[&id("operation.apply_payment")].program,
+            Some(
+                authored.operations[&id("operation.apply_payment")]
+                    .program
+                    .clone()
+            )
+        );
+
+        // One admissible repair: nothing to prefer, so nothing was asked.
+        assert!(opinions.asked().is_empty());
+
+        let summary = runs[0].attempts[0]
+            .agent_exit
+            .final_message
+            .clone()
+            .expect("a summary");
+
+        assert!(
+            summary.contains("1 of 2 candidates were admissible"),
+            "{summary}"
+        );
+    }
+
+    /// A guard rejects, and what an operation does when its transaction
+    /// is rejected is its author's to say. Without a `rejected` arm the
+    /// version route is not offered; what was tried, and what the
+    /// analyzer made of it, goes to the session.
+    #[tokio::test]
+    async fn a_repair_that_needs_a_judgment_is_handed_to_the_session() {
+        let (_, mut broken) = a_payment_without_its_version_guard();
+
+        // Take out every rejecting step and the arm with them, leaving a
+        // valid program whose author never said what a rejection does.
+        let operation = broken
+            .operations
+            .get_mut(&id("operation.apply_payment"))
+            .expect("the operation");
+
+        operation.requirements = Default::default();
+
+        for step in &mut operation.program.steps {
+            if let OperationStep::Transaction(execution) = step {
+                execution.rejected = None;
+
+                execution.transaction.requirements.ordering.clear();
+
+                execution.transaction.steps.retain(|step| {
+                    !matches!(
+                        step,
+                        conseqa::spec::TransactionStep::AdvanceCursor(_)
+                            | conseqa::spec::TransactionStep::Transition(_)
+                    )
+                });
+            }
+        }
+
+        operation
+            .program
+            .steps
+            .retain(|step| !matches!(step, OperationStep::ExecuteEffectIntent(_)));
+
+        let errors = conseqa::analyzer::validate(&broken);
+
+        assert!(errors.is_empty(), "{errors:?}");
+
+        let opinions = Opinions::default();
+
+        let (engine, seen, runs) = repair(&broken, "operation.apply_payment", &opinions).await;
+
+        assert!(!runs[0].committed());
+        assert_eq!(engine.head_revision(), broken.revision);
+
+        let handed = repairs(&seen);
+
+        assert_eq!(handed.len(), 1);
+        assert!(
+            handed[0].contains("Hand-off from the System One executor")
+                && handed[0].contains("tried: hold an exclusive lock")
+                && handed[0].contains("unproven"),
+            "{}",
+            handed[0].split("## Hand-off").last().unwrap_or_default()
+        );
+        assert!(
+            !handed[0].contains("validate at commit"),
+            "the version route was not offered"
+        );
+    }
+
+    /// With nothing unproven the builder says so itself.
+    #[tokio::test]
+    async fn a_proven_operation_needs_no_repair_and_no_session() {
+        let authored = authored("tenant_ledger.yaml");
+
+        let opinions = Opinions::default();
+
+        let (engine, seen, runs) = repair(&authored, "operation.post_entry", &opinions).await;
+
+        assert!(repairs(&seen).is_empty());
+        assert!(opinions.asked().is_empty());
+
+        // The task ended as a session that found nothing to do would:
+        // once, without a commit.
+        assert_eq!(runs[0].attempts.len(), 1);
+        assert!(!runs[0].committed());
+        assert_eq!(engine.head_revision(), authored.revision);
+    }
+
+    /// Between the thresholds the builder does not decide.
+    #[tokio::test]
+    async fn an_uncertain_judgment_is_escalated_not_guessed() {
+        let out_dir = scratch();
+
+        let opinions = Opinions::default().stating("recoverability", 0.5);
+
+        let (workflow, engine, seen) =
+            workflow_with(out_dir.clone(), no_requirements_script(), &opinions);
+
+        workflow.run().await.expect("the workflow runs");
+
+        let handed = discoveries(&seen);
+
+        assert!(!handed.is_empty());
+        assert!(
+            handed[0].contains("uncertain whether the prompt requires recoverability"),
+            "{}",
+            handed[0]
+        );
+
+        // The scripted agent proposes nothing, and neither did the
+        // builder.
+        let head = engine.head_snapshot();
+
+        assert!(head.workspace.requirement_proposals.is_empty());
+
+        std::fs::remove_dir_all(&out_dir).ok();
+    }
 }

@@ -84,6 +84,9 @@ enum Command {
         /// Where a triggered workflow writes its finalized artifacts.
         #[arg(long, default_value = ".conseqa/design")]
         design_out: PathBuf,
+
+        #[command(flatten)]
+        system_one: SystemOne,
     },
 
     /// Run one shared server hosting many projects, for global use from
@@ -115,6 +118,9 @@ enum Command {
         /// Maximum worker agents reasoning concurrently in a fanout.
         #[arg(long, default_value_t = 4)]
         max_agents: usize,
+
+        #[command(flatten)]
+        system_one: SystemOne,
     },
 
     /// Serve one shared multi-project instance over stdio, for the
@@ -137,6 +143,9 @@ enum Command {
         /// Maximum worker agents reasoning concurrently in a fanout.
         #[arg(long, default_value_t = 4)]
         max_agents: usize,
+
+        #[command(flatten)]
+        system_one: SystemOne,
     },
 
     /// Print the persisted head, tasks, and commit count.
@@ -185,6 +194,7 @@ async fn main() -> ExitCode {
             backend_program,
             max_agents,
             design_out,
+            system_one,
         } => {
             serve(ServeOptions {
                 database,
@@ -196,6 +206,7 @@ async fn main() -> ExitCode {
                 backend_program,
                 max_agents,
                 design_out,
+                system_one,
             })
             .await
         }
@@ -206,6 +217,7 @@ async fn main() -> ExitCode {
             backend,
             backend_program,
             max_agents,
+            system_one,
         } => {
             serve_global(GlobalOptions {
                 data_dir: PathBuf::from(data_dir),
@@ -214,6 +226,7 @@ async fn main() -> ExitCode {
                 backend,
                 backend_program,
                 max_agents,
+                system_one,
             })
             .await
         }
@@ -222,12 +235,14 @@ async fn main() -> ExitCode {
             backend,
             backend_program,
             max_agents,
+            system_one,
         } => {
             serve_stdio_cmd(StdioOptions {
                 data_dir: PathBuf::from(data_dir),
                 backend,
                 backend_program,
                 max_agents,
+                system_one,
             })
             .await
         }
@@ -278,6 +293,36 @@ enum Backend {
     Codex,
 }
 
+/// The System One layer of a triggered design run (§26 of the System
+/// One orchestration revision): the same flags `conseqa-harness design`
+/// takes. Nothing is enabled unless they say so.
+#[cfg(feature = "system-one")]
+type SystemOne = conseqa::harness::executors::cli::SystemOneArgs;
+
+/// Without the feature the flags do not exist, and the layer is off.
+#[cfg(not(feature = "system-one"))]
+#[derive(clap::Args, Debug, Clone)]
+struct SystemOne {}
+
+#[cfg(feature = "system-one")]
+type DesignExecutor = Option<conseqa::harness::executors::cli::Executor>;
+
+#[cfg(not(feature = "system-one"))]
+type DesignExecutor = ();
+
+/// Validates the settings, and says what a design run will send where.
+/// Called before anything is opened or served: a daemon must not come
+/// up on settings that are wrong.
+#[cfg(feature = "system-one")]
+fn design_executor(system_one: &SystemOne) -> Result<DesignExecutor, String> {
+    system_one.configure()
+}
+
+#[cfg(not(feature = "system-one"))]
+fn design_executor(_: &SystemOne) -> Result<DesignExecutor, String> {
+    Ok(())
+}
+
 struct ServeOptions {
     database: PathBuf,
     bind: SocketAddr,
@@ -288,9 +333,12 @@ struct ServeOptions {
     backend_program: Option<String>,
     max_agents: usize,
     design_out: PathBuf,
+    system_one: SystemOne,
 }
 
 async fn serve(options: ServeOptions) -> Result<(), String> {
+    let executor = design_executor(&options.system_one)?;
+
     let initial = initial_workspace(options.model, options.prompt)?;
 
     let engine = ConfluenceEngine::open(&options.database, initial)
@@ -305,6 +353,7 @@ async fn serve(options: ServeOptions) -> Result<(), String> {
 
     let launcher: Arc<dyn DesignLauncher> = Arc::new(DaemonDesignLauncher {
         backend,
+        executor,
         mcp_url: Arc::clone(&mcp_url),
         out_dir: options.design_out,
         max_agents: options.max_agents.max(1),
@@ -364,6 +413,7 @@ struct GlobalOptions {
     backend: Backend,
     backend_program: Option<String>,
     max_agents: usize,
+    system_one: SystemOne,
 }
 
 /// Where design-run artifacts go: a sibling of the projects directory,
@@ -427,6 +477,8 @@ fn load_or_create_api_key(
 }
 
 async fn serve_global(options: GlobalOptions) -> Result<(), String> {
+    let executor = design_executor(&options.system_one)?;
+
     std::fs::create_dir_all(&options.data_dir)
         .map_err(|error| format!("cannot create {}: {error}", options.data_dir.display()))?;
 
@@ -440,6 +492,7 @@ async fn serve_global(options: GlobalOptions) -> Result<(), String> {
 
     let launcher: Arc<dyn DesignLauncher> = Arc::new(DaemonDesignLauncher {
         backend,
+        executor,
         mcp_url: Arc::clone(&mcp_url),
         out_dir: design_runs_root(&options.data_dir),
         max_agents: options.max_agents.max(1),
@@ -527,9 +580,12 @@ struct StdioOptions {
     backend: Backend,
     backend_program: Option<String>,
     max_agents: usize,
+    system_one: SystemOne,
 }
 
 async fn serve_stdio_cmd(options: StdioOptions) -> Result<(), String> {
+    let executor = design_executor(&options.system_one)?;
+
     std::fs::create_dir_all(&options.data_dir)
         .map_err(|error| format!("cannot create {}: {error}", options.data_dir.display()))?;
 
@@ -544,6 +600,7 @@ async fn serve_stdio_cmd(options: StdioOptions) -> Result<(), String> {
 
     let launcher: Arc<dyn DesignLauncher> = Arc::new(DaemonDesignLauncher {
         backend,
+        executor,
         mcp_url: Arc::clone(&mcp_url),
         out_dir: design_runs_root(&options.data_dir),
         max_agents: options.max_agents.max(1),
@@ -621,10 +678,32 @@ struct DesignState {
 /// workers connecting back to this daemon's MCP endpoint.
 struct DaemonDesignLauncher {
     backend: Arc<dyn AgentBackend>,
+
+    /// The in-process builders put in front of `backend`, per run.
+    /// Without the feature there are none, and nothing reads this.
+    #[cfg_attr(not(feature = "system-one"), allow(dead_code))]
+    executor: DesignExecutor,
     mcp_url: Arc<RwLock<String>>,
     out_dir: PathBuf,
     max_agents: usize,
     state: Arc<DesignState>,
+}
+
+impl DaemonDesignLauncher {
+    /// The backend of one design run: the agent backend, behind the
+    /// System One builders when they are configured. A builder acts on
+    /// one engine, and each run has its own project's.
+    fn backend_for(&self, engine: &ConfluenceEngine) -> Arc<dyn AgentBackend> {
+        #[cfg(feature = "system-one")]
+        if let Some(executor) = &self.executor {
+            return executor.wrap(engine, Arc::clone(&self.backend));
+        }
+
+        #[cfg(not(feature = "system-one"))]
+        let _ = engine;
+
+        Arc::clone(&self.backend)
+    }
 }
 
 impl DesignLauncher for DaemonDesignLauncher {
@@ -656,7 +735,7 @@ impl DesignLauncher for DaemonDesignLauncher {
 
         let supervisor = Supervisor::new(
             engine.clone(),
-            Arc::clone(&self.backend),
+            self.backend_for(&engine),
             mcp_url,
             None,
             work_dir,

@@ -13,8 +13,8 @@ use conseqa::confluence::{
     EngineEvent, GraphQuery, InvalidationCause, Mutation, OperationDraftStage,
     OperationInterfaceDraft, OperationReadMode, PatchId, PromptObligation, PromptObligationId,
     PromptObligationStatus, ProposalStatus, ProposedRequirement, RequirementOrigin,
-    RequirementSubmission, RunId, RunMetadata, SpecPatch, SymbolKey, TaskBudget, TaskHandle,
-    TaskKind, TaskState, WorkspaceState, WriteGrant, WriteScope,
+    RequirementSubmission, RunId, RunMetadata, SearchSpec, SpecPatch, SymbolKey, SymbolKind,
+    TaskBudget, TaskHandle, TaskKind, TaskState, WorkspaceState, WriteGrant, WriteScope,
 };
 use conseqa::spec::{
     Derivation, ExecuteTransaction, FieldPath, Id, IdempotencyGuarantee, IdempotencyKey,
@@ -682,6 +682,484 @@ fn phantom_new_writer_invalidates_the_querying_task() {
     .expect_err("a cannot commit on a stale answer");
 
     assert!(rejection.is_stale_context());
+}
+
+async fn submit_async(
+    engine: &ConfluenceEngine,
+    task: &TaskHandle,
+    mutations: Vec<Mutation>,
+) -> Result<CommitReceipt, CommitRejection> {
+    engine
+        .submit(CommitRequest {
+            task: task.id,
+            patch_id: PatchId::fresh(),
+            base_revision: task.snapshot_revision,
+            patch: SpecPatch { mutations },
+            client_nonce: Uuid::new_v4(),
+        })
+        .await
+        .expect("the sequencer is running")
+}
+
+/// A candidate is judged by the pipeline a committed revision meets —
+/// scope, draft application, assembly, validation, verification — and
+/// nothing else happens: no commit, no event, no task state change.
+#[tokio::test]
+async fn a_candidate_is_judged_without_being_committed() {
+    let engine = engine();
+    let mut events = engine.subscribe();
+
+    let repairer = task(
+        &engine,
+        TaskKind::RequirementRepair,
+        WriteScope::requirement_repair(id("operation.cancel_order")),
+    );
+
+    let before = engine.head_revision();
+
+    // The empty candidate is the baseline: the model as it stands.
+    let baseline = engine
+        .evaluate_candidate(repairer.id, &SpecPatch::default(), &[])
+        .await
+        .expect("the task is active");
+
+    assert!(baseline.refusal().is_none(), "{:?}", baseline.refusal());
+    assert!(baseline.verified().is_some());
+
+    // A candidate that replaces the program is verified as a whole
+    // model, and the requirements its old program declared are no
+    // longer declared — so they are not regressions.
+    let candidate = SpecPatch {
+        mutations: vec![probe_program("operation.cancel_order", 7)],
+    };
+
+    let verdict = engine
+        .evaluate_candidate(repairer.id, &candidate, &[])
+        .await
+        .expect("the task is active");
+
+    assert!(verdict.verified().is_some(), "{:?}", verdict.refusal());
+    assert!(
+        verdict
+            .regressions(baseline.verified().expect("a baseline"))
+            .is_empty()
+    );
+
+    // A candidate the scope does not authorize is judged no further.
+    let outside = engine
+        .evaluate_candidate(
+            repairer.id,
+            &SpecPatch {
+                mutations: vec![probe_program("operation.transfer_stock", 7)],
+            },
+            &[],
+        )
+        .await
+        .expect("the task is active");
+
+    assert_eq!(
+        outside.scope_violation,
+        Some(SymbolKey::OperationProgram(id("operation.transfer_stock")))
+    );
+    assert!(outside.verified().is_none());
+
+    assert_eq!(engine.head_revision(), before);
+    assert_eq!(engine.task_status(repairer.id).unwrap(), TaskState::Running);
+
+    // Background analysis of the opening head may report in meanwhile;
+    // nothing a commit would publish does.
+    while let Ok(event) = events.try_recv() {
+        assert!(
+            !matches!(
+                event,
+                EngineEvent::HeadPublished { .. }
+                    | EngineEvent::TaskCommitted { .. }
+                    | EngineEvent::TaskInvalidated { .. }
+            ),
+            "evaluation published {event:?}"
+        );
+    }
+
+    // The task can still commit what it evaluated.
+    submit_async(&engine, &repairer, candidate.mutations)
+        .await
+        .expect("an evaluated candidate commits through the gate as any patch does");
+}
+
+/// What makes a partial repair safe: a candidate is compared with the
+/// baseline requirement by requirement, and one that un-proves anything
+/// — here, by dropping the lock a serializability proof rests on — says
+/// so, wherever in the model the casualty is.
+#[tokio::test]
+async fn a_candidate_that_unproves_a_requirement_reports_the_regression() {
+    let source =
+        std::fs::read_to_string("tests/fixtures/tenant_ledger.yaml").expect("fixture exists");
+
+    let model = conseqa::parser::yaml::parse(&source).expect("fixture parses");
+
+    let engine = ConfluenceEngine::in_memory(WorkspaceState::from_model(
+        &model,
+        RunMetadata::new(RunId("regression-test".to_string())),
+    ))
+    .expect("engine starts");
+
+    let repairer = task(
+        &engine,
+        TaskKind::RequirementRepair,
+        WriteScope::requirement_repair(id("operation.post_entry")),
+    );
+
+    let roots = [(id("operation.post_entry"), id("tx.post_entry"))];
+
+    let baseline = engine
+        .evaluate_candidate(repairer.id, &SpecPatch::default(), &roots)
+        .await
+        .expect("the task is active");
+
+    let baseline = baseline.verified().expect("the fixture verifies");
+
+    assert!(baseline.all_proven());
+
+    let mut program = model.operations[&id("operation.post_entry")]
+        .program
+        .clone();
+
+    program
+        .transaction_mut(&id("tx.post_entry"))
+        .expect("the transaction")
+        .steps
+        .retain(|step| !matches!(step, TransactionStep::Lock(_)));
+
+    let verdict = engine
+        .evaluate_candidate(
+            repairer.id,
+            &SpecPatch {
+                mutations: vec![Mutation::ReplaceOperationProgram {
+                    operation: id("operation.post_entry"),
+                    program,
+                }],
+            },
+            &roots,
+        )
+        .await
+        .expect("the task is active");
+
+    let regressions = verdict.regressions(baseline);
+
+    assert_eq!(regressions.len(), 1, "{regressions:?}");
+
+    assert_eq!(
+        regressions[0].to_string(),
+        "transaction_serializability #0 of tx.post_entry in operation.post_entry"
+    );
+}
+
+/// A verdict is a fact its caller relies on, so what it rests on is
+/// observed. Naming a transaction as a root records who reads and
+/// writes every object its conflict closure accesses: a transaction
+/// that joins the closure afterwards is a phantom, and the evaluator is
+/// invalidated rather than left to submit on a stale proof.
+#[tokio::test]
+async fn a_transaction_joining_an_evaluated_closure_invalidates_the_evaluator() {
+    let engine = engine();
+
+    let rooted = task(
+        &engine,
+        TaskKind::RequirementRepair,
+        WriteScope::requirement_repair(id("operation.cancel_order")),
+    );
+
+    let unrooted = task(
+        &engine,
+        TaskKind::RequirementRepair,
+        WriteScope::requirement_repair(id("operation.charge_payment")),
+    );
+
+    engine
+        .evaluate_candidate(
+            rooted.id,
+            &SpecPatch::default(),
+            &[(id("operation.cancel_order"), id("tx.cancel_order"))],
+        )
+        .await
+        .expect("the task is active");
+
+    // The same evaluation with no root claims nothing about any
+    // closure, and observes none.
+    engine
+        .evaluate_candidate(unrooted.id, &SpecPatch::default(), &[])
+        .await
+        .expect("the task is active");
+
+    // A new writer of `object.order` arrives.
+    let author = task(
+        &engine,
+        TaskKind::Decompose,
+        WriteScope::of([
+            WriteGrant::SharedSkeleton,
+            WriteGrant::OperationProgram(id("operation.admin_force_state")),
+        ]),
+    );
+
+    for key in [
+        SymbolKey::Service(id("service.checkout")),
+        SymbolKey::DataModel(id("data.checkout")),
+        SymbolKey::DataObject {
+            data_model: id("data.checkout"),
+            object: id("object.order"),
+        },
+    ] {
+        engine
+            .read_symbol(author.id, &key)
+            .expect("the author reads its deps");
+    }
+
+    submit_async(
+        &engine,
+        &author,
+        vec![
+            Mutation::PutOperationInterface {
+                operation: id("operation.admin_force_state"),
+                value: OperationInterfaceDraft {
+                    service: id("service.checkout"),
+                    description: Some("Force an order state.".to_string()),
+                    inputs: BTreeMap::new(),
+                },
+            },
+            Mutation::ReplaceOperationProgram {
+                operation: id("operation.admin_force_state"),
+                program: status_writer_program(),
+            },
+        ],
+    )
+    .await
+    .expect("the new writer commits");
+
+    assert_eq!(
+        engine.task_status(rooted.id).unwrap(),
+        TaskState::Invalidated
+    );
+
+    assert_eq!(engine.task_status(unrooted.id).unwrap(), TaskState::Running);
+}
+
+/// A transaction requirement is adopted onto the inline transaction it
+/// constrains, so proposing one changes the program's fingerprint. The
+/// proposal is *authorized* by a requirements grant and *conflicts* as
+/// a program write: a proposer whose base predates a replacement of
+/// that program is refused, though it never read the program and its
+/// own write target did not move.
+#[test]
+fn a_transaction_requirement_proposal_conflicts_with_a_program_replacement() {
+    let engine = engine();
+
+    let proposer = task(
+        &engine,
+        TaskKind::RequirementDiscovery,
+        WriteScope::requirement_discovery(id("operation.cancel_order")),
+    );
+
+    let synthesizer = task(
+        &engine,
+        TaskKind::OperationSynthesis,
+        WriteScope::operation_synthesis(id("operation.cancel_order")),
+    );
+
+    submit(
+        &engine,
+        &synthesizer,
+        vec![probe_program("operation.cancel_order", 1)],
+    )
+    .expect("the program is replaced");
+
+    let proposal = |transaction: &str| Mutation::ProposeRequirements {
+        operation: id("operation.cancel_order"),
+        proposals: vec![RequirementSubmission {
+            requirement: ProposedRequirement::TransactionSerializability {
+                transaction: id(transaction),
+                requirement: TransactionSerializabilityRequirement {
+                    key: ValueRef {
+                        source: ValueSource::Input(id("input.cancel_order.request")),
+                        path: path("order_id"),
+                    },
+                },
+            },
+            origin: RequirementOrigin::Recommended {
+                rationale: "cancellations of one order must not interleave".to_string(),
+                evidence: Vec::new(),
+            },
+        }],
+    };
+
+    // The footprint says so before anything is submitted.
+    assert_eq!(
+        SpecPatch {
+            mutations: vec![proposal("tx.cancel_order")],
+        }
+        .write_targets(),
+        vec![
+            SymbolKey::OperationProgram(id("operation.cancel_order")),
+            SymbolKey::OperationRequirements(id("operation.cancel_order")),
+        ]
+    );
+
+    let rejection = submit(&engine, &proposer, vec![proposal("tx.cancel_order")])
+        .expect_err("the program moved under the proposal");
+
+    assert!(
+        matches!(
+            &rejection,
+            CommitRejection::WriteConflict { symbol }
+                if *symbol == SymbolKey::OperationProgram(id("operation.cancel_order"))
+        ),
+        "{rejection:?}"
+    );
+
+    assert!(rejection.is_stale_context());
+
+    // Authorization did not widen: the same grant still cannot replace
+    // the program.
+    let discoverer = task(
+        &engine,
+        TaskKind::RequirementDiscovery,
+        WriteScope::requirement_discovery(id("operation.cancel_order")),
+    );
+
+    let rejection = submit(
+        &engine,
+        &discoverer,
+        vec![probe_program("operation.cancel_order", 2)],
+    )
+    .expect_err("a requirements grant replaces no program");
+
+    assert!(
+        matches!(rejection, CommitRejection::WriteScopeViolation { .. }),
+        "{rejection:?}"
+    );
+
+    // An operation-family proposal still touches the requirements alone.
+    assert_eq!(
+        SpecPatch {
+            mutations: vec![Mutation::ProposeRequirements {
+                operation: id("operation.cancel_order"),
+                proposals: vec![RequirementSubmission {
+                    requirement: ProposedRequirement::Idempotency(IdempotencyRequirement {
+                        key: IdempotencyKey {
+                            components: vec![ValueRef {
+                                source: ValueSource::Input(id("input.cancel_order.request")),
+                                path: path("request_id"),
+                            }],
+                        },
+                        result: ResultReplayRequirement::Unspecified,
+                    }),
+                    origin: RequirementOrigin::Recommended {
+                        rationale: "retries".to_string(),
+                        evidence: Vec::new(),
+                    },
+                }],
+            }],
+        }
+        .write_targets(),
+        vec![SymbolKey::OperationRequirements(id(
+            "operation.cancel_order"
+        ))]
+    );
+}
+
+/// Mapping a prompt obligation rewrites it, and discovery fans out one
+/// task per operation. A search narrowed to the obligations *targeting*
+/// one operation observes only that set: a peer rewriting another
+/// operation's obligation leaves the searcher valid, while an obligation
+/// newly aimed at its operation — a phantom — does not.
+#[test]
+fn a_targeted_obligation_search_observes_only_its_own_operations_obligations() {
+    let engine = engine();
+
+    let obligation = |intent: &str, targets: &[&str]| PromptObligation {
+        source_span: None,
+        normalized_intent: intent.to_string(),
+        targets: targets.iter().map(|target| id(target)).collect(),
+        status: PromptObligationStatus::Unmapped,
+    };
+
+    let put = |name: &str, value: PromptObligation| {
+        let author = task(
+            &engine,
+            TaskKind::Decompose,
+            WriteScope::of([WriteGrant::SharedSkeleton]),
+        );
+
+        submit(
+            &engine,
+            &author,
+            vec![Mutation::PutPromptObligation {
+                id: PromptObligationId(name.to_string()),
+                value,
+            }],
+        )
+        .expect("the obligation is recorded");
+    };
+
+    put(
+        "obl.order-once",
+        obligation("an order is created once", &["operation.create_order"]),
+    );
+
+    put(
+        "obl.stock-in-order",
+        obligation("stock moves apply in order", &["operation.transfer_stock"]),
+    );
+
+    let searcher = task(
+        &engine,
+        TaskKind::RequirementDiscovery,
+        WriteScope::requirement_discovery(id("operation.create_order")),
+    );
+
+    let aimed_here = engine
+        .search_symbols(
+            searcher.id,
+            &SearchSpec {
+                kind: Some(SymbolKind::PromptObligation),
+                targets: Some(id("operation.create_order")),
+                ..Default::default()
+            },
+        )
+        .expect("the search runs");
+
+    assert_eq!(
+        aimed_here,
+        vec![SymbolKey::PromptObligation(PromptObligationId(
+            "obl.order-once".to_string()
+        ))]
+    );
+
+    // A peer rewrites the obligation aimed elsewhere — as mapping it
+    // would. The searcher observed neither it nor a set containing it.
+    put(
+        "obl.stock-in-order",
+        obligation(
+            "stock moves apply in sequence order",
+            &["operation.transfer_stock"],
+        ),
+    );
+
+    assert_eq!(engine.task_status(searcher.id).unwrap(), TaskState::Running);
+
+    // The same obligation is now aimed here as well: the answer to the
+    // searcher's set-valued question changed.
+    put(
+        "obl.stock-in-order",
+        obligation(
+            "stock moves apply in sequence order",
+            &["operation.transfer_stock", "operation.create_order"],
+        ),
+    );
+
+    assert_eq!(
+        engine.task_status(searcher.id).unwrap(),
+        TaskState::Invalidated
+    );
 }
 
 #[test]

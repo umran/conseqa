@@ -83,6 +83,19 @@ pub struct RunReport {
     pub artifacts: Vec<String>,
 }
 
+/// What one executor cost over a run. Task wall times overlap when
+/// tasks run concurrently, so `wall_ms` is work, not elapsed time.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+struct ExecutorTotals {
+    tasks: usize,
+    sessions: usize,
+    wall_ms: u64,
+
+    /// Tasks this executor settled after an in-process builder
+    /// abstained from them.
+    abstentions_received: usize,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum WorkflowError {
     #[error(transparent)]
@@ -101,11 +114,18 @@ pub enum WorkflowError {
 pub struct Workflow {
     scheduler: Scheduler,
     config: WorkflowConfig,
+
+    /// When `run` began, for the manifest's wall time.
+    started: std::sync::OnceLock<std::time::Instant>,
 }
 
 impl Workflow {
     pub fn new(scheduler: Scheduler, config: WorkflowConfig) -> Self {
-        Self { scheduler, config }
+        Self {
+            scheduler,
+            config,
+            started: std::sync::OnceLock::new(),
+        }
     }
 
     fn engine(&self) -> &ConfluenceEngine {
@@ -114,6 +134,8 @@ impl Workflow {
 
     /// Drives the whole design to a fixpoint.
     pub async fn run(&self) -> Result<RunReport, WorkflowError> {
+        self.started.get_or_init(std::time::Instant::now);
+
         // Phase 2: decomposition establishes the interface epoch before
         // any operation fanout (§62, §96).
         self.decompose().await?;
@@ -918,13 +940,36 @@ impl Workflow {
             })
             .collect();
 
+        // Format 2 (§13.1 of the System One orchestration revision): one
+        // record per logical task, and what each executor cost in total,
+        // so a run says for itself where its time went.
+        let records = self.scheduler.ledger();
+
+        let mut executors: BTreeMap<&'static str, ExecutorTotals> = BTreeMap::new();
+
+        for record in &records {
+            let totals = executors.entry(record.executor).or_default();
+
+            totals.tasks += 1;
+            totals.sessions += record.attempts;
+            totals.wall_ms += record.wall_ms;
+            totals.abstentions_received += usize::from(record.abstained.is_some());
+        }
+
         serde_json::json!({
+            "manifest_format": 2,
             "final_revision": revision.0,
             "run": head.workspace.run_meta.run.0,
             "backend": self.scheduler.backend_name(),
             "status": status,
             "prompt_obligations": obligations,
             "tasks": self.engine().list_tasks().len(),
+            "wall_ms": self
+                .started
+                .get()
+                .map(|started| u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)),
+            "executors": executors,
+            "task_records": records,
         })
     }
 

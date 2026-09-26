@@ -48,7 +48,7 @@ impl fmt::Display for PatchId {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SpecPatch {
     pub mutations: Vec<Mutation>,
@@ -163,8 +163,38 @@ pub struct RequirementSubmission {
 }
 
 impl Mutation {
-    /// The symbol this mutation overwrites — the unit of write-write
-    /// conflict detection and scope checking.
+    /// The symbols whose fingerprint this mutation may change — the
+    /// unit of write-write conflict detection.
+    ///
+    /// It is the write target, with one addition. A transaction-family
+    /// requirement is adopted onto the inline transaction it
+    /// constrains, so proposing one may rewrite the operation's
+    /// program as well as its requirements.
+    ///
+    /// Authorization is a separate matter, decided by
+    /// [`WriteScope::violation`](super::task::WriteScope::violation): a
+    /// requirements grant authorizes the proposal whatever its family,
+    /// and still cannot replace a program.
+    pub fn conflict_footprint(&self) -> Vec<SymbolKey> {
+        let mut footprint = vec![self.write_target()];
+
+        if let Self::ProposeRequirements {
+            operation,
+            proposals,
+        } = self
+            && proposals
+                .iter()
+                .any(|proposal| proposal.requirement.transaction().is_some())
+        {
+            footprint.push(SymbolKey::OperationProgram(operation.clone()));
+        }
+
+        footprint
+    }
+
+    /// The symbol this mutation is addressed to — the unit of scope
+    /// checking. What it may change besides is its
+    /// [`conflict_footprint`](Self::conflict_footprint).
     pub fn write_target(&self) -> SymbolKey {
         match self {
             Self::PutService { id, .. } => SymbolKey::Service(id.clone()),
@@ -229,10 +259,14 @@ impl Mutation {
 }
 
 impl SpecPatch {
-    /// The symbols this patch overwrites, in canonical order.
+    /// The symbols this patch may change, in canonical order: the
+    /// union of its mutations' conflict footprints.
     pub fn write_targets(&self) -> Vec<SymbolKey> {
-        let mut targets: Vec<SymbolKey> =
-            self.mutations.iter().map(Mutation::write_target).collect();
+        let mut targets: Vec<SymbolKey> = self
+            .mutations
+            .iter()
+            .flat_map(Mutation::conflict_footprint)
+            .collect();
 
         targets.sort();
         targets.dedup();

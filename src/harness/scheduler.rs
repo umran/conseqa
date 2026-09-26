@@ -114,6 +114,87 @@ impl TaskRun {
     }
 }
 
+/// What one logical task cost and who settled it: one record of the
+/// run manifest (§13.1 of the System One orchestration revision).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct LogicalTaskRecord {
+    pub kind: TaskKind,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub operation: Option<Id>,
+
+    /// `system_one` when an in-process builder settled the final
+    /// attempt, `agent` when a session did.
+    pub executor: &'static str,
+
+    /// The backend that settled the final attempt.
+    pub backend: String,
+
+    pub attempts: usize,
+    pub final_state: TaskState,
+    pub exhausted: bool,
+
+    /// Creation of the first attempt to the final outcome, including
+    /// every restart.
+    pub wall_ms: u64,
+
+    /// Summed over attempts, where the provider reported them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub turns: Option<u64>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tokens: Option<u64>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usd_cents: Option<u64>,
+
+    /// Why an in-process builder handed the task to a session, when
+    /// one did.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub abstained: Option<String>,
+}
+
+impl LogicalTaskRecord {
+    fn of(logical: &LogicalTask, run: &TaskRun, wall: std::time::Duration) -> Self {
+        let sum = |field: fn(&crate::harness::backend::AgentUsage) -> Option<u64>| {
+            run.attempts
+                .iter()
+                .filter_map(|attempt| field(&attempt.agent_exit.usage))
+                .reduce(|total, next| total + next)
+        };
+
+        let settled = run.attempts.last().map(|attempt| &attempt.agent_exit);
+
+        let backend = settled
+            .map(|exit| exit.backend.name.clone())
+            .unwrap_or_default();
+
+        Self {
+            kind: logical.kind,
+            operation: logical.bundle.operation.clone(),
+            executor: if backend == crate::harness::backend::SYSTEM_ONE_EXECUTOR {
+                "system_one"
+            } else {
+                "agent"
+            },
+            backend,
+            attempts: run.attempts.len(),
+            final_state: run.final_state,
+            exhausted: run.exhausted,
+            wall_ms: u64::try_from(wall.as_millis()).unwrap_or(u64::MAX),
+            turns: sum(|usage| usage.turns),
+            tokens: sum(|usage| usage.tokens),
+            usd_cents: sum(|usage| usage.usd_cents),
+            abstained: run
+                .attempts
+                .iter()
+                .rev()
+                .find_map(|attempt| attempt.agent_exit.escalation.as_ref())
+                .map(|escalation| escalation.reason.clone()),
+        }
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum SchedulerError {
     #[error(transparent)]
@@ -130,6 +211,9 @@ pub struct Scheduler {
     /// shares it; the check is advisory — the OCC gate is the real
     /// safety net (§65), so distinct-operation tasks never contend.
     program_writers: Mutex<HashSet<crate::spec::Id>>,
+
+    /// One record per logical task run, in completion order.
+    ledger: Mutex<Vec<LogicalTaskRecord>>,
 }
 
 impl Scheduler {
@@ -139,7 +223,13 @@ impl Scheduler {
             supervisor,
             policy,
             program_writers: Mutex::new(HashSet::new()),
+            ledger: Mutex::new(Vec::new()),
         }
+    }
+
+    /// Every logical task run so far, for the run manifest.
+    pub fn ledger(&self) -> Vec<LogicalTaskRecord> {
+        self.ledger.lock().clone()
     }
 
     pub fn engine(&self) -> &ConfluenceEngine {
@@ -238,7 +328,15 @@ impl Scheduler {
         // operation on drop, even if the task panics.
         let _guard = self.claim_program_writer(logical);
 
-        self.run_inner(logical).await
+        let started = std::time::Instant::now();
+
+        let run = self.run_inner(logical).await?;
+
+        self.ledger
+            .lock()
+            .push(LogicalTaskRecord::of(logical, &run, started.elapsed()));
+
+        Ok(run)
     }
 
     /// Advisory claim on an operation's primary-writer slot, released
@@ -422,8 +520,13 @@ fn footprint(
                 writes.insert(SymbolKey::OperationProgram(operation.clone()));
             }
 
+            // A requirements grant authorizes proposals of every
+            // family, and a transaction-family requirement is adopted
+            // onto an inline transaction: the task may change the
+            // program's fingerprint though it may not replace it.
             WriteGrant::OperationRequirements(operation) => {
                 writes.insert(SymbolKey::OperationRequirements(operation.clone()));
+                writes.insert(SymbolKey::OperationProgram(operation.clone()));
             }
 
             WriteGrant::OperationInterface(operation) => {
@@ -677,6 +780,32 @@ mod tests {
 
         assert_eq!(waves.len(), 2, "{waves:?}");
         assert!(all_indices(&waves, 2));
+    }
+
+    // A transaction requirement is adopted onto the inline transaction
+    // it constrains, so a task that may propose requirements may change
+    // the program's fingerprint: it never shares a wave with a writer
+    // of that program. Discovery across operations stays one wave.
+    #[test]
+    fn requirement_proposers_never_share_a_wave_with_the_programs_writer() {
+        let tasks = vec![
+            op_task(
+                "operation.x",
+                WriteScope::requirement_discovery(id("operation.x")),
+            ),
+            op_task(
+                "operation.x",
+                WriteScope::requirement_repair(id("operation.x")),
+            ),
+            op_task(
+                "operation.y",
+                WriteScope::requirement_discovery(id("operation.y")),
+            ),
+        ];
+
+        let waves = plan_waves(&tasks, &FxHashMap::default(), false);
+
+        assert_eq!(waves, vec![vec![0, 2], vec![1]], "{waves:?}");
     }
 
     // A grant over arbitrary shared symbols (the topology author, the

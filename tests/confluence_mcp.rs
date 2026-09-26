@@ -1243,6 +1243,41 @@ async fn the_server_and_its_artifacts_declare_the_dsl_contract_version() {
     assert!(!is_error, "{report}");
     assert_eq!(report["dsl"], 4, "{report}");
 
+    // Every documented family filters. One that names nothing is an
+    // error naming the accepted values — never an empty report, which
+    // would read as "nothing is open". The v3 names have no alias.
+    for family in [
+        "transaction_serializability",
+        "transaction_ordering",
+        "idempotency",
+        "result_replay",
+        "recoverability",
+    ] {
+        let (report, is_error) = client
+            .call(
+                "requirement_report",
+                serde_json::json!({ "family": family }),
+            )
+            .await;
+
+        assert!(!is_error, "{family}: {report}");
+    }
+
+    let (refused, is_error) = client
+        .call(
+            "requirement_report",
+            serde_json::json!({ "family": "serialization" }),
+        )
+        .await;
+
+    assert!(is_error, "{refused}");
+    assert_eq!(refused["error"], "unknown_requirement_family", "{refused}");
+    assert_eq!(refused["family"], "serialization", "{refused}");
+    assert_eq!(
+        refused["accepted"][0], "transaction_serializability",
+        "{refused}"
+    );
+
     // The export leads with the stamp, and the stamped document
     // round-trips through the standalone two-phase parser.
     let dir = std::env::temp_dir().join(format!("conseqa-dsl-export-{}", uuid::Uuid::new_v4()));

@@ -9,13 +9,16 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
 
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 
 use conseqa::confluence::{ConfluenceEngine, RunId, RunMetadata, RunPolicy, WorkspaceState, mcp};
 use conseqa::harness::backends::{ClaudeCliBackend, CodexCliBackend};
 use conseqa::harness::{
     AgentBackend, Scheduler, SchedulerPolicy, Supervisor, Workflow, WorkflowConfig,
 };
+
+#[cfg(feature = "system-one")]
+mod decider;
 
 #[derive(Parser)]
 #[command(
@@ -30,56 +33,71 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Run the full design workflow: prompt to validated model.
-    Design {
-        /// The natural-language application prompt.
-        #[arg(long, conflicts_with = "prompt_file")]
-        prompt: Option<String>,
+    Design(Box<DesignArgs>),
 
-        /// Read the prompt from a file.
-        #[arg(long)]
-        prompt_file: Option<PathBuf>,
-
-        /// The application source repository (read-only evidence).
-        #[arg(long)]
-        repo: Option<PathBuf>,
-
-        /// Adopt an existing Conseqa model instead of decomposing.
-        #[arg(long)]
-        model: Option<PathBuf>,
-
-        /// Coding-agent backend.
-        #[arg(long, value_enum, default_value_t = Backend::Claude)]
-        backend: Backend,
-
-        /// Authoring database path.
-        #[arg(long, default_value = ".conseqa/confluence.redb")]
-        database: PathBuf,
-
-        /// Where to write the finalized model and reports.
-        #[arg(long, default_value = ".")]
-        out: PathBuf,
-
-        /// Adopt only requirements the checker can support strictly.
-        #[arg(long)]
-        strict_requirements: bool,
-
-        /// Maximum fresh sessions per logical task.
-        #[arg(long, default_value_t = 4)]
-        max_restarts: u32,
-
-        /// Maximum agent sessions reasoning concurrently during a
-        /// fanout.
-        #[arg(long, default_value_t = 4)]
-        max_agents: usize,
-
-        /// Keep the authoring database after the run.
-        #[arg(long)]
-        keep_workspace: bool,
-
-        /// Path to the backend executable (for a non-default install).
-        #[arg(long)]
-        backend_program: Option<String>,
+    /// Ask a System One decider directly, or vet a server before it is
+    /// trusted.
+    #[cfg(feature = "system-one")]
+    Decider {
+        #[command(subcommand)]
+        command: decider::DeciderCommand,
     },
+}
+
+#[derive(Args)]
+struct DesignArgs {
+    /// The natural-language application prompt.
+    #[arg(long, conflicts_with = "prompt_file")]
+    prompt: Option<String>,
+
+    /// Read the prompt from a file.
+    #[arg(long)]
+    prompt_file: Option<PathBuf>,
+
+    /// The application source repository (read-only evidence).
+    #[arg(long)]
+    repo: Option<PathBuf>,
+
+    /// Adopt an existing Conseqa model instead of decomposing.
+    #[arg(long)]
+    model: Option<PathBuf>,
+
+    /// Coding-agent backend.
+    #[arg(long, value_enum, default_value_t = Backend::Claude)]
+    backend: Backend,
+
+    /// Authoring database path.
+    #[arg(long, default_value = ".conseqa/confluence.redb")]
+    database: PathBuf,
+
+    /// Where to write the finalized model and reports.
+    #[arg(long, default_value = ".")]
+    out: PathBuf,
+
+    /// Adopt only requirements the checker can support strictly.
+    #[arg(long)]
+    strict_requirements: bool,
+
+    /// Maximum fresh sessions per logical task.
+    #[arg(long, default_value_t = 4)]
+    max_restarts: u32,
+
+    /// Maximum agent sessions reasoning concurrently during a
+    /// fanout.
+    #[arg(long, default_value_t = 4)]
+    max_agents: usize,
+
+    /// Keep the authoring database after the run.
+    #[arg(long)]
+    keep_workspace: bool,
+
+    /// Path to the backend executable (for a non-default install).
+    #[arg(long)]
+    backend_program: Option<String>,
+
+    #[cfg(feature = "system-one")]
+    #[command(flatten)]
+    system_one: conseqa::harness::executors::cli::SystemOneArgs,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -109,9 +127,18 @@ async fn main() -> ExitCode {
     }
 }
 
-#[allow(clippy::too_many_lines)]
 async fn run(command: Command) -> Result<ExitCode, String> {
-    let Command::Design {
+    match command {
+        Command::Design(args) => design(*args).await,
+
+        #[cfg(feature = "system-one")]
+        Command::Decider { command } => decider::run(command).await,
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+async fn design(args: DesignArgs) -> Result<ExitCode, String> {
+    let DesignArgs {
         prompt,
         prompt_file,
         repo,
@@ -124,7 +151,9 @@ async fn run(command: Command) -> Result<ExitCode, String> {
         max_agents,
         keep_workspace,
         backend_program,
-    } = command;
+        #[cfg(feature = "system-one")]
+        system_one,
+    } = args;
 
     let prompt = match (prompt, prompt_file) {
         (Some(prompt), _) => Some(prompt),
@@ -138,6 +167,11 @@ async fn run(command: Command) -> Result<ExitCode, String> {
     if prompt.is_none() && model.is_none() {
         return Err("provide --prompt/--prompt-file or --model".to_string());
     }
+
+    // Validated before anything is opened or served: a run must not
+    // start, and nothing may be sent, on settings that are wrong.
+    #[cfg(feature = "system-one")]
+    let executor = system_one.configure()?;
 
     let mut run_meta = RunMetadata::new(RunId(uuid::Uuid::new_v4().to_string()));
 
@@ -196,6 +230,12 @@ async fn run(command: Command) -> Result<ExitCode, String> {
 
             Arc::new(codex)
         }
+    };
+
+    #[cfg(feature = "system-one")]
+    let backend_impl = match executor {
+        Some(executor) => executor.wrap(&engine, backend_impl),
+        None => backend_impl,
     };
 
     let work_dir = database

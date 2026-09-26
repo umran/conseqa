@@ -21,6 +21,7 @@ use crate::spec::{Id, Input, Revision};
 
 use super::analysis::{AnalysisHub, AnalysisPin, AnalysisState};
 use super::auth::{TaskToken, TokenMap};
+use super::candidate::{CandidateVerdict, judge};
 use super::commit::{CommitReceipt, CommitRecord, CommitRejection, CommitRequest, apply_patch};
 use super::events::{EngineEvent, EventBus, InvalidationCause};
 use super::graph_query::{self, GraphQuery, QueryResult};
@@ -59,6 +60,14 @@ pub enum EngineError {
 
     #[error("analysis is not available for revision {} yet", .0.0)]
     AnalysisNotReady(Revision),
+
+    /// An empty report would read as "nothing is open", so a family
+    /// that names nothing is refused rather than matched against none.
+    #[error("unknown requirement family `{family}`; the families are: {}", .accepted.join(", "))]
+    UnknownRequirementFamily {
+        family: String,
+        accepted: Vec<String>,
+    },
 
     #[error("persistence: {0}")]
     Persistence(#[from] PersistenceError),
@@ -661,6 +670,28 @@ impl ConfluenceEngine {
         let revision = entry.snapshot.revision;
         let state = self.inner.analysis.state(revision);
 
+        // Checked before anything is reported, whatever the analysis
+        // state: a misspelt family must not look like a clean report.
+        // A custom property is a family when the analysis carries it.
+        if let Some(family) = family
+            && !REQUIREMENT_FAMILIES.contains(&family)
+        {
+            let declared = matches!(&state, AnalysisState::Ready(analysis)
+            if analysis.obligations.obligations.iter().any(|obligation| {
+                matches!(&obligation.property, Property::Custom { name } if name == family)
+            }));
+
+            if !declared {
+                return Err(EngineError::UnknownRequirementFamily {
+                    family: family.to_string(),
+                    accepted: REQUIREMENT_FAMILIES
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect(),
+                });
+            }
+        }
+
         let value = match &state {
             AnalysisState::Pending | AnalysisState::Validating | AnalysisState::Verifying => {
                 serde_json::json!({
@@ -1101,6 +1132,103 @@ impl ConfluenceEngine {
             prompt_evidence: entry.spec.prompt_evidence.clone(),
             analyzer_evidence,
         })
+    }
+
+    /// Judges a candidate patch against the task's pinned snapshot
+    /// without committing it (§15 of the System One orchestration
+    /// revision): scope, draft application, assembly, validation and
+    /// verification, exactly as a committed revision would meet them.
+    ///
+    /// Nothing is committed, no event is published, and no task is
+    /// invalidated. The pipeline runs on a blocking worker.
+    ///
+    /// A verdict is a fact its caller relies on, so it is observed like
+    /// any other. `roots` names the transactions, as `(operation,
+    /// transaction)`, whose obligations the caller will read off the
+    /// verdict. For each, the read-set records the program and
+    /// requirements of every operation in its conflict closure, and who
+    /// reads and writes every object that closure accesses — so a
+    /// changed member invalidates the task, and so does a new one. The
+    /// patch's own references are recorded as a context bundle would.
+    pub async fn evaluate_candidate(
+        &self,
+        task: TaskId,
+        patch: &SpecPatch,
+        roots: &[(Id, Id)],
+    ) -> Result<CandidateVerdict, EngineError> {
+        let entry = self.active_entry(task)?;
+
+        if let Some(attempted) = patch
+            .mutations
+            .iter()
+            .find_map(|mutation| entry.spec.write_scope.violation(mutation))
+        {
+            return Ok(CandidateVerdict {
+                scope_violation: Some(attempted),
+                ..Default::default()
+            });
+        }
+
+        let workspace = (*entry.snapshot.workspace).clone();
+
+        let (verdict, footprint) = {
+            let patch = patch.clone();
+            let roots = roots.to_vec();
+
+            match tokio::task::spawn_blocking(move || judge(workspace, &patch, &roots)).await {
+                Ok(judged) => judged,
+
+                Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
+
+                // The runtime is going away under the caller.
+                Err(_) => return Err(EngineError::Shutdown),
+            }
+        };
+
+        let snapshot = &entry.snapshot;
+
+        for operation in &footprint.operations {
+            if snapshot.workspace.operations.contains_key(operation) {
+                self.record_operation_inputs(&entry, operation);
+            }
+        }
+
+        let mut read_set = entry.read_set.lock();
+
+        for (data_model, object) in footprint.objects {
+            for query in [
+                GraphQuery::Readers {
+                    data_model: data_model.clone(),
+                    object: object.clone(),
+                    field: None,
+                },
+                GraphQuery::Writers {
+                    data_model: data_model.clone(),
+                    object: object.clone(),
+                    field: None,
+                },
+            ] {
+                let result = graph_query::run(&snapshot.workspace, &snapshot.graph, &query);
+
+                read_set.record_query(QueryObservation::graph(query, result.fingerprint));
+            }
+        }
+
+        for reference in patch.external_references() {
+            if let Some(node) = snapshot.graph.node(&reference) {
+                read_set.record_symbol(
+                    reference,
+                    SymbolObservation {
+                        version: node.version,
+                        fingerprint: node.fingerprint,
+                    },
+                );
+            }
+        }
+
+        drop(read_set);
+
+        Ok(verdict)
     }
 
     fn entry(&self, task: TaskId) -> Result<Arc<TaskEntry>, EngineError> {
@@ -1849,6 +1977,17 @@ fn requirement_content(
         }
     }
 }
+
+/// The requirement families a report can be restricted to, as
+/// `requirement_report` spells them. They are the DSL's own names: the
+/// v3 `serialization` and `ordering` have no alias.
+pub const REQUIREMENT_FAMILIES: [&str; 5] = [
+    "transaction_serializability",
+    "transaction_ordering",
+    "idempotency",
+    "result_replay",
+    "recoverability",
+];
 
 fn property_matches(property: &Property, family: &str) -> bool {
     match property {

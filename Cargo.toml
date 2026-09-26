@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [features]
-default = ["confluence"]
+default = ["confluence", "system-one"]
 
 # The agent-confluence layer: versioned draft workspaces, the semantic
 # symbol graph, the OCC commit engine, and the MCP surface. On by
@@ -35,6 +35,14 @@ confluence = [
     "dep:uuid",
 ]
 
+# The System One layer: typed closed-set decisions behind the `Decider`
+# trait, with the wire-format HTTP backend (the hosted service or any
+# local server that speaks the format), deterministic replay, and a
+# shadow comparator. On by default so the harness CLI carries the
+# `decider` commands; `--no-default-features --features confluence`
+# still builds without an HTTP client.
+system-one = ["confluence", "dep:reqwest"]
+
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_yaml = { package = "serde_yaml_ng", version = "0.10" }
@@ -53,6 +61,7 @@ getrandom = { version = "0.3", optional = true }
 http = { version = "1", optional = true }
 parking_lot = { version = "0.12", optional = true }
 redb = { version = "4", optional = true }
+reqwest = { version = "0.12", features = ["json"], optional = true }
 rmcp = { version = "3", features = [
     "server",
     "macros",
@@ -114,6 +123,10 @@ required-features = ["confluence"]
 [[test]]
 name = "harness_live"
 required-features = ["confluence"]
+
+[[test]]
+name = "system_one"
+required-features = ["system-one"]
 
 [[bin]]
 name = "conseqa"

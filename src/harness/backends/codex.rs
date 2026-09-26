@@ -131,6 +131,7 @@ impl AgentBackend for CodexCliBackend {
                 version: None,
                 session: outcome.session,
             },
+            escalation: None,
         })
     }
 }

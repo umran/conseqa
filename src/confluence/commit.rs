@@ -215,8 +215,8 @@ pub fn skeleton_diagnostics(workspace: &WorkspaceState) -> Vec<DraftDiagnostic> 
     }
 
     // Whatever runtime topology already exists is checked here too.
-    // L1 is normally authored after the fan-out, once verification has
-    // said what it must discharge, so usually there is none yet. When
+    // L1 is normally authored once, after the fan-out and after the
+    // requirements have settled, so usually there is none yet. When
     // an interactive author has declared some early, whole-model
     // validation cannot reach it until every operation has a program —
     // so without this it would go unchecked across the whole fan-out

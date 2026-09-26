@@ -194,6 +194,7 @@ impl AgentBackend for ClaudeCliBackend {
                 version: None,
                 session: outcome.session,
             },
+            escalation: None,
         })
     }
 }
