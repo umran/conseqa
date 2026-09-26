@@ -686,7 +686,8 @@ The thresholds are provisional — `act` 0.8, `dismiss` 0.25, `select` 0.6 — u
 | --- | --- |
 | an obligation's pairing with a requirement is at or above `act` | `ExplicitPrompt { obligation }` on that requirement — on every such requirement |
 | no pairing is at or above `act` | abstain: the obligation is real and must be mapped by someone |
-| any pairing falls between `dismiss` and `act` | abstain |
+| a pairing falls between `dismiss` and `act`, and its requirement is proposed anyway — by another obligation, or as stated by the prompt | no mapping for that pairing; nothing the obligation might need is dropped |
+| a pairing falls between `dismiss` and `act`, and nothing else proposes its requirement | abstain |
 | two obligations select the same requirement | both `ExplicitPrompt`: the requirement is proposed once per obligation, in order; the gate adopts the first and records each later one as a duplicate that maps its obligation to the adopted requirement |
 | the run's policy adopts implied requirements, and one is stated | `StronglyImplied`, citing the prompt as evidence |
 | stated, and nothing enumerated can express it | abstain |

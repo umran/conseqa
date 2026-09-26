@@ -2507,6 +2507,72 @@ mod system_one {
         );
     }
 
+    /// A pairing that is neither clearly asked for nor clearly not is
+    /// harmless when its requirement is proposed anyway: here the prompt
+    /// states serializability on its own, so the obligation is mapped to
+    /// what it clearly asks for and nothing it might need is dropped
+    /// (the benchmark's `pay_order`, 0.92 / 0.67 with 0.89 stated). With
+    /// nothing else proposing the requirement, the same judgment is
+    /// escalated.
+    #[tokio::test]
+    async fn an_unsure_pairing_escalates_only_when_its_requirement_would_be_dropped() {
+        let posting = id("operation.post_entry");
+
+        for (stated, handled_in_process) in [(0.89, true), (0.02, false)] {
+            let (mut workspace, _) = undeclared("tenant_ledger.yaml", &posting);
+
+            workspace.prompt_obligations.insert(
+                PromptObligationId("obl.post-once".to_string()),
+                PromptObligation {
+                    source_span: None,
+                    normalized_intent: "a posting is recorded at most once".to_string(),
+                    targets: vec![posting.clone()],
+                    status: PromptObligationStatus::Unmapped,
+                },
+            );
+
+            let opinions = Opinions::default()
+                .stating("obligation_0_idempotency", 0.92)
+                .stating("obligation_0_serializability_0", 0.67)
+                .stating("serializability_0", stated);
+
+            let (engine, seen) = discover(workspace, &posting, &opinions).await;
+
+            let handed = discoveries(&seen);
+
+            if handled_in_process {
+                assert!(handed.is_empty(), "{handed:?}");
+
+                let head = engine.head_snapshot();
+                let draft = &head.workspace.operations[&posting];
+
+                assert_eq!(draft.requirements.idempotency.len(), 1);
+                assert_eq!(
+                    draft.program.as_ref().expect("a program").transactions()[0]
+                        .1
+                        .requirements
+                        .serializability
+                        .len(),
+                    1,
+                    "adopted as stated by the prompt"
+                );
+
+                assert!(matches!(
+                    &head.workspace.prompt_obligations[&PromptObligationId("obl.post-once".into())]
+                        .status,
+                    PromptObligationStatus::Mapped { requirements } if requirements.len() == 1
+                ));
+            } else {
+                assert_eq!(handed.len(), 1);
+                assert!(
+                    handed[0].contains("it is uncertain whether the obligation"),
+                    "{}",
+                    handed[0]
+                );
+            }
+        }
+    }
+
     /// The claim the whole layer rests on: what a requirement is *keyed
     /// by* is a fact about the program, so code finds it. Told only that
     /// the four requirements are stated, the builder re-derives the keys,

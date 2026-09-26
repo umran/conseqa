@@ -764,6 +764,15 @@ fn decide(
     // just adopted and maps the obligation to it.
     let mut also: Vec<(Candidate, RequirementOrigin)> = Vec::new();
 
+    // Pairings that were neither clearly asked for nor clearly not.
+    // Settled at the end: one is harmless when its requirement is
+    // proposed anyway — by another obligation, or as stated by the
+    // prompt — because nothing the obligation might need is then
+    // dropped, only the provenance left narrower. Otherwise it is a
+    // requirement that might be needed and would not be proposed, and
+    // the task is escalated.
+    let mut unsure: Vec<(Candidate, String)> = Vec::new();
+
     // Explicit obligations first: each must map to at least one
     // enumerated requirement, or the run cannot succeed without the
     // session. It maps to every requirement it clearly asks for; any
@@ -781,13 +790,15 @@ fn decide(
             match policy.band(probability) {
                 Band::Stated => asked_for.push(candidate.clone()),
                 Band::NotStated => {}
-                Band::Uncertain => {
-                    return Err(Abstention::because(format!(
-                        "it is uncertain whether the obligation \"{}\" asks for {} ({probability:.2})",
+                Band::Uncertain => unsure.push((
+                    candidate.clone(),
+                    format!(
+                        "it is uncertain whether the obligation \"{}\" asks for {} \
+                         ({probability:.2})",
                         obligation.normalized_intent,
                         candidate.option()
-                    )));
-                }
+                    ),
+                )),
             }
         }
 
@@ -907,6 +918,13 @@ fn decide(
                 )?;
             }
         }
+    }
+
+    if let Some((_, why)) = unsure
+        .into_iter()
+        .find(|(candidate, _)| !origins.contains_key(candidate))
+    {
+        return Err(Abstention::because(why));
     }
 
     origins
