@@ -635,6 +635,53 @@ async fn the_credential_is_sent_as_a_bearer_and_shown_nowhere() {
     ));
 }
 
+/// A key file keeps the secret out of client configs the owning
+/// application rewrites; it is trimmed and sent like an env credential.
+#[tokio::test]
+async fn the_credential_can_be_read_from_a_file() {
+    let server = serve(Behaviour::Honest).await;
+
+    let path = std::env::temp_dir().join(format!("conseqa-key-{}", uuid::Uuid::new_v4()));
+
+    std::fs::write(&path, "file-credential\n").expect("key written");
+
+    let decider = server
+        .decider()
+        .with_credential_from_file(&path)
+        .expect("the file holds a credential");
+
+    assert!(!format!("{decider:?}").contains("file-credential"), "{decider:?}");
+
+    decider.decide(&triage()).await.expect("a decision");
+
+    assert_eq!(
+        server
+            .fake
+            .authorizations
+            .lock()
+            .unwrap()
+            .last()
+            .cloned()
+            .flatten()
+            .as_deref(),
+        Some("Bearer file-credential")
+    );
+
+    std::fs::write(&path, "  \n").expect("emptied");
+
+    assert!(matches!(
+        server.decider().with_credential_from_file(&path),
+        Err(DeciderConfigError::UnreadableCredentialFile { .. })
+    ));
+
+    std::fs::remove_file(&path).ok();
+
+    assert!(matches!(
+        server.decider().with_credential_from_file(&path),
+        Err(DeciderConfigError::UnreadableCredentialFile { .. })
+    ));
+}
+
 #[tokio::test]
 async fn a_model_alias_is_refused_unless_it_is_asked_for() {
     assert!(matches!(

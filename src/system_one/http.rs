@@ -310,6 +310,9 @@ pub enum DeciderConfigError {
     #[error("the environment variable `{var}` holds no credential")]
     MissingCredential { var: String },
 
+    #[error("cannot read a credential from {path}: {reason}")]
+    UnreadableCredentialFile { path: String, reason: String },
+
     /// An alias moves when a release ships, so the answers behind it
     /// change with no change here, and thresholds tuned against one
     /// model are silently applied to another (§11.1).
@@ -399,6 +402,29 @@ impl SystemOneHttpDecider {
             return Err(DeciderConfigError::MissingCredential {
                 var: var.to_string(),
             });
+        }
+
+        self.credential = Some(Credential(value.trim().to_string()));
+
+        Ok(self)
+    }
+
+    /// Reads the bearer credential from a file holding only the key.
+    /// Keeps the secret out of client configs that are rewritten by
+    /// the application that owns them.
+    pub fn with_credential_from_file(
+        mut self,
+        path: &std::path::Path,
+    ) -> Result<Self, DeciderConfigError> {
+        let unreadable = |reason: String| DeciderConfigError::UnreadableCredentialFile {
+            path: path.display().to_string(),
+            reason,
+        };
+
+        let value = std::fs::read_to_string(path).map_err(|error| unreadable(error.to_string()))?;
+
+        if value.trim().is_empty() {
+            return Err(unreadable("the file is empty".to_string()));
         }
 
         self.credential = Some(Credential(value.trim().to_string()));

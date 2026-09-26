@@ -34,6 +34,10 @@ pub struct BackendSettings {
     /// for a server that needs none.
     pub key_env: Option<String>,
 
+    /// A file holding only the bearer credential. Used when `key_env`
+    /// is absent.
+    pub key_file: Option<PathBuf>,
+
     /// Accept an alias such as `jev-latest`. For a connectivity probe
     /// only: thresholds are tuned per versioned id (§11.1).
     pub allow_alias: bool,
@@ -59,9 +63,10 @@ impl BackendSettings {
             SystemOneHttpDecider::new(url, model)?
         };
 
-        match &self.key_env {
-            Some(var) => Ok(decider.with_credential_from_env(var)?),
-            None => Ok(decider),
+        match (&self.key_env, &self.key_file) {
+            (Some(var), _) => Ok(decider.with_credential_from_env(var)?),
+            (None, Some(path)) => Ok(decider.with_credential_from_file(path)?),
+            (None, None) => Ok(decider),
         }
     }
 }

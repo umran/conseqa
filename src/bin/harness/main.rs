@@ -40,7 +40,7 @@ enum Command {
     #[cfg(feature = "system-one")]
     Decider {
         #[command(subcommand)]
-        command: decider::DeciderCommand,
+        command: Box<decider::DeciderCommand>,
     },
 }
 
@@ -132,7 +132,7 @@ async fn run(command: Command) -> Result<ExitCode, String> {
         Command::Design(args) => design(*args).await,
 
         #[cfg(feature = "system-one")]
-        Command::Decider { command } => decider::run(command).await,
+        Command::Decider { command } => decider::run(*command).await,
     }
 }
 

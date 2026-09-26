@@ -56,6 +56,12 @@ pub struct BackendArgs {
     #[arg(long)]
     pub decider_key_env: Option<String>,
 
+    /// A file holding only the bearer credential, for clients whose
+    /// config cannot carry an environment. Ignored when
+    /// --decider-key-env is given.
+    #[arg(long)]
+    pub decider_key_file: Option<PathBuf>,
+
     /// Accept a model alias such as jev-latest. For probing only:
     /// thresholds are tuned per versioned id.
     #[arg(long)]
@@ -68,6 +74,7 @@ impl BackendArgs {
             url: self.decider_url.clone(),
             model: self.decider_model.clone(),
             key_env: self.decider_key_env.clone(),
+            key_file: self.decider_key_file.clone(),
             allow_alias: self.decider_allow_alias,
         }
     }
@@ -122,6 +129,7 @@ impl DeciderArgs {
                 url: Some(url.clone()),
                 model: self.decider_shadow_model.clone(),
                 key_env: self.decider_shadow_key_env.clone(),
+                key_file: None,
                 allow_alias: false,
             }),
             replay: self.decider_replay.clone(),

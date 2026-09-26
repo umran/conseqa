@@ -181,7 +181,7 @@ async fn main() -> ExitCode {
         )
         .init();
 
-    let cli = Cli::parse();
+    let cli = Cli::parse_from(with_stdio_args_file(std::env::args().collect()));
 
     let outcome = match cli.command {
         Command::Serve {
@@ -262,6 +262,69 @@ async fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// Where `stdio` reads extra flags from: one flag or value per line,
+/// `#` comments allowed. A desktop client owns its own config file and
+/// may rewrite it at any time, so settings that must survive that live
+/// here instead, in a file only a person writes.
+fn stdio_args_file() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+
+    PathBuf::from(home).join(".conseqa/stdio.args")
+}
+
+/// Appends the flags in [`stdio_args_file`] to a `stdio` invocation.
+/// Flags given on the command line come first; clap rejects a flag
+/// given twice, so a conflict is loud rather than silently resolved.
+fn with_stdio_args_file(mut argv: Vec<String>) -> Vec<String> {
+    if argv.get(1).map(String::as_str) != Some("stdio") {
+        return argv;
+    }
+
+    let path = stdio_args_file();
+
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return argv;
+    };
+
+    let extra: Vec<String> = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(str::to_string)
+        .collect();
+
+    if !extra.is_empty() {
+        eprintln!("note: stdio flags from {}: {}", path.display(), extra.join(" "));
+        argv.extend(extra);
+    }
+
+    argv
+}
+
+/// The `claude` executable when none was named. A desktop app starts
+/// its servers with a minimal PATH that rarely includes the user's
+/// install, so the usual install locations are tried after PATH.
+fn default_claude_program() -> Option<String> {
+    let on_path = std::env::var_os("PATH").is_some_and(|path| {
+        std::env::split_paths(&path).any(|dir| dir.join("claude").is_file())
+    });
+
+    if on_path {
+        return None;
+    }
+
+    let home = std::env::var("HOME").unwrap_or_default();
+
+    [
+        format!("{home}/.local/bin/claude"),
+        format!("{home}/.claude/local/claude"),
+        "/opt/homebrew/bin/claude".to_string(),
+        "/usr/local/bin/claude".to_string(),
+    ]
+    .into_iter()
+    .find(|candidate| std::path::Path::new(candidate).is_file())
 }
 
 fn initial_workspace(
@@ -640,7 +703,7 @@ fn build_backend(backend: Backend, program: Option<String>) -> Arc<dyn AgentBack
         Backend::Claude => {
             let mut claude = ClaudeCliBackend::new();
 
-            if let Some(program) = program {
+            if let Some(program) = program.or_else(default_claude_program) {
                 claude = claude.with_program(program);
             }
 
