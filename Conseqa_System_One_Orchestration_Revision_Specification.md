@@ -819,25 +819,33 @@ L1 structural validation guards the result. Diagnostics the builder cannot resol
 
 # 20. Operation synthesis by archetype
 
-Later phase. The mechanism is fixed here; the catalogue is measured, not assumed.
+Implemented (`src/harness/executors/synthesis.rs`, wording in `src/system_one/questions/synthesis.rs`). The catalogue is measured, not assumed: archetype coverage — the share of `operation_synthesis` tasks whose record says `executor: system_one` — is read off every run's manifest.
 
 ## 20.1 Archetype
 
-An archetype is a typed program template with:
+An archetype is a typed program template with an applicability condition computed in code, slots filled from an enumeration over the symbol graph, and deterministic ids (`tx.<operation>.<role>`, `read.<operation>.<object>`, `output.<operation>.result`).
 
-- an applicability question;
-- slots, each with an enumerator over the symbol graph — which object, which state machine and transition, which topic or outbox, which input field is the key;
-- a deterministic identifier scheme for the ids it introduces (`tx.<operation>.<role>`, `read.<operation>.<object>`).
+Enumeration: the operation's single input (request, or a subscription consuming one message schema; outbox consumers are out of the catalogue), the fields that input carries, the request's `ok` schema and declared errors, and every **record the input identifies** — a data object whose every identity field the input carries under the same name, selected by `eq` on each. Lifecycles are the side-effect-free transitions of a state machine whose subject is such a record. All reads are tracked; the skeleton does not move during a fanout, so reading every data object and state machine invalidates no peer.
 
 ## 20.2 Seed catalogue
 
-Drawn from the fixtures: keyed insert; read–validate–write under a version; state transition with a transition-scoped outbox admission; external effect with result matching and a compensating arm; outbox consumer with dispatch; ordered subscription consumer under a successor cursor.
+- **keyed update** — read the changed fields (and any result field only the record holds), write the changed fields from the reads and the input, advance the version when the object has one, export an output when the result needs record fields;
+- **keyed insert** — insert the record from the input fields it shares;
+- **transition** — apply the transition to the identified record, advance the version when there is one; the `rejected` arm returns the chosen declared error (a request) or completes (a subscription).
+
+Each ends with `return ok` — payload from the input fields named in the `ok` schema, or the output — or `complete`. Transactions are `read_committed` with an unspecified commit key: requirements and their proofs are discovery's and repair's (a replay requirement gets its keyed commit from repair, §18.2).
+
+Not yet in the catalogue, and escalated: operations touching more than one record, external effects, outbox admissions, transitions with side effects, generated identities.
 
 ## 20.3 Selection
 
-Rank wide, then re-rank narrow. One request ranks every archetype against the operation's interface and prompt evidence and asks, separately, whether any archetype applies at all. A second request re-reads the top three with their full templates, with one absolute `fits` Noul each; all three may be rejected.
+One request, answered together: `archetype` — a Choice over the applicable archetypes, each described as *everything* the operation does, plus no-match; `record` when more than one candidate record; `changes_<record>_<field>` — a Noul per changeable field, speculatively for every candidate record; `transition` — a Choice over the enumerated transitions; `refusal` — a Choice over the declared errors, for a request.
 
-The filled program is evaluated by `evaluate_candidate`. If it validates it is submitted; otherwise the builder abstains. Archetype coverage — the share of operations synthesized without a session — is a reported metric of every run.
+A choice is accepted at or above `select`; a changed field at or above `act`, with anything between `dismiss` and `act` escalated, and no clearly changed field escalated too. The model writes nothing: it chooses among what code enumerated.
+
+## 20.4 Judgment
+
+The filled program goes through `evaluate_candidate`. Mid-fanout the model cannot assemble — siblings have no program yet — so the program is admitted when its only assembly gaps are sibling programs and its draft checks pass: exactly the validator's operation-local passes the gate runs on any session's program (§8.1), and runs again at commit. Otherwise it must validate and verify. A refused program is never submitted; the task goes to a session with the refusal.
 
 ---
 

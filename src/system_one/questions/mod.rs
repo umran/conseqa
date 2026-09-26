@@ -33,6 +33,7 @@
 pub mod conformance;
 pub mod discovery;
 pub mod repair;
+pub mod synthesis;
 
 /// The identity of one reviewed question.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

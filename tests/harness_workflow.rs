@@ -1690,8 +1690,25 @@ mod system_one {
     }
 
     impl Opinions {
+        fn choosing(mut self, question: &'static str, option: &'static str, p: f64) -> Self {
+            self.choices.insert(question, (option, p));
+            self
+        }
+
         fn stating(mut self, question: &'static str, p: f64) -> Self {
             self.nouls.insert(question, p);
+            self
+        }
+
+        fn choosing_for(
+            mut self,
+            operation: &'static str,
+            question: &'static str,
+            option: &'static str,
+            p: f64,
+        ) -> Self {
+            self.scoped_choices
+                .insert((operation, question), (option, p));
             self
         }
 
@@ -3097,6 +3114,293 @@ mod system_one {
                     .any(|request| request.questions.contains_key(&"gap_free".into()))
             );
         }
+    }
+
+    /// `shop` with one operation's program taken away, as the fanout
+    /// finds it.
+    fn shop_without_program(operation: &str) -> WorkspaceState {
+        let mut workspace = workspace_of(&authored("shop.yaml"), "A small shop backend.");
+
+        workspace
+            .operations
+            .get_mut(&id(operation))
+            .expect("the operation")
+            .program = None;
+
+        workspace
+    }
+
+    async fn synthesize(
+        operation: &str,
+        opinions: &Opinions,
+    ) -> (ConfluenceEngine, Seen, Vec<conseqa::harness::TaskRun>) {
+        run_tasks(
+            shop_without_program(operation),
+            vec![(
+                TaskKind::OperationSynthesis,
+                conseqa::confluence::WriteScope::operation_synthesis(id(operation)),
+                id(operation),
+            )],
+            opinions,
+        )
+        .await
+    }
+
+    fn syntheses(seen: &Seen) -> Vec<String> {
+        seen.lock()
+            .expect("not poisoned")
+            .iter()
+            .filter(|(kind, _)| *kind == TaskKind::OperationSynthesis)
+            .map(|(_, prompt)| prompt.clone())
+            .collect()
+    }
+
+    fn program_of(engine: &ConfluenceEngine, operation: &str) -> conseqa::spec::OperationBlock {
+        engine.head_snapshot().workspace.operations[&id(operation)]
+            .program
+            .clone()
+            .expect("a program")
+    }
+
+    /// Keyed update: told the operation changes one field of the one
+    /// record its input identifies, the builder writes the program — a
+    /// read, a write of that field, the version advanced, the result
+    /// returned — and the analyzer admits it. No session wrote it.
+    #[tokio::test]
+    async fn a_keyed_update_is_written_from_its_template() {
+        let opinions = Opinions::default()
+            .choosing("archetype", "keyed_update", 0.9)
+            .choosing("record", "object.product", 0.9)
+            .stating("changes_object_product_stock", 0.93);
+
+        let (engine, seen, runs) = synthesize("operation.restock", &opinions).await;
+
+        assert!(syntheses(&seen).is_empty(), "{:?}", syntheses(&seen));
+        assert!(runs[0].committed(), "{:?}", runs[0]);
+
+        let program = program_of(&engine, "operation.restock");
+
+        let transaction = program
+            .transaction(&id("tx.restock.update"))
+            .expect("the template's transaction");
+
+        let kinds: Vec<&str> = transaction
+            .steps
+            .iter()
+            .map(|step| match step {
+                conseqa::spec::TransactionStep::Read(_) => "read",
+                conseqa::spec::TransactionStep::Write(write) => {
+                    assert_eq!(write.fields, [path("stock")].into());
+                    "write"
+                }
+                conseqa::spec::TransactionStep::BumpVersion(_) => "bump_version",
+                _ => "other",
+            })
+            .collect();
+
+        assert_eq!(kinds, ["read", "write", "bump_version"]);
+
+        assert!(matches!(
+            program.steps.last(),
+            Some(conseqa::spec::OperationStep::Return(_))
+        ));
+
+        // One request decided it.
+        assert_eq!(opinions.asked().len(), 1);
+        assert_eq!(opinions.asked()[0].tags["builder"], "operation_synthesis");
+    }
+
+    /// Keyed insert: one record created from what the input carries,
+    /// its identity included.
+    #[tokio::test]
+    async fn a_keyed_insert_is_written_from_its_template() {
+        let opinions = Opinions::default()
+            .choosing("archetype", "keyed_insert", 0.9)
+            .choosing("record", "object.restock_receipt", 0.9);
+
+        let (engine, seen, runs) = synthesize("operation.restock", &opinions).await;
+
+        assert!(syntheses(&seen).is_empty(), "{:?}", syntheses(&seen));
+        assert!(runs[0].committed(), "{:?}", runs[0]);
+
+        let program = program_of(&engine, "operation.restock");
+
+        assert!(matches!(
+            &program
+                .transaction(&id("tx.restock.insert"))
+                .expect("the template's transaction")
+                .steps[..],
+            [conseqa::spec::TransactionStep::Insert(insert)]
+                if insert.object == id("object.restock_receipt")
+        ));
+    }
+
+    /// Transition: the builder applies the chosen lifecycle transition to
+    /// the record the input identifies, and a wrong-state record returns
+    /// the declared error chosen for it.
+    #[tokio::test]
+    async fn a_transition_is_written_from_its_template() {
+        let opinions = Opinions::default()
+            .choosing("archetype", "transition", 0.88)
+            .choosing(
+                "transition",
+                "machine_order_lifecycle_transition_order_ship",
+                0.9,
+            )
+            .choosing("refusal", "not_shippable", 0.86);
+
+        let (engine, seen, runs) = synthesize("operation.ship_order", &opinions).await;
+
+        assert!(syntheses(&seen).is_empty(), "{:?}", syntheses(&seen));
+        assert!(runs[0].committed(), "{:?}", runs[0]);
+
+        let program = program_of(&engine, "operation.ship_order");
+
+        let conseqa::spec::OperationStep::Transaction(execute) = &program.steps[0] else {
+            panic!("a transaction first: {program:?}");
+        };
+
+        assert!(execute.transaction.steps.iter().any(|step| matches!(
+            step,
+            conseqa::spec::TransactionStep::Transition(transition)
+                if transition.transition == id("transition.order.ship")
+        )));
+
+        let rejected = execute.rejected.as_ref().expect("a rejected arm");
+
+        assert!(matches!(
+            &rejected.steps[..],
+            [conseqa::spec::OperationStep::Return(conseqa::spec::Return {
+                outcome: conseqa::spec::ResultOutcome::Err { error, .. },
+                ..
+            })] if *error == id("not_shippable")
+        ));
+    }
+
+    /// Nothing is guessed: a template that matches nothing clearly, or a
+    /// field the model is unsure the operation changes, sends the task to
+    /// a session, told why.
+    #[tokio::test]
+    async fn an_unclear_template_is_handed_to_the_session() {
+        for (opinions, why) in [
+            (
+                Opinions::default().choosing("archetype", "none_of_these", 0.8),
+                "no archetype matches the operation",
+            ),
+            (
+                Opinions::default()
+                    .choosing("archetype", "keyed_update", 0.9)
+                    .choosing("record", "object.product", 0.9)
+                    .stating("changes_object_product_stock", 0.55),
+                "it is uncertain whether the operation changes `stock`",
+            ),
+        ] {
+            let (engine, seen, _) = synthesize("operation.restock", &opinions).await;
+
+            let handed = syntheses(&seen);
+
+            assert_eq!(handed.len(), 1);
+            assert!(handed[0].contains(why), "{}", handed[0]);
+
+            assert!(
+                engine.head_snapshot().workspace.operations[&id("operation.restock")]
+                    .program
+                    .is_none()
+            );
+        }
+    }
+
+    /// The layer end to end: an operation the fanout finds without a
+    /// program is written from its template, its replay requirements are
+    /// then repaired in process (the template leaves the commit
+    /// unkeyed; repair keys it), and the run succeeds with no session.
+    ///
+    /// Mid-fanout the model cannot assemble — siblings have no program
+    /// yet — so the template is judged as the gate judges any program,
+    /// by the validator's operation-local passes; the whole model is
+    /// verified once every program is in.
+    #[tokio::test]
+    async fn a_missing_program_is_written_and_proven_without_a_session() {
+        let workspace = shop_without_program("operation.restock");
+
+        let opinions = Opinions::default()
+            .choosing_for("operation.restock", "archetype", "keyed_update", 0.9)
+            .choosing_for("operation.restock", "record", "object.product", 0.9)
+            .stating_for("operation.restock", "changes_object_product_stock", 0.93);
+
+        let engine = ConfluenceEngine::in_memory(workspace).expect("engine starts");
+        let seen = Seen::default();
+        let idle: ScriptFn = Arc::new(|_, _| Box::pin(async {}));
+
+        let backend = Arc::new(SystemOneBackend::new(
+            engine.clone(),
+            Arc::new(opinions.clone()),
+            conseqa::harness::executors::BUILDABLE,
+            Arc::new(ScriptedBackend {
+                engine: engine.clone(),
+                script: recording(idle, seen.clone()),
+            }),
+        ));
+
+        let out_dir = scratch();
+
+        let supervisor = Supervisor::new(
+            engine.clone(),
+            backend,
+            "http://127.0.0.1:0/mcp",
+            None,
+            out_dir.join("work"),
+        );
+
+        let scheduler = Scheduler::new(engine.clone(), supervisor, SchedulerPolicy::default());
+
+        let workflow = Workflow::new(
+            scheduler,
+            WorkflowConfig {
+                out_dir: out_dir.clone(),
+                analysis_timeout: Duration::from_secs(20),
+                max_iterations: 8,
+                objective: None,
+            },
+        );
+
+        let report = workflow.run().await.expect("the workflow runs");
+
+        assert!(
+            matches!(report.status, RunStatus::Success { .. }),
+            "{:?}",
+            report.status
+        );
+
+        assert!(
+            seen.lock().expect("not poisoned").is_empty(),
+            "no session: {:?}",
+            seen.lock().expect("not poisoned")
+        );
+
+        let manifest = manifest_of(&out_dir);
+
+        for kind in ["operation_synthesis", "requirement_repair"] {
+            let ran = records(&manifest, kind);
+
+            assert!(!ran.is_empty(), "{kind} ran: {manifest}");
+            assert!(
+                ran.iter().all(|record| record["executor"] == "system_one"),
+                "{kind}: {manifest}"
+            );
+        }
+
+        let transaction = program_of(&engine, "operation.restock")
+            .transaction(&id("tx.restock.update"))
+            .expect("the template's transaction")
+            .clone();
+
+        assert!(matches!(
+            transaction.idempotency,
+            conseqa::spec::IdempotencyGuarantee::DeduplicatedBy { .. }
+        ));
+
+        std::fs::remove_dir_all(&out_dir).ok();
     }
 
     /// `tenant_ledger` as its author wrote it, and with the exclusive

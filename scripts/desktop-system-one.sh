@@ -48,7 +48,7 @@ $key_file
 --decider-log
 $dir/decisions.jsonl
 --system-one-kinds
-requirement_discovery,requirement_repair
+operation_synthesis,requirement_discovery,requirement_repair
 EOF
 
 echo "System One on ($model). Key: $key_file. Flags: $args_file"
