@@ -267,8 +267,13 @@ async fn main() -> ExitCode {
 /// Where `stdio` reads extra flags from: one flag or value per line,
 /// `#` comments allowed. A desktop client owns its own config file and
 /// may rewrite it at any time, so settings that must survive that live
-/// here instead, in a file only a person writes.
+/// here instead, in a file only a person writes. `CONSEQA_STDIO_ARGS`
+/// names another file (`/dev/null` for none).
 fn stdio_args_file() -> PathBuf {
+    if let Some(path) = std::env::var_os("CONSEQA_STDIO_ARGS") {
+        return PathBuf::from(path);
+    }
+
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
 
     PathBuf::from(home).join(".conseqa/stdio.args")
