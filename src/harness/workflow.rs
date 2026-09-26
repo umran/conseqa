@@ -402,6 +402,7 @@ impl Workflow {
                     operation: Some(operation.clone()),
                     requirements: Vec::new(),
                     include: Vec::new(),
+                    peers: Vec::new(),
                 },
                 prompt_evidence: self.prompt_evidence(),
                 interactive: false,
@@ -450,6 +451,7 @@ impl Workflow {
                         operation: Some(operation.clone()),
                         requirements: Vec::new(),
                         include: Vec::new(),
+                        peers: Vec::new(),
                     },
                     prompt_evidence: self.prompt_evidence(),
                     interactive: false,
@@ -594,6 +596,7 @@ impl Workflow {
                 include: crate::confluence::topology_symbols(
                     &self.engine().head_snapshot().workspace,
                 ),
+                peers: Vec::new(),
             },
             prompt_evidence: self.prompt_evidence(),
             interactive: false,
@@ -637,6 +640,7 @@ impl Workflow {
                     operation: Some(operation),
                     requirements: Vec::new(),
                     include: Vec::new(),
+                    peers: Vec::new(),
                 },
                 prompt_evidence: self.prompt_evidence(),
                 interactive: false,
@@ -708,6 +712,7 @@ impl Workflow {
                 include: crate::confluence::topology_symbols(
                     &self.engine().head_snapshot().workspace,
                 ),
+                peers: Vec::new(),
             },
             prompt_evidence: self.prompt_evidence(),
             interactive: false,
@@ -1146,13 +1151,21 @@ fn inline_obligations(targets: &[RepairTarget], analysis: &AnalysisSnapshot) -> 
     }
 }
 
-/// One repair task per operation, carrying every unproven obligation
-/// of that operation — never one per obligation. Concurrent tasks over
-/// one program are guaranteed write-write conflicts (the gate
-/// serializes them at the cost of a restarted session each), and the
-/// obligations trade off against each other: one revision often
-/// discharges several, which per-obligation workers cannot see. The
-/// same reasoning the topology author's batching follows.
+/// One repair task per conflict closure, carrying every unproven
+/// obligation of every operation in it — never one per obligation, and
+/// never one per operation when operations share a closure.
+///
+/// Concurrent tasks over one program are guaranteed write-write
+/// conflicts, and the obligations trade off against each other: one
+/// revision often discharges several. The same holds across programs
+/// that conflict: a lock or isolation change in one operation changes
+/// what its closure peers can prove, so peers repaired concurrently
+/// invalidate each other, and a repair of one alone is often refused
+/// because it un-proves a peer. So operations are grouped by the
+/// transactions their unproven obligations' evidence names, and each
+/// group is one task with a program grant per member — including a
+/// member with nothing unproven itself, whose program a proof may need
+/// to change (a strict-lock proof needs the lock on the writer too).
 fn application_repair_tasks(
     targets: Vec<RepairTarget>,
     analysis: &AnalysisSnapshot,
@@ -1167,36 +1180,230 @@ fn application_repair_tasks(
             .push(target);
     }
 
-    by_operation
+    repair_groups(&by_operation, analysis)
         .into_iter()
-        .map(|(operation, targets)| {
-            let listed = targets
+        .map(|group| {
+            let listed = group
                 .iter()
+                .flat_map(|operation| by_operation.get(operation).into_iter().flatten())
                 .map(|target| format!("- the {}", target.label()))
                 .collect::<Vec<_>>()
                 .join("\n");
 
+            let all: Vec<RepairTarget> = group
+                .iter()
+                .flat_map(|operation| by_operation.get(operation).into_iter().flatten())
+                .cloned()
+                .collect();
+
+            let requirements = |operation: &Id| {
+                by_operation
+                    .get(operation)
+                    .into_iter()
+                    .flatten()
+                    .map(|target| (target.family, target.transaction.clone(), target.index))
+                    .collect::<Vec<_>>()
+            };
+
+            // The primary is the first member with something unproven;
+            // every group has one.
+            let primary = group
+                .iter()
+                .find(|operation| by_operation.contains_key(*operation))
+                .expect("a group holds at least one target")
+                .clone();
+
+            let peers: Vec<Id> = group
+                .iter()
+                .filter(|operation| **operation != primary)
+                .cloned()
+                .collect();
+
+            let objective = if peers.is_empty() {
+                format!(
+                    "Make these requirements of {primary} provable, revising its \
+                     program once in a way that resolves them together:\n{listed}\n\n{}",
+                    inline_obligations(&all, analysis)
+                )
+            } else {
+                format!(
+                    "Make these requirements provable. {primary} and {} share one \
+                     conflict closure, so revise their programs together — in one \
+                     patch, with a replace_operation_program per program you change — \
+                     in a way that resolves them all:\n{listed}\n\n{}",
+                    peers
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    inline_obligations(&all, analysis)
+                )
+            };
+
             LogicalTask {
                 kind: TaskKind::RequirementRepair,
-                objective: format!(
-                    "Make these requirements of {operation} provable, revising its \
-                     program once in a way that resolves them together:\n{listed}\n\n{}",
-                    inline_obligations(&targets, analysis)
-                ),
-                write_scope: WriteScope::requirement_repair(operation.clone()),
-                bundle: BundleSpec {
-                    operation: Some(operation),
-                    requirements: targets
+                objective,
+                write_scope: WriteScope::of(
+                    group
                         .iter()
-                        .map(|target| (target.family, target.transaction.clone(), target.index))
-                        .collect(),
+                        .map(|operation| WriteGrant::OperationProgram(operation.clone())),
+                ),
+                bundle: BundleSpec {
+                    operation: Some(primary.clone()),
+                    requirements: requirements(&primary),
                     include: Vec::new(),
+                    peers: peers
+                        .iter()
+                        .map(|operation| (operation.clone(), requirements(operation)))
+                        .collect(),
                 },
                 prompt_evidence: prompt_evidence.clone(),
                 interactive: false,
             }
         })
         .collect()
+}
+
+/// The operations each repair task covers: the connected components of
+/// "an unproven transaction obligation of one names a transaction of
+/// the other in its evidence". Each component holds at least one
+/// operation with a target; components are in operation order.
+fn repair_groups(
+    by_operation: &BTreeMap<Id, Vec<RepairTarget>>,
+    analysis: &AnalysisSnapshot,
+) -> Vec<Vec<Id>> {
+    let mut edges: Vec<(Id, Id)> = Vec::new();
+
+    let report = &analysis.verification;
+
+    let unproven_serializability = report
+        .transaction_serializability
+        .iter()
+        .filter(|check| by_operation.contains_key(&check.operation))
+        .filter(|check| {
+            matches!(
+                check.verdict,
+                crate::analyzer::verification::transaction_serializability::TransactionSerializabilityVerdict::Unproven { .. }
+            )
+        })
+        .map(|check| (&check.operation, serde_json::to_value(&check.verdict)));
+
+    let unproven_ordering = report
+        .transaction_ordering
+        .iter()
+        .filter(|check| by_operation.contains_key(&check.operation))
+        .filter(|check| {
+            matches!(
+                check.verdict,
+                crate::analyzer::verification::transaction_ordering::TransactionOrderingVerdict::Unproven { .. }
+            )
+        })
+        .map(|check| (&check.operation, serde_json::to_value(&check.verdict)));
+
+    for (operation, verdict) in unproven_serializability.chain(unproven_ordering) {
+        let Ok(verdict) = verdict else {
+            continue;
+        };
+
+        let mut named = std::collections::BTreeSet::new();
+
+        referenced_operations(&verdict, &mut named);
+
+        for other in named {
+            if &other != operation {
+                edges.push((operation.clone(), other));
+            }
+        }
+    }
+
+    // Union-find over operation ids.
+    let mut parent: BTreeMap<Id, Id> = BTreeMap::new();
+
+    fn find(parent: &mut BTreeMap<Id, Id>, id: &Id) -> Id {
+        let next = parent.get(id).cloned().unwrap_or_else(|| id.clone());
+
+        if &next == id {
+            return next;
+        }
+
+        let root = find(parent, &next);
+
+        parent.insert(id.clone(), root.clone());
+
+        root
+    }
+
+    for operation in by_operation.keys() {
+        parent
+            .entry(operation.clone())
+            .or_insert_with(|| operation.clone());
+    }
+
+    for (a, b) in &edges {
+        parent.entry(a.clone()).or_insert_with(|| a.clone());
+        parent.entry(b.clone()).or_insert_with(|| b.clone());
+
+        let (ra, rb) = (find(&mut parent, a), find(&mut parent, b));
+
+        if ra != rb {
+            parent.insert(rb, ra);
+        }
+    }
+
+    let members: Vec<Id> = parent.keys().cloned().collect();
+
+    let mut groups: BTreeMap<Id, Vec<Id>> = BTreeMap::new();
+
+    for member in members {
+        let root = find(&mut parent, &member);
+
+        groups.entry(root).or_default().push(member);
+    }
+
+    let mut groups: Vec<Vec<Id>> = groups
+        .into_values()
+        .filter(|group| {
+            group
+                .iter()
+                .any(|operation| by_operation.contains_key(operation))
+        })
+        .collect();
+
+    for group in &mut groups {
+        group.sort();
+    }
+
+    groups.sort();
+
+    groups
+}
+
+/// Every operation a verdict's evidence names, found as the
+/// `{operation, transaction}` pair every transaction reference carries.
+fn referenced_operations(value: &serde_json::Value, into: &mut std::collections::BTreeSet<Id>) {
+    match value {
+        serde_json::Value::Object(map) => {
+            if let (
+                Some(serde_json::Value::String(operation)),
+                Some(serde_json::Value::String(_)),
+            ) = (map.get("operation"), map.get("transaction"))
+            {
+                into.insert(Id(operation.clone()));
+            }
+
+            for nested in map.values() {
+                referenced_operations(nested, into);
+            }
+        }
+
+        serde_json::Value::Array(items) => {
+            for item in items {
+                referenced_operations(item, into);
+            }
+        }
+
+        _ => {}
+    }
 }
 
 /// Open requests grouped by target symbol, in canonical order.
@@ -1248,6 +1455,7 @@ fn dependency_repair_task(
             operation: None,
             requirements: Vec::new(),
             include: vec![target.clone()],
+            peers: Vec::new(),
         },
         prompt_evidence,
         interactive: false,

@@ -1,0 +1,2006 @@
+dsl: 4
+revision: 24
+services:
+  service.shop:
+    kind: backend
+schemas:
+  schema.CancelOrderRequest:
+    kind: canonical
+    description: null
+    completeness: complete
+    fields:
+      order_id:
+        ty:
+          kind: scalar
+          value: uuid
+        optional: false
+      request_id:
+        ty:
+          kind: scalar
+          value: uuid
+        optional: false
+  schema.CancelOrderResponse:
+    kind: canonical
+    description: null
+    completeness: complete
+    fields:
+      order_id:
+        ty:
+          kind: scalar
+          value: uuid
+        optional: false
+  schema.InsufficientStock:
+    kind: canonical
+    description: null
+    completeness: complete
+    fields:
+      product_id:
+        ty:
+          kind: scalar
+          value: uuid
+        optional: false
+      requested:
+        ty:
+          kind: scalar
+          value: int
+        optional: false
+  schema.Order:
+    kind: canonical
+    description: A customer order for one product. status is governed by machine.order_lifecycle. request_id is the placing request's id, kept for retry deduplication.
+    completeness: complete
+    fields:
+      customer_id:
+        ty:
+          kind: scalar
+          value: uuid
+        optional: false
+      order_id:
+        ty:
+          kind: scalar
+          value: uuid
+        optional: false
+      product_id:
+        ty:
+          kind: scalar
+          value: uuid
+        optional: false
+      quantity:
+        ty:
+          kind: scalar
+          value: int
+        optional: false
+      request_id:
+        ty:
+          kind: scalar
+          value: uuid
+        optional: false
+      status:
+        ty:
+          kind: scalar
+          value: string
+        optional: false
+      version:
+        ty:
+          kind: scalar
+          value: int
+        optional: false
+  schema.OrderNotFound:
+    kind: canonical
+    description: null
+    completeness: complete
+    fields:
+      order_id:
+        ty:
+          kind: scalar
+          value: uuid
+        optional: false
+  schema.OrderStateConflict:
+    kind: canonical
+    description: The order exists but its current state does not admit the requested action.
+    completeness: complete
+    fields:
+      order_id:
+        ty:
+          kind: scalar
+          value: uuid
+        optional: false
+  schema.PayOrderRequest:
+    kind: canonical
+    description: null
+    completeness: complete
+    fields:
+      amount:
+        ty:
+          kind: scalar
+          value: decimal
+        optional: false
+      order_id:
+        ty:
+          kind: scalar
+          value: uuid
+        optional: false
+      request_id:
+        ty:
+          kind: scalar
+          value: uuid
+        optional: false
+  schema.PayOrderResponse:
+    kind: canonical
+    description: null
+    completeness: complete
+    fields:
+      order_id:
+        ty:
+          kind: scalar
+          value: uuid
+        optional: false
+      payment_id:
+        ty:
+          kind: scalar
+          value: uuid
+        optional: false
+  schema.Payment:
+    kind: canonical
+    description: A recorded payment for an order. Identified by order_id so an order holds at most one payment.
+    completeness: complete
+    fields:
+      amount:
+        ty:
+          kind: scalar
+          value: decimal
+        optional: false
+      order_id:
+        ty:
+          kind: scalar
+          value: uuid
+        optional: false
+      payment_id:
+        ty:
+          kind: scalar
+          value: uuid
+        optional: false
+      request_id:
+        ty:
+          kind: scalar
+          value: uuid
+        optional: false
+  schema.PlaceOrderRequest:
+    kind: canonical
+    description: null
+    completeness: complete
+    fields:
+      customer_id:
+        ty:
+          kind: scalar
+          value: uuid
+        optional: false
+      product_id:
+        ty:
+          kind: scalar
+          value: uuid
+        optional: false
+      quantity:
+        ty:
+          kind: scalar
+          value: int
+        optional: false
+      request_id:
+        ty:
+          kind: scalar
+          value: uuid
+        optional: false
+  schema.PlaceOrderResponse:
+    kind: canonical
+    description: null
+    completeness: complete
+    fields:
+      order_id:
+        ty:
+          kind: scalar
+          value: uuid
+        optional: false
+      product_id:
+        ty:
+          kind: scalar
+          value: uuid
+        optional: false
+      quantity:
+        ty:
+          kind: scalar
+          value: int
+        optional: false
+  schema.Product:
+    kind: canonical
+    description: A sellable product and its on-hand stock.
+    completeness: complete
+    fields:
+      product_id:
+        ty:
+          kind: scalar
+          value: uuid
+        optional: false
+      stock:
+        ty:
+          kind: scalar
+          value: int
+        optional: false
+      version:
+        ty:
+          kind: scalar
+          value: int
+        optional: false
+  schema.ProductNotFound:
+    kind: canonical
+    description: null
+    completeness: complete
+    fields:
+      product_id:
+        ty:
+          kind: scalar
+          value: uuid
+        optional: false
+  schema.RestockReceipt:
+    kind: canonical
+    description: A durable record of one applied restock request, identified by the restock request id.
+    completeness: complete
+    fields:
+      product_id:
+        ty:
+          kind: scalar
+          value: uuid
+        optional: false
+      quantity:
+        ty:
+          kind: scalar
+          value: int
+        optional: false
+      request_id:
+        ty:
+          kind: scalar
+          value: uuid
+        optional: false
+  schema.RestockRequest:
+    kind: canonical
+    description: null
+    completeness: complete
+    fields:
+      product_id:
+        ty:
+          kind: scalar
+          value: uuid
+        optional: false
+      quantity:
+        ty:
+          kind: scalar
+          value: int
+        optional: false
+      request_id:
+        ty:
+          kind: scalar
+          value: uuid
+        optional: false
+  schema.RestockResponse:
+    kind: canonical
+    description: null
+    completeness: complete
+    fields:
+      product_id:
+        ty:
+          kind: scalar
+          value: uuid
+        optional: false
+      request_id:
+        ty:
+          kind: scalar
+          value: uuid
+        optional: false
+  schema.ShipOrderRequest:
+    kind: canonical
+    description: null
+    completeness: complete
+    fields:
+      order_id:
+        ty:
+          kind: scalar
+          value: uuid
+        optional: false
+      request_id:
+        ty:
+          kind: scalar
+          value: uuid
+        optional: false
+  schema.ShipOrderResponse:
+    kind: canonical
+    description: null
+    completeness: complete
+    fields:
+      order_id:
+        ty:
+          kind: scalar
+          value: uuid
+        optional: false
+  schema.StockReservation:
+    kind: canonical
+    description: 'The outcome of one stock reservation attempt inside place_order''s reservation transaction, established as its output so program control can branch on it. outcome is one of "reserved", "insufficient_stock", "product_not_found". remaining is the product''s stock after the reservation; when the outcome is not "reserved" it is the stock unchanged (0 when the product does not exist). Not a stored state and not an error payload: the error classes of place_order still carry schema.InsufficientStock and schema.ProductNotFound.'
+    completeness: complete
+    fields:
+      outcome:
+        ty:
+          kind: scalar
+          value: string
+        optional: false
+      product_id:
+        ty:
+          kind: scalar
+          value: uuid
+        optional: false
+      remaining:
+        ty:
+          kind: scalar
+          value: int
+        optional: false
+data_models:
+  data.shop:
+    objects:
+      object.order:
+        schema: schema.Order
+        identity:
+        - - order_id
+        version:
+          field:
+          - version
+      object.payment:
+        schema: schema.Payment
+        identity:
+        - - order_id
+      object.product:
+        schema: schema.Product
+        identity:
+        - - product_id
+        version:
+          field:
+          - version
+      object.restock_receipt:
+        schema: schema.RestockReceipt
+        identity:
+        - - request_id
+topics: {}
+state_machines:
+  machine.order_lifecycle:
+    subject:
+      kind: object
+      object: object.order
+      state:
+      - status
+    states:
+    - state.order.cancelled
+    - state.order.paid
+    - state.order.pending
+    - state.order.shipped
+    initial: state.order.pending
+    transitions:
+      transition.order.cancel:
+        from:
+        - state.order.pending
+        to: state.order.cancelled
+        side_effects: {}
+        effects: {}
+      transition.order.pay:
+        from:
+        - state.order.pending
+        to: state.order.paid
+        side_effects: {}
+        effects: {}
+      transition.order.ship:
+        from:
+        - state.order.paid
+        to: state.order.shipped
+        side_effects: {}
+        effects: {}
+operations:
+  operation.cancel_order:
+    service: service.shop
+    description: Cancels an unpaid (pending) order and returns its reserved quantity to the product's stock. Cancelling an already-cancelled order has no further effect.
+    inputs:
+      input.cancel_order.request:
+        kind: request
+        schema: schema.CancelOrderRequest
+        identity:
+          kind: keyed
+          fields:
+          - - request_id
+        result:
+          ok: schema.CancelOrderResponse
+          errors:
+            not_cancellable:
+              schema: schema.OrderStateConflict
+              disposition: terminal
+            order_not_found:
+              schema: schema.OrderNotFound
+              disposition: terminal
+    program:
+      steps:
+      - kind: transaction
+        transaction:
+          id: tx.cancel_order
+          data_model: data.shop
+          isolation: read_committed
+          idempotency:
+            kind: deduplicated_by
+            key:
+              components:
+              - source:
+                  kind: input
+                  id: input.cancel_order.request
+                path:
+                - request_id
+          requirements:
+            serializability:
+            - key:
+                source:
+                  kind: input
+                  id: input.cancel_order.request
+                path:
+                - order_id
+            ordering: []
+          steps:
+          - kind: read
+            bind: read.order
+            target:
+              object: object.order
+              predicate:
+                kind: eq
+                field:
+                - order_id
+                value:
+                  kind: value
+                  value:
+                    source:
+                      kind: input
+                      id: input.cancel_order.request
+                    path:
+                    - order_id
+            fields:
+              kind: only
+              fields:
+              - - product_id
+              - - quantity
+              - - status
+              - - version
+          - kind: validate_version
+            target:
+              object: object.order
+              predicate:
+                kind: eq
+                field:
+                - order_id
+                value:
+                  kind: value
+                  value:
+                    source:
+                      kind: input
+                      id: input.cancel_order.request
+                    path:
+                    - order_id
+            expected:
+              source:
+                kind: transaction_read
+                id: read.order
+              path:
+              - version
+          - kind: transition
+            machine: machine.order_lifecycle
+            transition: transition.order.cancel
+            subject:
+              object: object.order
+              predicate:
+                kind: eq
+                field:
+                - order_id
+                value:
+                  kind: value
+                  value:
+                    source:
+                      kind: input
+                      id: input.cancel_order.request
+                    path:
+                    - order_id
+            effect_intents: {}
+            effects: {}
+          - kind: bump_version
+            target:
+              object: object.order
+              predicate:
+                kind: eq
+                field:
+                - order_id
+                value:
+                  kind: value
+                  value:
+                    source:
+                      kind: input
+                      id: input.cancel_order.request
+                    path:
+                    - order_id
+          - kind: lock
+            target:
+              object: object.product
+              predicate:
+                kind: eq
+                field:
+                - product_id
+                value:
+                  kind: value
+                  value:
+                    source:
+                      kind: transaction_read
+                      id: read.order
+                    path:
+                    - product_id
+            mode: exclusive
+            order:
+              kind: unspecified
+          - kind: read
+            bind: read.product
+            target:
+              object: object.product
+              predicate:
+                kind: eq
+                field:
+                - product_id
+                value:
+                  kind: value
+                  value:
+                    source:
+                      kind: transaction_read
+                      id: read.order
+                    path:
+                    - product_id
+            fields:
+              kind: only
+              fields:
+              - - stock
+              - - version
+          - kind: write
+            target:
+              object: object.product
+              predicate:
+                kind: eq
+                field:
+                - product_id
+                value:
+                  kind: value
+                  value:
+                    source:
+                      kind: transaction_read
+                      id: read.order
+                    path:
+                    - product_id
+            fields:
+            - - stock
+            values:
+              kind: deterministic
+              from:
+              - source:
+                  kind: transaction_read
+                  id: read.product
+                path:
+                - stock
+              - source:
+                  kind: transaction_read
+                  id: read.order
+                path:
+                - quantity
+          - kind: bump_version
+            target:
+              object: object.product
+              predicate:
+                kind: eq
+                field:
+                - product_id
+                value:
+                  kind: value
+                  value:
+                    source:
+                      kind: transaction_read
+                      id: read.order
+                    path:
+                    - product_id
+          - kind: establish_transaction_output
+            bind: output.cancelled
+            schema: schema.CancelOrderResponse
+            values:
+              kind: deterministic
+              from:
+              - source:
+                  kind: input
+                  id: input.cancel_order.request
+                path:
+                - order_id
+        rejected:
+          steps:
+          - kind: transaction
+            transaction:
+              id: tx.inspect_order
+              data_model: data.shop
+              isolation: read_committed
+              idempotency:
+                kind: deduplicated_by
+                key:
+                  components:
+                  - source:
+                      kind: input
+                      id: input.cancel_order.request
+                    path:
+                    - request_id
+              requirements:
+                serializability: []
+                ordering: []
+              steps:
+              - kind: read
+                bind: read.order_state
+                target:
+                  object: object.order
+                  predicate:
+                    kind: eq
+                    field:
+                    - order_id
+                    value:
+                      kind: value
+                      value:
+                        source:
+                          kind: input
+                          id: input.cancel_order.request
+                        path:
+                        - order_id
+                fields:
+                  kind: only
+                  fields:
+                  - - status
+                  - - version
+              - kind: validate_version
+                target:
+                  object: object.order
+                  predicate:
+                    kind: eq
+                    field:
+                    - order_id
+                    value:
+                      kind: value
+                      value:
+                        source:
+                          kind: input
+                          id: input.cancel_order.request
+                        path:
+                        - order_id
+                expected:
+                  source:
+                    kind: transaction_read
+                    id: read.order_state
+                  path:
+                  - version
+              - kind: establish_transaction_output
+                bind: output.order_state
+                schema: schema.Order
+                values:
+                  kind: deterministic
+                  from:
+                  - source:
+                      kind: input
+                      id: input.cancel_order.request
+                    path:
+                    - order_id
+                  - source:
+                      kind: transaction_read
+                      id: read.order_state
+                    path:
+                    - status
+            rejected:
+              steps:
+              - kind: return
+                request: input.cancel_order.request
+                outcome:
+                  kind: err
+                  error: not_cancellable
+                  values:
+                    kind: deterministic
+                    from:
+                    - source:
+                        kind: input
+                        id: input.cancel_order.request
+                      path:
+                      - order_id
+          - kind: branch
+            condition:
+              kind: eq
+              value:
+                source:
+                  kind: transaction_output
+                  id: output.order_state
+                path:
+                - status
+              equals:
+                kind: literal
+                value:
+                  kind: string
+                  value: state.order.cancelled
+            then:
+              steps:
+              - kind: return
+                request: input.cancel_order.request
+                outcome:
+                  kind: ok
+                  values:
+                    kind: deterministic
+                    from:
+                    - source:
+                        kind: input
+                        id: input.cancel_order.request
+                      path:
+                      - order_id
+            otherwise:
+              steps:
+              - kind: branch
+                condition:
+                  kind: eq
+                  value:
+                    source:
+                      kind: transaction_output
+                      id: output.order_state
+                    path:
+                    - status
+                  equals:
+                    kind: literal
+                    value:
+                      kind: string
+                      value: state.order.paid
+                then:
+                  steps:
+                  - kind: return
+                    request: input.cancel_order.request
+                    outcome:
+                      kind: err
+                      error: not_cancellable
+                      values:
+                        kind: deterministic
+                        from:
+                        - source:
+                            kind: input
+                            id: input.cancel_order.request
+                          path:
+                          - order_id
+                otherwise:
+                  steps:
+                  - kind: branch
+                    condition:
+                      kind: eq
+                      value:
+                        source:
+                          kind: transaction_output
+                          id: output.order_state
+                        path:
+                        - status
+                      equals:
+                        kind: literal
+                        value:
+                          kind: string
+                          value: state.order.shipped
+                    then:
+                      steps:
+                      - kind: return
+                        request: input.cancel_order.request
+                        outcome:
+                          kind: err
+                          error: not_cancellable
+                          values:
+                            kind: deterministic
+                            from:
+                            - source:
+                                kind: input
+                                id: input.cancel_order.request
+                              path:
+                              - order_id
+                    otherwise:
+                      steps:
+                      - kind: return
+                        request: input.cancel_order.request
+                        outcome:
+                          kind: err
+                          error: order_not_found
+                          values:
+                            kind: deterministic
+                            from:
+                            - source:
+                                kind: input
+                                id: input.cancel_order.request
+                              path:
+                              - order_id
+      - kind: return
+        request: input.cancel_order.request
+        outcome:
+          kind: ok
+          values:
+            kind: deterministic
+            from:
+            - source:
+                kind: transaction_output
+                id: output.cancelled
+              path:
+              - order_id
+    requirements:
+      idempotency:
+      - key:
+          components:
+          - source:
+              kind: input
+              id: input.cancel_order.request
+            path:
+            - request_id
+        result: unspecified
+      recoverability: []
+  operation.pay_order:
+    service: service.shop
+    description: Records a payment for a pending order and moves it to paid. An order is paid at most once, even when the payment request is retried.
+    inputs:
+      input.pay_order.request:
+        kind: request
+        schema: schema.PayOrderRequest
+        identity:
+          kind: keyed
+          fields:
+          - - request_id
+        result:
+          ok: schema.PayOrderResponse
+          errors:
+            not_payable:
+              schema: schema.OrderStateConflict
+              disposition: terminal
+            order_not_found:
+              schema: schema.OrderNotFound
+              disposition: terminal
+    program:
+      steps:
+      - kind: transaction
+        transaction:
+          id: tx.pay_order.record
+          data_model: data.shop
+          isolation: read_committed
+          idempotency:
+            kind: deduplicated_by
+            key:
+              components:
+              - source:
+                  kind: input
+                  id: input.pay_order.request
+                path:
+                - request_id
+          requirements:
+            serializability:
+            - key:
+                source:
+                  kind: input
+                  id: input.pay_order.request
+                path:
+                - order_id
+            ordering: []
+          steps:
+          - kind: read
+            bind: read.pay_order.order
+            target:
+              object: object.order
+              predicate:
+                kind: eq
+                field:
+                - order_id
+                value:
+                  kind: value
+                  value:
+                    source:
+                      kind: input
+                      id: input.pay_order.request
+                    path:
+                    - order_id
+            fields:
+              kind: only
+              fields:
+              - - order_id
+              - - status
+              - - version
+          - kind: validate_version
+            target:
+              object: object.order
+              predicate:
+                kind: eq
+                field:
+                - order_id
+                value:
+                  kind: value
+                  value:
+                    source:
+                      kind: input
+                      id: input.pay_order.request
+                    path:
+                    - order_id
+            expected:
+              source:
+                kind: transaction_read
+                id: read.pay_order.order
+              path:
+              - version
+          - kind: transition
+            machine: machine.order_lifecycle
+            transition: transition.order.pay
+            subject:
+              object: object.order
+              predicate:
+                kind: eq
+                field:
+                - order_id
+                value:
+                  kind: value
+                  value:
+                    source:
+                      kind: input
+                      id: input.pay_order.request
+                    path:
+                    - order_id
+            effect_intents: {}
+            effects: {}
+          - kind: bump_version
+            target:
+              object: object.order
+              predicate:
+                kind: eq
+                field:
+                - order_id
+                value:
+                  kind: value
+                  value:
+                    source:
+                      kind: input
+                      id: input.pay_order.request
+                    path:
+                    - order_id
+          - kind: insert
+            object: object.payment
+            values:
+              kind: deterministic
+              from:
+              - source:
+                  kind: input
+                  id: input.pay_order.request
+                path:
+                - request_id
+              - source:
+                  kind: input
+                  id: input.pay_order.request
+                path:
+                - order_id
+              - source:
+                  kind: input
+                  id: input.pay_order.request
+                path:
+                - amount
+          - kind: establish_transaction_output
+            bind: output.pay_order.paid
+            schema: schema.PayOrderResponse
+            values:
+              kind: deterministic
+              from:
+              - source:
+                  kind: input
+                  id: input.pay_order.request
+                path:
+                - order_id
+              - source:
+                  kind: input
+                  id: input.pay_order.request
+                path:
+                - request_id
+        rejected:
+          steps:
+          - kind: transaction
+            transaction:
+              id: tx.pay_order.classify
+              data_model: data.shop
+              isolation: read_committed
+              idempotency:
+                kind: not_deduplicated
+              requirements:
+                serializability: []
+                ordering: []
+              steps:
+              - kind: read
+                bind: read.pay_order.lookup
+                target:
+                  object: object.order
+                  predicate:
+                    kind: eq
+                    field:
+                    - order_id
+                    value:
+                      kind: value
+                      value:
+                        source:
+                          kind: input
+                          id: input.pay_order.request
+                        path:
+                        - order_id
+                fields:
+                  kind: only
+                  fields:
+                  - - order_id
+                  - - status
+                  - - version
+              - kind: validate_version
+                target:
+                  object: object.order
+                  predicate:
+                    kind: eq
+                    field:
+                    - order_id
+                    value:
+                      kind: value
+                      value:
+                        source:
+                          kind: input
+                          id: input.pay_order.request
+                        path:
+                        - order_id
+                expected:
+                  source:
+                    kind: transaction_read
+                    id: read.pay_order.lookup
+                  path:
+                  - version
+              - kind: establish_transaction_output
+                bind: output.pay_order.lookup
+                schema: schema.Order
+                values:
+                  kind: deterministic
+                  from:
+                  - source:
+                      kind: transaction_read
+                      id: read.pay_order.lookup
+                    path:
+                    - order_id
+                  - source:
+                      kind: transaction_read
+                      id: read.pay_order.lookup
+                    path:
+                    - status
+            rejected:
+              steps:
+              - kind: return
+                request: input.pay_order.request
+                outcome:
+                  kind: err
+                  error: not_payable
+                  values:
+                    kind: deterministic
+                    from:
+                    - source:
+                        kind: input
+                        id: input.pay_order.request
+                      path:
+                      - order_id
+          - kind: branch
+            condition:
+              kind: not
+              condition:
+                kind: and
+                conditions:
+                - kind: not
+                  condition:
+                    kind: eq
+                    value:
+                      source:
+                        kind: transaction_output
+                        id: output.pay_order.lookup
+                      path:
+                      - status
+                    equals:
+                      kind: literal
+                      value:
+                        kind: string
+                        value: state.order.paid
+                - kind: not
+                  condition:
+                    kind: eq
+                    value:
+                      source:
+                        kind: transaction_output
+                        id: output.pay_order.lookup
+                      path:
+                      - status
+                    equals:
+                      kind: literal
+                      value:
+                        kind: string
+                        value: state.order.cancelled
+                - kind: not
+                  condition:
+                    kind: eq
+                    value:
+                      source:
+                        kind: transaction_output
+                        id: output.pay_order.lookup
+                      path:
+                      - status
+                    equals:
+                      kind: literal
+                      value:
+                        kind: string
+                        value: state.order.shipped
+            then:
+              steps:
+              - kind: return
+                request: input.pay_order.request
+                outcome:
+                  kind: err
+                  error: not_payable
+                  values:
+                    kind: deterministic
+                    from:
+                    - source:
+                        kind: input
+                        id: input.pay_order.request
+                      path:
+                      - order_id
+            otherwise:
+              steps:
+              - kind: return
+                request: input.pay_order.request
+                outcome:
+                  kind: err
+                  error: order_not_found
+                  values:
+                    kind: deterministic
+                    from:
+                    - source:
+                        kind: input
+                        id: input.pay_order.request
+                      path:
+                      - order_id
+      - kind: return
+        request: input.pay_order.request
+        outcome:
+          kind: ok
+          values:
+            kind: deterministic
+            from:
+            - source:
+                kind: transaction_output
+                id: output.pay_order.paid
+              path:
+              - order_id
+            - source:
+                kind: transaction_output
+                id: output.pay_order.paid
+              path:
+              - payment_id
+    requirements:
+      idempotency:
+      - key:
+          components:
+          - source:
+              kind: input
+              id: input.pay_order.request
+            path:
+            - request_id
+        result: unspecified
+      recoverability: []
+  operation.place_order:
+    service: service.shop
+    description: 'A customer places an order for a product and quantity. Reserves stock atomically: stock never goes negative, two concurrent orders for the last unit cannot both succeed, and a retried request with the same request_id does not create a second order.'
+    inputs:
+      input.place_order.request:
+        kind: request
+        schema: schema.PlaceOrderRequest
+        identity:
+          kind: keyed
+          fields:
+          - - request_id
+        result:
+          ok: schema.PlaceOrderResponse
+          errors:
+            insufficient_stock:
+              schema: schema.InsufficientStock
+              disposition: terminal
+            product_not_found:
+              schema: schema.ProductNotFound
+              disposition: terminal
+    program:
+      steps:
+      - kind: transaction
+        transaction:
+          id: tx.place_order.reserve
+          data_model: data.shop
+          isolation: read_committed
+          idempotency:
+            kind: deduplicated_by
+            key:
+              components:
+              - source:
+                  kind: input
+                  id: input.place_order.request
+                path:
+                - request_id
+          requirements:
+            serializability:
+            - key:
+                source:
+                  kind: input
+                  id: input.place_order.request
+                path:
+                - product_id
+            ordering: []
+          steps:
+          - kind: lock
+            target:
+              object: object.product
+              predicate:
+                kind: eq
+                field:
+                - product_id
+                value:
+                  kind: value
+                  value:
+                    source:
+                      kind: input
+                      id: input.place_order.request
+                    path:
+                    - product_id
+            mode: exclusive
+            order:
+              kind: unspecified
+          - kind: read
+            bind: read.place_order.product
+            target:
+              object: object.product
+              predicate:
+                kind: eq
+                field:
+                - product_id
+                value:
+                  kind: value
+                  value:
+                    source:
+                      kind: input
+                      id: input.place_order.request
+                    path:
+                    - product_id
+            fields:
+              kind: all
+          - kind: validate_version
+            target:
+              object: object.product
+              predicate:
+                kind: eq
+                field:
+                - product_id
+                value:
+                  kind: value
+                  value:
+                    source:
+                      kind: input
+                      id: input.place_order.request
+                    path:
+                    - product_id
+            expected:
+              source:
+                kind: transaction_read
+                id: read.place_order.product
+              path:
+              - version
+          - kind: write
+            target:
+              object: object.product
+              predicate:
+                kind: eq
+                field:
+                - product_id
+                value:
+                  kind: value
+                  value:
+                    source:
+                      kind: input
+                      id: input.place_order.request
+                    path:
+                    - product_id
+            fields:
+            - - stock
+            values:
+              kind: deterministic
+              from:
+              - source:
+                  kind: transaction_read
+                  id: read.place_order.product
+                path:
+                - stock
+              - source:
+                  kind: input
+                  id: input.place_order.request
+                path:
+                - quantity
+          - kind: bump_version
+            target:
+              object: object.product
+              predicate:
+                kind: eq
+                field:
+                - product_id
+                value:
+                  kind: value
+                  value:
+                    source:
+                      kind: input
+                      id: input.place_order.request
+                    path:
+                    - product_id
+          - kind: insert
+            object: object.order
+            values:
+              kind: deterministic
+              from:
+              - source:
+                  kind: input
+                  id: input.place_order.request
+                path:
+                - request_id
+              - source:
+                  kind: input
+                  id: input.place_order.request
+                path:
+                - customer_id
+              - source:
+                  kind: input
+                  id: input.place_order.request
+                path:
+                - product_id
+              - source:
+                  kind: input
+                  id: input.place_order.request
+                path:
+                - quantity
+          - kind: establish_transaction_output
+            bind: output.place_order.order
+            schema: schema.PlaceOrderResponse
+            values:
+              kind: deterministic
+              from:
+              - source:
+                  kind: input
+                  id: input.place_order.request
+                path:
+                - request_id
+              - source:
+                  kind: input
+                  id: input.place_order.request
+                path:
+                - product_id
+              - source:
+                  kind: input
+                  id: input.place_order.request
+                path:
+                - quantity
+        rejected:
+          steps:
+          - kind: complete
+      - kind: return
+        request: input.place_order.request
+        outcome:
+          kind: ok
+          values:
+            kind: deterministic
+            from:
+            - source:
+                kind: transaction_output
+                id: output.place_order.order
+              path:
+              - order_id
+            - source:
+                kind: transaction_output
+                id: output.place_order.order
+              path:
+              - product_id
+            - source:
+                kind: transaction_output
+                id: output.place_order.order
+              path:
+              - quantity
+    requirements:
+      idempotency:
+      - key:
+          components:
+          - source:
+              kind: input
+              id: input.place_order.request
+            path:
+            - request_id
+        result: replay_consistent
+      recoverability: []
+  operation.restock:
+    service: service.shop
+    description: Adds quantity to a product's stock. A retried restock with the same request_id does not add stock twice.
+    inputs:
+      input.restock.request:
+        kind: request
+        schema: schema.RestockRequest
+        identity:
+          kind: keyed
+          fields:
+          - - request_id
+        result:
+          ok: schema.RestockResponse
+          errors:
+            product_not_found:
+              schema: schema.ProductNotFound
+              disposition: terminal
+    program:
+      steps:
+      - kind: transaction
+        transaction:
+          id: tx.restock.apply
+          data_model: data.shop
+          isolation: read_committed
+          idempotency:
+            kind: deduplicated_by
+            key:
+              components:
+              - source:
+                  kind: input
+                  id: input.restock.request
+                path:
+                - request_id
+          requirements:
+            serializability:
+            - key:
+                source:
+                  kind: input
+                  id: input.restock.request
+                path:
+                - product_id
+            ordering: []
+          steps:
+          - kind: lock
+            target:
+              object: object.product
+              predicate:
+                kind: eq
+                field:
+                - product_id
+                value:
+                  kind: value
+                  value:
+                    source:
+                      kind: input
+                      id: input.restock.request
+                    path:
+                    - product_id
+            mode: exclusive
+            order:
+              kind: unspecified
+          - kind: read
+            bind: read.restock.product
+            target:
+              object: object.product
+              predicate:
+                kind: eq
+                field:
+                - product_id
+                value:
+                  kind: value
+                  value:
+                    source:
+                      kind: input
+                      id: input.restock.request
+                    path:
+                    - product_id
+            fields:
+              kind: only
+              fields:
+              - - stock
+          - kind: write
+            target:
+              object: object.product
+              predicate:
+                kind: eq
+                field:
+                - product_id
+                value:
+                  kind: value
+                  value:
+                    source:
+                      kind: input
+                      id: input.restock.request
+                    path:
+                    - product_id
+            fields:
+            - - stock
+            values:
+              kind: deterministic
+              from:
+              - source:
+                  kind: transaction_read
+                  id: read.restock.product
+                path:
+                - stock
+              - source:
+                  kind: input
+                  id: input.restock.request
+                path:
+                - quantity
+          - kind: bump_version
+            target:
+              object: object.product
+              predicate:
+                kind: eq
+                field:
+                - product_id
+                value:
+                  kind: value
+                  value:
+                    source:
+                      kind: input
+                      id: input.restock.request
+                    path:
+                    - product_id
+          - kind: insert
+            object: object.restock_receipt
+            values:
+              kind: deterministic
+              from:
+              - source:
+                  kind: input
+                  id: input.restock.request
+                path:
+                - request_id
+              - source:
+                  kind: input
+                  id: input.restock.request
+                path:
+                - product_id
+              - source:
+                  kind: input
+                  id: input.restock.request
+                path:
+                - quantity
+          - kind: establish_transaction_output
+            bind: output.restock.response
+            schema: schema.RestockResponse
+            values:
+              kind: deterministic
+              from:
+              - source:
+                  kind: input
+                  id: input.restock.request
+                path:
+                - product_id
+              - source:
+                  kind: input
+                  id: input.restock.request
+                path:
+                - request_id
+      - kind: return
+        request: input.restock.request
+        outcome:
+          kind: ok
+          values:
+            kind: deterministic
+            from:
+            - source:
+                kind: transaction_output
+                id: output.restock.response
+              path:
+              - product_id
+            - source:
+                kind: transaction_output
+                id: output.restock.response
+              path:
+              - request_id
+    requirements:
+      idempotency:
+      - key:
+          components:
+          - source:
+              kind: input
+              id: input.restock.request
+            path:
+            - request_id
+        result: replay_consistent
+      recoverability: []
+  operation.ship_order:
+    service: service.shop
+    description: Marks a paid order shipped. Only paid orders ship, and an order ships at most once.
+    inputs:
+      input.ship_order.request:
+        kind: request
+        schema: schema.ShipOrderRequest
+        identity:
+          kind: keyed
+          fields:
+          - - request_id
+        result:
+          ok: schema.ShipOrderResponse
+          errors:
+            not_shippable:
+              schema: schema.OrderStateConflict
+              disposition: terminal
+            order_not_found:
+              schema: schema.OrderNotFound
+              disposition: terminal
+    program:
+      steps:
+      - kind: transaction
+        transaction:
+          id: tx.ship_order.inspect
+          data_model: data.shop
+          isolation: read_committed
+          idempotency:
+            kind: deduplicated_by
+            key:
+              components:
+              - source:
+                  kind: input
+                  id: input.ship_order.request
+                path:
+                - request_id
+          requirements:
+            serializability: []
+            ordering: []
+          steps:
+          - kind: read
+            bind: read.ship_order.inspect
+            target:
+              object: object.order
+              predicate:
+                kind: eq
+                field:
+                - order_id
+                value:
+                  kind: value
+                  value:
+                    source:
+                      kind: input
+                      id: input.ship_order.request
+                    path:
+                    - order_id
+            fields:
+              kind: only
+              fields:
+              - - order_id
+              - - status
+              - - version
+          - kind: validate_version
+            target:
+              object: object.order
+              predicate:
+                kind: eq
+                field:
+                - order_id
+                value:
+                  kind: value
+                  value:
+                    source:
+                      kind: input
+                      id: input.ship_order.request
+                    path:
+                    - order_id
+            expected:
+              source:
+                kind: transaction_read
+                id: read.ship_order.inspect
+              path:
+              - version
+          - kind: establish_transaction_output
+            bind: output.ship_order.lookup
+            schema: schema.Order
+            values:
+              kind: deterministic
+              from:
+              - source:
+                  kind: input
+                  id: input.ship_order.request
+                path:
+                - order_id
+              - source:
+                  kind: transaction_read
+                  id: read.ship_order.inspect
+                path:
+                - status
+        rejected:
+          steps:
+          - kind: complete
+      - kind: branch
+        condition:
+          kind: eq
+          value:
+            source:
+              kind: transaction_output
+              id: output.ship_order.lookup
+            path:
+            - status
+          equals:
+            kind: literal
+            value:
+              kind: string
+              value: state.order.paid
+        then:
+          steps:
+          - kind: transaction
+            transaction:
+              id: tx.ship_order
+              data_model: data.shop
+              isolation: read_committed
+              idempotency:
+                kind: deduplicated_by
+                key:
+                  components:
+                  - source:
+                      kind: input
+                      id: input.ship_order.request
+                    path:
+                    - request_id
+              requirements:
+                serializability:
+                - key:
+                    source:
+                      kind: input
+                      id: input.ship_order.request
+                    path:
+                    - order_id
+                ordering: []
+              steps:
+              - kind: read
+                bind: read.ship_order.order
+                target:
+                  object: object.order
+                  predicate:
+                    kind: eq
+                    field:
+                    - order_id
+                    value:
+                      kind: value
+                      value:
+                        source:
+                          kind: input
+                          id: input.ship_order.request
+                        path:
+                        - order_id
+                fields:
+                  kind: only
+                  fields:
+                  - - order_id
+                  - - status
+                  - - version
+              - kind: validate_version
+                target:
+                  object: object.order
+                  predicate:
+                    kind: eq
+                    field:
+                    - order_id
+                    value:
+                      kind: value
+                      value:
+                        source:
+                          kind: input
+                          id: input.ship_order.request
+                        path:
+                        - order_id
+                expected:
+                  source:
+                    kind: transaction_read
+                    id: read.ship_order.order
+                  path:
+                  - version
+              - kind: transition
+                machine: machine.order_lifecycle
+                transition: transition.order.ship
+                subject:
+                  object: object.order
+                  predicate:
+                    kind: eq
+                    field:
+                    - order_id
+                    value:
+                      kind: value
+                      value:
+                        source:
+                          kind: input
+                          id: input.ship_order.request
+                        path:
+                        - order_id
+                effect_intents: {}
+                effects: {}
+              - kind: bump_version
+                target:
+                  object: object.order
+                  predicate:
+                    kind: eq
+                    field:
+                    - order_id
+                    value:
+                      kind: value
+                      value:
+                        source:
+                          kind: input
+                          id: input.ship_order.request
+                        path:
+                        - order_id
+              - kind: establish_transaction_output
+                bind: output.ship_order.shipped
+                schema: schema.ShipOrderResponse
+                values:
+                  kind: deterministic
+                  from:
+                  - source:
+                      kind: input
+                      id: input.ship_order.request
+                    path:
+                    - order_id
+            rejected:
+              steps:
+              - kind: complete
+          - kind: return
+            request: input.ship_order.request
+            outcome:
+              kind: ok
+              values:
+                kind: deterministic
+                from:
+                - source:
+                    kind: transaction_output
+                    id: output.ship_order.shipped
+                  path:
+                  - order_id
+        otherwise:
+          steps:
+          - kind: branch
+            condition:
+              kind: not
+              condition:
+                kind: and
+                conditions:
+                - kind: not
+                  condition:
+                    kind: eq
+                    value:
+                      source:
+                        kind: transaction_output
+                        id: output.ship_order.lookup
+                      path:
+                      - status
+                    equals:
+                      kind: literal
+                      value:
+                        kind: string
+                        value: state.order.pending
+                - kind: not
+                  condition:
+                    kind: eq
+                    value:
+                      source:
+                        kind: transaction_output
+                        id: output.ship_order.lookup
+                      path:
+                      - status
+                    equals:
+                      kind: literal
+                      value:
+                        kind: string
+                        value: state.order.cancelled
+                - kind: not
+                  condition:
+                    kind: eq
+                    value:
+                      source:
+                        kind: transaction_output
+                        id: output.ship_order.lookup
+                      path:
+                      - status
+                    equals:
+                      kind: literal
+                      value:
+                        kind: string
+                        value: state.order.shipped
+            then:
+              steps:
+              - kind: return
+                request: input.ship_order.request
+                outcome:
+                  kind: err
+                  error: not_shippable
+                  values:
+                    kind: deterministic
+                    from:
+                    - source:
+                        kind: input
+                        id: input.ship_order.request
+                      path:
+                      - order_id
+            otherwise:
+              steps:
+              - kind: return
+                request: input.ship_order.request
+                outcome:
+                  kind: err
+                  error: order_not_found
+                  values:
+                    kind: deterministic
+                    from:
+                    - source:
+                        kind: input
+                        id: input.ship_order.request
+                      path:
+                      - order_id
+    requirements:
+      idempotency:
+      - key:
+          components:
+          - source:
+              kind: input
+              id: input.ship_order.request
+            path:
+            - request_id
+        result: replay_consistent
+      recoverability: []
+runtime:
+  topics: {}
+  subscriptions: {}
+  execution_pools:
+    pool.shop_api:
+      member_concurrency:
+        kind: unspecified
+  routers:
+    router.cancel_order:
+      boundary:
+        operation: operation.cancel_order
+        input: input.cancel_order.request
+      pool: pool.shop_api
+    router.pay_order:
+      boundary:
+        operation: operation.pay_order
+        input: input.pay_order.request
+      pool: pool.shop_api
+    router.place_order:
+      boundary:
+        operation: operation.place_order
+        input: input.place_order.request
+      pool: pool.shop_api
+    router.restock:
+      boundary:
+        operation: operation.restock
+        input: input.restock.request
+      pool: pool.shop_api
+    router.ship_order:
+      boundary:
+        operation: operation.ship_order
+        input: input.ship_order.request
+      pool: pool.shop_api
+  storage_layouts:
+    layout.order:
+      object:
+        data_model: data.shop
+        object: object.order
+      partition_key:
+      - - order_id
+    layout.payment:
+      object:
+        data_model: data.shop
+        object: object.payment
+      partition_key:
+      - - order_id
+    layout.product:
+      object:
+        data_model: data.shop
+        object: object.product
+      partition_key:
+      - - product_id
+    layout.restock_receipt:
+      object:
+        data_model: data.shop
+        object: object.restock_receipt
+      partition_key:
+      - - request_id

@@ -11,8 +11,9 @@
 //! A remedy does not have to be right. Every candidate is judged by the
 //! analyzer before it is considered (§18.4), so a remedy that does not
 //! prove its target is simply not admissible. What a remedy must never
-//! do is edit outside the operation it was given: the repair task's
-//! scope is one program.
+//! do is edit outside the operations it was given: the repair task's
+//! scope is the programs of one conflict closure (§18.3), and a gap in
+//! a transaction outside it is left alone.
 //!
 //! The first catalogue covers serializability through the routes that
 //! need no judgment about the application: declared isolation, strict
@@ -58,11 +59,17 @@ pub enum RemedyKind {
     VersionProtocol,
 }
 
-/// One candidate repair of one operation's program.
+/// The programs a remedy reads and rewrites, by operation.
+pub type Programs = BTreeMap<Id, OperationBlock>;
+
+/// One candidate repair of the programs in scope.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Remedy {
     pub kind: RemedyKind,
-    pub program: OperationBlock,
+
+    /// Every program in scope after the edit; compare with the input to
+    /// find the ones it changed ([`Remedy::edited`]).
+    pub programs: Programs,
 
     /// How invasive it is, for the deterministic preference.
     pub transactions_edited: usize,
@@ -78,17 +85,42 @@ impl Remedy {
     pub fn invasiveness(&self) -> (usize, usize, RemedyKind) {
         (self.transactions_edited, self.steps_added, self.kind)
     }
+
+    /// The programs this remedy changes relative to `before`.
+    pub fn edited<'a>(
+        &'a self,
+        before: &'a Programs,
+    ) -> impl Iterator<Item = (&'a Id, &'a OperationBlock)> {
+        self.programs
+            .iter()
+            .filter(move |(operation, program)| before.get(*operation) != Some(program))
+    }
+}
+
+/// A transaction of one program in scope.
+type Tx = (Id, Id);
+
+fn transaction_mut<'a>(
+    programs: &'a mut Programs,
+    (operation, transaction): &Tx,
+) -> Option<&'a mut crate::spec::Transaction> {
+    programs.get_mut(operation)?.transaction_mut(transaction)
 }
 
 /// Every candidate the catalogue offers for `obstacles`, each an edit
-/// of `program` alone. Candidates that would be identical to another
-/// are dropped; one that would change nothing is not a candidate.
+/// of the programs in scope alone. Candidates that would be identical
+/// to another are dropped; one that would change nothing is not a
+/// candidate.
+///
+/// Besides each route alone, the catalogue offers declared isolation
+/// composed with each step-adding route: an obstacle's gaps can mix an
+/// unspecified isolation on one dependency with a missing lock or
+/// version guard on another, and neither route alone closes both.
 ///
 /// `versions` maps each versioned object to its version field — a fact
 /// of the data model, which a remedy reads and never edits.
 pub fn candidates(
-    operation: &Id,
-    program: &OperationBlock,
+    programs: &Programs,
     obstacles: &[&TransactionSerializabilityObstacle],
     versions: &BTreeMap<Id, FieldPath>,
 ) -> Vec<Remedy> {
@@ -106,32 +138,101 @@ pub fn candidates(
         })
         .collect();
 
+    let isolation = declared_isolation(programs, &gaps);
+
+    // Declared isolation edits no step, so the step indices the gaps
+    // name still hold in the program it produces.
+    let composed = |route: fn(&Programs, &[&DependencyGap]) -> Option<Remedy>| {
+        let base = isolation.as_ref()?;
+        let then = route(&base.programs, &gaps)?;
+
+        Some(Remedy {
+            kind: then.kind,
+            transactions_edited: count_edited(programs, &then.programs),
+            steps_added: then.steps_added,
+            summary: format!("{}, and {}", base.summary, then.summary),
+            programs: then.programs,
+        })
+    };
+
+    let version_route =
+        |programs: &Programs, gaps: &[&DependencyGap]| version_protocol(programs, gaps, versions);
+
     let mut remedies: Vec<Remedy> = [
-        declared_isolation(operation, program, &gaps),
-        serializable_closure(operation, program, obstacles),
-        strict_locks(operation, program, &gaps),
-        version_protocol(operation, program, &gaps, versions),
+        isolation.clone(),
+        serializable_closure(programs, obstacles),
+        strict_locks(programs, &gaps),
+        version_route(programs, &gaps),
+        composed(strict_locks),
+        isolation.as_ref().and_then(|base| {
+            let then = version_route(&base.programs, &gaps)?;
+
+            Some(Remedy {
+                kind: then.kind,
+                transactions_edited: count_edited(programs, &then.programs),
+                steps_added: then.steps_added,
+                summary: format!("{}, and {}", base.summary, then.summary),
+                programs: then.programs,
+            })
+        }),
     ]
     .into_iter()
     .flatten()
-    .filter(|remedy| &remedy.program != program)
+    .filter(|remedy| &remedy.programs != programs)
     .collect();
 
     remedies.sort_by_key(Remedy::invasiveness);
 
-    remedies.dedup_by(|later, earlier| later.program == earlier.program);
+    remedies.dedup_by(|later, earlier| later.programs == earlier.programs);
 
     remedies
 }
 
-fn in_scope<'a>(operation: &Id, transaction: &'a TransactionRef) -> Option<&'a Id> {
-    (&transaction.operation == operation).then_some(&transaction.transaction)
+/// How many transactions differ between two sets of programs.
+fn count_edited(before: &Programs, after: &Programs) -> usize {
+    after
+        .iter()
+        .map(|(operation, program)| {
+            let Some(old) = before.get(operation) else {
+                return program.transactions().len();
+            };
+
+            program
+                .transactions()
+                .into_iter()
+                .filter(|(_, transaction)| old.transaction(&transaction.id) != Some(*transaction))
+                .count()
+        })
+        .sum()
 }
 
-fn listed(transactions: &BTreeSet<Id>) -> String {
+/// The transaction a gap names, when its program is in scope.
+fn in_scope(programs: &Programs, transaction: &TransactionRef) -> Option<Tx> {
+    programs.contains_key(&transaction.operation).then(|| {
+        (
+            transaction.operation.clone(),
+            transaction.transaction.clone(),
+        )
+    })
+}
+
+fn listed(transactions: &BTreeSet<Tx>) -> String {
+    let single = transactions
+        .iter()
+        .map(|(operation, _)| operation)
+        .collect::<BTreeSet<_>>()
+        .len()
+        <= 1;
+
     transactions
         .iter()
-        .map(|transaction| format!("`{transaction}`"))
+        .map(|(operation, transaction)| {
+            if single {
+                format!("`{transaction}`")
+            } else {
+                format!("`{transaction}` of {operation}")
+            }
+        })
         .collect::<Vec<_>>()
         .join(", ")
 }
@@ -139,33 +240,29 @@ fn listed(transactions: &BTreeSet<Id>) -> String {
 /// `IsolationUnspecified`: nothing says the transaction reads committed
 /// data or installs conflicting writes in commit order. `read_committed`
 /// is the weakest declaration that says both.
-fn declared_isolation(
-    operation: &Id,
-    program: &OperationBlock,
-    gaps: &[&DependencyGap],
-) -> Option<Remedy> {
-    let undeclared: BTreeSet<Id> = gaps
+fn declared_isolation(programs: &Programs, gaps: &[&DependencyGap]) -> Option<Remedy> {
+    let undeclared: BTreeSet<Tx> = gaps
         .iter()
         .filter_map(|gap| match gap {
-            DependencyGap::IsolationUnspecified { transaction } => in_scope(operation, transaction),
+            DependencyGap::IsolationUnspecified { transaction } => in_scope(programs, transaction),
             _ => None,
         })
-        .cloned()
         .collect();
 
     if undeclared.is_empty() {
         return None;
     }
 
-    let mut program = program.clone();
+    let mut programs = programs.clone();
 
     for transaction in &undeclared {
-        program.transaction_mut(transaction)?.isolation = TransactionIsolation::ReadCommitted;
+        transaction_mut(&mut programs, transaction)?.isolation =
+            TransactionIsolation::ReadCommitted;
     }
 
     Some(Remedy {
         kind: RemedyKind::DeclaredIsolation,
-        program,
+        programs,
         transactions_edited: undeclared.len(),
         steps_added: 0,
         summary: format!(
@@ -176,10 +273,9 @@ fn declared_isolation(
 }
 
 /// The closure route needs *every* member serializable, so it is a
-/// candidate only when every weaker member is this operation's.
+/// candidate only when every weaker member is in scope.
 fn serializable_closure(
-    operation: &Id,
-    program: &OperationBlock,
+    programs: &Programs,
     obstacles: &[&TransactionSerializabilityObstacle],
 ) -> Option<Remedy> {
     let weaker: Vec<&TransactionRef> = obstacles
@@ -196,25 +292,28 @@ fn serializable_closure(
         })
         .collect();
 
-    let ours: BTreeSet<Id> = weaker
+    let ours: BTreeSet<Tx> = weaker
         .iter()
-        .filter_map(|transaction| in_scope(operation, transaction))
-        .cloned()
+        .filter_map(|transaction| in_scope(programs, transaction))
         .collect();
 
-    if ours.is_empty() || weaker.iter().any(|member| &member.operation != operation) {
+    if ours.is_empty()
+        || weaker
+            .iter()
+            .any(|member| !programs.contains_key(&member.operation))
+    {
         return None;
     }
 
-    let mut program = program.clone();
+    let mut programs = programs.clone();
 
     for transaction in &ours {
-        program.transaction_mut(transaction)?.isolation = TransactionIsolation::Serializable;
+        transaction_mut(&mut programs, transaction)?.isolation = TransactionIsolation::Serializable;
     }
 
     Some(Remedy {
         kind: RemedyKind::SerializableClosure,
-        program,
+        programs,
         transactions_edited: ours.len(),
         steps_added: 0,
         summary: format!("declare serializable isolation on {}", listed(&ours)),
@@ -248,26 +347,22 @@ fn selector_of(step: &TransactionStep) -> Option<&ObjectSelector> {
 /// not this function, decides whether a weaker mode would have done.
 ///
 /// A covering lock acquired too late is moved, not duplicated.
-fn strict_locks(
-    operation: &Id,
-    program: &OperationBlock,
-    gaps: &[&DependencyGap],
-) -> Option<Remedy> {
-    let mut program = program.clone();
+fn strict_locks(programs: &Programs, gaps: &[&DependencyGap]) -> Option<Remedy> {
+    let mut programs = programs.clone();
 
-    let mut edited: BTreeSet<Id> = BTreeSet::new();
+    let mut edited: BTreeSet<Tx> = BTreeSet::new();
     let mut added = 0;
 
     // Late locks first, by step index descending, so that moving one
     // does not shift the index another gap names.
-    let mut late: Vec<(&Id, usize)> = gaps
+    let mut late: Vec<(Tx, usize)> = gaps
         .iter()
         .filter_map(|gap| match gap {
             DependencyGap::LockAcquiredAfterProtectedAccess {
                 transaction,
                 lock_step,
                 ..
-            } => in_scope(operation, transaction).map(|id| (id, *lock_step)),
+            } => in_scope(&programs, transaction).map(|id| (id, *lock_step)),
             _ => None,
         })
         .collect();
@@ -276,7 +371,7 @@ fn strict_locks(
     late.dedup();
 
     for (transaction, lock_step) in late {
-        let body = &mut program.transaction_mut(transaction)?.steps;
+        let body = &mut transaction_mut(&mut programs, &transaction)?.steps;
 
         if !matches!(body.get(lock_step), Some(TransactionStep::Lock(_))) {
             continue;
@@ -291,7 +386,7 @@ fn strict_locks(
 
     // Then the missing ones. Selectors are collected before anything is
     // inserted, against the body the gaps' step indices describe.
-    let mut missing: Vec<(Id, ObjectSelector)> = Vec::new();
+    let mut missing: Vec<(Tx, ObjectSelector)> = Vec::new();
 
     for gap in gaps {
         let DependencyGap::LockCoverageMissing {
@@ -301,19 +396,20 @@ fn strict_locks(
             continue;
         };
 
-        let Some(id) = in_scope(operation, transaction) else {
+        let Some(id) = in_scope(&programs, transaction) else {
             continue;
         };
 
-        let Some(selector) = program
-            .transaction(id)
+        let Some(selector) = programs
+            .get(&id.0)
+            .and_then(|program| program.transaction(&id.1))
             .and_then(|transaction| transaction.steps.get(*step))
             .and_then(selector_of)
         else {
             continue;
         };
 
-        let wanted = (id.clone(), selector.clone());
+        let wanted = (id, selector.clone());
 
         if !missing.contains(&wanted) {
             missing.push(wanted);
@@ -321,7 +417,7 @@ fn strict_locks(
     }
 
     for (transaction, selector) in missing {
-        let body = &mut program.transaction_mut(&transaction)?.steps;
+        let body = &mut transaction_mut(&mut programs, &transaction)?.steps;
 
         let held = body.iter().any(|step| {
             matches!(step, TransactionStep::Lock(lock)
@@ -352,7 +448,7 @@ fn strict_locks(
 
     Some(Remedy {
         kind: RemedyKind::StrictLocks,
-        program,
+        programs,
         transactions_edited: edited.len(),
         steps_added: added,
         summary: format!(
@@ -370,18 +466,17 @@ fn strict_locks(
 /// read's selector, so it identifies the very instance that was
 /// observed; the bump goes after the last step that mutates the object.
 fn version_protocol(
-    operation: &Id,
-    program: &OperationBlock,
+    programs: &Programs,
     gaps: &[&DependencyGap],
     versions: &BTreeMap<Id, FieldPath>,
 ) -> Option<Remedy> {
-    let mut program = program.clone();
+    let mut programs = programs.clone();
 
-    let mut edited: BTreeSet<Id> = BTreeSet::new();
+    let mut edited: BTreeSet<Tx> = BTreeSet::new();
     let mut added = 0;
 
-    let mut unvalidated: Vec<(&Id, &Id)> = Vec::new();
-    let mut unbumped: Vec<(&Id, &Id)> = Vec::new();
+    let mut unvalidated: Vec<(Tx, &Id)> = Vec::new();
+    let mut unbumped: Vec<(Tx, &Id)> = Vec::new();
 
     for gap in gaps {
         match gap {
@@ -389,8 +484,8 @@ fn version_protocol(
                 transaction,
                 object,
             } => {
-                if let Some(id) = in_scope(operation, transaction)
-                    && !unvalidated.contains(&(id, object))
+                if let Some(id) = in_scope(&programs, transaction)
+                    && !unvalidated.contains(&(id.clone(), object))
                 {
                     unvalidated.push((id, object));
                 }
@@ -400,8 +495,8 @@ fn version_protocol(
                 transaction,
                 object,
             } => {
-                if let Some(id) = in_scope(operation, transaction)
-                    && !unbumped.contains(&(id, object))
+                if let Some(id) = in_scope(&programs, transaction)
+                    && !unbumped.contains(&(id.clone(), object))
                 {
                     unbumped.push((id, object));
                 }
@@ -415,15 +510,20 @@ fn version_protocol(
         let version = versions.get(object)?;
 
         // A guard rejects. Only an author says what a rejection does.
-        let declares_rejection = program.executions().into_iter().any(|(_, execution)| {
-            &execution.transaction.id == transaction && execution.rejected.is_some()
-        });
+        let declares_rejection =
+            programs
+                .get(&transaction.0)?
+                .executions()
+                .into_iter()
+                .any(|(_, execution)| {
+                    execution.transaction.id == transaction.1 && execution.rejected.is_some()
+                });
 
         if !declares_rejection {
             return None;
         }
 
-        let body = &mut program.transaction_mut(transaction)?.steps;
+        let body = &mut transaction_mut(&mut programs, &transaction)?.steps;
 
         let position = body.iter().position(
             |step| matches!(step, TransactionStep::Read(read) if &read.target.object == object),
@@ -449,7 +549,7 @@ fn version_protocol(
 
         added += 1;
 
-        edited.insert(transaction.clone());
+        edited.insert(transaction);
     }
 
     for (transaction, object) in unbumped {
@@ -457,7 +557,7 @@ fn version_protocol(
             return None;
         }
 
-        let body = &mut program.transaction_mut(transaction)?.steps;
+        let body = &mut transaction_mut(&mut programs, &transaction)?.steps;
 
         let mutation = body.iter().rposition(|step| {
             matches!(
@@ -478,7 +578,7 @@ fn version_protocol(
 
         added += 1;
 
-        edited.insert(transaction.clone());
+        edited.insert(transaction);
     }
 
     if edited.is_empty() {
@@ -487,7 +587,7 @@ fn version_protocol(
 
     Some(Remedy {
         kind: RemedyKind::VersionProtocol,
-        program,
+        programs,
         transactions_edited: edited.len(),
         steps_added: added,
         summary: format!(

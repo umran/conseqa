@@ -439,6 +439,7 @@ async fn context_bundles_slice_and_track() {
                 operation: Some(id("operation.charge_payment")),
                 requirements: vec![(RequirementFamily::Idempotency, None, 0)],
                 include: Vec::new(),
+                peers: Vec::new(),
             },
         )
         .expect("the bundle builds");
@@ -581,6 +582,7 @@ async fn bundles_fall_back_to_interfaces_before_analysis_and_use_summaries_after
                 operation: Some(id("operation.gateway")),
                 requirements: Vec::new(),
                 include: Vec::new(),
+                peers: Vec::new(),
             },
         )
         .expect("the bundle builds");
@@ -615,6 +617,7 @@ async fn bundles_fall_back_to_interfaces_before_analysis_and_use_summaries_after
                 operation: Some(id("operation.gateway")),
                 requirements: Vec::new(),
                 include: Vec::new(),
+                peers: Vec::new(),
             },
         )
         .expect("the bundle builds");
@@ -680,6 +683,7 @@ async fn a_broken_program_is_rejected_in_session_then_repaired() {
                 operation: Some(id("operation.create_order")),
                 requirements: Vec::new(),
                 include: Vec::new(),
+                peers: Vec::new(),
             },
         )
         .expect("the bundle builds");

@@ -152,11 +152,21 @@ pub struct BundleSpec {
     /// obligation becomes bundle evidence. Several, because one repair
     /// task carries every unproven obligation of its operation — they
     /// are discharged by one program and often by one revision.
-    pub requirements: Vec<(super::symbol::RequirementFamily, Option<Id>, usize)>,
+    pub requirements: Vec<BundleRequirement>,
 
     /// Extra shared symbols the scheduler wants included.
     pub include: Vec<SymbolKey>,
+
+    /// Further operations the task writes beside `operation`, each with
+    /// its requirements under repair. A closure-scoped repair edits
+    /// every program of one conflict closure, so each draft enters the
+    /// bundle exactly as `operation`'s does.
+    pub peers: Vec<(Id, Vec<BundleRequirement>)>,
 }
+
+/// A requirement under repair, as a bundle asks for its obligation:
+/// family, the inline transaction for a transaction family, and index.
+pub type BundleRequirement = (super::symbol::RequirementFamily, Option<Id>, usize);
 
 /// A tracked initial context bundle (§23): everything it includes is
 /// recorded in the task's read-set at creation, so prompt context
@@ -169,6 +179,11 @@ pub struct ContextBundle {
     /// The task's operation draft, in full.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub operation: Option<serde_json::Value>,
+
+    /// The drafts of the task's peer operations (`BundleSpec::peers`),
+    /// in full, in the order asked.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub peer_operations: Vec<serde_json::Value>,
 
     pub shared_symbols: Vec<SymbolView>,
 
@@ -1021,22 +1036,39 @@ impl ConfluenceEngine {
 
         let mut dependency_summaries = Vec::new();
         let mut operation_view = None;
+        let mut peer_operations = Vec::new();
         let mut analyzer_evidence = Vec::new();
 
-        if let Some(operation) = &spec.operation {
+        let focus = spec
+            .operation
+            .iter()
+            .map(|operation| (operation, &spec.requirements, true))
+            .chain(
+                spec.peers
+                    .iter()
+                    .map(|(operation, requirements)| (operation, requirements, false)),
+            );
+
+        let analysis = self.inner.analysis.state(snapshot.revision);
+
+        for (operation, requirements, primary) in focus {
             let draft = snapshot
                 .workspace
                 .operations
                 .get(operation)
                 .ok_or_else(|| EngineError::UnknownOperation(operation.clone()))?;
 
-            operation_view = Some(serde_json::to_value(draft).expect("draft serializes"));
+            let view = serde_json::to_value(draft).expect("draft serializes");
+
+            if primary {
+                operation_view = Some(view);
+            } else {
+                peer_operations.push(view);
+            }
 
             self.record_operation_inputs(&entry, operation);
 
             shared.extend(slice_shared_symbols(snapshot, operation));
-
-            let analysis = self.inner.analysis.state(snapshot.revision);
 
             let callees: Vec<Id> = snapshot
                 .graph
@@ -1049,6 +1081,13 @@ impl ConfluenceEngine {
                 .collect();
 
             for target in callees {
+                if dependency_summaries
+                    .iter()
+                    .any(|summary: &OperationSummary| summary.operation == target)
+                {
+                    continue;
+                }
+
                 let summary = match &analysis {
                     AnalysisState::Ready(analysis) => analysis.summaries.get(&target).cloned(),
                     _ => None,
@@ -1074,8 +1113,8 @@ impl ConfluenceEngine {
                 }
             }
 
-            if let AnalysisState::Ready(analysis) = self.inner.analysis.state(snapshot.revision) {
-                for (family, transaction, index) in &spec.requirements {
+            if let AnalysisState::Ready(analysis) = &analysis {
+                for (family, transaction, index) in requirements {
                     let id = match transaction {
                         Some(transaction) => {
                             format!("oblig.{operation}.{transaction}.{family}.{index}")
@@ -1127,6 +1166,7 @@ impl ConfluenceEngine {
             task,
             revision: snapshot.revision,
             operation: operation_view,
+            peer_operations,
             shared_symbols,
             dependency_summaries,
             prompt_evidence: entry.spec.prompt_evidence.clone(),

@@ -39,7 +39,7 @@ use crate::system_one::DecisionRequest;
 use crate::system_one::questions::repair as wording;
 
 use super::describe::summarize;
-use super::remedies::{self, Remedy, RemedyKind};
+use super::remedies::{self, Programs, Remedy, RemedyKind};
 use super::{Abstention, BuildContext, Built};
 
 /// What repair acts on. Provisional, as every threshold is (§13.3).
@@ -88,20 +88,26 @@ fn abstain(reason: impl Into<String>, findings: Vec<String>) -> Built {
 async fn repair(context: &BuildContext<'_>, policy: &RepairPolicy) -> Result<Built, EngineError> {
     let task = context.engine.task_context(context.task)?;
 
-    let Some(operation) = task
+    // Every program the task may rewrite: one, or every program of one
+    // conflict closure (§18.3).
+    let scope: Vec<Id> = task
         .write_scope
         .grants
         .iter()
-        .find_map(|grant| match grant {
+        .filter_map(|grant| match grant {
             WriteGrant::OperationProgram(operation) => Some(operation.clone()),
             _ => None,
         })
-    else {
+        .collect();
+
+    let Some((operation, peers)) = scope.split_first() else {
         return Ok(abstain(
             "the task's scope names no program to repair",
             Vec::new(),
         ));
     };
+
+    let operation = operation.clone();
 
     let bundle = context.engine.context_bundle(
         context.task,
@@ -109,31 +115,51 @@ async fn repair(context: &BuildContext<'_>, policy: &RepairPolicy) -> Result<Bui
             operation: Some(operation.clone()),
             requirements: Vec::new(),
             include: Vec::new(),
+            peers: peers
+                .iter()
+                .map(|peer| (peer.clone(), Vec::new()))
+                .collect(),
         },
     )?;
 
-    let Some(draft) = bundle
+    let drafts: Vec<DraftOperation> = bundle
         .operation
-        .as_ref()
-        .and_then(|draft| serde_json::from_value::<DraftOperation>(draft.clone()).ok())
-    else {
+        .iter()
+        .chain(&bundle.peer_operations)
+        .filter_map(|draft| serde_json::from_value::<DraftOperation>(draft.clone()).ok())
+        .collect();
+
+    if drafts.len() != scope.len() {
         return Ok(abstain(
-            "the operation's draft could not be read",
+            "an operation's draft could not be read",
             Vec::new(),
         ));
-    };
+    }
 
-    let Some(program) = &draft.program else {
-        return Ok(abstain("the operation has no program yet", Vec::new()));
-    };
+    let mut programs: Programs = BTreeMap::new();
+
+    for (id, draft) in scope.iter().zip(&drafts) {
+        let Some(program) = &draft.program else {
+            return Ok(abstain(format!("{id} has no program yet"), Vec::new()));
+        };
+
+        programs.insert(id.clone(), program.clone());
+    }
+
+    let draft = &drafts[0];
 
     // Every transaction whose serializability the verdicts below speak
     // to: their closures are what those verdicts rest on.
-    let roots: Vec<(Id, Id)> = program
-        .transactions()
-        .into_iter()
-        .filter(|(_, transaction)| !transaction.requirements.serializability.is_empty())
-        .map(|(_, transaction)| (operation.clone(), transaction.id.clone()))
+    let roots: Vec<(Id, Id)> = programs
+        .iter()
+        .flat_map(|(id, program)| {
+            program
+                .transactions()
+                .into_iter()
+                .filter(|(_, transaction)| !transaction.requirements.serializability.is_empty())
+                .map(|(_, transaction)| (id.clone(), transaction.id.clone()))
+                .collect::<Vec<_>>()
+        })
         .collect();
 
     // The baseline is the empty candidate: the same pipeline, tracked
@@ -157,13 +183,19 @@ async fn repair(context: &BuildContext<'_>, policy: &RepairPolicy) -> Result<Bui
 
     let unproven: Vec<RequirementRef> = standing(before)
         .into_iter()
-        .filter(|(requirement, proven)| requirement.operation == operation && !proven)
+        .filter(|(requirement, proven)| programs.contains_key(&requirement.operation) && !proven)
         .map(|(requirement, _)| requirement)
         .collect();
 
+    let named = scope
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+
     if unproven.is_empty() {
         return Ok(Built::NothingToDo {
-            summary: format!("{operation}: nothing is unproven at this snapshot"),
+            summary: format!("{named}: nothing is unproven at this snapshot"),
         });
     }
 
@@ -187,7 +219,7 @@ async fn repair(context: &BuildContext<'_>, policy: &RepairPolicy) -> Result<Bui
     let obstacles: Vec<&TransactionSerializabilityObstacle> = before
         .transaction_serializability
         .iter()
-        .filter(|check| check.operation == operation)
+        .filter(|check| programs.contains_key(&check.operation))
         .filter_map(|check| match &check.verdict {
             TransactionSerializabilityVerdict::Unproven { obstacles } => Some(obstacles),
             TransactionSerializabilityVerdict::Proven { .. } => None,
@@ -211,13 +243,13 @@ async fn repair(context: &BuildContext<'_>, policy: &RepairPolicy) -> Result<Bui
         })
         .collect();
 
-    let mut candidates = remedies::candidates(&operation, program, &obstacles, &versions);
+    let mut candidates = remedies::candidates(&programs, &obstacles, &versions);
 
     candidates.truncate(policy.max_candidates);
 
     if candidates.is_empty() {
         let mut findings = vec![
-            "every route the catalogue knows needs an edit outside this operation's program, \
+            "every route the catalogue knows needs an edit outside the programs in scope, \
              or a judgment about what a rejected transaction should do"
                 .to_string(),
         ];
@@ -225,12 +257,12 @@ async fn repair(context: &BuildContext<'_>, policy: &RepairPolicy) -> Result<Bui
         findings.extend(left);
 
         return Ok(abstain(
-            "the catalogue offers no repair of this program alone",
+            "the catalogue offers no repair of the programs in scope",
             findings,
         ));
     }
 
-    let judged = judge(context, &operation, candidates, before, &targets, &roots).await?;
+    let judged = judge(context, &programs, candidates, before, &targets, &roots).await?;
 
     let admissible: Vec<&Remedy> = judged
         .iter()
@@ -261,7 +293,8 @@ async fn repair(context: &BuildContext<'_>, policy: &RepairPolicy) -> Result<Bui
         context,
         policy,
         &task.prompt_evidence,
-        &draft,
+        draft,
+        &programs,
         &operation,
         &admissible,
     )
@@ -273,7 +306,7 @@ async fn repair(context: &BuildContext<'_>, policy: &RepairPolicy) -> Result<Bui
             task: context.task,
             patch_id: PatchId::fresh(),
             base_revision: task.snapshot_revision,
-            patch: replacing(&operation, chosen),
+            patch: replacing(&programs, chosen),
             client_nonce: Uuid::new_v4(),
         })
         .await?;
@@ -281,7 +314,7 @@ async fn repair(context: &BuildContext<'_>, policy: &RepairPolicy) -> Result<Bui
     Ok(match outcome {
         Ok(_) => Built::Committed {
             summary: format!(
-                "{operation}: {} — proves {}; {} of {} candidates were admissible{why}{}",
+                "{named}: {} — proves {}; {} of {} candidates were admissible{why}{}",
                 chosen.summary,
                 targets
                     .iter()
@@ -316,12 +349,16 @@ async fn repair(context: &BuildContext<'_>, policy: &RepairPolicy) -> Result<Bui
     })
 }
 
-fn replacing(operation: &Id, remedy: &Remedy) -> SpecPatch {
+/// One program replacement per program the remedy changes.
+fn replacing(before: &Programs, remedy: &Remedy) -> SpecPatch {
     SpecPatch {
-        mutations: vec![Mutation::ReplaceOperationProgram {
-            operation: operation.clone(),
-            program: remedy.program.clone(),
-        }],
+        mutations: remedy
+            .edited(before)
+            .map(|(operation, program)| Mutation::ReplaceOperationProgram {
+                operation: operation.clone(),
+                program: program.clone(),
+            })
+            .collect(),
     }
 }
 
@@ -330,14 +367,14 @@ fn replacing(operation: &Id, remedy: &Remedy) -> SpecPatch {
 /// nothing proven before it is unproven under it (§18.4).
 async fn judge(
     context: &BuildContext<'_>,
-    operation: &Id,
+    programs: &Programs,
     candidates: Vec<Remedy>,
     before: &crate::analyzer::verification::VerificationReport,
     targets: &[RequirementRef],
     roots: &[(Id, Id)],
 ) -> Result<Vec<Judged>, EngineError> {
     let verdicts = futures::future::join_all(candidates.iter().map(|remedy| {
-        let patch = replacing(operation, remedy);
+        let patch = replacing(programs, remedy);
 
         async move {
             context
@@ -403,6 +440,7 @@ async fn prefer<'a>(
     policy: &RepairPolicy,
     prompt_evidence: &[crate::confluence::PromptEvidence],
     draft: &DraftOperation,
+    programs: &Programs,
     operation: &Id,
     admissible: &[&'a Remedy],
 ) -> (&'a Remedy, &'static str) {
@@ -433,9 +471,8 @@ async fn prefer<'a>(
         return (first, "");
     }
 
-    let work: Vec<String> = draft
-        .program
-        .iter()
+    let work: Vec<String> = programs
+        .values()
         .flat_map(|program| program.transactions())
         .filter_map(|(_, transaction)| summarize(transaction))
         .collect();

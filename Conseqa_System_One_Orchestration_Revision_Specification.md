@@ -686,13 +686,15 @@ The thresholds are provisional — `act` 0.8, `dismiss` 0.25, `select` 0.6 — u
 | --- | --- |
 | an obligation's Choice selects an enumerated requirement at or above `select` | `ExplicitPrompt { obligation }` |
 | it selects no-match, or nothing clearly | abstain: the obligation is real and must be mapped by someone |
-| two obligations select the same requirement | abstain |
+| two obligations select the same requirement | both `ExplicitPrompt`: the requirement is proposed once per obligation, in order; the gate adopts the first and records each later one as a duplicate that maps its obligation to the adopted requirement |
 | the run's policy adopts implied requirements, and one is stated | `StronglyImplied`, citing the prompt as evidence |
 | stated, and nothing enumerated can express it | abstain |
 | uncertain whether stated | abstain |
 | not stated | no proposal |
 
 An explicit mapping settles a requirement: whether the prompt also implies it is then a branch not taken, and its uncertainty is ignored.
+
+The gate maps an explicit obligation whenever its proposal names a declared requirement — adopted by that proposal or already declared. This is what lets an obligation be mapped after the requirement it names was declared by someone else (an interactive author, or a synthesis worker), and it is why the workflow schedules discovery for every operation an unmapped obligation targets, not only for operations with no requirements yet.
 
 `rationale` is a fixed template naming the question and its probability. It is not generated prose.
 
@@ -739,9 +741,13 @@ Ordering obstacles are not in the first catalogue, and nor is any operation fami
 
 ## 18.3 Scope
 
-The first increment repairs within the workflow's existing repair task: one operation, one program. A closure that spans operations is then repaired only by a route that needs no edit elsewhere — the version guard of `flash_checkout`'s `apply_payment` is one — and otherwise escalates, with what was tried.
+The first increment repaired within one operation's program; a closure spanning operations was repaired only by a route needing no edit elsewhere (the version guard of `flash_checkout`'s `apply_payment` is one), and otherwise escalated. That is superseded:
 
-A remedy may need several templates: a strict-lock proof needs the lock on the reader and on the writer. A later increment creates a System One repair task over the obligation's conflict closure, with an `OperationProgram` grant for each operation a remedy may edit. The scheduler footprints it accordingly; it shares no wave with a task touching those programs.
+A remedy may need several templates: a strict-lock proof needs the lock on the reader and on the writer. So a repair task covers a **conflict closure**, not an operation. The workflow groups the operations with unproven transaction obligations into the connected components of "an unproven obligation of one names a transaction of the other in its evidence" (every `{operation, transaction}` reference in the verdict), and schedules one repair task per component, with an `OperationProgram` grant for every member — including a member with nothing unproven itself, whose program a proof may need to change. The bundle carries every member's draft (`BundleSpec::peers`); the scheduler footprints every grant, and claims every program's writer slot.
+
+The catalogue then edits any program in scope: a remedy is a set of program replacements, submitted as one patch. The closure route is a candidate when every weaker member is in scope. Declared isolation is also offered composed with each step-adding route, because one obstacle's gaps can mix an unspecified isolation with a missing lock or guard.
+
+Grouping serves the agent path as much as the builder: peers that share a closure were previously repaired concurrently, and each commit invalidated the others' snapshots, while a repair of one alone was often refused because it un-proved a peer. The benchmark that motivated this (5 operations over shared stock) spent 19 attempts on 11 repair tasks.
 
 ## 18.4 Evaluation
 
@@ -1017,7 +1023,7 @@ Each phase ends with the benchmark of §33. A phase that lowers proven-over-tota
 1. **Telemetry and baseline.** Manifest format 2; the benchmark corpus; an agent-only baseline recorded under `reports/`.
 2. **Primitives.** `Decider`, the wire-format, replay and shadow backends, the conformance suite, the question registry, the decision log, replay fixtures. Exit: a local server that passes conformance, and a hosted–local agreement report over a fixed question set.
 3. **Executor seam and discovery.** `SystemOneBackend`, abstention, requirement discovery for all five families, the targeted obligation search (§4.4), and the task records of §13.1. `evaluate_candidate` moves to phase 4, its first user.
-4. **Repair.** The conflict footprint of §4, which repair's eagerness depends on; `evaluate_candidate`; the remedy catalogue; generate-and-verify within the per-operation repair task. Closure-scoped repair tasks (§18.3) follow.
+4. **Repair.** The conflict footprint of §4, which repair's eagerness depends on; `evaluate_candidate`; the remedy catalogue; generate-and-verify; closure-scoped repair tasks (§18.3).
 5. **Topology.** Defaults and knobs.
 6. **Advisors.** Advisor mode; `suggest_requirements`; `suggest_remedies`.
 7. **Archetypes.** Operation synthesis, with coverage reported.

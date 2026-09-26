@@ -294,6 +294,7 @@ fn enumerate(
             operation: Some(operation.clone()),
             requirements: Vec::new(),
             include: Vec::new(),
+            peers: Vec::new(),
         },
     )?;
 
@@ -752,6 +753,12 @@ fn decide(
 
     let mut origins: BTreeMap<Candidate, RequirementOrigin> = BTreeMap::new();
 
+    // Further obligations discharged by a requirement another obligation
+    // already maps to. Each is submitted again after the first, with its
+    // own origin: the gate records it as a duplicate of the requirement
+    // just adopted and maps the obligation to it.
+    let mut also: Vec<(Candidate, RequirementOrigin)> = Vec::new();
+
     // Explicit obligations first: each must map to one enumerated
     // requirement, or the run cannot succeed without the session.
     for (index, (id, obligation)) in enumerated.obligations.iter().enumerate() {
@@ -781,19 +788,18 @@ fn decide(
             )]));
         };
 
-        if origins
-            .insert(
-                candidate.clone(),
-                RequirementOrigin::ExplicitPrompt {
-                    obligation: id.clone(),
-                },
-            )
-            .is_some()
-        {
-            return Err(Abstention::because(format!(
-                "two obligations map to the same requirement, `{}`",
-                candidate.option()
-            )));
+        let origin = RequirementOrigin::ExplicitPrompt {
+            obligation: id.clone(),
+        };
+
+        match origins.entry(candidate) {
+            std::collections::btree_map::Entry::Occupied(taken) => {
+                also.push((taken.key().clone(), origin));
+            }
+
+            std::collections::btree_map::Entry::Vacant(free) => {
+                free.insert(origin);
+            }
         }
     }
 
@@ -885,6 +891,7 @@ fn decide(
 
     origins
         .into_iter()
+        .chain(also)
         .map(|(candidate, origin)| {
             Ok(RequirementSubmission {
                 requirement: requirement(enumerated, &candidate, decision, policy)?,

@@ -37,12 +37,16 @@ use super::task_prompt;
 /// Releases an operation's advisory primary-writer claim on drop.
 struct ProgramWriterGuard<'a> {
     writers: &'a Mutex<HashSet<Id>>,
-    operation: Id,
+    operations: Vec<Id>,
 }
 
 impl Drop for ProgramWriterGuard<'_> {
     fn drop(&mut self) {
-        self.writers.lock().remove(&self.operation);
+        let mut writers = self.writers.lock();
+
+        for operation in &self.operations {
+            writers.remove(operation);
+        }
     }
 }
 
@@ -339,22 +343,35 @@ impl Scheduler {
         Ok(run)
     }
 
-    /// Advisory claim on an operation's primary-writer slot, released
-    /// when the returned guard drops. `None` for non-program tasks.
+    /// Advisory claim on the primary-writer slot of every program the
+    /// task writes, released when the returned guard drops. `None` for
+    /// non-program tasks.
     fn claim_program_writer(&self, logical: &LogicalTask) -> Option<ProgramWriterGuard<'_>> {
-        let operation = self.program_write_target(logical)?;
+        let operations = self.program_write_targets(logical);
 
-        if !self.program_writers.lock().insert(operation.clone()) {
-            tracing::warn!(
-                %operation,
-                "a primary program writer is already active for this operation; \
-                 running anyway relies on OCC"
-            );
+        if operations.is_empty() {
+            return None;
+        }
+
+        let mut writers = self.program_writers.lock();
+
+        let mut claimed = Vec::new();
+
+        for operation in operations {
+            if writers.insert(operation.clone()) {
+                claimed.push(operation);
+            } else {
+                tracing::warn!(
+                    %operation,
+                    "a primary program writer is already active for this operation; \
+                     running anyway relies on OCC"
+                );
+            }
         }
 
         Some(ProgramWriterGuard {
             writers: &self.program_writers,
-            operation,
+            operations: claimed,
         })
     }
 
@@ -466,15 +483,20 @@ impl Scheduler {
         })
     }
 
-    /// The operation a program-scope task writes, for one-writer
-    /// bookkeeping.
-    fn program_write_target(&self, logical: &LogicalTask) -> Option<crate::spec::Id> {
-        logical.write_scope.grants.iter().find_map(|grant| match grant {
-            WriteGrant::OperationProgram(operation) | WriteGrant::Operation(operation) => {
-                Some(operation.clone())
-            }
-            _ => None,
-        })
+    /// The operations whose programs a task writes, for one-writer
+    /// bookkeeping. A closure-scoped repair writes several.
+    fn program_write_targets(&self, logical: &LogicalTask) -> Vec<crate::spec::Id> {
+        logical
+            .write_scope
+            .grants
+            .iter()
+            .filter_map(|grant| match grant {
+                WriteGrant::OperationProgram(operation) | WriteGrant::Operation(operation) => {
+                    Some(operation.clone())
+                }
+                _ => None,
+            })
+            .collect()
     }
 }
 
@@ -537,7 +559,13 @@ fn footprint(
 
     let mut reads: BTreeSet<SymbolKey> = task.bundle.include.iter().cloned().collect();
 
-    if let Some(operation) = &task.bundle.operation {
+    let focus = task
+        .bundle
+        .operation
+        .iter()
+        .chain(task.bundle.peers.iter().map(|(operation, _)| operation));
+
+    for operation in focus {
         reads.insert(SymbolKey::OperationInterface(operation.clone()));
         reads.insert(SymbolKey::OperationProgram(operation.clone()));
         reads.insert(SymbolKey::OperationRequirements(operation.clone()));
@@ -684,6 +712,7 @@ mod tests {
                 operation: Some(id(operation)),
                 requirements: Vec::new(),
                 include: Vec::new(),
+                peers: Vec::new(),
             },
             prompt_evidence: Vec::new(),
             interactive: false,

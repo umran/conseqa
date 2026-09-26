@@ -691,7 +691,9 @@ async fn an_unmapped_obligation_is_discovered_despite_declared_requirements() {
             if kind == conseqa::confluence::TaskKind::OperationSynthesis {
                 let author = engine
                     .create_session(
-                        conseqa::confluence::WriteScope::requirement_discovery(id("operation.ping")),
+                        conseqa::confluence::WriteScope::requirement_discovery(id(
+                            "operation.ping",
+                        )),
                         "author",
                     )
                     .expect("session");
@@ -1202,6 +1204,7 @@ async fn operation_fanout_runs_agents_concurrently() {
                 operation: Some(id(&format!("operation.worker{index}"))),
                 requirements: Vec::new(),
                 include: Vec::new(),
+                peers: Vec::new(),
             },
             prompt_evidence: Vec::new(),
             interactive: false,
@@ -1468,6 +1471,7 @@ async fn an_invalidated_attempt_hands_its_patch_to_the_replacement() {
                 operation: Some(id("operation.worker0")),
                 requirements: Vec::new(),
                 include: Vec::new(),
+                peers: Vec::new(),
             },
             prompt_evidence: Vec::new(),
             interactive: false,
@@ -1608,6 +1612,7 @@ async fn attempt_exhaustion_is_reported_without_discarding_siblings() {
                 operation: Some(id(&format!("operation.worker{index}"))),
                 requirements: Vec::new(),
                 include: Vec::new(),
+                peers: Vec::new(),
             },
             prompt_evidence: Vec::new(),
             interactive: false,
@@ -2315,6 +2320,7 @@ mod system_one {
                         operation: Some(operation),
                         requirements: Vec::new(),
                         include: Vec::new(),
+                        peers: Vec::new(),
                     },
                     prompt_evidence: vec![conseqa::confluence::PromptEvidence {
                         source: conseqa::confluence::EvidenceRef("run.prompt".to_string()),
@@ -2398,6 +2404,65 @@ mod system_one {
                     matches!(obligation.status, PromptObligationStatus::Mapped { .. })
                 })
         );
+    }
+
+    /// Two statements in the prompt can ask for one requirement — "a
+    /// retried posting records one entry" and "a duplicate request is
+    /// harmless" are both idempotency by the request's id. The builder
+    /// adopts the requirement once and maps both obligations to it,
+    /// rather than escalating (as the benchmark's Jev run did).
+    #[tokio::test]
+    async fn two_obligations_discharged_by_one_requirement_are_both_mapped() {
+        let posting = id("operation.post_entry");
+
+        let (mut workspace, _) = undeclared("tenant_ledger.yaml", &posting);
+
+        for (obligation, intent) in [
+            ("obl.post-once", "a retried posting records one entry"),
+            (
+                "obl.duplicates-harmless",
+                "a duplicate posting request is harmless",
+            ),
+        ] {
+            workspace.prompt_obligations.insert(
+                PromptObligationId(obligation.to_string()),
+                PromptObligation {
+                    source_span: None,
+                    normalized_intent: intent.to_string(),
+                    targets: vec![posting.clone()],
+                    status: PromptObligationStatus::Unmapped,
+                },
+            );
+        }
+
+        let opinions = Opinions::default()
+            .choosing("obligation_0", "idempotency", 0.9)
+            .choosing("obligation_1", "idempotency", 0.88);
+
+        let (engine, seen) = discover(workspace, &posting, &opinions).await;
+
+        assert!(discoveries(&seen).is_empty(), "{:?}", discoveries(&seen));
+
+        let head = engine.head_snapshot();
+
+        assert_eq!(
+            head.workspace.operations[&posting]
+                .requirements
+                .idempotency
+                .len(),
+            1,
+            "adopted once"
+        );
+
+        for obligation in head.workspace.prompt_obligations.values() {
+            assert!(
+                matches!(
+                    &obligation.status,
+                    PromptObligationStatus::Mapped { requirements } if requirements.len() == 1
+                ),
+                "{obligation:?}"
+            );
+        }
     }
 
     /// The claim the whole layer rests on: what a requirement is *keyed
@@ -2540,6 +2605,182 @@ mod system_one {
                 .requirement_proposals
                 .is_empty()
         );
+    }
+
+    /// `shop` as the benchmark's Jev run exported it, with the product
+    /// locks of the operations that reserve and add stock taken out.
+    fn stock_without_its_locks() -> conseqa::spec::Model {
+        let mut broken = authored("shop.yaml");
+
+        for (operation, transaction) in [
+            ("operation.place_order", "tx.place_order.reserve"),
+            ("operation.restock", "tx.restock.apply"),
+        ] {
+            broken
+                .operations
+                .get_mut(&id(operation))
+                .expect("the operation")
+                .program
+                .transaction_mut(&id(transaction))
+                .expect("the transaction")
+                .steps
+                .retain(|step| !matches!(step, conseqa::spec::TransactionStep::Lock(_)));
+        }
+
+        broken
+    }
+
+    fn program_scope(operations: &[&str]) -> conseqa::confluence::WriteScope {
+        conseqa::confluence::WriteScope::of(
+            operations
+                .iter()
+                .map(|operation| conseqa::confluence::WriteGrant::OperationProgram(id(operation))),
+        )
+    }
+
+    /// The case the benchmark's Jev run escalated three times: a strict
+    /// lock proof needs the lock on the writer as well as the reader,
+    /// and they are different operations. Scoped to either program
+    /// alone, every candidate leaves its own target unproven; scoped to
+    /// the conflict closure, one candidate edits both programs, the
+    /// whole model is proven again, and it is the programs the run
+    /// authored.
+    #[tokio::test]
+    async fn a_closure_is_repaired_where_no_single_program_can_be() {
+        let authored = authored("shop.yaml");
+        let broken = stock_without_its_locks();
+
+        for alone in ["operation.place_order", "operation.restock"] {
+            let (_, seen, runs) = run_tasks(
+                workspace_of(&broken, "A shop."),
+                vec![(
+                    TaskKind::RequirementRepair,
+                    program_scope(&[alone]),
+                    id(alone),
+                )],
+                &Opinions::default(),
+            )
+            .await;
+
+            assert!(!runs[0].committed(), "{alone} alone: {:?}", runs[0]);
+
+            let handed = repairs(&seen);
+
+            assert_eq!(handed.len(), 1, "{alone} alone escalates");
+            assert!(
+                handed[0].contains("leaves transaction_serializability #0"),
+                "{}",
+                handed[0]
+            );
+        }
+
+        let (engine, seen, runs) = run_tasks(
+            workspace_of(&broken, "A shop."),
+            vec![(
+                TaskKind::RequirementRepair,
+                program_scope(&["operation.place_order", "operation.restock"]),
+                id("operation.place_order"),
+            )],
+            &Opinions::default(),
+        )
+        .await;
+
+        assert!(repairs(&seen).is_empty(), "{:?}", repairs(&seen));
+        assert!(runs[0].committed(), "{:?}", runs[0]);
+        assert_eq!(runs[0].attempts.len(), 1);
+
+        assert!(head_model_is_proven(&engine).await);
+
+        let head = engine.head_snapshot();
+
+        for operation in ["operation.place_order", "operation.restock"] {
+            assert_eq!(
+                head.workspace.operations[&id(operation)].program,
+                Some(authored.operations[&id(operation)].program.clone()),
+                "{operation}"
+            );
+        }
+    }
+
+    /// The workflow schedules that repair itself: every operation the
+    /// unproven obligations' evidence ties together goes to one task,
+    /// with a program grant for each, so peers that share stock neither
+    /// invalidate each other nor refuse each other's repairs — and here
+    /// no session is needed at all.
+    #[tokio::test]
+    async fn the_workflow_repairs_a_conflict_closure_as_one_task() {
+        let authored = authored("shop.yaml");
+        let broken = stock_without_its_locks();
+
+        let engine =
+            ConfluenceEngine::in_memory(workspace_of(&broken, "A shop.")).expect("engine starts");
+
+        let seen = Seen::default();
+        let idle: ScriptFn = Arc::new(|_, _| Box::pin(async {}));
+
+        let backend = Arc::new(SystemOneBackend::new(
+            engine.clone(),
+            Arc::new(Opinions::default()),
+            conseqa::harness::executors::BUILDABLE,
+            Arc::new(ScriptedBackend {
+                engine: engine.clone(),
+                script: recording(idle, seen.clone()),
+            }),
+        ));
+
+        let out_dir = scratch();
+
+        let supervisor = Supervisor::new(
+            engine.clone(),
+            backend,
+            "http://127.0.0.1:0/mcp",
+            None,
+            out_dir.join("work"),
+        );
+
+        let scheduler = Scheduler::new(engine.clone(), supervisor, SchedulerPolicy::default());
+
+        let workflow = Workflow::new(
+            scheduler,
+            WorkflowConfig {
+                out_dir: out_dir.clone(),
+                analysis_timeout: Duration::from_secs(20),
+                max_iterations: 8,
+                objective: None,
+            },
+        );
+
+        let report = workflow.run().await.expect("the workflow runs");
+
+        assert!(
+            matches!(report.status, RunStatus::Success { .. }),
+            "{:?}",
+            report.status
+        );
+
+        assert!(
+            seen.lock().expect("not poisoned").is_empty(),
+            "no session was needed: {:?}",
+            seen.lock().expect("not poisoned")
+        );
+
+        let manifest = manifest_of(&out_dir);
+        let repaired = records(&manifest, "requirement_repair");
+
+        assert_eq!(repaired.len(), 1, "one task for the closure: {manifest}");
+        assert_eq!(repaired[0]["executor"], "system_one");
+
+        let head = engine.head_snapshot();
+
+        for operation in ["operation.place_order", "operation.restock"] {
+            assert_eq!(
+                head.workspace.operations[&id(operation)].program,
+                Some(authored.operations[&id(operation)].program.clone()),
+                "{operation}"
+            );
+        }
+
+        std::fs::remove_dir_all(&out_dir).ok();
     }
 
     fn authored(fixture: &str) -> conseqa::spec::Model {
