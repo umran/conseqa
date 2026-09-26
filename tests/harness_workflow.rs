@@ -663,6 +663,111 @@ async fn prompt_to_validated_model_with_all_requirements_proven() {
     std::fs::remove_dir_all(&out_dir).ok();
 }
 
+/// Requirements declared before discovery — by an interactive author,
+/// or a synthesis worker — without mapping the prompt's obligation do
+/// not stop discovery for that operation: nothing else maps an
+/// obligation, so skipping it would leave the run incomplete forever.
+#[tokio::test]
+async fn an_unmapped_obligation_is_discovered_despite_declared_requirements() {
+    let out_dir = std::env::temp_dir().join(format!("conseqa-wf-{}", Uuid::new_v4()));
+
+    let seen: Arc<std::sync::Mutex<Vec<conseqa::confluence::TaskKind>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+
+    let inner = success_script();
+    let recorder = Arc::clone(&seen);
+
+    let script: ScriptFn = Arc::new(move |engine, invocation| {
+        recorder.lock().expect("not poisoned").push(invocation.kind);
+
+        let inner = Arc::clone(&inner);
+
+        Box::pin(async move {
+            let kind = invocation.kind;
+            let result = inner(engine.clone(), invocation).await;
+
+            // An author declares the requirement right after the
+            // program lands, without naming the obligation.
+            if kind == conseqa::confluence::TaskKind::OperationSynthesis {
+                let author = engine
+                    .create_session(
+                        conseqa::confluence::WriteScope::requirement_discovery(id("operation.ping")),
+                        "author",
+                    )
+                    .expect("session");
+
+                engine
+                    .submit(CommitRequest {
+                        task: author.id,
+                        patch_id: PatchId::fresh(),
+                        base_revision: author.snapshot_revision,
+                        patch: SpecPatch {
+                            mutations: vec![Mutation::ProposeRequirements {
+                                operation: id("operation.ping"),
+                                proposals: vec![RequirementSubmission {
+                                    requirement: ProposedRequirement::Idempotency(
+                                        conseqa::spec::IdempotencyRequirement {
+                                            key: IdempotencyKey {
+                                                components: vec![ValueRef {
+                                                    source: ValueSource::Input(id(
+                                                        "input.ping.request",
+                                                    )),
+                                                    path: path("id"),
+                                                }],
+                                            },
+                                            result:
+                                                conseqa::spec::ResultReplayRequirement::ReplayConsistent,
+                                        },
+                                    ),
+                                    origin: RequirementOrigin::StronglyImplied {
+                                        rationale: "pings carry an id".to_string(),
+                                        evidence: Vec::new(),
+                                    },
+                                }],
+                            }],
+                        },
+                        client_nonce: Uuid::new_v4(),
+                    })
+                    .await
+                    .expect("the sequencer runs")
+                    .expect("the author's proposal commits");
+            }
+
+            result
+        })
+    });
+
+    let (workflow, engine) = workflow(out_dir.clone(), script, 8);
+
+    let report = workflow.run().await.expect("the workflow runs");
+
+    let kinds = seen.lock().expect("not poisoned").clone();
+
+    assert!(
+        kinds.contains(&conseqa::confluence::TaskKind::RequirementDiscovery),
+        "discovery ran for the unmapped obligation: {kinds:?}"
+    );
+
+    let head = engine.head_snapshot();
+
+    assert!(
+        matches!(
+            head.workspace.prompt_obligations[&PromptObligationId(OBLIGATION.to_string())].status,
+            PromptObligationStatus::Mapped { .. }
+        ),
+        "{:?}",
+        report.status
+    );
+
+    assert!(
+        matches!(report.status, RunStatus::Success { .. }),
+        "{:?}",
+        report.status
+    );
+
+    std::fs::remove_dir_all(&out_dir).ok();
+}
+
 /// The phase order the two-layer model requires: the fanout writes L0
 /// programs, requirement discovery says what must hold, and only then
 /// does a single agent author the runtime topology that realizes them.

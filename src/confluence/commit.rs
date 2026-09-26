@@ -643,31 +643,21 @@ fn apply_proposals(
                     index,
                 };
 
-                if let RequirementOrigin::ExplicitPrompt { obligation } = &submission.origin
-                    && let Some(obligation) = workspace.prompt_obligations.get_mut(obligation)
-                {
-                    match &mut obligation.status {
-                        PromptObligationStatus::Unmapped => {
-                            obligation.status = PromptObligationStatus::Mapped {
-                                requirements: vec![reference.clone()],
-                            };
-                        }
-
-                        PromptObligationStatus::Mapped { requirements } => {
-                            requirements.push(reference.clone());
-                        }
-
-                        // An unsupported or waived obligation keeps its
-                        // status; the proposal is still recorded.
-                        _ => {}
-                    }
-                }
-
                 ProposalStatus::Adopted { reference }
             } else {
                 ProposalStatus::Advisory
             }
         };
+
+        // An explicit obligation is discharged by the requirement the
+        // proposal names — adopted now, or already declared (by an
+        // author who declared it before mapping the obligation).
+        if let RequirementOrigin::ExplicitPrompt { obligation } = &submission.origin
+            && let ProposalStatus::Adopted { reference } | ProposalStatus::Duplicate { reference } =
+                &status
+        {
+            map_obligation(workspace, obligation, reference);
+        }
 
         workspace.requirement_proposals.push(RequirementProposal {
             operation: operation.clone(),
@@ -679,6 +669,36 @@ fn apply_proposals(
 
     if let Some(draft) = workspace.operations.get_mut(operation) {
         draft.recompute_stage();
+    }
+}
+
+/// Records that `reference` discharges `obligation`. Idempotent: a
+/// reference already recorded is not added twice.
+fn map_obligation(
+    workspace: &mut WorkspaceState,
+    obligation: &super::workspace::PromptObligationId,
+    reference: &RequirementRef,
+) {
+    let Some(obligation) = workspace.prompt_obligations.get_mut(obligation) else {
+        return;
+    };
+
+    match &mut obligation.status {
+        PromptObligationStatus::Unmapped => {
+            obligation.status = PromptObligationStatus::Mapped {
+                requirements: vec![reference.clone()],
+            };
+        }
+
+        PromptObligationStatus::Mapped { requirements } => {
+            if !requirements.contains(reference) {
+                requirements.push(reference.clone());
+            }
+        }
+
+        // An unsupported or waived obligation keeps its status; the
+        // proposal is still recorded.
+        _ => {}
     }
 }
 

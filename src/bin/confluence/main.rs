@@ -800,9 +800,10 @@ impl DesignLauncher for DaemonDesignLauncher {
             "started_at_revision": started_revision,
             "note": "One worker per unfinished operation is now running in the background \
                      against this shared model. Do not submit patches while the run is \
-                     active — poll spec_status, whose design block shows running and, when \
-                     finished, the run's report. Then call open_project again to refresh \
-                     your session to the new head before reading or patching.",
+                     active — call await_design, which blocks until the run finishes (call \
+                     it again if it returns finished false) and returns the run's report. \
+                     Then call open_project again to refresh your session to the new head \
+                     before reading or patching.",
         }))
     }
 

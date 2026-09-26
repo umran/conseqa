@@ -72,8 +72,9 @@ state lives in this server, never in files you edit.
 The authoring loop:
 1. create_project or open_project selects the model you are building.
 2. Learn the DSL from this server, not from source code: dsl_guide \
-explains the semantics by topic; dsl_reference gives the exact JSON \
-shapes plus a worked program example.
+explains the semantics by topic — pass every section you need as \
+topics in ONE call rather than one call per section; dsl_reference \
+gives the exact JSON shapes plus a worked program example.
 3. Author the shared skeleton yourself with submit_patch: services, \
 schemas, data models (outboxes included), topics, state machines, and \
 one interface per planned operation (its id, service, inputs, and \
@@ -101,8 +102,9 @@ the part you have gotten to so far. The server refuses a run whose \
 skeleton has unresolved references, but it cannot know which \
 operations you still mean to declare — that judgment is yours, so make \
 it deliberately.
-5. While a run is active, do not submit patches: poll spec_status, \
-whose design block reports running and then the finished run's report. \
+5. While a run is active, do not submit patches: call await_design, \
+which blocks until the run finishes (call it again if it returns \
+finished false) and then returns the run's report. \
 When it finishes, call open_project again to refresh your session to \
 the new head.
 6. spec_status is your feedback loop throughout: assembly gaps while \
@@ -243,6 +245,17 @@ pub struct RequestDesignParams {
     #[serde(default)]
     pub objective: Option<String>,
 }
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct AwaitDesignParams {
+    /// How long to wait, in seconds; at most 55. Defaults to 50.
+    #[serde(default)]
+    pub wait_secs: Option<u64>,
+}
+
+/// The longest `await_design` holds a call open: under the minute an
+/// MCP client commonly allows a tool call.
+const AWAIT_DESIGN_MAX_SECS: u64 = 55;
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct OpenProjectParams {
@@ -702,6 +715,11 @@ pub struct DslGuideParams {
     /// contents.
     #[serde(default)]
     pub topic: Option<String>,
+
+    /// Several topics at once, answered in one response in the order
+    /// given. Prefer this to one call per section.
+    #[serde(default)]
+    pub topics: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -1024,6 +1042,59 @@ impl ConseqaMcp {
     }
 
     #[tool(
+        description = "Wait for the running design workflow to finish, instead of polling \
+                       spec_status in a loop. Blocks up to wait_secs (default 50, at most 55) \
+                       and returns the design block: finished true with the run's report, or \
+                       finished false while workers are still committing — then call it \
+                       again. When it finishes, call open_project to refresh your session, \
+                       then spec_status for the verdict."
+    )]
+    async fn await_design(
+        &self,
+        params: Parameters<AwaitDesignParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let Some(launcher) = &self.launcher else {
+            return json_error(serde_json::json!({
+                "error": "concurrent design is not available on this server",
+            }));
+        };
+
+        let wait = std::time::Duration::from_secs(
+            params.0.wait_secs.unwrap_or(50).min(AWAIT_DESIGN_MAX_SECS),
+        );
+        let deadline = tokio::time::Instant::now() + wait;
+
+        let running = |status: &Option<serde_json::Value>| {
+            status
+                .as_ref()
+                .and_then(|status| status.get("running"))
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+        };
+
+        let mut status = launcher.status();
+
+        while running(&status) && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            status = launcher.status();
+        }
+
+        let finished = !running(&status);
+
+        json_result(serde_json::json!({
+            "finished": finished,
+            "design": status,
+            "guidance": if finished {
+                "The run is over. Call open_project to refresh your session to the new \
+                 head, then spec_status for the verdict."
+            } else {
+                "Workers are still committing. Call await_design again; do not submit \
+                 patches meanwhile."
+            },
+        }))
+    }
+
+    #[tool(
         description = "Fan out concurrent coding agents to write the operation programs. \
                        This is the normal way to build a system with more than one \
                        operation, and is far faster than synthesizing them yourself one at \
@@ -1038,8 +1109,8 @@ impl ConseqaMcp {
                        skeleton has unresolved references is refused; check \
                        spec_status.skeleton.ready_to_fan_out first, and confirm the \
                        operations it reports are the whole system you intend. Optionally \
-                       pass an objective to steer the workers. Returns immediately; poll \
-                       spec_status (its design block) rather than patching while it runs, \
+                       pass an objective to steer the workers. Returns immediately; call \
+                       await_design (not a polling loop) rather than patching while it runs, \
                        then call open_project to refresh your session to the new head. One \
                        workflow runs at a time."
     )]
@@ -1255,15 +1326,26 @@ impl ConseqaMcp {
                        effects, effect intents, value references, and requirements mean and \
                        how they compose. Call with no topic for the table of contents, then \
                        with a topic — a section name or a few words of it — for the full \
-                       section. Use this instead of reading Conseqa's source code."
+                       section, or with topics to read several sections in one call. Use \
+                       this instead of reading Conseqa's source code."
     )]
     async fn dsl_guide(
         &self,
         params: Parameters<DslGuideParams>,
     ) -> Result<CallToolResult, McpError> {
-        let text = match params.0.topic.as_deref() {
-            None => guide_toc(),
-            Some(topic) => guide_lookup(topic),
+        let params = params.0;
+
+        let mut topics: Vec<&str> = params.topic.iter().map(String::as_str).collect();
+        topics.extend(params.topics.iter().map(String::as_str));
+
+        let text = match topics.as_slice() {
+            [] => guide_toc(),
+            [topic] => guide_lookup(topic),
+            topics => topics
+                .iter()
+                .map(|topic| guide_lookup(topic))
+                .collect::<Vec<_>>()
+                .join("\n\n---\n\n"),
         };
 
         Ok(CallToolResult::success(vec![ContentBlock::text(text)]))
@@ -2155,7 +2237,7 @@ fn guide_toc() -> String {
     let mut toc = format!(
         "The Conseqa DSL semantics guide, DSL contract version {}. Call dsl_guide again \
          with a topic — a section name or a few words of it — to read that section in \
-         full.\n\nSections:\n",
+         full, or with topics (a list) to read every section you need in one call.\n\nSections:\n",
         crate::spec::DSL_VERSION,
     );
 

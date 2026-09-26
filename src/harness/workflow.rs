@@ -605,15 +605,24 @@ impl Workflow {
     }
 
     /// Phase 5: one discovery task per operation with no declared
-    /// requirements yet, run concurrently. Returns how many ran.
+    /// requirements yet, or targeted by an explicit prompt obligation
+    /// still unmapped, run concurrently. Returns how many ran.
+    ///
+    /// The second arm matters when requirements were declared before
+    /// the run — by an interactive author or a synthesis worker —
+    /// without mapping the obligations they discharge: nothing else
+    /// maps an obligation, so finalization would stay incomplete.
     async fn requirement_discovery(&self) -> Result<u32, WorkflowError> {
         let candidates: Vec<Id> = {
             let head = self.engine().head_snapshot();
+            let workspace = &head.workspace;
 
-            head.workspace
+            let unmapped = unmapped_obligation_targets(workspace);
+
+            workspace
                 .operations
                 .iter()
-                .filter(|(_, draft)| requirements_empty(draft))
+                .filter(|(id, draft)| requirements_empty(draft) || unmapped.contains(id))
                 .map(|(id, _)| id.clone())
                 .collect()
         };
@@ -1344,6 +1353,31 @@ fn operation_owned_ids(
 
 /// Whether a draft declares no requirement at all — none on the
 /// operation, and none on any inline transaction of its program.
+/// The operations an unmapped prompt obligation concerns. An
+/// obligation naming no operation concerns all of them.
+fn unmapped_obligation_targets(
+    workspace: &crate::confluence::WorkspaceState,
+) -> std::collections::BTreeSet<Id> {
+    let mut targets = std::collections::BTreeSet::new();
+
+    for obligation in workspace.prompt_obligations.values() {
+        if !matches!(
+            obligation.status,
+            crate::confluence::PromptObligationStatus::Unmapped
+        ) {
+            continue;
+        }
+
+        if obligation.targets.is_empty() {
+            targets.extend(workspace.operations.keys().cloned());
+        } else {
+            targets.extend(obligation.targets.iter().cloned());
+        }
+    }
+
+    targets
+}
+
 fn requirements_empty(draft: &crate::confluence::DraftOperation) -> bool {
     let transactional = draft.program.as_ref().is_some_and(|program| {
         program

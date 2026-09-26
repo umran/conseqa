@@ -158,7 +158,11 @@ to its origin — an explicit prompt obligation, a strongly implied \
 requirement, or a recommendation. Find the explicit obligations aimed \
 at this operation with `search_symbols` (`kind: prompt_obligation`, \
 `targets:` this operation) rather than listing them all: a peer \
-mapping its own obligation then cannot invalidate this session. Do \
+mapping its own obligation then cannot invalidate this session. An \
+explicit obligation that a requirement already declared on this \
+operation discharges is mapped by proposing that same requirement \
+again with the obligation as its origin — it is recorded as a \
+duplicate and the obligation becomes mapped. Do \
 not rewrite the program. Prefer \
 the context below and `proof_summary`/`interface` reads over \
 whole-set queries — peers run concurrently and a changed tracked \

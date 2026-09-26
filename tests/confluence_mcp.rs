@@ -948,6 +948,22 @@ async fn status_export_and_guide_serve_the_authoring_loop() {
         "{guide}"
     );
 
+    // Several sections come back in one call, in the order asked.
+    let (guides, is_error) = client
+        .call(
+            "dsl_guide",
+            serde_json::json!({"topics": ["effect intents", "Locks"]}),
+        )
+        .await;
+
+    assert!(!is_error);
+
+    let text = guides.as_str().expect("text");
+    let intents = text.find("EstablishEffectIntent").expect("first section");
+    let locks = text.find("## 21. Locks").expect("second section");
+
+    assert!(intents < locks, "{text}");
+
     std::fs::remove_dir_all(&dir).ok();
     server.shutdown().await;
 }
@@ -1096,6 +1112,79 @@ async fn a_ready_skeleton_launches_and_names_its_operations() {
     );
 
     server.shutdown().await;
+}
+
+/// A client with no way to sleep waits on the run by holding one call
+/// open: await_design returns as soon as the run finishes, with its
+/// report, and says so when it does not finish within the wait.
+#[tokio::test]
+async fn await_design_blocks_until_the_run_finishes() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct FinishingLauncher {
+        polls: AtomicUsize,
+        finish_after: usize,
+    }
+
+    impl mcp::DesignLauncher for FinishingLauncher {
+        fn launch(
+            &self,
+            _engine: ConfluenceEngine,
+            _objective: Option<String>,
+        ) -> Result<serde_json::Value, String> {
+            Ok(serde_json::json!({"launched": true}))
+        }
+
+        fn status(&self) -> Option<serde_json::Value> {
+            let polls = self.polls.fetch_add(1, Ordering::SeqCst);
+            let running = polls < self.finish_after;
+
+            let last_run = if running {
+                serde_json::Value::Null
+            } else {
+                serde_json::json!({"status": "done"})
+            };
+
+            Some(serde_json::json!({"running": running, "last_run": last_run}))
+        }
+    }
+
+    for (finish_after, wait_secs, finished) in [(3, 5, true), (usize::MAX, 1, false)] {
+        let engine = ConfluenceEngine::in_memory(fixture_workspace()).expect("engine starts");
+
+        let launcher = Arc::new(FinishingLauncher {
+            polls: AtomicUsize::new(0),
+            finish_after,
+        });
+
+        let router = mcp::router_with_launcher(engine.clone(), launcher);
+
+        let server = mcp::serve_router(router, "127.0.0.1:0".parse().expect("addr"))
+            .await
+            .expect("mcp server binds");
+
+        let url = format!("http://{}/mcp", server.local_addr);
+
+        let handle = engine
+            .create_session(WriteScope::shared_skeleton(), "ui")
+            .expect("session");
+
+        let mut client = McpClient::connect(&url, &handle.token.0).await;
+
+        let (waited, is_error) = client
+            .call("await_design", serde_json::json!({"wait_secs": wait_secs}))
+            .await;
+
+        assert!(!is_error, "{waited}");
+        assert_eq!(waited["finished"], finished, "{waited}");
+
+        if finished {
+            assert_eq!(waited["design"]["last_run"]["status"], "done", "{waited}");
+        }
+
+        server.shutdown().await;
+    }
 }
 
 /// The fanout hand-off an interactive agent depends on: its objective
