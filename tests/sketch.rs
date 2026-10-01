@@ -11,7 +11,7 @@ use conseqa::spec::Id;
 
 mod common;
 
-use common::sketches::shop_sketches;
+use common::sketches::{flash_checkout_sketches, shop_sketches, tenant_ledger_sketches};
 
 fn id(value: &str) -> Id {
     Id(value.to_string())
@@ -212,4 +212,137 @@ fn the_gate_compiles_a_sketch_when_it_is_written() {
             .sketch
             .is_some()
     );
+}
+
+/// The model of `fixture` with every program recompiled from its sketch,
+/// and the authors' transaction requirements declared on the compiled
+/// transactions.
+fn recompile_fixture(
+    fixture: &str,
+    sketches: Vec<(&'static str, serde_json::Value)>,
+) -> (conseqa::spec::Model, conseqa::spec::Model) {
+    let source = std::fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures")
+            .join(fixture),
+    )
+    .expect("fixture readable");
+
+    let authored = conseqa::parser::yaml::parse(&source).expect("fixture parses");
+    let mut model = authored.clone();
+
+    let workspace = WorkspaceState::from_model(&model, RunMetadata::new(RunId("sketch".into())));
+    let symbols = Symbols::of(&workspace);
+
+    assert_eq!(
+        sketches.len(),
+        model.operations.len(),
+        "{fixture}: every operation is sketched"
+    );
+
+    for (operation, sketch) in sketches {
+        let mut draft: DraftOperation = workspace.operations[&id(operation)].clone();
+
+        draft.sketch = Some(serde_json::from_value::<OperationSketch>(sketch).expect("parses"));
+
+        let mut program = sketch::compile(&id(operation), &draft, &symbols, &Settled::default())
+            .unwrap_or_else(|error| panic!("{fixture} {operation}: {error}"));
+
+        let name = operation.strip_prefix("operation.").expect("prefixed");
+
+        let declared = authored.operations[&id(operation)]
+            .program
+            .transactions()
+            .into_iter()
+            .map(|(_, transaction)| transaction.requirements.clone())
+            .fold(
+                conseqa::spec::TransactionRequirements::default(),
+                |mut all, one| {
+                    all.serializability.extend(one.serializability);
+                    all.ordering.extend(one.ordering);
+                    all
+                },
+            );
+
+        if let Some(main) = program.transaction_mut(&id(&format!("tx.{name}"))) {
+            main.requirements = declared;
+        } else {
+            assert!(
+                declared.serializability.is_empty() && declared.ordering.is_empty(),
+                "{fixture} {operation}: its transaction requirements need a transaction"
+            );
+        }
+
+        model
+            .operations
+            .get_mut(&id(operation))
+            .expect("declared")
+            .program = program;
+    }
+
+    (authored, model)
+}
+
+/// Proven obligations, by operation and family.
+fn proven(model: &conseqa::spec::Model) -> std::collections::BTreeMap<(String, String), usize> {
+    let report =
+        serde_json::to_value(conseqa::analyzer::verification::verify(model)).expect("serializes");
+
+    let mut proven = std::collections::BTreeMap::new();
+
+    for family in [
+        "transaction_serializability",
+        "transaction_ordering",
+        "idempotency",
+        "result_replay",
+        "recoverability",
+    ] {
+        for check in report[family].as_array().expect("checks") {
+            if check["verdict"]["kind"] == "proven" {
+                *proven
+                    .entry((
+                        check["operation"]
+                            .as_str()
+                            .expect("an operation")
+                            .to_string(),
+                        family.to_string(),
+                    ))
+                    .or_insert(0) += 1;
+            }
+        }
+    }
+
+    proven
+}
+
+/// The vocabulary's coverage: every program of `tenant_ledger` and
+/// `flash_checkout` — outbox admissions, relays, publications executed
+/// after commit, cursors, transition side effects, external calls with
+/// result matching, composite identities — compiles from a sketch,
+/// validates, and proves at least every obligation its authors' program
+/// proved.
+#[test]
+fn every_fixture_compiles_from_sketches_and_proves_what_its_authors_proved() {
+    for (fixture, sketches) in [
+        ("tenant_ledger.yaml", tenant_ledger_sketches()),
+        ("flash_checkout.yaml", flash_checkout_sketches()),
+        ("shop.yaml", shop_sketches()),
+    ] {
+        let (authored, compiled) = recompile_fixture(fixture, sketches);
+
+        let errors = conseqa::analyzer::validate(&compiled);
+
+        assert!(errors.is_empty(), "{fixture}: {errors:#?}");
+
+        let before = proven(&authored);
+        let after = proven(&compiled);
+
+        for (key, count) in &before {
+            assert!(
+                after.get(key).copied().unwrap_or(0) >= *count,
+                "{fixture}: {key:?} proved {count} as authored, {} compiled",
+                after.get(key).copied().unwrap_or(0)
+            );
+        }
+    }
 }

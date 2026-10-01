@@ -564,7 +564,9 @@ async fn from_sketch(
     let provisional = sketch::Settled {
         refusal: open.iter().find_map(|choice| match choice {
             sketch::Open::Refusal { errors, .. } => errors.first().cloned(),
+            sketch::Open::CursorRule { .. } => None,
         }),
+        cursor_rule: Some(crate::spec::CursorAdvanceRule::MonotonicAfter),
     };
 
     let program = match sketch::compile(operation, draft, &symbols, &provisional) {
@@ -578,7 +580,13 @@ async fn from_sketch(
         "program": in_words(&program),
         "errors": open.iter().flat_map(|choice| match choice {
             sketch::Open::Refusal { errors, .. } => errors.clone(),
+            sketch::Open::CursorRule { .. } => Vec::new(),
         }).collect::<Vec<_>>(),
+        "work": program
+            .transactions()
+            .into_iter()
+            .filter_map(|(_, transaction)| super::describe::summarize(transaction))
+            .collect::<Vec<_>>(),
     }))
     .tag("task", context.task.to_string())
     .tag("builder", "operation_synthesis")
@@ -590,26 +598,41 @@ async fn from_sketch(
     );
 
     for choice in &open {
-        let sketch::Open::Refusal { errors, .. } = choice;
+        match choice {
+            sketch::Open::Refusal { errors, .. } => {
+                let options: Vec<(String, String)> = errors
+                    .iter()
+                    .map(|class| (class.0.clone(), format!("The error `{class}`.")))
+                    .collect();
 
-        let options: Vec<(String, String)> = errors
-            .iter()
-            .map(|class| (class.0.clone(), format!("The error `{class}`.")))
-            .collect();
+                request = request.ask("refusal", wording::refusal(&options)).tag(
+                    format!("spec.{}", wording::REFUSAL.id),
+                    wording::REFUSAL.tag(),
+                );
+            }
 
-        request = request.ask("refusal", wording::refusal(&options)).tag(
-            format!("spec.{}", wording::REFUSAL.id),
-            wording::REFUSAL.tag(),
-        );
+            sketch::Open::CursorRule { .. } => {
+                use crate::system_one::questions::repair as preference;
+
+                request = request.ask("gap_free", preference::gap_free()).tag(
+                    format!("spec.{}", preference::GAP_FREE.id),
+                    preference::GAP_FREE.tag(),
+                );
+            }
+        }
     }
 
     let decision = match context.decider.decide(&request).await {
         Ok(decision) => Some(decision),
 
         // The sketch is its author's explicit statement and compiles
-        // deterministically: an unavailable decider blocks only a choice
+        // deterministically: an unavailable decider blocks only a refusal
         // the sketch left open.
-        Err(error) if !open.is_empty() => {
+        Err(error)
+            if open
+                .iter()
+                .any(|choice| matches!(choice, sketch::Open::Refusal { .. })) =>
+        {
             return Ok(abstain(format!("the decider gave no answer: {error}")));
         }
 
@@ -631,8 +654,32 @@ async fn from_sketch(
 
     let mut settled = sketch::Settled::default();
 
-    if !open.is_empty() {
-        let decision = decision.as_ref().expect("asked when a choice is open");
+    // A cursor rule is a preference between two shapes that both order
+    // what they admit: only a stated "none skipped" moves it off the
+    // permissive default, and an unsure answer reorders nothing.
+    if open
+        .iter()
+        .any(|choice| matches!(choice, sketch::Open::CursorRule { .. }))
+    {
+        let stated = decision
+            .as_ref()
+            .and_then(|decision| decision.noul("gap_free"))
+            .is_some_and(|probability| probability >= policy.act);
+
+        settled.cursor_rule = Some(if stated {
+            crate::spec::CursorAdvanceRule::Successor
+        } else {
+            crate::spec::CursorAdvanceRule::MonotonicAfter
+        });
+    }
+
+    if open
+        .iter()
+        .any(|choice| matches!(choice, sketch::Open::Refusal { .. }))
+    {
+        let Some(decision) = decision.as_ref() else {
+            return Ok(abstain("the decider gave no answer for an open refusal"));
+        };
 
         let Some((choice, probabilities)) = decision.choice("refusal") else {
             return Ok(abstain("`refusal` went unanswered"));

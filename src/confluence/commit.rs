@@ -1015,7 +1015,10 @@ fn check_sketch(
         operation,
         draft,
         &symbols,
-        &super::sketch::Settled { refusal },
+        &super::sketch::Settled {
+            refusal,
+            cursor_rule: Some(crate::spec::CursorAdvanceRule::MonotonicAfter),
+        },
     ) {
         diagnostics.push(DraftDiagnostic::new(
             Some(SymbolKey::OperationInterface(operation.clone())),

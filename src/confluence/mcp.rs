@@ -80,8 +80,8 @@ schemas, data models (outboxes included), topics, state machines, and \
 one interface per planned operation (its id, service, inputs, and \
 request, subscription, or outbox contracts). Give every interface a \
 `sketch` — the operation's business actions as typed steps (find, \
-update, create, transition; see dsl_reference) — whenever its work \
-fits that vocabulary: a sketched program is compiled in code during \
+update, create, transition, advance, enqueue, publish, call; see \
+dsl_reference) — whenever its work fits that vocabulary: a sketched program is compiled in code during \
 the fanout, in seconds, where an unsketched one costs a worker \
 session of minutes. Many small typed patches are normal. The \
 commit gate rejects a structurally broken patch with precise \
@@ -1929,15 +1929,35 @@ PATCH — {"mutations": [<mutation>, ...]}; each mutation {"kind": K, ...}:
        transition {record: <a find's as>, transition: <transition id>,
                    otherwise: <declared error a wrong-state record returns>,
                    already_ok: true when repeating a completed transition
-                   returns ok}.
+                   returns ok, effects_from: [values] for the transition's
+                   declared side effects — the trigger's fields if omitted};
+       advance    {record, field, to: <position value>,
+                   rule: "successor" (every position, none skipped) |
+                   "monotonic_after" (any later one) — omit to let the
+                   prompt decide};
+       enqueue    {outbox, schema, from} — admitted with the commit;
+       publish    {topic, schema, from} — after the commit when the
+                  operation changes records, directly otherwise;
+       call       {name, as, identity: [values] | omitted,
+                   duplicates: unspecified | distinguishable |
+                   identical_per_identity | side_effect_free,
+                   result_replay: unspecified | unstable | replay_stable,
+                   result: {ok: <schema>, errors: {class: <schema>}},
+                   from, on_ok: [steps], on_error: {class: [steps]}} — an
+                  outside service, in an operation that changes no record;
+                  its answer's arms may publish or call.
+     A sketch may also give "returns": [values] when the result's fields
+     are not found by name in the input and the records.
      Values are "input.<field>" or "<find's as>.<field>". All records
      must belong to one data model; at most one transition per sketch;
-     the operation has exactly one input (a request, or a subscription
-     consuming one schema). The gate compiles the sketch when you write
-     it and rejects one that does not compile, saying why. Compiled
-     programs carry the version protocol, keyed commits from the
-     request's identity, and the inspect-then-decide shape a guarded
-     transition needs; requirements are added after, by discovery.)
+     the operation has exactly one input (a request, a subscription
+     consuming one schema, or an outbox consumer). The gate compiles the
+     sketch when you write it and rejects one that does not compile,
+     saying why. Compiled programs carry the version protocol (strict
+     locks for unversioned records), keyed commits from the trigger's
+     identity, its propagation into every message's identity, and the
+     inspect-then-decide shape a guarded transition needs; requirements
+     are added after, by discovery.)
   {"kind":"replace_operation_program","operation":"operation.x","program":{"steps":[...]}}
   {"kind":"replace_operation_requirements","operation":"operation.x","requirements":{...}}
     (operation requirements are idempotency and recoverability only;
