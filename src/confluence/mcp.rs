@@ -81,7 +81,8 @@ one interface per planned operation (its id, service, inputs, and \
 request, subscription, or outbox contracts). Give every interface a \
 `sketch` — the operation's business actions as typed steps (find, \
 update, create, delete, transition, advance, fence, enqueue, publish, \
-call, request, when, reject, parallel, race, start; see dsl_reference) — whenever its work fits that vocabulary: a sketched program is compiled in code during \
+call, request, when, reject, parallel, answer, race, start; see \
+dsl_reference) — whenever its work fits that vocabulary: a sketched program is compiled in code during \
 the fanout, in seconds, where an unsketched one costs a worker \
 session of minutes. Many small typed patches are normal. The \
 commit gate rejects a structurally broken patch with precise \
@@ -1920,66 +1921,71 @@ PATCH — {"mutations": [<mutation>, ...]}; each mutation {"kind": K, ...}:
               {"kind":"create","record":"object.payment",
                "from":["input.request_id","input.order_id","input.amount"]}]}}}
     (sketch — optional, and the fastest way to get a program: what the
-     operation does as typed business actions, in order. It is compiled
-     into the program in code, with no worker session. Steps:
-       find       {as, record, by: {record_field: value}} — one instance,
-                  by every identity field of the record;
-       update     {record: <a find's as>, set: [fields], from: [values]};
-       create     {record: <data object>, from: [values]};
-       transition {record: <a find's as>, transition: <transition id>,
-                   otherwise: <declared error a wrong-state record returns>,
-                   already_ok: true when repeating a completed transition
-                   returns ok, effects_from: [values] for the transition's
-                   declared side effects — the trigger's fields if omitted};
-       advance    {record, field, to: <position value>,
-                   rule: "successor" (every position, none skipped) |
-                   "monotonic_after" (any later one) — omit to let the
-                   prompt decide};
-       enqueue    {outbox, schema, from} — admitted with the commit;
-       publish    {topic, schema, from} — after the commit when the
-                  operation changes records, directly otherwise;
-       call       {name, as, identity: [values] | omitted,
-                   duplicates: unspecified | distinguishable |
-                   identical_per_identity | side_effect_free,
-                   result_replay: unspecified | unstable | replay_stable,
-                   result: {ok: <schema>, errors: {class: <schema>}},
-                   from, on_ok: [steps], on_error: {class: [steps]}} — an
-                  outside service; result errors are a schema, or
-                  {schema, disposition: terminal | retryable};
-       request    {operation, input (when it has several), as,
-                   retry: unspecified | never | may_repeat, from,
-                   on_ok, on_error} — another operation's request input;
+     operation does as typed business actions, in order, compiled into
+     the program in code with no worker session. Every construct of the
+     program language is reachable from a sketch. Steps:
+       find       {as, record, by: {field: value-or-literal}, all: true to
+                   select every match instead of one instance by its whole
+                   identity, lock: "shared"|"exclusive", lock_order:
+                   [{field, direction: "ascending"|"descending"}],
+                   isolation: <this transaction's>};
+       update     {record: <a find's as>, set: [fields], from: values};
+       create     {record: <data object>, from: values, isolation};
        delete     {record: <a find's as>};
-       fence      {record, field, token};
-       when       {if: <condition>, then: [steps], otherwise: [steps]} —
-                  conditions: {"equals": [value, value-or-literal]},
-                  {"present": value}, {"not": c}, {"all": [c]},
-                  {"any": [c]}; literals are strings (a state id, say),
-                  integers or booleans;
+       transition {record, transition, otherwise: <declared error>,
+                   already_ok: true, effects_from: [values] for its
+                   declared side effects and outbox writes};
+       advance    {record, field, to, rule: "successor"|"monotonic_after"
+                   (omit to let the prompt decide), otherwise};
+       fence      {record, field, token, otherwise};
+       enqueue    {outbox, schema, from, key};
+       publish    {topic, schema, from, key, durable, detached} — after
+                  the commit when records change first, directly
+                  otherwise; durable arranges it in a transaction anyway;
+                  detached does not wait for it;
+       call       {name, as, identity: [values], duplicates: unspecified |
+                   distinguishable | identical_per_identity |
+                   side_effect_free, result_replay: unspecified | unstable
+                   | replay_stable, result: {ok: <schema>, errors: {class:
+                   <schema> | {schema, disposition: terminal|retryable}}},
+                   from, on_ok, on_error, durable, detached};
+       request    {operation, input, as, retry: unspecified | never |
+                   may_repeat, from, key, on_ok, on_error, durable,
+                   detached} — another operation's request input;
+       when       {if, then, otherwise} — if: {"equals": [value,
+                  value-or-literal]}, {"present": value}, {"not": c},
+                  {"all": [c]}, {"any": [c]}, {"unspecified": "<a rule the
+                  model states no fact about, in words>"};
        reject     {error, from} — end a request with a declared error;
-       parallel   {steps: [publish|call|request]} — start all, wait all;
-       race       {steps, as, on_ok, on_error} — start all, act on the
-                  first answer;
+       parallel   {steps} — start all, wait for all; a member's `as` binds
+                  its answer for an `answer` step;
+       answer     {of: <a parallel member's as>, on_ok, on_error};
+       race       {steps, as, on_ok, on_error} — act on the first answer;
        start      {step} — start an effect and never wait for it.
-     A sketch may also give "returns": [values] when the result's fields
-     are not found by name in the input and the records.
-     Values are "input.<field>", "<find's as>.<field>", or "<as>.<field>"
-     of an answer inside its arms — or after it: when later steps use an
-     answer they run in its ok arm, and each error arm must end the
-     operation (reject, or the error of the same name). Consecutive
-     record steps on one data model are one transaction; a step on
-     another data model, an effect or a when starts the next, and records
-     found earlier are carried into later steps through the transaction's
-     output — change a record only in the transaction that found it
-     (find it again otherwise). The operation has exactly one input (a
-     request, a subscription consuming one schema, or an outbox
-     consumer). The gate compiles the
-     sketch when you write it and rejects one that does not compile,
-     saying why. Compiled programs carry the version protocol (strict
-     locks for unversioned records), keyed commits from the trigger's
-     identity, its propagation into every message's identity, and the
-     inspect-then-decide shape a guarded transition needs; requirements
-     are added after, by discovery.)
+     Values ("from") are a list of references, or a map {target field:
+     reference} whose fields are checked against the target's schema (an
+     update's `set` may then be omitted). References are "input.<field>",
+     "<input id>.<field>" when the operation has several inputs,
+     "<find's as>.<field>", or "<as>.<field>" of an answer — inside its
+     arms, or after it, in which case later steps run in its ok arm and
+     each error arm must end the operation. Literals are strings,
+     integers or booleans. Sketch-level: "returns": [values] for the ok
+     result; "returns_for": <request input> when there are several;
+     "isolation" for every transaction (each defaults to read_committed;
+     repair strengthens where a proof needs it); "commit_key": [values],
+     or [] for no deduplication (the trigger's identity by default);
+     "on_rejected": [steps] a refused transaction runs instead of
+     completing (a request's must reject).
+     Consecutive record steps on one data model are one transaction; a
+     step on another, an effect or a when starts the next; a durable
+     effect with no record before it gets a transaction of its own.
+     Records found earlier are carried forward through the transaction's
+     output — change one only in the transaction that found it. The gate
+     compiles the sketch when you write it and rejects one that does not
+     compile, saying why. Compiled programs carry the version protocol or
+     strict locks, keyed commits, key propagation into messages and
+     requests, and the inspect-then-decide shape a guarded transition
+     needs; requirements are added after, by discovery.)
   {"kind":"replace_operation_program","operation":"operation.x","program":{"steps":[...]}}
   {"kind":"replace_operation_requirements","operation":"operation.x","requirements":{...}}
     (operation requirements are idempotency and recoverability only;

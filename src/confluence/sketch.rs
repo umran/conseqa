@@ -50,6 +50,27 @@ pub struct OperationSketch {
     /// simply found by name in the input and the records.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub returns: Option<Vec<String>>,
+
+    /// The isolation every transaction declares; `read_committed` when
+    /// omitted, and repair strengthens it where a proof needs it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub isolation: Option<TransactionIsolation>,
+
+    /// The values every transaction's commit is deduplicated by; the
+    /// trigger's identity when omitted, and `[]` for no deduplication.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit_key: Option<Vec<String>>,
+
+    /// With several request inputs, the one the program's result is for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub returns_for: Option<Id>,
+
+    /// What a transaction refused by its guards — a version conflict, a
+    /// stale position or token, a transition from the wrong state with
+    /// no `otherwise` — does instead of completing: steps that end the
+    /// operation (a request's must reject).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub on_rejected: Vec<SketchStep>,
 }
 
 /// One business action.
@@ -62,21 +83,52 @@ pub enum SketchStep {
         #[serde(rename = "as")]
         alias: String,
         record: Id,
-        /// Record field → value reference, e.g. `product_id:
-        /// input.product_id`. Together they must pin one instance.
-        by: BTreeMap<String, String>,
+        /// Record field → value reference or literal, e.g. `product_id:
+        /// input.product_id`. Together they must pin one instance,
+        /// unless `all` is said.
+        #[serde(default)]
+        by: BTreeMap<String, serde_json::Value>,
+
+        /// Select every instance `by` matches (all of them when `by` is
+        /// empty), not one.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        all: bool,
+
+        /// Hold the selection under a lock from before it is read:
+        /// `shared` or `exclusive`. A record that changes is held
+        /// exclusively, or version-guarded, whether or not this is said.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        lock: Option<LockMode>,
+
+        /// The order in which a multi-instance lock is acquired.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        lock_order: Vec<LockOrderTerm>,
+
+        /// The isolation of the transaction this step belongs to.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        isolation: Option<TransactionIsolation>,
     },
 
     /// Give fields of a found record new values, derived from `from`.
     Update {
         record: String,
+        /// The fields that change; the map form of `from` names them
+        /// itself, and `set` may then be omitted.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
         set: Vec<String>,
         #[serde(default)]
-        from: Vec<String>,
+        from: Values,
     },
 
     /// Create one instance of `record` from `from`.
-    Create { record: Id, from: Vec<String> },
+    Create {
+        record: Id,
+        from: Values,
+
+        /// The isolation of the transaction this step belongs to.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        isolation: Option<TransactionIsolation>,
+    },
 
     /// Apply a lifecycle transition to a found record.
     Transition {
@@ -112,6 +164,10 @@ pub enum SketchStep {
         /// omitted, for the prompt to settle.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         rule: Option<CursorAdvanceRule>,
+
+        /// The declared error a request returns for a stale position.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        otherwise: Option<Id>,
     },
 
     /// Admit a message to a transactional outbox, atomically with the
@@ -119,7 +175,12 @@ pub enum SketchStep {
     Enqueue {
         outbox: Id,
         schema: Id,
-        from: Vec<String>,
+        from: Values,
+
+        /// The values carried into the message's (or request's) own
+        /// identity; the trigger's identity when omitted.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        key: Option<Vec<String>>,
     },
 
     /// Publish a message to a topic: after the commit when the
@@ -127,7 +188,21 @@ pub enum SketchStep {
     Publish {
         topic: Id,
         schema: Id,
-        from: Vec<String>,
+        from: Values,
+
+        /// Start it without waiting for it to complete.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        detached: bool,
+
+        /// Arrange it durably in a transaction and make it once that
+        /// commits — implied when the operation changes records first.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        durable: bool,
+
+        /// The values carried into the message's (or request's) own
+        /// identity; the trigger's identity when omitted.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        key: Option<Vec<String>>,
     },
 
     /// Call an outside service, and act on what it answers.
@@ -155,7 +230,7 @@ pub enum SketchStep {
         result: Option<CallResult>,
 
         #[serde(default)]
-        from: Vec<String>,
+        from: Values,
 
         /// Steps on an `ok` answer.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -164,6 +239,15 @@ pub enum SketchStep {
         /// Steps on each declared error.
         #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
         on_error: BTreeMap<Id, Vec<SketchStep>>,
+
+        /// Arrange the call durably in the transaction before it, and
+        /// make it once that commits.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        durable: bool,
+
+        /// Start it without waiting for it to complete.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        detached: bool,
     },
 
     /// Delete a found record.
@@ -174,6 +258,10 @@ pub enum SketchStep {
         record: String,
         field: String,
         token: String,
+
+        /// The declared error a request returns for a stale token.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        otherwise: Option<Id>,
     },
 
     /// Invoke another operation's request input, and act on its answer.
@@ -192,7 +280,32 @@ pub enum SketchStep {
         retry: crate::spec::RetrySemantics,
 
         #[serde(default)]
-        from: Vec<String>,
+        from: Values,
+
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        on_ok: Vec<SketchStep>,
+
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        on_error: BTreeMap<Id, Vec<SketchStep>>,
+
+        /// Arrange the request durably in the transaction before it, and
+        /// make it once that commits.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        durable: bool,
+
+        /// Start it without waiting for it to complete.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        detached: bool,
+
+        /// The values carried into the message's (or request's) own
+        /// identity; the trigger's identity when omitted.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        key: Option<Vec<String>>,
+    },
+
+    /// Act on the answer a `parallel` member bound with its `as`.
+    Answer {
+        of: String,
 
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         on_ok: Vec<SketchStep>,
@@ -216,7 +329,7 @@ pub enum SketchStep {
     Reject {
         error: Id,
         #[serde(default)]
-        from: Vec<String>,
+        from: Values,
     },
 
     /// Start every effect at once and wait for all of them.
@@ -256,6 +369,18 @@ pub enum SketchCondition {
     Not(Box<SketchCondition>),
     All(Vec<SketchCondition>),
     Any(Vec<SketchCondition>),
+
+    /// A decision the model states no fact about — a business rule the
+    /// DSL cannot express — described in words for its readers.
+    Unspecified(String),
+}
+
+/// One term of a lock acquisition order.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LockOrderTerm {
+    pub field: String,
+    pub direction: crate::spec::OrderingDirection,
 }
 
 fn unspecified_duplicates() -> ExternalIdempotency {
@@ -302,6 +427,61 @@ impl CallError {
                 disposition: *disposition,
             },
         }
+    }
+}
+
+/// The values a step derives from: a list of value references, or —
+/// to say which target field each feeds — a map from target field to
+/// value reference, whose fields are checked against the target's
+/// schema. Both compile to the same provenance: the DSL records which
+/// values a write derives from, not a per-field mapping.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum Values {
+    List(Vec<String>),
+    Fields(BTreeMap<String, String>),
+}
+
+impl Default for Values {
+    fn default() -> Self {
+        Self::List(Vec::new())
+    }
+}
+
+impl Values {
+    pub fn refs(&self) -> Vec<String> {
+        match self {
+            Self::List(values) => values.clone(),
+            Self::Fields(fields) => fields.values().cloned().collect(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        match self {
+            Self::List(values) => values.is_empty(),
+            Self::Fields(fields) => fields.is_empty(),
+        }
+    }
+
+    /// The target fields named, when the map form is used.
+    pub fn fields(&self) -> Option<BTreeSet<String>> {
+        match self {
+            Self::List(_) => None,
+            Self::Fields(fields) => Some(fields.keys().cloned().collect()),
+        }
+    }
+
+    /// Fails when the map form names a field `target` lacks.
+    fn check(&self, target: &BTreeSet<String>, what: &str) -> Result<(), CompileError> {
+        if let Some(fields) = self.fields() {
+            for field in fields {
+                if !target.contains(&field) {
+                    return fail(format!("{what} has no field `{field}`"));
+                }
+            }
+        }
+
+        Ok(())
     }
 }
 
@@ -443,6 +623,13 @@ struct Context<'a> {
 
     /// The trigger's identity: the request's, or the message's.
     key: Option<IdempotencyKey>,
+
+    /// Every input, with the fields it carries.
+    inputs: BTreeMap<Id, BTreeSet<String>>,
+
+    /// Whether the operation has one input, so `input.<field>` is
+    /// unambiguous.
+    single: bool,
 }
 
 /// A record found by a `find` step.
@@ -457,6 +644,9 @@ struct Found {
     /// Whether its selector rests only on the input: what an inspection
     /// before the main transaction can select.
     input_only: bool,
+
+    /// Whether it is one instance, pinned by its identity, or a set.
+    single: bool,
 
     /// Whether the transaction that found it is still being built.
     open: bool,
@@ -503,6 +693,12 @@ pub fn open_choices(
                     on_ok, on_error, ..
                 }
                 | SketchStep::Request {
+                    on_ok, on_error, ..
+                }
+                | SketchStep::Race {
+                    on_ok, on_error, ..
+                }
+                | SketchStep::Answer {
                     on_ok, on_error, ..
                 } => {
                     visit(on_ok, context, open);
@@ -579,7 +775,7 @@ struct Compiler<'a> {
 
     /// Intents established inside the transaction, executed after it
     /// commits, in order.
-    after_commit: Vec<Id>,
+    after_commit: Vec<(Id, bool)>,
 
     effects: usize,
 
@@ -603,6 +799,18 @@ struct Compiler<'a> {
     /// The `ok` result's output, when the last transaction established
     /// it.
     final_output: Option<Id>,
+
+    /// Answers a `parallel` bound: `as` → binding, error classes.
+    joined: BTreeMap<String, (Id, Vec<Id>)>,
+
+    /// What a rejected transaction does, from the sketch.
+    on_rejected: Vec<SketchStep>,
+
+    /// A step's own propagation key, while the step is compiled.
+    key_override: Option<IdempotencyKey>,
+
+    /// The isolation a step declared for the open transaction.
+    segment_isolation: Option<TransactionIsolation>,
 }
 
 impl Compiler<'_> {
@@ -622,6 +830,13 @@ impl Compiler<'_> {
         resolve(&self.context, &self.found, &self.results, reference)
     }
 
+    /// `from`, checked against `schema` when it names target fields.
+    fn checked(&self, from: &Values, schema: &Id) -> Result<Derivation, CompileError> {
+        from.check(&self.symbols.fields(schema), &format!("`{schema}`"))?;
+
+        self.derivation(&from.refs())
+    }
+
     fn derivation(&self, from: &[String]) -> Result<Derivation, CompileError> {
         derivation(&self.context, &self.found, &self.results, from)
     }
@@ -634,7 +849,9 @@ impl Compiler<'_> {
         identity: &MessageIdentity,
         schema: &Id,
     ) -> Vec<IdempotencyKeyPropagation> {
-        let (Some(key), MessageIdentity::Keyed(target)) = (&self.context.key, identity) else {
+        let source = self.key_override.as_ref().or(self.context.key.as_ref());
+
+        let (Some(key), MessageIdentity::Keyed(target)) = (source, identity) else {
             return Vec::new();
         };
 
@@ -690,8 +907,26 @@ impl Compiler<'_> {
 
     /// A transactional step, into the transaction body.
     fn record_step(&mut self, step: &SketchStep) -> Result<(), CompileError> {
+        self.key_override = match step {
+            SketchStep::Enqueue { key, .. }
+            | SketchStep::Publish { key, .. }
+            | SketchStep::Request { key, .. } => self.key_of(key)?,
+            _ => None,
+        };
+
         match step {
-            SketchStep::Find { alias, record, by } => self.find(alias, record, by),
+            SketchStep::Find {
+                alias,
+                record,
+                by,
+                all,
+                lock,
+                lock_order,
+                isolation,
+            } => {
+                self.declare_isolation(*isolation)?;
+                self.find(alias, record, by, *all, *lock, lock_order)
+            }
 
             SketchStep::Update { record, set, from } => {
                 let Some(target) = self.found.get(record) else {
@@ -699,6 +934,15 @@ impl Compiler<'_> {
                         "update names `{record}`, which no find before it names"
                     ));
                 };
+
+                from.check(&target.fields, &format!("`{}`", target.record))?;
+
+                let set: Vec<String> = match (set.is_empty(), from.fields()) {
+                    (true, Some(fields)) => fields.into_iter().collect(),
+                    _ => set.clone(),
+                };
+
+                let set = &set;
 
                 if set.is_empty() {
                     return fail(format!("update of `{record}` sets no field"));
@@ -725,7 +969,7 @@ impl Compiler<'_> {
                 }
 
                 let selector = target.selector.clone();
-                let values = self.derivation(from)?;
+                let values = self.derivation(&from.refs())?;
 
                 self.steps.push(TransactionStep::Write(Write {
                     target: selector,
@@ -741,14 +985,22 @@ impl Compiler<'_> {
                 Ok(())
             }
 
-            SketchStep::Create { record, from } => {
+            SketchStep::Create {
+                record,
+                from,
+                isolation,
+            } => {
+                self.declare_isolation(*isolation)?;
+
                 let Some((data_model, data)) = self.symbols.objects.get(record) else {
                     return fail(format!("`{record}` is not a declared data object"));
                 };
 
                 let (data_model, data) = (data_model.clone(), data.clone());
 
-                let values = self.derivation(from)?;
+                from.check(&self.symbols.fields(&data.schema), &format!("`{record}`"))?;
+
+                let values = self.derivation(&from.refs())?;
 
                 let Derivation::Deterministic { from: roots } = &values else {
                     return fail(format!("create `{record}` derives its values from nothing"));
@@ -779,7 +1031,10 @@ impl Compiler<'_> {
                 field,
                 to,
                 rule,
+                otherwise,
             } => {
+                self.refusal(otherwise)?;
+
                 let Some(target) = self.found.get(record) else {
                     return fail(format!(
                         "advance names `{record}`, which no find before it names"
@@ -817,7 +1072,10 @@ impl Compiler<'_> {
                 outbox,
                 schema,
                 from,
+                key,
             } => {
+                let _ = key;
+
                 let Some((data_model, declared)) = self.symbols.outboxes.get(outbox) else {
                     return fail(format!("`{outbox}` is not a declared outbox"));
                 };
@@ -830,7 +1088,7 @@ impl Compiler<'_> {
                     (data_model.clone(), declared.message_identity.clone());
 
                 let (effect, _) = self.effect_ids("enqueue");
-                let values = self.derivation(from)?;
+                let values = self.checked(from, schema)?;
 
                 self.data_models.insert(data_model);
 
@@ -855,9 +1113,11 @@ impl Compiler<'_> {
                 topic,
                 schema,
                 from,
+                detached,
+                ..
             } => {
                 let (effect, intent, publication) = self.publication(topic, schema)?;
-                let values = self.derivation(from)?;
+                let values = self.checked(from, schema)?;
 
                 self.steps.push(TransactionStep::EstablishEffectIntent(
                     EstablishEffectIntent {
@@ -868,7 +1128,7 @@ impl Compiler<'_> {
                     },
                 ));
 
-                self.after_commit.push(intent);
+                self.after_commit.push((intent, *detached));
 
                 Ok(())
             }
@@ -905,7 +1165,10 @@ impl Compiler<'_> {
                 record,
                 field,
                 token,
+                otherwise,
             } => {
+                self.refusal(otherwise)?;
+
                 let Some(target) = self.found.get(record) else {
                     return fail(format!(
                         "fence names `{record}`, which no find before it names"
@@ -941,7 +1204,10 @@ impl Compiler<'_> {
         &mut self,
         alias: &str,
         record: &Id,
-        by: &BTreeMap<String, String>,
+        by: &BTreeMap<String, serde_json::Value>,
+        all: bool,
+        lock: Option<LockMode>,
+        lock_order: &[LockOrderTerm],
     ) -> Result<(), CompileError> {
         if self.found.contains_key(alias) || alias == "input" {
             return fail(format!(
@@ -955,8 +1221,11 @@ impl Compiler<'_> {
 
         let fields = self.symbols.fields(&data.schema);
 
-        if by.is_empty() {
-            return fail(format!("find `{alias}` gives no field to find it by"));
+        if by.is_empty() && !all {
+            return fail(format!(
+                "find `{alias}` gives no field to find it by; say `all` to select every \
+                 instance"
+            ));
         }
 
         let mut predicates = Vec::new();
@@ -967,13 +1236,15 @@ impl Compiler<'_> {
                 return fail(format!("`{record}` has no field `{field}` to find it by"));
             }
 
-            let value = self.resolve(value)?;
+            let value = self.operand(value)?;
 
-            input_only &= matches!(value.source, ValueSource::Input(_));
+            if let SelectorValue::Value(value) = &value {
+                input_only &= matches!(value.source, ValueSource::Input(_));
+            }
 
             predicates.push(SelectorPredicate::Eq {
                 field: FieldPath(vec![field.clone()]),
-                value: SelectorValue::Value(value),
+                value,
             });
         }
 
@@ -983,9 +1254,12 @@ impl Compiler<'_> {
             .filter_map(|path| path.0.last())
             .collect();
 
-        if !identity.iter().all(|field| by.contains_key(*field)) {
+        let single = identity.iter().all(|field| by.contains_key(*field));
+
+        if !single && !all {
             return fail(format!(
-                "find `{alias}` must give every identity field of `{record}`: {}",
+                "find `{alias}` must give every identity field of `{record}` ({}), or say `all` \
+                 to select every instance that matches",
                 identity
                     .iter()
                     .map(|field| format!("`{field}`"))
@@ -996,6 +1270,7 @@ impl Compiler<'_> {
 
         let predicate = match <[_; 1]>::try_from(predicates) {
             Ok([only]) => only,
+            Err(many) if many.is_empty() => SelectorPredicate::All,
             Err(many) => SelectorPredicate::And { predicates: many },
         };
 
@@ -1003,6 +1278,39 @@ impl Compiler<'_> {
             object: record.clone(),
             predicate,
         };
+
+        for term in lock_order {
+            if !fields.contains(&term.field) {
+                return fail(format!(
+                    "`{record}` has no field `{}` to order locks by",
+                    term.field
+                ));
+            }
+        }
+
+        if let Some(mode) = lock {
+            self.steps.push(TransactionStep::Lock(Lock {
+                target: selector.clone(),
+                mode,
+                order: if lock_order.is_empty() {
+                    LockOrder::Unspecified
+                } else {
+                    LockOrder::By(
+                        lock_order
+                            .iter()
+                            .map(|term| crate::spec::OrderingTerm {
+                                field: FieldPath(vec![term.field.clone()]),
+                                direction: term.direction,
+                            })
+                            .collect(),
+                    )
+                },
+            }));
+        } else if !lock_order.is_empty() {
+            return fail(format!(
+                "find `{alias}` orders locks but takes none: add a `lock`"
+            ));
+        }
 
         let read = Id(format!("read.{}.{alias}", self.context.name));
 
@@ -1014,7 +1322,9 @@ impl Compiler<'_> {
             fields: FieldSelection::All,
         }));
 
-        if let Some(version) = &data.version {
+        // A version guard identifies one instance (§20): a set is
+        // protected by a lock instead.
+        if single && let Some(version) = &data.version {
             self.steps
                 .push(TransactionStep::ValidateVersion(ValidateVersion {
                     target: selector.clone(),
@@ -1035,12 +1345,32 @@ impl Compiler<'_> {
                 selector,
                 read,
                 input_only,
+                single,
                 open: true,
                 exported: None,
             },
         );
 
         Ok(())
+    }
+
+    /// A value reference, or a literal: a string that names no value in
+    /// scope, an integer, or a boolean.
+    fn operand(&self, value: &serde_json::Value) -> Result<SelectorValue, CompileError> {
+        Ok(match value {
+            serde_json::Value::String(text) if self.is_reference(text) => {
+                SelectorValue::Value(self.resolve(text)?)
+            }
+            serde_json::Value::String(text) => {
+                SelectorValue::Literal(Literal::String(text.clone()))
+            }
+            serde_json::Value::Bool(flag) => SelectorValue::Literal(Literal::Bool(*flag)),
+            serde_json::Value::Number(number) => match number.as_i64() {
+                Some(number) => SelectorValue::Literal(Literal::Int(number)),
+                None => return fail("literals are strings, integers or booleans"),
+            },
+            _ => return fail("a value is a reference, a string, an integer or a boolean"),
+        })
     }
 
     fn transition(
@@ -1125,7 +1455,7 @@ impl Compiler<'_> {
                 },
             );
 
-            self.after_commit.push(intent);
+            self.after_commit.push((intent, false));
         }
 
         // Every declared side effect is a publication or a request: the
@@ -1177,18 +1507,26 @@ impl Compiler<'_> {
 
     /// An effect step outside any transaction.
     fn effect_step(&mut self, step: &SketchStep) -> Result<Vec<OperationStep>, CompileError> {
+        self.key_override = match step {
+            SketchStep::Enqueue { key, .. }
+            | SketchStep::Publish { key, .. }
+            | SketchStep::Request { key, .. } => self.key_of(key)?,
+            _ => None,
+        };
+
         match step {
             SketchStep::Publish {
                 topic,
                 schema,
                 from,
+                ..
             } => {
                 let (effect, _, publication) = self.publication(topic, schema)?;
 
                 Ok(vec![OperationStep::ExecuteEffect(ExecuteEffect {
                     effect_id: effect,
                     effect: Effect::Publication(publication),
-                    values: self.derivation(from)?,
+                    values: self.checked(from, schema)?,
                     bind: None,
                 })])
             }
@@ -1203,6 +1541,7 @@ impl Compiler<'_> {
                 from,
                 on_ok,
                 on_error,
+                ..
             } => {
                 let (effect, _) = self.effect_ids("call");
 
@@ -1253,7 +1592,7 @@ impl Compiler<'_> {
                     ))
                 });
 
-                let values = self.derivation(from)?;
+                let values = self.derivation(&from.refs())?;
 
                 let mut steps = vec![OperationStep::ExecuteEffect(ExecuteEffect {
                     effect_id: effect,
@@ -1330,6 +1669,67 @@ pub fn compile(
     symbols: &Symbols,
     settled: &Settled,
 ) -> Result<OperationBlock, CompileError> {
+    let mut program = compile_inner(operation, draft, symbols, settled)?;
+
+    let sketch = sketch_of(operation, draft)?;
+    let context = context(operation, draft, symbols)?;
+
+    // Declarations the sketch makes for every transaction.
+    let commit = match &sketch.commit_key {
+        None => None,
+        Some(values) if values.is_empty() => Some(IdempotencyGuarantee::NotDeduplicated),
+        Some(values) => Some(IdempotencyGuarantee::DeduplicatedBy {
+            key: IdempotencyKey {
+                components: values
+                    .iter()
+                    .map(|value| {
+                        let reference =
+                            resolve(&context, &BTreeMap::new(), &BTreeMap::new(), value)?;
+
+                        if !matches!(reference.source, ValueSource::Input(_)) {
+                            return fail(format!(
+                                "the commit key `{value}` is not a field of the input"
+                            ));
+                        }
+
+                        Ok(reference)
+                    })
+                    .collect::<Result<_, CompileError>>()?,
+            },
+        }),
+    };
+
+    let ids: Vec<Id> = program
+        .transactions()
+        .into_iter()
+        .map(|(_, transaction)| transaction.id.clone())
+        .collect();
+
+    for id in ids {
+        let transaction = program.transaction_mut(&id).expect("listed");
+
+        // The sketch's isolation is every transaction's default; a step
+        // that declared its own transaction's keeps it.
+        if let Some(isolation) = sketch.isolation
+            && transaction.isolation == TransactionIsolation::ReadCommitted
+        {
+            transaction.isolation = isolation;
+        }
+
+        if let Some(commit) = &commit {
+            transaction.idempotency = commit.clone();
+        }
+    }
+
+    Ok(program)
+}
+
+fn compile_inner(
+    operation: &Id,
+    draft: &super::DraftOperation,
+    symbols: &Symbols,
+    settled: &Settled,
+) -> Result<OperationBlock, CompileError> {
     let context = context(operation, draft, symbols)?;
     let sketch = sketch_of(operation, draft)?;
 
@@ -1352,6 +1752,10 @@ pub fn compile(
         refusals: Vec::new(),
         results: BTreeMap::new(),
         final_output: None,
+        joined: BTreeMap::new(),
+        on_rejected: Vec::new(),
+        key_override: None,
+        segment_isolation: None,
     };
 
     if !is_simple(sketch, symbols) {
@@ -1419,7 +1823,9 @@ impl Compiler<'_> {
         let mut main = Transaction {
             id: Id(format!("tx.{}", context.name)),
             data_model: Some(data_model),
-            isolation: TransactionIsolation::ReadCommitted,
+            isolation: self
+                .segment_isolation
+                .unwrap_or(TransactionIsolation::ReadCommitted),
             idempotency: match &context.key {
                 Some(key) => IdempotencyGuarantee::DeduplicatedBy { key: key.clone() },
                 None => IdempotencyGuarantee::Unspecified,
@@ -1435,13 +1841,9 @@ impl Compiler<'_> {
         // What runs after the commit: the intents established in it.
         let mut success: Vec<OperationStep> = self
             .after_commit
-            .iter()
-            .map(|intent| {
-                OperationStep::ExecuteEffectIntent(ExecuteEffectIntent {
-                    intent: intent.clone(),
-                    bind: None,
-                })
-            })
+            .clone()
+            .into_iter()
+            .map(|(intent, detached)| execute_intent(intent, detached))
             .collect();
 
         success.push(finish(context, output.as_ref().map(|(bind, _, _)| bind)));
@@ -1452,6 +1854,7 @@ impl Compiler<'_> {
             && context.request
             && let Some(key) = &context.key
             && self.found[alias].input_only
+            && self.found[alias].single
         {
             let target = &self.found[alias];
             let state = state_field(self.symbols, machine)?;
@@ -1623,24 +2026,66 @@ impl Compiler<'_> {
     }
 }
 
-fn context<'a>(
-    operation: &'a Id,
-    draft: &'a super::DraftOperation,
-    symbols: &'a Symbols,
-) -> Result<Context<'a>, CompileError> {
-    let [(input_id, input)] = draft.inputs.iter().collect::<Vec<_>>()[..] else {
-        return fail("a sketched operation has exactly one input");
+/// One input's contract, as compilation sees it.
+struct Shape {
+    request: bool,
+    carries: BTreeSet<String>,
+    ok: Option<(Id, BTreeSet<String>)>,
+    errors: BTreeMap<Id, BTreeSet<String>>,
+    key: Option<IdempotencyKey>,
+}
+
+/// The fields every one of `schemas` carries, and the identity key they
+/// share when each maps it to the same fields.
+fn messages(
+    schemas: &BTreeSet<Id>,
+    identity: Option<&MessageIdentity>,
+    input: &Id,
+    symbols: &Symbols,
+) -> Result<(BTreeSet<String>, Option<IdempotencyKey>), CompileError> {
+    let mut carries: Option<BTreeSet<String>> = None;
+    let mut keys: Option<Option<IdempotencyKey>> = None;
+
+    for schema in schemas {
+        let fields = symbols.fields(schema);
+
+        carries = Some(match carries {
+            None => fields,
+            Some(seen) => seen.intersection(&fields).cloned().collect(),
+        });
+
+        let key = identity.and_then(|identity| message_key(identity, schema, input));
+
+        keys = Some(match keys {
+            None => key,
+            Some(seen) if seen == key => seen,
+            Some(_) => None,
+        });
+    }
+
+    let Some(carries) = carries else {
+        return fail(format!("`{input}` consumes no message schema"));
     };
 
-    let name = operation
-        .0
-        .strip_prefix("operation.")
-        .unwrap_or(&operation.0)
-        .to_string();
+    Ok((carries, keys.flatten()))
+}
 
-    let (request, schema, ok, errors, key) = match input {
-        Input::Request(request) => {
-            let key = match &request.identity {
+fn shape(input_id: &Id, input: &Input, symbols: &Symbols) -> Result<Shape, CompileError> {
+    Ok(match input {
+        Input::Request(request) => Shape {
+            request: true,
+            carries: symbols.fields(&request.schema),
+            ok: Some((
+                request.result.ok.clone(),
+                symbols.fields(&request.result.ok),
+            )),
+            errors: request
+                .result
+                .errors
+                .iter()
+                .map(|(class, error)| (class.clone(), symbols.fields(&error.schema)))
+                .collect(),
+            key: match &request.identity {
                 RequestIdentity::Keyed(key) => Some(IdempotencyKey {
                     components: key
                         .fields
@@ -1652,44 +2097,33 @@ fn context<'a>(
                         .collect(),
                 }),
                 RequestIdentity::Unspecified => None,
-            };
-
-            (
-                true,
-                request.schema.clone(),
-                Some((
-                    request.result.ok.clone(),
-                    symbols.fields(&request.result.ok),
-                )),
-                request
-                    .result
-                    .errors
-                    .iter()
-                    .map(|(class, error)| (class.clone(), symbols.fields(&error.schema)))
-                    .collect(),
-                key,
-            )
-        }
+            },
+        },
 
         Input::Subscription(subscription) => {
-            let one = |schemas: &BTreeSet<Id>| match schemas.iter().collect::<Vec<_>>()[..] {
-                [schema] => Ok(schema.clone()),
-                _ => fail("a sketched subscription consumes one message schema"),
-            };
-
             let topic = symbols.topics.get(&subscription.topic);
 
-            let schema = match &subscription.messages {
-                MessageSelector::Only(schemas) => one(schemas)?,
-                MessageSelector::All => one(&topic
+            let schemas = match &subscription.messages {
+                MessageSelector::Only(schemas) => schemas.clone(),
+                MessageSelector::All => topic
                     .map(|topic| topic.messages.clone())
-                    .unwrap_or_default())?,
+                    .unwrap_or_default(),
             };
 
-            let key =
-                topic.and_then(|topic| message_key(&topic.message_identity, &schema, input_id));
+            let (carries, key) = messages(
+                &schemas,
+                topic.map(|topic| &topic.message_identity),
+                input_id,
+                symbols,
+            )?;
 
-            (false, schema, None, BTreeMap::new(), key)
+            Shape {
+                request: false,
+                carries,
+                ok: None,
+                errors: BTreeMap::new(),
+                key,
+            }
         }
 
         Input::Outbox(consumer) => {
@@ -1697,25 +2131,103 @@ fn context<'a>(
                 return fail(format!("`{}` is not a declared outbox", consumer.outbox));
             };
 
-            let [schema] = outbox.messages.iter().collect::<Vec<_>>()[..] else {
-                return fail("a sketched outbox consumer consumes one message schema");
-            };
+            let (carries, key) = messages(
+                &outbox.messages,
+                Some(&outbox.message_identity),
+                input_id,
+                symbols,
+            )?;
 
-            let key = message_key(&outbox.message_identity, schema, input_id);
+            Shape {
+                request: false,
+                carries,
+                ok: None,
+                errors: BTreeMap::new(),
+                key,
+            }
+        }
+    })
+}
 
-            (false, schema.clone(), None, BTreeMap::new(), key)
+fn context<'a>(
+    operation: &'a Id,
+    draft: &'a super::DraftOperation,
+    symbols: &'a Symbols,
+) -> Result<Context<'a>, CompileError> {
+    let name = operation
+        .0
+        .strip_prefix("operation.")
+        .unwrap_or(&operation.0)
+        .to_string();
+
+    let mut shapes: BTreeMap<Id, Shape> = BTreeMap::new();
+
+    for (input_id, input) in &draft.inputs {
+        shapes.insert(input_id.clone(), shape(input_id, input, symbols)?);
+    }
+
+    if shapes.is_empty() {
+        return fail(format!("{operation} declares no input"));
+    }
+
+    // The input the program's result belongs to: with several request
+    // inputs, the sketch names it (a path is the input's it returns for,
+    // §16); otherwise the only request input, or the first input.
+    let named = draft
+        .sketch
+        .as_ref()
+        .and_then(|sketch| sketch.returns_for.clone());
+
+    let requests: Vec<&Id> = shapes
+        .iter()
+        .filter(|(_, shape)| shape.request)
+        .map(|(id, _)| id)
+        .collect();
+
+    let primary = match (&named, requests.as_slice()) {
+        (Some(input), _) if draft.inputs.contains_key(input) => input.clone(),
+        (Some(input), _) => {
+            return fail(format!("`{input}` is not an input of {operation}"));
+        }
+        (None, [only]) => (*only).clone(),
+        (None, []) => shapes.keys().next().expect("an input").clone(),
+        (None, _) => {
+            return fail(format!(
+                "{operation} has several request inputs; name the one its result is for with \
+                 `returns_for`"
+            ));
         }
     };
+
+    let single = shapes.len() == 1;
+
+    let inputs: BTreeMap<Id, BTreeSet<String>> = shapes
+        .iter()
+        .map(|(id, shape)| (id.clone(), shape.carries.clone()))
+        .collect();
+
+    let shape = shapes.remove(&primary).expect("an input");
+
+    let input = draft
+        .inputs
+        .keys()
+        .find(|id| **id == primary)
+        .expect("declared");
 
     Ok(Context {
         operation,
         name,
-        input: input_id,
-        request,
-        carries: symbols.fields(&schema),
-        ok,
-        errors,
-        key,
+        input,
+        request: shape.request,
+        carries: shape.carries,
+        ok: shape.ok,
+        errors: shape.errors,
+
+        // Several inputs have no one identity to key commits by; a
+        // sketch states its `commit_key` instead.
+        key: if single { shape.key } else { None },
+        inputs,
+        single,
     })
 }
 
@@ -1739,10 +2251,38 @@ fn resolve(
         ));
     };
 
+    // A value of a named input: the input's id, then the field.
+    if let Some((input_id, carries)) = context
+        .inputs
+        .iter()
+        .filter(|(id, _)| reference.starts_with(&format!("{}.", id.0)))
+        .max_by_key(|(id, _)| id.0.len())
+    {
+        let rest = &reference[input_id.0.len() + 1..];
+        let path = FieldPath(rest.split('.').map(str::to_string).collect());
+        let head = path.0.first().cloned().unwrap_or_default();
+
+        if !carries.contains(&head) {
+            return fail(format!("`{input_id}` carries no `{head}`"));
+        }
+
+        return Ok(ValueRef {
+            source: ValueSource::Input(input_id.clone()),
+            path,
+        });
+    }
+
     let path = FieldPath(field.split('.').map(str::to_string).collect());
     let head = path.0.first().cloned().unwrap_or_default();
 
     if source == "input" {
+        if !context.single {
+            return fail(format!(
+                "{} has several inputs: write `<input id>.{field}` to say whose",
+                context.operation
+            ));
+        }
+
         if !context.carries.contains(&head) {
             return fail(format!(
                 "the input of {} carries no `{head}`",
@@ -2072,67 +2612,73 @@ fn step_name(step: &SketchStep) -> &'static str {
         SketchStep::Parallel { .. } => "parallel",
         SketchStep::Race { .. } => "race",
         SketchStep::Start { .. } => "start",
+        SketchStep::Answer { .. } => "answer",
     }
 }
 
 impl Compiler<'_> {
     /// Protects every record the open transaction changes or deletes.
     fn protect(&mut self) {
-        // A changed record is protected: a versioned one validates the
-        // version it read and advances it after its last change; an
-        // unversioned one is held under an exclusive lock from before its
-        // read.
-        for alias in self.mutated.iter().collect::<BTreeSet<_>>() {
-            let target = &self.found[alias];
+        // A changed single record that carries a version validates the
+        // version it read and advances it after its last change.
+        // Everything else that changes or is deleted — an unversioned
+        // record, or a set of instances — is held under an exclusive lock
+        // from before its read.
+        let changed: BTreeSet<&String> = self.mutated.iter().collect();
+        let deleted: BTreeSet<&String> = self.deleted.iter().collect();
 
-            if target.data.version.is_some() {
-                let last = self
-                    .steps
-                    .iter()
-                    .rposition(|step| match step {
-                        TransactionStep::Write(write) => write.target == target.selector,
-                        TransactionStep::Transition(transition) => {
-                            transition.subject == target.selector
-                        }
-                        TransactionStep::AdvanceCursor(advance) => {
-                            advance.target == target.selector
-                        }
-                        _ => false,
-                    })
-                    .expect("a mutated record has a mutating step");
+        let mut held: Vec<String> = Vec::new();
 
-                self.steps.insert(
-                    last + 1,
-                    TransactionStep::BumpVersion(BumpVersion {
-                        target: target.selector.clone(),
-                    }),
-                );
-            } else {
-                let read = self
-                    .steps
-                    .iter()
-                    .position(|step| {
-                        matches!(step, TransactionStep::Read(read) if read.bind == target.read)
-                    })
-                    .expect("a found record has a read");
+        for alias in changed
+            .iter()
+            .chain(deleted.iter())
+            .collect::<BTreeSet<_>>()
+        {
+            let target = &self.found[*alias];
+            let versioned = target.single && target.data.version.is_some();
 
-                self.steps.insert(
-                    read,
-                    TransactionStep::Lock(Lock {
-                        target: target.selector.clone(),
-                        mode: LockMode::Exclusive,
-                        order: LockOrder::Unspecified,
-                    }),
-                );
+            if versioned {
+                if changed.contains(alias) {
+                    let last = self
+                        .steps
+                        .iter()
+                        .rposition(|step| match step {
+                            TransactionStep::Write(write) => write.target == target.selector,
+                            TransactionStep::Transition(transition) => {
+                                transition.subject == target.selector
+                            }
+                            TransactionStep::AdvanceCursor(advance) => {
+                                advance.target == target.selector
+                            }
+                            TransactionStep::Fence(fence) => fence.target == target.selector,
+                            _ => false,
+                        })
+                        .expect("a mutated record has a mutating step");
+
+                    self.steps.insert(
+                        last + 1,
+                        TransactionStep::BumpVersion(BumpVersion {
+                            target: target.selector.clone(),
+                        }),
+                    );
+                }
+
+                continue;
             }
+
+            held.push((*alias).clone());
         }
 
-        // A deleted unversioned record is held from before its read, as a
-        // changed one is; a versioned one was validated when it was read.
-        for alias in self.deleted.iter().collect::<BTreeSet<_>>() {
-            let target = &self.found[alias];
+        for alias in held {
+            let target = &self.found[&alias];
 
-            if target.data.version.is_some() || self.mutated.contains(alias) {
+            // An author's lock on the selection is kept, and made
+            // exclusive: it now protects a change.
+            if let Some(lock) = self.steps.iter_mut().find_map(|step| match step {
+                TransactionStep::Lock(lock) if lock.target == target.selector => Some(lock),
+                _ => None,
+            }) {
+                lock.mode = LockMode::Exclusive;
                 continue;
             }
 
@@ -2165,6 +2711,21 @@ impl Compiler<'_> {
 /// effect-only path compile, with the inspect-then-decide shape where it
 /// applies. Everything else takes the general path.
 fn is_simple(sketch: &OperationSketch, symbols: &Symbols) -> bool {
+    let plain = |step: &SketchStep| match step {
+        SketchStep::Publish {
+            detached, durable, ..
+        } => !detached && !durable,
+        SketchStep::Call {
+            durable, detached, ..
+        } => !durable && !detached,
+        SketchStep::Advance { otherwise, .. } => otherwise.is_none(),
+        _ => true,
+    };
+
+    if !sketch.on_rejected.is_empty() || !sketch.steps.iter().all(plain) {
+        return false;
+    }
+
     let effects_only = sketch
         .steps
         .iter()
@@ -2245,6 +2806,7 @@ struct Answered {
 impl Compiler<'_> {
     fn general(mut self, sketch: &OperationSketch) -> Result<OperationBlock, CompileError> {
         self.general = true;
+        self.on_rejected = sketch.on_rejected.clone();
 
         let returns = serde_json::to_string(&sketch.returns).expect("serializes");
 
@@ -2312,14 +2874,16 @@ impl Compiler<'_> {
             return Ok(Vec::new());
         }
 
-        let [data_model] = self.data_models.iter().collect::<Vec<_>>()[..] else {
-            return fail(format!(
-                "one transaction touches {} data models",
-                self.data_models.len()
-            ));
+        let data_model = match self.data_models.iter().collect::<Vec<_>>()[..] {
+            [] => None,
+            [data_model] => Some(data_model.clone()),
+            _ => {
+                return fail(format!(
+                    "one transaction touches {} data models",
+                    self.data_models.len()
+                ));
+            }
         };
-
-        let data_model = data_model.clone();
 
         self.protect();
 
@@ -2384,8 +2948,11 @@ impl Compiler<'_> {
 
         let mut transaction = Transaction {
             id: Id(id),
-            data_model: Some(data_model),
-            isolation: TransactionIsolation::ReadCommitted,
+            data_model,
+            isolation: self
+                .segment_isolation
+                .take()
+                .unwrap_or(TransactionIsolation::ReadCommitted),
             idempotency: match &self.context.key {
                 Some(key) => IdempotencyGuarantee::DeduplicatedBy { key: key.clone() },
                 None => IdempotencyGuarantee::Unspecified,
@@ -2396,21 +2963,61 @@ impl Compiler<'_> {
 
         narrow_reads(&mut transaction, &self.found);
 
-        let rejected = transaction.rejects().then(|| OperationBlock {
-            steps: vec![match self.refusals.first() {
-                Some(refusal) if self.context.request => refused(&self.context, refusal),
-                _ => OperationStep::Complete,
-            }],
-        });
+        // A rejected transaction committed nothing: nothing it found is
+        // in scope on that course.
+        for target in self.found.values_mut() {
+            target.open = false;
+        }
+
+        let rejected = if !transaction.rejects() {
+            None
+        } else if let Some(refusal) = self.refusals.first().filter(|_| self.context.request) {
+            Some(OperationBlock {
+                steps: vec![refused(&self.context, refusal)],
+            })
+        } else if !self.on_rejected.is_empty() {
+            let steps = self.on_rejected.clone();
+
+            let course = OperationSketch {
+                steps: steps.clone(),
+                returns: None,
+                isolation: None,
+                commit_key: None,
+                returns_for: None,
+                on_rejected: Vec::new(),
+            };
+
+            let outer = std::mem::take(&mut self.on_rejected);
+            let (mut block, ended) = self.block(&steps, "", false, &course)?;
+            self.on_rejected = outer;
+
+            if !ended {
+                if self.context.request {
+                    return fail("`on_rejected` must end a request: add a reject");
+                }
+
+                block.push(OperationStep::Complete);
+            }
+
+            Some(OperationBlock { steps: block })
+        } else {
+            Some(OperationBlock {
+                steps: vec![OperationStep::Complete],
+            })
+        };
 
         let mut out = vec![OperationStep::Transaction(ExecuteTransaction {
             transaction,
             rejected,
         })];
 
-        out.extend(self.after_commit.drain(..).map(|intent| {
-            OperationStep::ExecuteEffectIntent(ExecuteEffectIntent { intent, bind: None })
-        }));
+        let after_commit: Vec<(Id, bool)> = self.after_commit.drain(..).collect();
+
+        out.extend(
+            after_commit
+                .into_iter()
+                .map(|(intent, detached)| execute_intent(intent, detached)),
+        );
 
         for target in self.found.values_mut() {
             target.open = false;
@@ -2433,6 +3040,13 @@ impl Compiler<'_> {
 
     /// A call's or request's effect.
     fn answered(&mut self, step: &SketchStep) -> Result<Answered, CompileError> {
+        self.key_override = match step {
+            SketchStep::Enqueue { key, .. }
+            | SketchStep::Publish { key, .. }
+            | SketchStep::Request { key, .. } => self.key_of(key)?,
+            _ => None,
+        };
+
         match step {
             SketchStep::Call {
                 name,
@@ -2444,6 +3058,7 @@ impl Compiler<'_> {
                 from,
                 on_ok,
                 on_error,
+                ..
             } => {
                 let (effect_id, _) = self.effect_ids("call");
 
@@ -2480,7 +3095,7 @@ impl Compiler<'_> {
                         result_replay: *result_replay,
                         result: result_type,
                     }),
-                    values: self.derivation(from)?,
+                    values: self.derivation(&from.refs())?,
                     effect_id,
                     on_ok: on_ok.clone(),
                     on_error: on_error.clone(),
@@ -2495,6 +3110,7 @@ impl Compiler<'_> {
                 from,
                 on_ok,
                 on_error,
+                ..
             } => {
                 let Some(inputs) = self.symbols.requests.get(operation) else {
                     return fail(format!("`{operation}` is not a declared operation"));
@@ -2525,7 +3141,10 @@ impl Compiler<'_> {
 
                 // The trigger's identity carried into the target's own,
                 // so a duplicate of this invocation is one request.
-                let propagation = match (&self.context.key, &request.identity) {
+                let propagation = match (
+                    self.key_override.as_ref().or(self.context.key.as_ref()),
+                    &request.identity,
+                ) {
                     (Some(key), RequestIdentity::Keyed(target))
                         if target.fields.len() == key.components.len() =>
                     {
@@ -2558,7 +3177,7 @@ impl Compiler<'_> {
                         retry: *retry,
                         idempotency_key_propagation: propagation,
                     }),
-                    values: self.derivation(from)?,
+                    values: self.checked(from, &request.schema)?,
                     effect_id,
                     on_ok: on_ok.clone(),
                     on_error: on_error.clone(),
@@ -2569,6 +3188,7 @@ impl Compiler<'_> {
                 topic,
                 schema,
                 from,
+                ..
             } => {
                 let (effect_id, _, publication) = self.publication(topic, schema)?;
 
@@ -2576,7 +3196,7 @@ impl Compiler<'_> {
                     alias: None,
                     classes: None,
                     effect: Effect::Publication(publication),
-                    values: self.derivation(from)?,
+                    values: self.checked(from, schema)?,
                     effect_id,
                     on_ok: Vec::new(),
                     on_error: BTreeMap::new(),
@@ -2629,6 +3249,8 @@ impl Compiler<'_> {
 
                 Condition::Eq { value, equals }
             }
+
+            SketchCondition::Unspecified(_) => Condition::Unspecified,
 
             SketchCondition::Present(value) => Condition::Present {
                 value: self.resolve(value)?,
@@ -2715,9 +3337,74 @@ impl Compiler<'_> {
                 SketchStep::Publish { .. }
                 | SketchStep::Call { .. }
                 | SketchStep::Request { .. } => {
-                    out.extend(self.seal(&here, None)?);
+                    let (durable, detached) = match step {
+                        SketchStep::Call {
+                            durable, detached, ..
+                        }
+                        | SketchStep::Request {
+                            durable, detached, ..
+                        } => (*durable, *detached),
+                        SketchStep::Publish {
+                            detached, durable, ..
+                        } => (*durable, *detached),
+                        _ => (false, false),
+                    };
 
-                    let answered = self.answered(step)?;
+                    // A durable effect is arranged in the open
+                    // transaction, as an intent its commit establishes,
+                    // and made once that commits.
+                    // With no record step before it, the transaction
+                    // that arranges it holds nothing else: an
+                    // artifact-only transaction, of no data model.
+                    let launch = if durable {
+                        let answered = self.answered(step)?;
+                        let intent = Id(answered.effect_id.0.replacen("effect.", "intent.", 1));
+
+                        self.steps.push(TransactionStep::EstablishEffectIntent(
+                            EstablishEffectIntent {
+                                bind: intent.clone(),
+                                effect_id: answered.effect_id.clone(),
+                                effect: answered.effect.clone(),
+                                values: answered.values.clone(),
+                            },
+                        ));
+
+                        out.extend(self.seal(&rest, None)?);
+
+                        (answered, Launch::Intent(intent))
+                    } else {
+                        out.extend(self.seal(&here, None)?);
+
+                        let answered = self.answered(step)?;
+
+                        let launch = Launch::Direct {
+                            effect_id: answered.effect_id.clone(),
+                            effect: answered.effect.clone(),
+                            values: answered.values.clone(),
+                        };
+
+                        (answered, launch)
+                    };
+
+                    let (answered, launch) = launch;
+
+                    if detached {
+                        if !answered.on_ok.is_empty() || !answered.on_error.is_empty() {
+                            return fail(format!(
+                                "a detached {} is not waited for, so it cannot act on its answer",
+                                step_name(step)
+                            ));
+                        }
+
+                        self.effects += 1;
+
+                        out.push(launch.detached(Id(format!(
+                            "handle.{}.{}",
+                            self.context.name, self.effects
+                        ))));
+
+                        continue;
+                    }
 
                     let used_later = answered
                         .alias
@@ -2732,12 +3419,7 @@ impl Compiler<'_> {
                             return fail("a step acts on an answer its effect does not declare");
                         }
 
-                        out.push(OperationStep::ExecuteEffect(ExecuteEffect {
-                            effect_id: answered.effect_id,
-                            effect: answered.effect,
-                            values: answered.values,
-                            bind: None,
-                        }));
+                        out.push(launch.waited(None));
 
                         continue;
                     };
@@ -2749,12 +3431,7 @@ impl Compiler<'_> {
 
                     let bind = Id(format!("result.{}.{name}", self.context.name));
 
-                    out.push(OperationStep::ExecuteEffect(ExecuteEffect {
-                        effect_id: answered.effect_id,
-                        effect: answered.effect,
-                        values: answered.values,
-                        bind: Some(bind.clone()),
-                    }));
+                    out.push(launch.waited(Some(bind.clone())));
 
                     out.push(self.matched(
                         &bind,
@@ -2763,6 +3440,41 @@ impl Compiler<'_> {
                         &classes,
                         &answered.on_ok,
                         &answered.on_error,
+                        used_later,
+                        &steps[index + 1..],
+                        &rest,
+                        after,
+                        top,
+                        sketch,
+                    )?);
+
+                    if used_later {
+                        self.found.retain(|alias, _| in_scope.contains(alias));
+
+                        return Ok((out, true));
+                    }
+                }
+
+                SketchStep::Answer {
+                    of,
+                    on_ok,
+                    on_error,
+                } => {
+                    out.extend(self.seal(&here, None)?);
+
+                    let Some((bind, classes)) = self.joined.get(of).cloned() else {
+                        return fail(format!("`{of}` names no answer a parallel bound before it"));
+                    };
+
+                    let used_later = !referenced_fields(&rest, of).is_empty();
+
+                    out.push(self.matched(
+                        &bind,
+                        of,
+                        &Some(of.clone()),
+                        &classes,
+                        on_ok,
+                        on_error,
                         used_later,
                         &steps[index + 1..],
                         &rest,
@@ -2830,10 +3542,12 @@ impl Compiler<'_> {
                         return fail("nothing may follow a reject");
                     }
 
+                    from.check(&self.context.errors[error], &format!("the error `{error}`"))?;
+
                     let values = if from.is_empty() {
                         payload(&self.context, &self.context.errors[error])
                     } else {
-                        self.derivation(from)?
+                        self.derivation(&from.refs())?
                     };
 
                     out.push(OperationStep::Return(Return {
@@ -2856,27 +3570,48 @@ impl Compiler<'_> {
                         return fail("parallel starts nothing");
                     }
 
-                    let mut handles = Vec::new();
+                    let mut joins = Vec::new();
 
                     for member in members {
-                        let (handle, launch, _) = self.launch(member, "parallel")?;
+                        let Launched {
+                            handle,
+                            step: launch,
+                            classes,
+                            alias,
+                        } = self.launch(member, "parallel")?;
+
+                        // A member named with `as` has its answer bound by
+                        // the join, for an `answer` step to act on.
+                        let bind = match &alias {
+                            Some(alias) => {
+                                let Some(classes) = classes else {
+                                    return fail(format!(
+                                        "`{alias}` names an answer its effect does not declare"
+                                    ));
+                                };
+
+                                let bind = Id(format!("result.{}.{alias}", self.context.name));
+
+                                self.joined.insert(alias.clone(), (bind.clone(), classes));
+
+                                Some(bind)
+                            }
+                            None => None,
+                        };
 
                         out.push(launch);
-                        handles.push(handle);
+                        joins.push(crate::spec::AsyncJoin { handle, bind });
                     }
 
                     out.push(OperationStep::JoinAll(crate::spec::JoinAll {
-                        handles: handles
-                            .into_iter()
-                            .map(|handle| crate::spec::AsyncJoin { handle, bind: None })
-                            .collect(),
+                        handles: joins,
                     }));
                 }
 
                 SketchStep::Start { step: member } => {
                     out.extend(self.seal(&here, None)?);
 
-                    let (_, launch, _) = self.launch(member, "start")?;
+                    let launch = self.launch(member, "start")?.step;
 
                     out.push(launch);
                 }
@@ -2897,7 +3632,12 @@ impl Compiler<'_> {
                     let mut classes: Option<Option<Vec<Id>>> = None;
 
                     for member in members {
-                        let (handle, launch, answers) = self.launch(member, "race")?;
+                        let Launched {
+                            handle,
+                            step: launch,
+                            classes: answers,
+                            ..
+                        } = self.launch(member, "race")?;
 
                         match &classes {
                             None => classes = Some(answers),
@@ -2947,7 +3687,7 @@ impl Compiler<'_> {
                         while let Some(SketchStep::Start { step: member }) =
                             steps.get(remaining_index)
                         {
-                            let (_, launch, _) = self.launch(member, "start")?;
+                            let launch = self.launch(member, "start")?.step;
 
                             out.push(launch);
                             remaining_index += 1;
@@ -3095,11 +3835,7 @@ impl Compiler<'_> {
     }
 
     /// Launches one effect without waiting for it.
-    fn launch(
-        &mut self,
-        member: &SketchStep,
-        of: &str,
-    ) -> Result<(Id, OperationStep, Option<Vec<Id>>), CompileError> {
+    fn launch(&mut self, member: &SketchStep, of: &str) -> Result<Launched, CompileError> {
         let answered = self.answered(member)?;
 
         if !answered.on_ok.is_empty() || !answered.on_error.is_empty() {
@@ -3110,16 +3846,146 @@ impl Compiler<'_> {
 
         let handle = Id(format!("handle.{}.{}", self.context.name, self.effects));
 
-        Ok((
-            handle.clone(),
-            OperationStep::ExecuteEffectAsync(crate::spec::ExecuteEffectAsync {
+        Ok(Launched {
+            handle: handle.clone(),
+            step: OperationStep::ExecuteEffectAsync(crate::spec::ExecuteEffectAsync {
                 handle,
                 effect_id: answered.effect_id,
                 effect: answered.effect,
                 values: answered.values,
             }),
-            answered.classes,
-        ))
+            classes: answered.classes,
+            alias: answered.alias,
+        })
+    }
+}
+
+/// Executes an intent established in a transaction, once it has
+/// committed: waiting for it, or — detached — not.
+fn execute_intent(intent: Id, detached: bool) -> OperationStep {
+    if detached {
+        OperationStep::ExecuteEffectIntentAsync(crate::spec::ExecuteEffectIntentAsync {
+            handle: Id(intent.0.replacen("intent.", "handle.", 1)),
+            intent,
+        })
+    } else {
+        OperationStep::ExecuteEffectIntent(ExecuteEffectIntent { intent, bind: None })
+    }
+}
+
+/// An effect started without waiting: its handle, the launching step,
+/// the error classes of its answer (none when it answers nothing), and
+/// the name it is bound under.
+struct Launched {
+    handle: Id,
+    step: OperationStep,
+    classes: Option<Vec<Id>>,
+    alias: Option<String>,
+}
+
+/// How an effect is made: directly, or by executing the intent a
+/// transaction established.
+enum Launch {
+    Direct {
+        effect_id: Id,
+        effect: Effect,
+        values: Derivation,
+    },
+    Intent(Id),
+}
+
+impl Launch {
+    /// Made, and waited for.
+    fn waited(self, bind: Option<Id>) -> OperationStep {
+        match self {
+            Self::Direct {
+                effect_id,
+                effect,
+                values,
+            } => OperationStep::ExecuteEffect(ExecuteEffect {
+                effect_id,
+                effect,
+                values,
+                bind,
+            }),
+            Self::Intent(intent) => {
+                OperationStep::ExecuteEffectIntent(ExecuteEffectIntent { intent, bind })
+            }
+        }
+    }
+
+    /// Started, and not waited for.
+    fn detached(self, handle: Id) -> OperationStep {
+        match self {
+            Self::Direct {
+                effect_id,
+                effect,
+                values,
+            } => OperationStep::ExecuteEffectAsync(crate::spec::ExecuteEffectAsync {
+                handle,
+                effect_id,
+                effect,
+                values,
+            }),
+            Self::Intent(intent) => {
+                OperationStep::ExecuteEffectIntentAsync(crate::spec::ExecuteEffectIntentAsync {
+                    intent,
+                    handle,
+                })
+            }
+        }
+    }
+}
+
+impl Compiler<'_> {
+    /// Records the declared error a guard's rejection returns.
+    fn refusal(&mut self, otherwise: &Option<Id>) -> Result<(), CompileError> {
+        if let Some(error) = otherwise {
+            if !self.context.errors.contains_key(error) {
+                return fail(format!("`{error}` is not an error the request declares"));
+            }
+
+            self.refusals.push(error.clone());
+        }
+
+        Ok(())
+    }
+}
+
+impl Compiler<'_> {
+    /// A step's `key`, resolved.
+    fn key_of(&self, key: &Option<Vec<String>>) -> Result<Option<IdempotencyKey>, CompileError> {
+        key.as_ref()
+            .map(|values| {
+                Ok(IdempotencyKey {
+                    components: values
+                        .iter()
+                        .map(|value| self.resolve(value))
+                        .collect::<Result<_, CompileError>>()?,
+                })
+            })
+            .transpose()
+    }
+
+    /// Records the isolation a step declares for its transaction; two
+    /// steps of one transaction may not disagree.
+    fn declare_isolation(
+        &mut self,
+        isolation: Option<TransactionIsolation>,
+    ) -> Result<(), CompileError> {
+        let Some(isolation) = isolation else {
+            return Ok(());
+        };
+
+        match self.segment_isolation {
+            Some(declared) if declared != isolation => {
+                fail("two steps of one transaction declare different isolation".to_string())
+            }
+            _ => {
+                self.segment_isolation = Some(isolation);
+                Ok(())
+            }
+        }
     }
 }
 

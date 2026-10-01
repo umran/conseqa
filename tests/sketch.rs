@@ -747,3 +747,646 @@ fn the_general_vocabulary_compiles_into_valid_programs() {
     assert!(errors.is_empty(), "{errors:#?}");
     assert_eq!(program.transactions().len(), 2);
 }
+
+/// [`compile_into`], with the fixture's model edited first.
+fn compile_edited(
+    fixture: &str,
+    edit: impl FnOnce(&mut conseqa::spec::Model),
+    operation: &str,
+    sketch: serde_json::Value,
+) -> Result<(conseqa::spec::OperationBlock, Vec<String>), String> {
+    let source = std::fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures")
+            .join(fixture),
+    )
+    .expect("fixture readable");
+
+    let mut model = conseqa::parser::yaml::parse(&source).expect("fixture parses");
+
+    edit(&mut model);
+
+    let workspace = WorkspaceState::from_model(&model, RunMetadata::new(RunId("edited".into())));
+    let symbols = Symbols::of(&workspace);
+
+    let mut draft: DraftOperation = workspace.operations[&id(operation)].clone();
+
+    draft.sketch = Some(serde_json::from_value::<OperationSketch>(sketch).expect("parses"));
+
+    let program = sketch::compile(&id(operation), &draft, &symbols, &Settled::default())
+        .map_err(|error| error.0)?;
+
+    model
+        .operations
+        .get_mut(&id(operation))
+        .expect("declared")
+        .program = program.clone();
+
+    let errors = conseqa::analyzer::validate(&model)
+        .iter()
+        .map(|error| format!("{error:?}"))
+        .collect();
+
+    Ok((program, errors))
+}
+
+thread_local! {
+    /// Every `kind` the programs compiled on this thread contain.
+    static PRODUCED: std::cell::RefCell<std::collections::BTreeSet<String>> =
+        std::cell::RefCell::default();
+}
+
+fn compiled(
+    fixture: &str,
+    edit: impl FnOnce(&mut conseqa::spec::Model),
+    operation: &str,
+    sketch: serde_json::Value,
+) -> conseqa::spec::OperationBlock {
+    let (program, errors) = compile_edited(fixture, edit, operation, sketch)
+        .unwrap_or_else(|error| panic!("{operation}: {error}"));
+
+    assert!(errors.is_empty(), "{operation}: {errors:#?}");
+
+    PRODUCED.with(|produced| produced.borrow_mut().extend(every_kind(&program)));
+
+    program
+}
+
+fn every_kind(block: &conseqa::spec::OperationBlock) -> Vec<String> {
+    let mut kinds = Vec::new();
+
+    fn walk(value: &serde_json::Value, kinds: &mut Vec<String>) {
+        match value {
+            serde_json::Value::Object(map) => {
+                if let Some(serde_json::Value::String(kind)) = map.get("kind") {
+                    kinds.push(kind.clone());
+                }
+                for nested in map.values() {
+                    walk(nested, kinds);
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    walk(item, kinds);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    walk(
+        &serde_json::to_value(block).expect("serializes"),
+        &mut kinds,
+    );
+
+    kinds
+}
+
+fn none(_: &mut conseqa::spec::Model) {}
+
+/// Every DSL construct is reachable from a sketch: what the general
+/// vocabulary test does not cover — transition outbox writes, durable
+/// and detached effects, answers bound by a parallel, whole-scope and
+/// locked selections with literals, declared isolation and commit keys,
+/// several message schemas, several inputs, and field-mapped values —
+/// compiles into programs the validator admits.
+#[test]
+fn every_dsl_construct_is_reachable_from_a_sketch() {
+    // A transition that admits an outbox message: its derivation comes
+    // from the transition step.
+    let program = compiled(
+        "flash_checkout.yaml",
+        |model| {
+            let checkout = model
+                .data_models
+                .get_mut(&id("data.checkout"))
+                .expect("declared");
+
+            checkout.outboxes.insert(
+                id("outbox.checkout_events"),
+                serde_json::from_value(serde_json::json!({
+                    "messages": ["schema.OrderCancelled"],
+                    "message_identity": { "kind": "keyed",
+                        "mapping": { "schema.OrderCancelled": [["event_id"]] } }
+                }))
+                .expect("an outbox"),
+            );
+
+            // Its exclusive consumer, which relays nothing further.
+            let mut relay = model.operations[&id("operation.charge_payment")].clone();
+
+            relay.inputs = [(
+                id("input.relay_checkout.outbox"),
+                serde_json::from_value(serde_json::json!({
+                    "kind": "outbox", "outbox": "outbox.checkout_events"
+                }))
+                .expect("an outbox input"),
+            )]
+            .into();
+
+            relay.program = serde_json::from_value(serde_json::json!({
+                "steps": [ { "kind": "complete" } ]
+            }))
+            .expect("a program");
+
+            relay.requirements = Default::default();
+
+            model
+                .operations
+                .insert(id("operation.relay_checkout"), relay);
+
+            model
+                .state_machines
+                .get_mut(&id("machine.order_lifecycle"))
+                .expect("declared")
+                .transitions
+                .get_mut(&id("transition.order.cancel"))
+                .expect("declared")
+                .effects
+                .insert(
+                    id("effect.order.cancelled_event"),
+                    serde_json::from_value(serde_json::json!({
+                        "kind": "outbox_write", "outbox": "outbox.checkout_events",
+                        "schema": "schema.OrderCancelled", "idempotency_key_propagation": []
+                    }))
+                    .expect("an outbox write"),
+                );
+        },
+        "operation.cancel_order",
+        serde_json::json!({ "steps": [
+            { "kind": "find", "as": "order", "record": "object.order",
+              "by": { "order_id": "input.order_id" } },
+            { "kind": "transition", "record": "order", "transition": "transition.order.cancel",
+              "otherwise": "not_pending", "effects_from": ["input.order_id"] }
+        ]}),
+    );
+
+    assert!(
+        serde_json::to_string(&program)
+            .expect("serializes")
+            .contains("effect.order.cancelled_event")
+    );
+
+    // A durable call: arranged in the transaction, made after it, and
+    // acted on.
+    let program = compiled(
+        "shop.yaml",
+        none,
+        "operation.place_order",
+        serde_json::json!({ "steps": [
+            { "kind": "find", "as": "product", "record": "object.product",
+              "by": { "product_id": "input.product_id" } },
+            { "kind": "update", "record": "product", "set": ["stock"],
+              "from": ["product.stock", "input.quantity"] },
+            { "kind": "call", "name": "payment-gateway.authorize", "as": "auth",
+              "durable": true, "duplicates": "identical_per_identity",
+              "identity": ["input.request_id"],
+              "result": { "ok": "schema.PlaceOrderResponse",
+                          "errors": { "declined": { "schema": "schema.ProductNotFound",
+                                                    "disposition": "terminal" } } },
+              "from": ["input.request_id", "product.stock"],
+              "on_error": { "declined": [ { "kind": "reject", "error": "insufficient_stock" } ] } }
+        ]}),
+    );
+
+    let seen = every_kind(&program);
+
+    assert!(
+        seen.contains(&"establish_effect_intent".to_string()),
+        "{seen:?}"
+    );
+    assert!(
+        seen.contains(&"execute_effect_intent".to_string()),
+        "{seen:?}"
+    );
+    assert!(seen.contains(&"match_result".to_string()), "{seen:?}");
+
+    // Detached effects: a publication after the commit, not waited for,
+    // and a direct call left in flight.
+    let program = compiled(
+        "flash_checkout.yaml",
+        none,
+        "operation.cancel_order",
+        serde_json::json!({ "steps": [
+            { "kind": "find", "as": "order", "record": "object.order",
+              "by": { "order_id": "input.order_id" } },
+            { "kind": "transition", "record": "order", "transition": "transition.order.cancel",
+              "otherwise": "not_pending" },
+            { "kind": "publish", "topic": "topic.order_events", "schema": "schema.OrderCancelled",
+              "from": ["input.order_id"], "detached": true },
+            { "kind": "call", "name": "audit-log", "from": ["input.order_id"], "detached": true }
+        ]}),
+    );
+
+    let seen = every_kind(&program);
+
+    assert!(
+        seen.contains(&"execute_effect_intent_async".to_string()),
+        "{seen:?}"
+    );
+    assert!(
+        seen.contains(&"execute_effect_async".to_string()),
+        "{seen:?}"
+    );
+
+    // Answers bound by a parallel, acted on after the join.
+    let program = compiled(
+        "flash_checkout.yaml",
+        none,
+        "operation.charge_payment",
+        serde_json::json!({ "steps": [
+            { "kind": "parallel", "steps": [
+                { "kind": "call", "name": "fraud-check", "as": "fraud",
+                  "result": { "ok": "schema.ChargeAccepted",
+                              "errors": { "declined": "schema.ChargeDeclined" } },
+                  "from": ["input.order_id"] },
+                { "kind": "call", "name": "risk-score", "from": ["input.order_id"] } ] },
+            { "kind": "answer", "of": "fraud",
+              "on_error": { "declined": [
+                { "kind": "publish", "topic": "topic.order_events",
+                  "schema": "schema.PaymentFailed",
+                  "from": ["input.event_id", "input.order_id", "fraud.reason"] } ] } }
+        ]}),
+    );
+
+    assert_eq!(
+        kinds(&program),
+        [
+            "execute_effect_async",
+            "execute_effect_async",
+            "join_all",
+            "match_result",
+            "complete"
+        ]
+    );
+
+    // Whole-scope and locked selections, with literal values.
+    let program = compiled(
+        "shop.yaml",
+        none,
+        "operation.restock",
+        serde_json::json!({ "steps": [
+            { "kind": "find", "as": "every", "record": "object.product", "all": true,
+              "lock": "shared",
+              "lock_order": [ { "field": "product_id", "direction": "ascending" } ] },
+            { "kind": "find", "as": "product", "record": "object.product",
+              "by": { "product_id": "input.product_id", "stock": 0 } },
+            { "kind": "update", "record": "product", "from": { "stock": "input.quantity" } }
+        ]}),
+    );
+
+    let text = serde_json::to_string(&program).expect("serializes");
+
+    assert!(
+        text.contains("\"shared\"") && text.contains("\"ascending\""),
+        "{text}"
+    );
+    assert!(text.contains("\"kind\":\"all\""), "{text}");
+    assert!(text.contains("\"literal\""), "{text}");
+
+    // Declared isolation and an explicit (absent) commit key.
+    let program = compiled(
+        "shop.yaml",
+        none,
+        "operation.restock",
+        serde_json::json!({ "steps": [
+            { "kind": "find", "as": "product", "record": "object.product",
+              "by": { "product_id": "input.product_id" } },
+            { "kind": "update", "record": "product", "set": ["stock"],
+              "from": ["product.stock", "input.quantity"] }
+        ], "isolation": "serializable", "commit_key": [] }),
+    );
+
+    let transaction = program.transactions()[0].1.clone();
+
+    assert_eq!(
+        transaction.isolation,
+        conseqa::spec::TransactionIsolation::Serializable
+    );
+    assert_eq!(
+        transaction.idempotency,
+        conseqa::spec::IdempotencyGuarantee::NotDeduplicated
+    );
+
+    // A subscription to several message schemas: the fields they share,
+    // and the identity they share.
+    let program = compiled(
+        "flash_checkout.yaml",
+        |model| {
+            let input = model
+                .operations
+                .get_mut(&id("operation.charge_payment"))
+                .expect("declared")
+                .inputs
+                .get_mut(&id("input.charge_payment.reserved"))
+                .expect("declared");
+
+            if let conseqa::spec::Input::Subscription(subscription) = input {
+                subscription.messages = conseqa::spec::MessageSelector::Only(
+                    [id("schema.PaymentCaptured"), id("schema.PaymentFailed")].into(),
+                );
+            }
+        },
+        "operation.charge_payment",
+        serde_json::json!({ "steps": [
+            { "kind": "publish", "topic": "topic.order_events", "schema": "schema.OrderPaid",
+              "from": ["input.event_id", "input.order_id"] }
+        ]}),
+    );
+
+    assert!(
+        serde_json::to_string(&program)
+            .expect("serializes")
+            .contains("idempotency_key_propagation\":[{"),
+        "the shared identity propagates"
+    );
+
+    // Several inputs: values name their input, and the result names the
+    // request it is for.
+    let program = compiled(
+        "shop.yaml",
+        |model| {
+            let operation = model
+                .operations
+                .get_mut(&id("operation.restock"))
+                .expect("declared");
+
+            let first = operation.inputs[&id("input.restock.request")].clone();
+
+            operation.inputs.insert(id("input.restock.bulk"), first);
+        },
+        "operation.restock",
+        serde_json::json!({ "steps": [
+            { "kind": "find", "as": "product", "record": "object.product",
+              "by": { "product_id": "input.restock.request.product_id" } },
+            { "kind": "update", "record": "product", "set": ["stock"],
+              "from": ["product.stock", "input.restock.request.quantity"] }
+        ], "returns_for": "input.restock.request",
+           "returns": ["input.restock.request.product_id", "input.restock.request.request_id"] }),
+    );
+
+    assert_eq!(program.transactions().len(), 1);
+
+    // A durable call and a durable publication with no record before
+    // them: arranged in an artifact-only transaction of no data model.
+    let program = compiled(
+        "flash_checkout.yaml",
+        none,
+        "operation.charge_payment",
+        serde_json::json!({ "steps": [
+            { "kind": "call", "name": "payment-provider.charge", "as": "charge", "durable": true,
+              "duplicates": "distinguishable",
+              "result": { "ok": "schema.ChargeAccepted",
+                          "errors": { "declined": "schema.ChargeDeclined" } },
+              "on_error": { "declined": [
+                { "kind": "publish", "topic": "topic.order_events",
+                  "schema": "schema.PaymentFailed", "durable": true,
+                  "from": ["input.event_id", "input.order_id", "charge.reason"] } ] } }
+        ]}),
+    );
+
+    let transactions = program.transactions();
+
+    assert!(
+        transactions
+            .iter()
+            .all(|(_, transaction)| transaction.data_model.is_none())
+    );
+    assert_eq!(transactions.len(), 2);
+
+    // A decision the DSL states no fact about.
+    let program = compiled(
+        "flash_checkout.yaml",
+        none,
+        "operation.charge_payment",
+        serde_json::json!({ "steps": [
+            { "kind": "when", "if": { "unspecified": "the order looks risky" },
+              "then": [ { "kind": "call", "name": "manual-review", "from": ["input.order_id"] } ] }
+        ]}),
+    );
+
+    assert!(
+        serde_json::to_string(&program)
+            .expect("serializes")
+            .contains("\"unspecified\"")
+    );
+
+    // A stale position refused with a declared error, and what a
+    // version conflict does instead of completing.
+    let program = compiled(
+        "tenant_ledger.yaml",
+        none,
+        "operation.post_entry",
+        serde_json::json!({ "steps": [
+            { "kind": "find", "as": "tenant", "record": "object.tenant",
+              "by": { "tenant_id": "input.tenant_id" } },
+            { "kind": "advance", "record": "tenant", "field": "last_sequence",
+              "to": "tenant.last_sequence", "rule": "monotonic_after", "otherwise": "rejected" }
+        ], "returns": ["input.entry_id", "input.entry_id"] }),
+    );
+
+    assert!(
+        serde_json::to_string(&program)
+            .expect("serializes")
+            .contains("\"err\"")
+    );
+
+    let program = compiled(
+        "shop.yaml",
+        none,
+        "operation.restock",
+        serde_json::json!({ "steps": [
+            { "kind": "find", "as": "product", "record": "object.product",
+              "by": { "product_id": "input.product_id" } },
+            { "kind": "update", "record": "product", "set": ["stock"],
+              "from": ["product.stock", "input.quantity"] }
+        ], "on_rejected": [ { "kind": "reject", "error": "product_not_found" } ] }),
+    );
+
+    let conseqa::spec::OperationStep::Transaction(execute) = &program.steps[0] else {
+        panic!("a transaction first: {program:?}");
+    };
+
+    assert!(matches!(
+        execute.rejected.as_ref().map(|block| &block.steps[..]),
+        Some([conseqa::spec::OperationStep::Return(_)])
+    ));
+
+    // Each transaction's own isolation, and a message keyed by
+    // something other than the trigger.
+    let program = compiled(
+        "flash_checkout.yaml",
+        none,
+        "operation.create_order",
+        serde_json::json!({ "steps": [
+            { "kind": "create", "record": "object.order", "isolation": "serializable",
+              "from": ["input.order_id", "input.amount"] },
+            { "kind": "find", "as": "stock", "record": "object.stock", "isolation": "snapshot",
+              "by": { "warehouse_id": "input.warehouse_id", "sku": "input.sku" } },
+            { "kind": "update", "record": "stock", "set": ["reserved"],
+              "from": ["stock.reserved", "input.quantity"] },
+            { "kind": "publish", "topic": "topic.order_events", "schema": "schema.OrderCreated",
+              "key": ["input.order_id"], "from": ["input.order_id"] }
+        ]}),
+    );
+
+    let isolations: Vec<conseqa::spec::TransactionIsolation> = program
+        .transactions()
+        .iter()
+        .map(|(_, transaction)| transaction.isolation)
+        .collect();
+
+    assert_eq!(
+        isolations,
+        [
+            conseqa::spec::TransactionIsolation::Serializable,
+            conseqa::spec::TransactionIsolation::Snapshot
+        ]
+    );
+
+    let text = serde_json::to_string(&program).expect("serializes");
+
+    assert!(
+        text.contains("\"source\":{\"components\":[{\"source\":{\"kind\":\"input\",\"id\":\"input.create_order.request\"},\"path\":[\"order_id\"]}]}"),
+        "{text}"
+    );
+
+    // The rest of the vocabulary, for the coverage check below.
+    compiled(
+        "tenant_ledger.yaml",
+        none,
+        "operation.post_entry",
+        serde_json::json!({ "steps": [
+            { "kind": "find", "as": "tenant", "record": "object.tenant",
+              "by": { "tenant_id": "input.tenant_id" } },
+            { "kind": "fence", "record": "tenant", "field": "last_sequence",
+              "token": "tenant.last_sequence", "otherwise": "rejected" },
+            { "kind": "create", "record": "object.entry",
+              "from": ["input.tenant_id", "input.entry_id", "tenant.last_sequence", "input.amount"] },
+            { "kind": "enqueue", "outbox": "outbox.tenant_events", "schema": "schema.EntryPosted",
+              "from": ["input.request_id", "input.tenant_id", "input.entry_id", "input.amount"] }
+        ], "returns": ["input.entry_id", "tenant.last_sequence"] }),
+    );
+
+    compiled(
+        "tenant_ledger.yaml",
+        none,
+        "operation.apply_entry",
+        serde_json::json!({ "steps": [
+            { "kind": "find", "as": "ledger", "record": "object.tenant_ledger",
+              "by": { "tenant_id": "input.tenant_id" } },
+            { "kind": "advance", "record": "ledger", "field": "last_applied_sequence",
+              "to": "input.sequence", "rule": "successor" }
+        ]}),
+    );
+
+    compiled(
+        "shop.yaml",
+        none,
+        "operation.ship_order",
+        serde_json::json!({ "steps": [
+            { "kind": "request", "operation": "operation.pay_order", "as": "paid",
+              "from": ["input.request_id", "input.order_id"],
+              "on_error": {
+                "not_payable": [ { "kind": "reject", "error": "not_shippable" } ],
+                "order_not_found": [ { "kind": "reject", "error": "order_not_found" } ] } },
+            { "kind": "find", "as": "order", "record": "object.order",
+              "by": { "order_id": "input.order_id" } },
+            { "kind": "when", "if": { "any": [
+                { "present": "order.status" },
+                { "all": [ { "not": { "equals": ["order.status", "state.order.paid"] } } ] } ] },
+              "then": [ { "kind": "reject", "error": "not_shippable" } ] },
+            { "kind": "find", "as": "payment", "record": "object.payment",
+              "by": { "order_id": "input.order_id" } },
+            { "kind": "delete", "record": "payment" }
+        ]}),
+    );
+
+    compiled(
+        "hedged_read.yaml",
+        none,
+        "operation.hedged_read",
+        serde_json::json!({ "steps": [
+            { "kind": "race", "as": "read",
+              "steps": [
+                { "kind": "call", "name": "store-a",
+                  "result": { "ok": "schema.Row", "errors": { "miss": "schema.Miss" } },
+                  "from": ["input.id"] },
+                { "kind": "call", "name": "store-b",
+                  "result": { "ok": "schema.Row", "errors": { "miss": "schema.Miss" } },
+                  "from": ["input.id"] } ],
+              "on_error": { "miss": [ { "kind": "reject", "error": "miss" } ] } }
+        ], "returns": ["read.id"] }),
+    );
+
+    // Every kind of operation step, transaction step, effect, selector
+    // predicate and condition the DSL has was produced from a sketch.
+    let produced = PRODUCED.with(|produced| produced.borrow().clone());
+
+    for kind in [
+        // operation steps
+        "transaction",
+        "execute_effect",
+        "execute_effect_async",
+        "execute_effect_intent",
+        "execute_effect_intent_async",
+        "join_all",
+        "race",
+        "match_result",
+        "branch",
+        "return",
+        "complete",
+        // transaction steps
+        "read",
+        "write",
+        "insert",
+        "delete",
+        "lock",
+        "transition",
+        "establish_effect_intent",
+        "establish_transaction_output",
+        "write_outbox",
+        "validate_version",
+        "bump_version",
+        "advance_cursor",
+        "fence",
+        // effects
+        "publication",
+        "request",
+        "external",
+        // (an outbox write is `write_outbox` in a program; a transition's
+        // own is asserted by its effect id above)
+        // selector predicates and conditions
+        "all",
+        "eq",
+        "and",
+        "not",
+        "present",
+        "unspecified",
+        // values and outcomes
+        "literal",
+        "value",
+        "deterministic",
+        "ok",
+        "err",
+    ] {
+        assert!(
+            produced.contains(kind),
+            "no sketch produced `{kind}`: {produced:?}"
+        );
+    }
+
+    // Field-mapped values are checked against the target's schema.
+    let error = compile_edited(
+        "shop.yaml",
+        none,
+        "operation.restock",
+        serde_json::json!({ "steps": [
+            { "kind": "create", "record": "object.restock_receipt",
+              "from": { "request_id": "input.request_id", "units": "input.quantity" } }
+        ]}),
+    )
+    .expect_err("an unknown target field");
+
+    assert!(error.contains("no field `units`"), "{error}");
+}
