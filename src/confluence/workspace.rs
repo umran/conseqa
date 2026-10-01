@@ -189,6 +189,10 @@ pub struct DraftOperation {
     pub description: Option<String>,
     pub inputs: BTreeMap<Id, Input>,
 
+    /// The author's sketch of the program, part of the interface.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sketch: Option<super::sketch::OperationSketch>,
+
     /// None until the operation synthesis task commits.
     pub program: Option<OperationBlock>,
 
@@ -208,6 +212,7 @@ impl DraftOperation {
             service: operation.service.clone(),
             description: operation.description.clone(),
             inputs: operation.inputs.clone(),
+            sketch: None,
             program: Some(operation.program.clone()),
             requirements: operation.requirements.clone(),
             stage: OperationDraftStage::ReadyForAssembly,
@@ -221,6 +226,7 @@ impl DraftOperation {
             service: interface.service,
             description: interface.description,
             inputs: interface.inputs,
+            sketch: interface.sketch,
             program: None,
             requirements: OperationRequirements::default(),
             stage: OperationDraftStage::Planned,
@@ -233,6 +239,7 @@ impl DraftOperation {
             service: self.service.clone(),
             description: self.description.clone(),
             inputs: self.inputs.clone(),
+            sketch: self.sketch.clone(),
         }
     }
 
@@ -293,6 +300,13 @@ pub struct OperationInterfaceDraft {
     pub service: Id,
     pub description: Option<String>,
     pub inputs: BTreeMap<Id, Input>,
+
+    /// What the operation does, as typed business actions, when its
+    /// author wrote one: compiled into the program in code
+    /// ([`super::sketch`]) instead of synthesized by a session. Never
+    /// part of the exported model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sketch: Option<super::sketch::OperationSketch>,
 }
 
 /// Identity of one explicit correctness statement extracted from the

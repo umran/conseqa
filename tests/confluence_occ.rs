@@ -176,6 +176,7 @@ fn ping_interface() -> OperationInterfaceDraft {
                 },
             }),
         )]),
+        sketch: None,
     }
 }
 
@@ -645,6 +646,7 @@ fn phantom_new_writer_invalidates_the_querying_task() {
                     service: id("service.checkout"),
                     description: Some("Force an order state.".to_string()),
                     inputs: BTreeMap::new(),
+                    sketch: None,
                 },
             },
             Mutation::ReplaceOperationProgram {
@@ -924,6 +926,7 @@ async fn a_transaction_joining_an_evaluated_closure_invalidates_the_evaluator() 
                     service: id("service.checkout"),
                     description: Some("Force an order state.".to_string()),
                     inputs: BTreeMap::new(),
+                    sketch: None,
                 },
             },
             Mutation::ReplaceOperationProgram {
@@ -1244,6 +1247,7 @@ fn unobserved_reference_is_rejected_then_fixable() {
                 service: id("service.checkout"),
                 description: Some("Calls create_order.".to_string()),
                 inputs: BTreeMap::new(),
+                sketch: None,
             },
         },
         Mutation::ReplaceOperationProgram {
@@ -1584,6 +1588,7 @@ fn the_gate_refuses_a_transaction_requirement_keyed_from_an_undeclared_input() {
                         acknowledge_on_success: None,
                     }),
                 )]),
+                sketch: None,
             },
         }],
     )
@@ -1700,6 +1705,7 @@ fn planned_operation_commits_as_draft_and_requirements_flow_through_proposals() 
                             acknowledge_on_success: None,
                         }),
                     )]),
+                    sketch: None,
                 },
             },
             Mutation::PutPromptObligation {

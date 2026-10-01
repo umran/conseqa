@@ -38,6 +38,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde_json::json;
 use uuid::Uuid;
 
+use crate::confluence::sketch;
 use crate::confluence::{
     AssemblyGap, BundleSpec, CommitRequest, DraftOperation, EngineError, Mutation, PatchId,
     SearchSpec, SpecPatch, SymbolKey, SymbolKind, WriteGrant,
@@ -197,6 +198,35 @@ async fn synthesize(
         return Ok(abstain("the task's scope names no program to write"));
     };
 
+    // The author's sketch, when there is one, is compiled; templates are
+    // for operations without one.
+    let interface = context.engine.read_symbol(
+        context.task,
+        &SymbolKey::OperationInterface(operation.clone()),
+    )?;
+
+    if let Ok(interface) =
+        serde_json::from_value::<crate::confluence::OperationInterfaceDraft>(interface.content)
+        && interface.sketch.is_some()
+    {
+        let prompt: String = task
+            .prompt_evidence
+            .iter()
+            .map(|evidence| evidence.excerpt.as_str())
+            .collect::<Vec<_>>()
+            .join("\n\n");
+
+        return from_sketch(
+            context,
+            policy,
+            task.snapshot_revision,
+            &operation,
+            &DraftOperation::planned(interface),
+            &prompt,
+        )
+        .await;
+    }
+
     let enumerated = match enumerate(context, &operation)? {
         Ok(enumerated) => enumerated,
         Err(reason) => return Ok(abstain(reason)),
@@ -333,10 +363,29 @@ async fn synthesize(
         other => return Ok(abstain(format!("`{other}` is not an archetype"))),
     };
 
+    submit_program(
+        context,
+        task.snapshot_revision,
+        &operation,
+        program,
+        &format!("a {archetype} program"),
+    )
+    .await
+}
+
+/// Judges a program and submits it: the shared end of the template and
+/// sketch paths.
+async fn submit_program(
+    context: &BuildContext<'_>,
+    base_revision: crate::spec::Revision,
+    operation: &Id,
+    program: OperationBlock,
+    what: &str,
+) -> Result<Built, EngineError> {
     let patch = SpecPatch {
         mutations: vec![Mutation::ReplaceOperationProgram {
             operation: operation.clone(),
-            program: program.clone(),
+            program,
         }],
     };
 
@@ -355,15 +404,12 @@ async fn synthesize(
         && verdict.draft_diagnostics.is_empty()
         && !verdict.assembly_gaps.is_empty()
         && verdict.assembly_gaps.iter().all(|gap| {
-            matches!(gap, AssemblyGap::MissingProgram { operation: sibling } if *sibling != operation)
+            matches!(gap, AssemblyGap::MissingProgram { operation: sibling } if sibling != operation)
         });
 
     if verdict.verified().is_none() && !only_siblings_missing {
         return Ok(Built::Abstained(
-            Abstention::because(format!(
-                "the {archetype} program the template produced was refused"
-            ))
-            .with_findings(vec![
+            Abstention::because(format!("{what} was refused")).with_findings(vec![
                 verdict
                     .refusal()
                     .unwrap_or_else(|| "it was not verified".to_string()),
@@ -376,7 +422,7 @@ async fn synthesize(
         .submit(CommitRequest {
             task: context.task,
             patch_id: PatchId::fresh(),
-            base_revision: task.snapshot_revision,
+            base_revision,
             patch,
             client_nonce: Uuid::new_v4(),
         })
@@ -384,7 +430,7 @@ async fn synthesize(
 
     Ok(match outcome {
         Ok(_) => Built::Committed {
-            summary: format!("{operation}: a {archetype} program"),
+            summary: format!("{operation}: {what}"),
         },
 
         Err(rejection) if rejection.is_stale_context() => Built::Stale,
@@ -394,6 +440,229 @@ async fn synthesize(
                 .with_findings(vec![format!("{rejection:?}")]),
         ),
     })
+}
+
+// ---------------------------------------------------------------------
+// Sketches
+// ---------------------------------------------------------------------
+
+/// Everything a sketch compiles against, read through the task so that
+/// each read is tracked.
+fn tracked_symbols(context: &BuildContext<'_>) -> Result<sketch::Symbols, EngineError> {
+    let mut symbols = sketch::Symbols::default();
+
+    let all = |kind| {
+        context.engine.search_symbols(
+            context.task,
+            &SearchSpec {
+                kind: Some(kind),
+                ..Default::default()
+            },
+        )
+    };
+
+    for key in all(SymbolKind::DataObject)? {
+        if let SymbolKey::DataObject { data_model, object } = &key
+            && let Ok(data) = serde_json::from_value::<DataObject>(
+                context.engine.read_symbol(context.task, &key)?.content,
+            )
+        {
+            symbols
+                .objects
+                .insert(object.clone(), (data_model.clone(), data));
+        }
+    }
+
+    for key in all(SymbolKind::Schema)? {
+        if let SymbolKey::Schema(id) = &key
+            && let Ok(schema) = serde_json::from_value::<Schema>(
+                context.engine.read_symbol(context.task, &key)?.content,
+            )
+        {
+            symbols
+                .schemas
+                .insert(id.clone(), sketch::schema_fields(&schema));
+        }
+    }
+
+    for key in all(SymbolKind::StateMachine)? {
+        if let SymbolKey::StateMachine(id) = &key
+            && let Ok(machine) = serde_json::from_value::<StateMachine>(
+                context.engine.read_symbol(context.task, &key)?.content,
+            )
+        {
+            symbols.machines.insert(id.clone(), machine);
+        }
+    }
+
+    Ok(symbols)
+}
+
+/// The program, in words: what a fidelity judgment compares with the
+/// description.
+fn in_words(program: &OperationBlock) -> Vec<String> {
+    let mut words: Vec<String> = program
+        .transactions()
+        .into_iter()
+        .filter_map(|(_, transaction)| super::describe::summarize(transaction))
+        .collect();
+
+    fn outcomes(block: &OperationBlock, into: &mut BTreeSet<String>) {
+        for step in &block.steps {
+            match step {
+                OperationStep::Return(Return {
+                    outcome: ResultOutcome::Err { error, .. },
+                    ..
+                }) => {
+                    into.insert(format!("returns the error `{error}`"));
+                }
+                OperationStep::Branch(branch) => {
+                    outcomes(&branch.then, into);
+                    if let Some(otherwise) = &branch.otherwise {
+                        outcomes(otherwise, into);
+                    }
+                }
+                OperationStep::Transaction(execute) => {
+                    if let Some(rejected) = &execute.rejected {
+                        outcomes(rejected, into);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let mut errors = BTreeSet::new();
+
+    outcomes(program, &mut errors);
+
+    words.extend(errors);
+
+    words
+}
+
+/// The sketch path: the program is compiled from what its author
+/// wrote. A decider settles the one choice a sketch may leave open — a
+/// request's refusal error — and guards against a sketch that plainly
+/// contradicts its description; it writes nothing.
+async fn from_sketch(
+    context: &BuildContext<'_>,
+    policy: &SynthesisPolicy,
+    base_revision: crate::spec::Revision,
+    operation: &Id,
+    draft: &DraftOperation,
+    prompt: &str,
+) -> Result<Built, EngineError> {
+    let symbols = tracked_symbols(context)?;
+
+    let open = match sketch::open_choices(operation, draft, &symbols) {
+        Ok(open) => open,
+        Err(error) => return Ok(abstain(format!("the sketch does not compile: {error}"))),
+    };
+
+    // A draft compile first: the fidelity question shows what it does.
+    let provisional = sketch::Settled {
+        refusal: open.iter().find_map(|choice| match choice {
+            sketch::Open::Refusal { errors, .. } => errors.first().cloned(),
+        }),
+    };
+
+    let program = match sketch::compile(operation, draft, &symbols, &provisional) {
+        Ok(program) => program,
+        Err(error) => return Ok(abstain(format!("the sketch does not compile: {error}"))),
+    };
+
+    let mut request = DecisionRequest::new(json!({
+        "prompt": prompt,
+        "operation": { "id": operation, "description": draft.description },
+        "program": in_words(&program),
+        "errors": open.iter().flat_map(|choice| match choice {
+            sketch::Open::Refusal { errors, .. } => errors.clone(),
+        }).collect::<Vec<_>>(),
+    }))
+    .tag("task", context.task.to_string())
+    .tag("builder", "operation_synthesis")
+    .tag("operation", operation.to_string())
+    .ask("fidelity", wording::fidelity())
+    .tag(
+        format!("spec.{}", wording::FIDELITY.id),
+        wording::FIDELITY.tag(),
+    );
+
+    for choice in &open {
+        let sketch::Open::Refusal { errors, .. } = choice;
+
+        let options: Vec<(String, String)> = errors
+            .iter()
+            .map(|class| (class.0.clone(), format!("The error `{class}`.")))
+            .collect();
+
+        request = request.ask("refusal", wording::refusal(&options)).tag(
+            format!("spec.{}", wording::REFUSAL.id),
+            wording::REFUSAL.tag(),
+        );
+    }
+
+    let decision = match context.decider.decide(&request).await {
+        Ok(decision) => Some(decision),
+
+        // The sketch is its author's explicit statement and compiles
+        // deterministically: an unavailable decider blocks only a choice
+        // the sketch left open.
+        Err(error) if !open.is_empty() => {
+            return Ok(abstain(format!("the decider gave no answer: {error}")));
+        }
+
+        Err(_) => None,
+    };
+
+    if let Some(decision) = &decision
+        && let Some(probability) = decision.noul("fidelity")
+        && probability <= policy.dismiss
+    {
+        return Ok(Built::Abstained(
+            Abstention::because(format!(
+                "the program compiled from the sketch does not do what the operation is \
+                 described to do ({probability:.2})"
+            ))
+            .with_findings(in_words(&program)),
+        ));
+    }
+
+    let mut settled = sketch::Settled::default();
+
+    if !open.is_empty() {
+        let decision = decision.as_ref().expect("asked when a choice is open");
+
+        let Some((choice, probabilities)) = decision.choice("refusal") else {
+            return Ok(abstain("`refusal` went unanswered"));
+        };
+
+        let probability = probabilities.get(choice).copied().unwrap_or(0.0);
+
+        if choice == wording::NONE_OF_THESE || probability < policy.select {
+            return Ok(abstain(format!(
+                "no declared error is clearly the one a wrong-state record returns: `{choice}` \
+                 at {probability:.2}"
+            )));
+        }
+
+        settled.refusal = Some(Id(choice.to_string()));
+    }
+
+    let program = match sketch::compile(operation, draft, &symbols, &settled) {
+        Ok(program) => program,
+        Err(error) => return Ok(abstain(format!("the sketch does not compile: {error}"))),
+    };
+
+    submit_program(
+        context,
+        base_revision,
+        operation,
+        program,
+        "the program compiled from its sketch",
+    )
+    .await
 }
 
 // ---------------------------------------------------------------------

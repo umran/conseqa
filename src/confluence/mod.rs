@@ -32,6 +32,7 @@ pub mod mcp;
 pub mod patch;
 pub mod persistence;
 pub mod read_set;
+pub mod sketch;
 pub mod snapshot;
 pub mod summary;
 pub mod symbol;

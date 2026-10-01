@@ -182,6 +182,7 @@ async fn draft_heads_report_precise_assembly_gaps_until_programs_arrive() {
             service: id("service.checkout"),
             description: None,
             inputs: BTreeMap::new(),
+            sketch: None,
         }),
     );
 
@@ -533,6 +534,7 @@ async fn bundles_fall_back_to_interfaces_before_analysis_and_use_summaries_after
                     acknowledge_on_success: None,
                 }),
             )]),
+            sketch: None,
         }),
     );
 

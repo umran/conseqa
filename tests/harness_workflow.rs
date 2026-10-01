@@ -12,6 +12,8 @@
 
 #![allow(clippy::result_large_err)]
 
+mod common;
+
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -168,6 +170,7 @@ fn ping_interface() -> OperationInterfaceDraft {
                 },
             }),
         )]),
+        sketch: None,
     }
 }
 
@@ -1096,6 +1099,7 @@ fn planned_workspace(count: usize) -> WorkspaceState {
                         acknowledge_on_success: None,
                     }),
                 )]),
+                sketch: None,
             }),
         );
     }
@@ -3806,6 +3810,139 @@ mod system_one {
         );
 
         std::fs::remove_dir_all(&out_dir).ok();
+    }
+
+    /// The sketch architecture end to end: the fanout finds every
+    /// program of `shop` missing and every interface sketched. Each
+    /// program is compiled from its sketch, a decider only confirming it
+    /// does what the description says; the run succeeds and no session
+    /// writes, discovers or repairs anything.
+    #[tokio::test]
+    async fn every_program_is_compiled_from_its_sketch_without_a_session() {
+        let mut workspace = workspace_of(&authored("shop.yaml"), "A small shop backend.");
+
+        for (operation, sketch) in common::sketches::shop_sketches() {
+            let draft = workspace
+                .operations
+                .get_mut(&id(operation))
+                .expect("the operation");
+
+            draft.program = None;
+            draft.sketch = Some(serde_json::from_value(sketch).expect("parses"));
+        }
+
+        let opinions = Opinions::default().stating("fidelity", 0.92);
+
+        let engine = ConfluenceEngine::in_memory(workspace).expect("engine starts");
+        let seen = Seen::default();
+        let idle: ScriptFn = Arc::new(|_, _| Box::pin(async {}));
+
+        let backend = Arc::new(SystemOneBackend::new(
+            engine.clone(),
+            Arc::new(opinions.clone()),
+            conseqa::harness::executors::BUILDABLE,
+            Arc::new(ScriptedBackend {
+                engine: engine.clone(),
+                script: recording(idle, seen.clone()),
+            }),
+        ));
+
+        let out_dir = scratch();
+
+        let supervisor = Supervisor::new(
+            engine.clone(),
+            backend,
+            "http://127.0.0.1:0/mcp",
+            None,
+            out_dir.join("work"),
+        );
+
+        let scheduler = Scheduler::new(engine.clone(), supervisor, SchedulerPolicy::default());
+
+        let workflow = Workflow::new(
+            scheduler,
+            WorkflowConfig {
+                out_dir: out_dir.clone(),
+                analysis_timeout: Duration::from_secs(20),
+                max_iterations: 8,
+                objective: None,
+            },
+        );
+
+        let report = workflow.run().await.expect("the workflow runs");
+
+        assert!(
+            matches!(report.status, RunStatus::Success { .. }),
+            "{:?}",
+            report.status
+        );
+
+        assert!(
+            seen.lock().expect("not poisoned").is_empty(),
+            "no session: {:?}",
+            seen.lock().expect("not poisoned")
+        );
+
+        let manifest = manifest_of(&out_dir);
+        let synthesized = records(&manifest, "operation_synthesis");
+
+        assert_eq!(synthesized.len(), 5, "{manifest}");
+        assert!(
+            synthesized
+                .iter()
+                .all(|record| record["executor"] == "system_one"),
+            "{manifest}"
+        );
+
+        std::fs::remove_dir_all(&out_dir).ok();
+    }
+
+    /// The guard: a sketch whose program plainly contradicts the
+    /// operation's description goes to a session, told why.
+    #[tokio::test]
+    async fn a_sketch_contradicting_its_description_goes_to_a_session() {
+        let mut workspace = shop_without_program("operation.ship_order");
+
+        workspace
+            .operations
+            .get_mut(&id("operation.ship_order"))
+            .expect("the operation")
+            .sketch = Some(
+            serde_json::from_value(
+                common::sketches::shop_sketches()
+                    .into_iter()
+                    .find(|(operation, _)| *operation == "operation.ship_order")
+                    .expect("sketched")
+                    .1,
+            )
+            .expect("parses"),
+        );
+
+        let (engine, seen, _) = run_tasks(
+            workspace,
+            vec![(
+                TaskKind::OperationSynthesis,
+                conseqa::confluence::WriteScope::operation_synthesis(id("operation.ship_order")),
+                id("operation.ship_order"),
+            )],
+            &Opinions::default().stating("fidelity", 0.04),
+        )
+        .await;
+
+        let handed = syntheses(&seen);
+
+        assert_eq!(handed.len(), 1);
+        assert!(
+            handed[0].contains("does not do what the operation is described to do"),
+            "{}",
+            handed[0]
+        );
+
+        assert!(
+            engine.head_snapshot().workspace.operations[&id("operation.ship_order")]
+                .program
+                .is_none()
+        );
     }
 
     /// `tenant_ledger` as its author wrote it, and with the exclusive

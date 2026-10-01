@@ -191,3 +191,35 @@ pub fn refusal(errors: &[(String, String)]) -> Question {
             )]),
     )
 }
+
+pub const FIDELITY: QuestionSpec = QuestionSpec {
+    id: "synthesis.fidelity",
+    version: 1,
+    decides: "whether a program compiled from its author's sketch does what the operation is \
+              described to do",
+};
+
+/// The guard on a compiled sketch. The sketch is its author's explicit
+/// statement, so this does not second-guess it: it catches a sketch
+/// that plainly contradicts its own operation's description — a wrong
+/// record, a missing step, the wrong transition.
+pub fn fidelity() -> Question {
+    Question::noul_with_criteria(
+        json!({
+            "question": "Does `program` do what `operation.description` says the operation \
+                         does?",
+            "focus": "Compare the work: which records are found, changed or created, and which \
+                      lifecycle change is applied. Ignore wording, and ignore mechanics the \
+                      description does not mention — version checks, deduplication, reading a \
+                      record before deciding.",
+        }),
+        json!({
+            "what": "The program does the work the description states, and nothing it \
+                     contradicts.",
+        }),
+        json!({
+            "what": "The program leaves out work the description states, or does work it \
+                     contradicts.",
+        }),
+    )
+}

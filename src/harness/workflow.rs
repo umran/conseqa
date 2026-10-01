@@ -1884,6 +1884,7 @@ mod tests {
             service: id("service.x"),
             description: None,
             inputs: BTreeMap::new(),
+            sketch: None,
         });
 
         draft.program = Some(OperationBlock {

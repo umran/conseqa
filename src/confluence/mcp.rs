@@ -78,8 +78,12 @@ gives the exact JSON shapes plus a worked program example.
 3. Author the shared skeleton yourself with submit_patch: services, \
 schemas, data models (outboxes included), topics, state machines, and \
 one interface per planned operation (its id, service, inputs, and \
-request, subscription, or outbox contracts). Many small typed patches \
-are normal. The \
+request, subscription, or outbox contracts). Give every interface a \
+`sketch` — the operation's business actions as typed steps (find, \
+update, create, transition; see dsl_reference) — whenever its work \
+fits that vocabulary: a sketched program is compiled in code during \
+the fanout, in seconds, where an unsketched one costs a worker \
+session of minutes. Many small typed patches are normal. The \
 commit gate rejects a structurally broken patch with precise \
 diagnostics; fix it and resubmit in the same session.
 4. Only once that skeleton is complete for the whole system, hand the \
@@ -1903,7 +1907,37 @@ PATCH — {"mutations": [<mutation>, ...]}; each mutation {"kind": K, ...}:
      schema. The applying transaction step supplies each message's
      derivation under the same key.)
   {"kind":"put_operation_interface","operation":"operation.x",
-   "value":{"service":"service.x","description":"...","inputs":{...}}}
+   "value":{"service":"service.x","description":"...","inputs":{...},
+            "sketch":{"steps":[
+              {"kind":"find","as":"order","record":"object.order",
+               "by":{"order_id":"input.order_id"}},
+              {"kind":"transition","record":"order","transition":"transition.order.pay",
+               "otherwise":"not_payable"},
+              {"kind":"find","as":"product","record":"object.product",
+               "by":{"product_id":"order.product_id"}},
+              {"kind":"update","record":"product","set":["stock"],
+               "from":["product.stock","order.quantity"]},
+              {"kind":"create","record":"object.payment",
+               "from":["input.request_id","input.order_id","input.amount"]}]}}}
+    (sketch — optional, and the fastest way to get a program: what the
+     operation does as typed business actions, in order. It is compiled
+     into the program in code, with no worker session. Steps:
+       find       {as, record, by: {record_field: value}} — one instance,
+                  by every identity field of the record;
+       update     {record: <a find's as>, set: [fields], from: [values]};
+       create     {record: <data object>, from: [values]};
+       transition {record: <a find's as>, transition: <transition id>,
+                   otherwise: <declared error a wrong-state record returns>,
+                   already_ok: true when repeating a completed transition
+                   returns ok}.
+     Values are "input.<field>" or "<find's as>.<field>". All records
+     must belong to one data model; at most one transition per sketch;
+     the operation has exactly one input (a request, or a subscription
+     consuming one schema). The gate compiles the sketch when you write
+     it and rejects one that does not compile, saying why. Compiled
+     programs carry the version protocol, keyed commits from the
+     request's identity, and the inspect-then-decide shape a guarded
+     transition needs; requirements are added after, by discovery.)
   {"kind":"replace_operation_program","operation":"operation.x","program":{"steps":[...]}}
   {"kind":"replace_operation_requirements","operation":"operation.x","requirements":{...}}
     (operation requirements are idempotency and recoverability only;

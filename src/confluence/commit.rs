@@ -365,6 +365,7 @@ fn apply_mutation(
                     draft.service = value.service.clone();
                     draft.description = value.description.clone();
                     draft.inputs = value.inputs.clone();
+                    draft.sketch = value.sketch.clone();
                     draft.recompute_stage();
                 }
 
@@ -870,6 +871,8 @@ fn check_patch(candidate: &WorkspaceState, patch: &SpecPatch) -> Vec<DraftDiagno
                 for (input_id, input) in &value.inputs {
                     check_input(candidate, operation, input_id, input, &mut diagnostics);
                 }
+
+                check_sketch(candidate, operation, &mut diagnostics);
             }
 
             Mutation::ReplaceOperationProgram { operation, program } => {
@@ -981,6 +984,44 @@ fn probe_model(candidate: &WorkspaceState, operation: &Id) -> Option<Model> {
         operations,
         runtime: (!candidate.runtime.is_empty()).then(|| candidate.runtime.clone()),
     })
+}
+
+/// A sketch is dry-compiled when it is written, so a sketch that names
+/// something the skeleton lacks is fixed by its author in-session rather
+/// than discovered by every synthesis at once. A request's refusal error
+/// left unnamed is a choice made at synthesis time, not a defect: the
+/// dry run stands any declared error in for it.
+fn check_sketch(
+    candidate: &WorkspaceState,
+    operation: &Id,
+    diagnostics: &mut Vec<DraftDiagnostic>,
+) {
+    let Some(draft) = candidate.operations.get(operation) else {
+        return;
+    };
+
+    if draft.sketch.is_none() {
+        return;
+    }
+
+    let refusal = draft.inputs.values().find_map(|input| match input {
+        crate::spec::Input::Request(request) => request.result.errors.keys().next().cloned(),
+        _ => None,
+    });
+
+    let symbols = super::sketch::Symbols::of(candidate);
+
+    if let Err(error) = super::sketch::compile(
+        operation,
+        draft,
+        &symbols,
+        &super::sketch::Settled { refusal },
+    ) {
+        diagnostics.push(DraftDiagnostic::new(
+            Some(SymbolKey::OperationInterface(operation.clone())),
+            format!("the sketch of {operation} does not compile: {error}"),
+        ));
+    }
 }
 
 fn check_schema(
