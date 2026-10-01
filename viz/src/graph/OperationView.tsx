@@ -4,10 +4,11 @@ import { ClipboardText } from "@cloudflare/kumo/components/clipboard-text";
 import { Collapsible } from "@cloudflare/kumo/components/collapsible";
 import { Empty } from "@cloudflare/kumo/components/empty";
 import { Flow } from "@cloudflare/kumo/components/flow";
+import { Sidebar } from "@cloudflare/kumo/components/sidebar";
 import { Table } from "@cloudflare/kumo/components/table";
 import { Text } from "@cloudflare/kumo/components/text";
 import { ArrowSquareOutIcon, CaretRightIcon, GraphIcon } from "@phosphor-icons/react";
-import { Fragment, useEffect, type CSSProperties, type ComponentPropsWithRef, type ReactElement, type ReactNode } from "react";
+import { Fragment, useEffect, useState, type CSSProperties, type ComponentPropsWithRef, type ReactElement, type ReactNode } from "react";
 
 import { definedAtLabel, usedAtLabel, type BindingKind } from "../lib/bindings";
 import {
@@ -316,67 +317,101 @@ export function TxStepRow({ step, index, txId, opId }: { step: TransactionStep; 
 
 type ArmTone = "outline" | "warning" | "success";
 
-const ARM_BOX: Record<ArmTone, string> = {
-  outline: "border-kumo-hairline bg-kumo-elevated/30",
-  warning: "border-kumo-warning/40 bg-kumo-warning-tint/60",
-  success: "border-kumo-success/40 bg-kumo-success-tint/60",
-};
-
-/** One box of a set of alternatives — a decision's arm, a transaction's
- *  outcome: its label, an optional note beside it, an optional caption
- *  under it, and whatever the alternative holds. */
-function ArmBox({ label, tone = "outline", note, caption, children }: {
-  label: string; tone?: ArmTone; note?: ReactNode; caption?: ReactNode; children: ReactNode;
+/** A step that branches, as one node of the program: its card, and
+ *  under it the tree of its alternatives. Rendered through
+ *  `Flow.Node`'s `render` prop, so it takes the ref, position style
+ *  and data attributes Kumo's layout engine clones onto it; the card
+ *  inside fills the node. */
+function BranchingNode({ card, branches, className, style, ...rest }: Omit<ComponentPropsWithRef<"div">, "children"> & {
+  card: ReactElement; branches: ReactNode;
 }) {
   return (
-    <div className={`min-w-0 space-y-2 rounded-md border p-2 ${ARM_BOX[tone]}`}>
-      <div className="flex flex-wrap items-center gap-1.5">
-        <Badge variant={tone}>{label}</Badge>
-        {note && <span className="text-xs text-kumo-subtle">{note}</span>}
-      </div>
-      {caption && <div className="text-[11px] leading-snug text-kumo-subtle">{caption}</div>}
-      {children}
+    <div {...rest} style={style} className={`w-(--step-w) ${className ?? ""}`}>
+      <div style={{ "--step-w": "100%" } as CSSProperties}>{card}</div>
+      {branches}
     </div>
   );
 }
 
-/** One arm of a decision — or the rejection block of a transaction
- *  step: its label, as the checker spells it in a step location, and
- *  its block, rendered recursively. */
-function DecisionArm({ opId, op, label, block, hops, tone = "outline", caption, note, startIndex = 0 }: {
+/** The alternatives of a branching step as a vertical, nested tree —
+ *  Kumo's sub-menu list, with its guide line — rather than columns
+ *  side by side: each level of nesting costs one fixed indent, never
+ *  half the width, so arbitrarily deep and wide programs stay legible. */
+function BranchTree({ children }: { children: ReactNode }) {
+  return (
+    // The list clips by default; selection rings and shadows must show.
+    <Sidebar.MenuSub className="mt-1 overflow-visible">{children}</Sidebar.MenuSub>
+  );
+}
+
+/** One alternative of a branching step — a decision's arm, a
+ *  transaction's outcome: a collapsible row with its label, a note
+ *  beside it and a caption under it, and the steps it holds nested
+ *  beneath. A tick joins it to the tree's guide line. */
+function Branch({ label, tone = "outline", note, caption, children }: {
+  label: string; tone?: ArmTone; note?: ReactNode; caption?: ReactNode; children: ReactNode;
+}) {
+  const [open, setOpen] = useState(true);
+  return (
+    <Sidebar.MenuSubItem className="py-1">
+      <span aria-hidden className="absolute top-[17px] -left-[9px] h-px w-[9px] bg-kumo-line" />
+      <Collapsible.Root open={open} onOpenChange={setOpen}>
+        <Collapsible.Trigger
+          className="flex w-full min-w-0 cursor-pointer items-center gap-1.5 rounded-md px-1 py-1 text-left hover:bg-kumo-elevated"
+          onClick={(e) => e.stopPropagation()}
+        >
+          <CaretRightIcon size={12} className={`shrink-0 text-kumo-subtle transition-transform ${open ? "rotate-90" : ""}`} />
+          <Badge variant={tone}>{label}</Badge>
+          {note && <span className="min-w-0 truncate text-xs text-kumo-subtle">{note}</span>}
+        </Collapsible.Trigger>
+        {caption && <div className="mt-0.5 ml-[22px] text-[11px] leading-snug text-kumo-subtle">{caption}</div>}
+        <Collapsible.Panel>
+          <div className="mt-1.5">{children}</div>
+        </Collapsible.Panel>
+      </Collapsible.Root>
+    </Sidebar.MenuSubItem>
+  );
+}
+
+/** One arm of a decision — or an outcome of a transaction step: its
+ *  label, as the checker spells it in a step location, and its block,
+ *  rendered recursively beneath it. */
+function DecisionArm({ opId, op, label, block, hops, tone = "outline", caption, note, startIndex = 0, empty }: {
   opId: Id; op: Operation; label: string; block: OperationBlock | null; hops: StepHop[];
   tone?: ArmTone; caption?: ReactNode; note?: ReactNode;
   /** The index in `hops`' block of the arm's first step, when the arm
    *  holds the tail of that block rather than a block of its own — a
    *  transaction's committed continuation. */
   startIndex?: number;
+  /** What to say when the arm holds no step. */
+  empty?: string;
 }) {
   return (
-    <ArmBox label={label} tone={tone} caption={caption} note={note}>
+    <Branch label={label} tone={tone} caption={caption} note={note}>
       {block ? (
         block.steps.length ? (
           <ProgramBlock opId={opId} op={op} block={block} hops={hops} startIndex={startIndex} nested />
         ) : (
-          <Muted>empty arm</Muted>
+          <Muted>{empty ?? "empty arm"}</Muted>
         )
       ) : (
         <Muted>falls through</Muted>
       )}
-    </ArmBox>
+    </Branch>
   );
 }
 
 /** One block of the program as a vertical sequence of step cards. The
- *  top-level block is a Kumo Flow with connectors; nested arm blocks are
- *  plain stacks, so arbitrary nesting stays legible. */
-function ProgramBlock({ opId, op, block, hops, nested, startIndex = 0, fill = false }: {
+ *  top-level block is a Kumo Flow with connectors; a step that branches
+ *  carries its alternatives as a nested tree beneath its card, and the
+ *  blocks inside it are plain stacks, so arbitrary nesting stays
+ *  legible. */
+function ProgramBlock({ opId, op, block, hops, nested, startIndex = 0 }: {
   opId: Id; op: Operation; block: OperationBlock; hops: StepHop[]; nested?: boolean;
   /** The index in the enclosing block of `block.steps[0]`, so a tail
-   *  drawn as a fork's committed lane keeps the locations the checker
+   *  drawn as a fork's committed branch keeps the locations the checker
    *  names its steps by. */
   startIndex?: number;
-  /** Fill the lane the block is drawn in rather than the section. */
-  fill?: boolean;
 }) {
   const { model, index, expandedTx, toggleTx, navigateTo } = useApp();
   const effectKind = (effectId: Id): EffectKind | null => effectDef(model, index, effectId)?.effect.kind ?? null;
@@ -386,8 +421,8 @@ function ProgramBlock({ opId, op, block, hops, nested, startIndex = 0, fill = fa
   // A transaction that can reject forks the path: the steps after it
   // are the committed path's and nothing else's (a rejected block that
   // terminates never reaches them; one that falls through rejoins them
-  // and says so). They are drawn inside its committed arm, beside the
-  // rejected arm, so the two outcomes read as the alternatives they
+  // and says so). They are drawn as its committed branch, next to the
+  // rejected branch, so the two outcomes read as the alternatives they
   // are — never as "commit, then reject". The block's own sequence ends
   // at that transaction.
   const forkAt = block.steps.findIndex((step) => step.kind === "transaction" && step.rejected !== undefined);
@@ -414,7 +449,7 @@ function ProgramBlock({ opId, op, block, hops, nested, startIndex = 0, fill = fa
 
         // What a commit makes available to the steps that follow. On
         // a transaction that cannot reject it is shown on the card; on
-        // one that can, it heads the committed lane of the fork below.
+        // one that can, it heads the committed branch below.
         const available = established.length ? (
           <div className="space-y-1">
             {established}
@@ -422,9 +457,7 @@ function ProgramBlock({ opId, op, block, hops, nested, startIndex = 0, fill = fa
           </div>
         ) : null;
 
-        return {
-          key: location,
-          element: (
+        const card = (
             <StepCard selKey={`tx:${tx.id}`} detailId={tx.id} stripe={STEP_STRIPE.tx}>
               <div className="flex items-center justify-between gap-2">
                 <Badge variant="neutral">transaction</Badge>
@@ -491,21 +524,49 @@ function ProgramBlock({ opId, op, block, hops, nested, startIndex = 0, fill = fa
                   </div>
                 </Collapsible.Panel>
               </Collapsible.Root>
-              {/* The two outcomes of an attempt, side by side like a
-                  decision's arms — never "commit, then reject". Left,
-                  what a commit establishes and where control continues;
-                  right, the block control enters when a commit guard
-                  rejects: nothing committed, no artifact established,
-                  its steps located beneath this one as `n.rejected.m`.
-                  A body with no guard cannot reject, so it gets one
-                  full-width committed strip and no arm to pretend
-                  otherwise. */}
-              {/* A transaction that can reject forks the flow below this
-                  card — see the outcome lanes the block draws after it.
-                  One that cannot only says what its commit makes
-                  available. */}
+              {/* A transaction that can reject branches below this card
+                  into its committed and rejected outcomes — never
+                  "commit, then reject". One that cannot only says what
+                  its commit makes available. */}
               {!step.rejected && available && <div className="mt-2">{available}</div>}
             </StepCard>
+        );
+
+        if (!step.rejected) return { key: location, element: card };
+
+        // A transaction that can reject forks the path, and its two
+        // outcomes are the step's branches. The committed branch is this
+        // block's own flow continuing — the steps after the transaction,
+        // its terminal included, with the locations the checker names
+        // them by. The rejected branch is the rejected block, located
+        // beneath the transaction as `n.rejected.m`.
+        const tail: OperationBlock = { steps: block.steps.slice(si + 1 - startIndex) };
+        const rejoins = blockTerminates(step.rejected)
+          ? null
+          : tail.steps.length
+            ? `falls through · rejoins the committed branch at step ${locationLabel([...hops, { step: si + 1 }])}`
+            : "falls through · rejoins the committed branch at the end of this block";
+
+        return {
+          key: location,
+          element: (
+            <BranchingNode
+              card={card}
+              branches={
+                <BranchTree>
+                  <DecisionArm opId={opId} op={op} label="committed" tone="success"
+                    block={tail} hops={hops} startIndex={si + 1}
+                    note={established.length ? "available from here on:" : "establishes no binding"}
+                    caption={established.length ? <div className="space-y-1">{established}</div> : undefined}
+                    empty={hops.length ? "falls through to the enclosing join" : "end of program"} />
+                  <DecisionArm opId={opId} op={op} label="rejected" tone="warning"
+                    block={step.rejected} hops={[...hops, { step: si, arm: "rejected" }]}
+                    note="nothing committed · no binding above is available"
+                    caption={rejoins ?? undefined}
+                    empty="empty block · falls through" />
+                </BranchTree>
+              }
+            />
           ),
         };
       }
@@ -668,25 +729,31 @@ function ProgramBlock({ opId, op, block, hops, nested, startIndex = 0, fill = fa
         return {
           key: location,
           element: (
-            <StepCard selKey={`step:${location}`} detailId={opId} ctx={stepCtx(location)} stripe={STEP_STRIPE.decision}>
-              <div className="flex flex-wrap items-center gap-1.5">
-                <Badge variant="neutral">match result</Badge>
-                <Badge variant="outline">step {location}</Badge>
-              </div>
-              <StepTitle><BindingChip role="uses" name={step.result} kind="result" /></StepTitle>
-              {/* One arm per outcome the contract declares: ok, then an
-                  arm per error class, labelled as the checker locates
-                  its steps. */}
-              <div className="mt-2 grid gap-2 sm:grid-cols-2">
-                <DecisionArm opId={opId} op={op} label="ok" block={step.ok} hops={under("ok")} />
-                {Object.entries(step.errors).map(([error, arm]) => (
-                  <DecisionArm key={error} opId={opId} op={op} label={errArm(error)} block={arm} hops={under(errArm(error))} />
-                ))}
-              </div>
-              {Object.keys(step.errors).length === 0 && (
-                <div className="mt-1 text-xs text-kumo-subtle">the contract declares no error class</div>
-              )}
-            </StepCard>
+            <BranchingNode
+              card={
+                <StepCard selKey={`step:${location}`} detailId={opId} ctx={stepCtx(location)} stripe={STEP_STRIPE.decision}>
+                  <div className="flex flex-wrap items-center gap-1.5">
+                    <Badge variant="neutral">match result</Badge>
+                    <Badge variant="outline">step {location}</Badge>
+                  </div>
+                  <StepTitle><BindingChip role="uses" name={step.result} kind="result" /></StepTitle>
+                  {Object.keys(step.errors).length === 0 && (
+                    <div className="mt-1 text-xs text-kumo-subtle">the contract declares no error class</div>
+                  )}
+                </StepCard>
+              }
+              branches={
+                // One arm per outcome the contract declares: ok, then an
+                // arm per error class, labelled as the checker locates
+                // its steps.
+                <BranchTree>
+                  <DecisionArm opId={opId} op={op} label="ok" block={step.ok} hops={under("ok")} />
+                  {Object.entries(step.errors).map(([error, arm]) => (
+                    <DecisionArm key={error} opId={opId} op={op} label={errArm(error)} block={arm} hops={under(errArm(error))} />
+                  ))}
+                </BranchTree>
+              }
+            />
           ),
         };
 
@@ -694,20 +761,26 @@ function ProgramBlock({ opId, op, block, hops, nested, startIndex = 0, fill = fa
         return {
           key: location,
           element: (
-            <StepCard selKey={`step:${location}`} detailId={opId} ctx={stepCtx(location)} stripe={STEP_STRIPE.decision}>
-              <div className="flex flex-wrap items-center gap-1.5">
-                <Badge variant="neutral">branch</Badge>
-                <Badge variant="outline">step {location}</Badge>
-                {step.condition.kind === "unspecified" && <Badge variant="warning">condition unspecified</Badge>}
-              </div>
-              <StepTitle>
-                <span className="break-words font-normal text-kumo-subtle"><ConditionView condition={step.condition} /></span>
-              </StepTitle>
-              <div className="mt-2 grid gap-2 sm:grid-cols-2">
-                <DecisionArm opId={opId} op={op} label="then" block={step.then} hops={under("then")} />
-                <DecisionArm opId={opId} op={op} label="otherwise" block={step.otherwise} hops={under("otherwise")} />
-              </div>
-            </StepCard>
+            <BranchingNode
+              card={
+                <StepCard selKey={`step:${location}`} detailId={opId} ctx={stepCtx(location)} stripe={STEP_STRIPE.decision}>
+                  <div className="flex flex-wrap items-center gap-1.5">
+                    <Badge variant="neutral">branch</Badge>
+                    <Badge variant="outline">step {location}</Badge>
+                    {step.condition.kind === "unspecified" && <Badge variant="warning">condition unspecified</Badge>}
+                  </div>
+                  <StepTitle>
+                    <span className="break-words font-normal text-kumo-subtle"><ConditionView condition={step.condition} /></span>
+                  </StepTitle>
+                </StepCard>
+              }
+              branches={
+                <BranchTree>
+                  <DecisionArm opId={opId} op={op} label="then" block={step.then} hops={under("then")} />
+                  <DecisionArm opId={opId} op={op} label="otherwise" block={step.otherwise} hops={under("otherwise")} />
+                </BranchTree>
+              }
+            />
           ),
         };
 
@@ -755,48 +828,6 @@ function ProgramBlock({ opId, op, block, hops, nested, startIndex = 0, fill = fa
     }
   });
 
-  // The fork after a transaction that can reject: two lanes of the same
-  // form, side by side. The committed lane is this block's own flow
-  // continuing — the steps after the transaction, its terminal
-  // included, drawn as the explicit cards they are, with the locations
-  // the checker names them by. The rejected lane is the rejected block,
-  // located beneath the transaction as `n.rejected.m`. Neither lane is
-  // inside the transaction card, and nothing after the card is drawn
-  // as a sequence with it.
-  const fork = (() => {
-    if (forkAt === -1) return null;
-    const step = block.steps[forkAt];
-    if (step.kind !== "transaction" || !step.rejected) return null;
-    const si = startIndex + forkAt;
-    const tail: OperationBlock = { steps: block.steps.slice(forkAt + 1) };
-    const established = establishedBindings(step.transaction);
-    const rejoins = blockTerminates(step.rejected)
-      ? null
-      : tail.steps.length
-        ? `falls through · rejoins the committed lane at step ${locationLabel([...hops, { step: si + 1 }])}`
-        : "falls through · rejoins the committed lane at the end of this block";
-    return (
-      <div className="mt-3 grid gap-4 sm:grid-cols-2">
-        <OutcomeLane label="committed" tone="success" glyph="↓"
-          caption={established.length ? <>{established}<div>available from here on</div></> : "establishes no binding"}>
-          {tail.steps.length ? (
-            <ProgramBlock opId={opId} op={op} block={tail} hops={hops} startIndex={si + 1} nested={nested} fill />
-          ) : (
-            <Muted>{hops.length ? "falls through to the enclosing join" : "end of program"}</Muted>
-          )}
-        </OutcomeLane>
-        <OutcomeLane label="rejected" tone="warning" glyph="↘"
-          caption={<>nothing committed · no binding above is available{rejoins && <><br />{rejoins}</>}</>}>
-          {step.rejected.steps.length ? (
-            <ProgramBlock opId={opId} op={op} block={step.rejected} hops={[...hops, { step: si, arm: "rejected" }]} nested={nested} fill />
-          ) : (
-            <Muted>empty block · falls through</Muted>
-          )}
-        </OutcomeLane>
-      </div>
-    );
-  })();
-
   if (nested) {
     // Arm blocks stack without connectors; the surrounding decision card
     // already communicates the sequence.
@@ -805,7 +836,6 @@ function ProgramBlock({ opId, op, block, hops, nested, startIndex = 0, fill = fa
         {nodes.map((n) => (
           <div key={n.key}>{n.element}</div>
         ))}
-        {fork}
       </div>
     );
   }
@@ -813,34 +843,13 @@ function ProgramBlock({ opId, op, block, hops, nested, startIndex = 0, fill = fa
   return (
     // Step cards size to the section body (a container), capped for
     // readability; the 12px accounts for the diagram's own padding,
-    // which keeps selection rings clear of its clipping edge. A lane
-    // of a fork fills its column instead.
-    <div className="arch-flow" style={{ "--step-w": fill ? "100%" : "min(640px, 100cqw - 12px)" } as CSSProperties}>
+    // which keeps selection rings clear of its clipping edge.
+    <div className="arch-flow" style={{ "--step-w": "min(640px, 100cqw - 12px)" } as CSSProperties}>
       <Flow orientation="vertical" canvas={false} padding={{ x: 6, y: 6 }}>
         {nodes.map((n) => (
           <Flow.Node key={n.key} id={n.key} render={n.element} />
         ))}
       </Flow>
-      {fork}
-    </div>
-  );
-}
-
-/** One lane of a transaction's fork: a branch tick, its label with the
- *  glyph of the direction it takes, a caption, and the flow it holds. */
-function OutcomeLane({ label, tone, glyph, caption, children }: {
-  label: string; tone: ArmTone; glyph: string; caption: ReactNode; children: ReactNode;
-}) {
-  return (
-    <div className="min-w-0">
-      <div aria-hidden className="ml-5 h-3 w-0 border-l-2 border-dashed border-kumo-line" />
-      <div className={`rounded-md border px-2 py-1.5 ${ARM_BOX[tone]}`}>
-        <div className="flex flex-wrap items-center gap-1.5">
-          <Badge variant={tone}>{`${glyph} ${label}`}</Badge>
-        </div>
-        <div className="mt-1 text-[11px] leading-snug text-kumo-subtle">{caption}</div>
-      </div>
-      <div className="mt-2">{children}</div>
     </div>
   );
 }
