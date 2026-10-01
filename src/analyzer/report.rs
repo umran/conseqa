@@ -73,7 +73,9 @@ pub struct ProverReport {
 /// closure — serializable isolation, strict locks, version validation,
 /// ordered cursors, fences — and never from L1. Format 8 judges a
 /// request result per variant: a target's retryable error class is
-/// never replay-stable (`target_error_retryable`).
+/// never replay-stable (`target_error_retryable`) — and scopes the
+/// idempotency-inert continuation admission to the path, so
+/// `idempotency_inert_continuation` is cited per path.
 pub const FORMAT: u32 = 8;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -451,9 +453,9 @@ pub fn obligations(model: &Model, verification: &VerificationReport) -> ProverRe
                                 obligation.evidence.push(EvidenceItem {
                                     subject: None,
                                     message: format!(
-                                        "{} is not established to replay; every continuation \
-                                         to a terminal is idempotency-inert, so divergence \
-                                         cannot add modeled work and may affect only terminal \
+                                        "{} is not established to replay; on this path only \
+                                         decisions and the terminal follow it, so taking it \
+                                         adds no modeled work and may affect only terminal \
                                          construction — which is the result-replay \
                                          obligation's concern, not this one's.",
                                         decision_label(&decision.decision),

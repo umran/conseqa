@@ -4618,3 +4618,105 @@ fn a_target_error_held_to_its_result_replay_obligation_stays_stable() {
         );
     }
 }
+
+/// A second, duplicate-safe request into `transfer_stock` from
+/// `rebalance`: effectful work for a continuation.
+fn more_work(effect: &str) -> OperationStep {
+    execute(
+        effect,
+        transfer_request(effect),
+        deterministic(vec![input_key("input.rebalance.request", &["sku"])]),
+        None,
+    )
+}
+
+/// The common shape: the `ok` arm does work, the retryable arm passes
+/// the error up. The decision on the retryable arm does not replay,
+/// but on its own path nothing follows it but the return, so it adds
+/// no work: the inert-continuation admission is judged per path, and
+/// the `ok` arm's work no longer disqualifies it.
+#[test]
+fn bubbling_beside_an_effectful_arm_is_idempotent() {
+    let model = a_request_chain(
+        ErrorDisposition::Retryable,
+        vec![more_work("effect.rebalance.again")],
+    );
+
+    let verdict = idempotency_verdict(&model, "operation.rebalance", 0);
+
+    let IdempotencyVerdict::Proven {
+        proof: IdempotencyProof::RetrySafePaths { paths },
+        ..
+    } = &verdict
+    else {
+        panic!("expected a proven verdict, found {verdict:#?}");
+    };
+
+    let rules: Vec<(&ResultArm, &DecisionRule)> = paths
+        .iter()
+        .flat_map(|path| &path.decisions)
+        .filter_map(|replay| match &replay.decision {
+            verification::DecisionTaken::Match { arm, .. } => Some((arm, &replay.rule)),
+            _ => None,
+        })
+        .collect();
+
+    assert!(
+        rules.iter().any(|(arm, rule)| matches!(arm, ResultArm::Ok)
+            && matches!(rule, DecisionRule::StableResult { .. })),
+        "{rules:#?}"
+    );
+    assert!(
+        rules.iter().any(|(arm, rule)| matches!(arm, ResultArm::Err { .. })
+            && matches!(rule, DecisionRule::IdempotencyInertContinuation)),
+        "{rules:#?}"
+    );
+}
+
+/// Divergent work is still an obstacle: when the retryable arm does
+/// work of its own, an attempt observing the error and a retry
+/// observing `ok` do different things.
+#[test]
+fn work_on_an_unstable_arm_is_still_an_obstacle() {
+    let mut model = a_request_chain(
+        ErrorDisposition::Retryable,
+        vec![more_work("effect.rebalance.again")],
+    );
+
+    let OperationStep::MatchResult(matched) =
+        &mut program_mut(&mut model, "operation.rebalance").steps[1]
+    else {
+        panic!("expected the match");
+    };
+
+    matched
+        .errors
+        .get_mut(&id("rejected"))
+        .unwrap()
+        .steps
+        .insert(0, more_work("effect.rebalance.compensate"));
+
+    let verdict = idempotency_verdict(&model, "operation.rebalance", 0);
+
+    let IdempotencyVerdict::Unproven { obstacles } = &verdict else {
+        panic!("expected an unproven verdict, found {verdict:#?}");
+    };
+
+    assert!(
+        obstacles.iter().any(|obstacle| matches!(
+            obstacle,
+            IdempotencyObstacle::PathDecisionUnstable {
+                decision: verification::DecisionTaken::Match {
+                    arm: ResultArm::Err { .. },
+                    ..
+                },
+                gap: DecisionGap::ResultUnstable {
+                    gap: ResultGap::TargetErrorRetryable { .. },
+                    ..
+                },
+                ..
+            }
+        )),
+        "{obstacles:#?}"
+    );
+}
