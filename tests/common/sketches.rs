@@ -199,3 +199,188 @@ pub fn flash_checkout_sketches() -> Vec<(&'static str, serde_json::Value)> {
         ),
     ]
 }
+
+/// `transactional_outbox`.
+pub fn transactional_outbox_sketches() -> Vec<(&'static str, serde_json::Value)> {
+    vec![
+        (
+            "operation.create_order",
+            serde_json::json!({ "steps": [
+                { "kind": "create", "record": "object.order",
+                  "from": ["input.order_id", "input.tenant_id", "input.amount"] },
+                { "kind": "enqueue", "outbox": "outbox.order_events",
+                  "schema": "schema.OrderCreated",
+                  "from": ["input.request_id", "input.order_id", "input.tenant_id",
+                           "input.amount"] }
+            ]}),
+        ),
+        (
+            "operation.publish_order_event",
+            serde_json::json!({ "steps": [
+                { "kind": "publish", "topic": "topic.order_events",
+                  "schema": "schema.OrderCreated",
+                  "from": ["input.event_id", "input.order_id", "input.tenant_id",
+                           "input.amount"] }
+            ]}),
+        ),
+        (
+            "operation.project_order",
+            serde_json::json!({ "steps": [
+                { "kind": "create", "record": "object.order_projection",
+                  "from": ["input.event_id", "input.order_id"] }
+            ]}),
+        ),
+    ]
+}
+
+/// `payment_capture`.
+pub fn payment_capture_sketches() -> Vec<(&'static str, serde_json::Value)> {
+    vec![
+        (
+            "operation.capture_payment",
+            serde_json::json!({ "steps": [
+                { "kind": "create", "record": "object.payment",
+                  "from": ["input.payment_id", "input.order_id", "input.account_id",
+                           "input.amount_cents", "input.currency"] },
+                { "kind": "enqueue", "outbox": "outbox.payment_events",
+                  "schema": "schema.PaymentCaptured",
+                  "from": ["input.idempotency_key", "input.payment_id", "input.order_id",
+                           "input.account_id", "input.amount_cents", "input.currency"] }
+            ]}),
+        ),
+        (
+            "operation.publish_payment_event",
+            serde_json::json!({ "steps": [
+                { "kind": "publish", "topic": "topic.payment_events",
+                  "schema": "schema.PaymentCaptured",
+                  "from": ["input.event_id", "input.payment_id", "input.order_id",
+                           "input.account_id", "input.amount_cents", "input.currency"] }
+            ]}),
+        ),
+        (
+            "operation.post_ledger_entry",
+            serde_json::json!({ "steps": [
+                { "kind": "create", "record": "object.ledger_entry",
+                  "from": ["input.event_id", "input.payment_id", "input.account_id",
+                           "input.amount_cents", "input.currency"] }
+            ]}),
+        ),
+        (
+            "operation.send_receipt",
+            serde_json::json!({ "steps": [
+                { "kind": "call", "name": "receipt_email_provider",
+                  "identity": ["input.event_id"], "duplicates": "identical_per_identity",
+                  "from": ["input.event_id", "input.payment_id", "input.account_id",
+                           "input.amount_cents", "input.currency"] }
+            ]}),
+        ),
+    ]
+}
+
+/// `video_streaming`: an external call inside a record-changing
+/// operation, transactions in its answer's arms, transitions with side
+/// effects.
+pub fn video_streaming_sketches() -> Vec<(&'static str, serde_json::Value)> {
+    vec![
+        (
+            "operation.complete_upload",
+            serde_json::json!({ "steps": [
+                { "kind": "create", "record": "object.video",
+                  "from": ["input.video_id", "input.owner_id", "input.source_uri"] },
+                { "kind": "publish", "topic": "topic.video_events",
+                  "schema": "schema.VideoUploaded",
+                  "from": ["input.upload_id", "input.video_id", "input.owner_id",
+                           "input.source_uri"] }
+            ]}),
+        ),
+        (
+            "operation.transcode_video",
+            serde_json::json!({ "steps": [
+                { "kind": "create", "record": "object.job",
+                  "from": ["input.video_id", "input.source_uri"] },
+                { "kind": "find", "as": "job", "record": "object.job",
+                  "by": { "video_id": "input.video_id" } },
+                { "kind": "transition", "record": "job", "transition": "transition.job.start" },
+                { "kind": "call", "name": "transcoding-engine.render", "as": "render",
+                  "identity": ["input.video_id"], "duplicates": "identical_per_identity",
+                  "result_replay": "replay_stable",
+                  "result": { "ok": "schema.RenderCompleted",
+                              "errors": { "failed": { "schema": "schema.RenderFailed",
+                                                      "disposition": "terminal" } } },
+                  "from": ["input.video_id", "input.source_uri"],
+                  "on_ok": [
+                    { "kind": "find", "as": "done", "record": "object.job",
+                      "by": { "video_id": "input.video_id" } },
+                    { "kind": "update", "record": "done", "set": ["manifest_uri"],
+                      "from": ["render.manifest_uri"] },
+                    { "kind": "transition", "record": "done",
+                      "transition": "transition.job.complete",
+                      "effects_from": ["input.event_id", "input.video_id",
+                                       "render.manifest_uri"] } ],
+                  "on_error": { "failed": [
+                    { "kind": "find", "as": "failed", "record": "object.job",
+                      "by": { "video_id": "input.video_id" } },
+                    { "kind": "transition", "record": "failed",
+                      "transition": "transition.job.fail" } ] } }
+            ]}),
+        ),
+        (
+            "operation.publish_video",
+            serde_json::json!({ "steps": [
+                { "kind": "find", "as": "video", "record": "object.video",
+                  "by": { "video_id": "input.video_id" } },
+                { "kind": "update", "record": "video", "set": ["manifest_uri"],
+                  "from": ["input.manifest_uri"] },
+                { "kind": "transition", "record": "video",
+                  "transition": "transition.video.mark_ready",
+                  "effects_from": ["input.event_id", "input.video_id", "input.manifest_uri"] }
+            ]}),
+        ),
+        (
+            "operation.notify_published",
+            serde_json::json!({ "steps": [
+                { "kind": "call", "name": "push-gateway.notify",
+                  "identity": ["input.event_id"], "duplicates": "identical_per_identity",
+                  "from": ["input.event_id", "input.video_id", "input.manifest_uri"] }
+            ]}),
+        ),
+        (
+            "operation.get_playback",
+            serde_json::json!({ "steps": [
+                { "kind": "find", "as": "video", "record": "object.video",
+                  "by": { "video_id": "input.video_id" } }
+            ], "returns": ["input.video_id", "video.status", "video.manifest_uri"] }),
+        ),
+    ]
+}
+
+/// `hedged_read`: a race acting on the winner's answer, and a
+/// fire-and-forget publication left in flight.
+pub fn hedged_read_sketches() -> Vec<(&'static str, serde_json::Value)> {
+    vec![
+        (
+            "operation.hedged_read",
+            serde_json::json!({ "steps": [
+                { "kind": "race", "as": "read",
+                  "steps": [
+                    { "kind": "call", "name": "store-a",
+                      "result": { "ok": "schema.Row", "errors": { "miss": "schema.Miss" } },
+                      "from": ["input.id"] },
+                    { "kind": "call", "name": "store-b",
+                      "result": { "ok": "schema.Row", "errors": { "miss": "schema.Miss" } },
+                      "from": ["input.id"] } ],
+                  "on_error": { "miss": [
+                    { "kind": "reject", "error": "miss", "from": ["read.reason"] } ] } },
+                { "kind": "start", "step":
+                    { "kind": "publish", "topic": "topic.reads", "schema": "schema.ReadLogged",
+                      "from": ["input.id"] } }
+            ], "returns": ["read.id"] }),
+        ),
+        (
+            "operation.record_read",
+            serde_json::json!({ "steps": [
+                { "kind": "call", "name": "read-ledger", "from": ["input.id"] }
+            ]}),
+        ),
+    ]
+}

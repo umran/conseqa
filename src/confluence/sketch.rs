@@ -165,6 +165,97 @@ pub enum SketchStep {
         #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
         on_error: BTreeMap<Id, Vec<SketchStep>>,
     },
+
+    /// Delete a found record.
+    Delete { record: String },
+
+    /// Accept a fencing token for a found record, rejecting a stale one.
+    Fence {
+        record: String,
+        field: String,
+        token: String,
+    },
+
+    /// Invoke another operation's request input, and act on its answer.
+    Request {
+        operation: Id,
+
+        /// The target's request input; its only one when omitted.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        input: Option<Id>,
+
+        #[serde(rename = "as", default, skip_serializing_if = "Option::is_none")]
+        alias: Option<String>,
+
+        /// `unspecified`, `never` or `may_repeat`.
+        #[serde(default = "unspecified_retry")]
+        retry: crate::spec::RetrySemantics,
+
+        #[serde(default)]
+        from: Vec<String>,
+
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        on_ok: Vec<SketchStep>,
+
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        on_error: BTreeMap<Id, Vec<SketchStep>>,
+    },
+
+    /// Decide between two courses on values known at this point: the
+    /// input, records found in finished transactions, and answers.
+    When {
+        #[serde(rename = "if")]
+        condition: SketchCondition,
+        #[serde(default)]
+        then: Vec<SketchStep>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        otherwise: Vec<SketchStep>,
+    },
+
+    /// End a request with one of its declared errors.
+    Reject {
+        error: Id,
+        #[serde(default)]
+        from: Vec<String>,
+    },
+
+    /// Start every effect at once and wait for all of them.
+    Parallel { steps: Vec<SketchStep> },
+
+    /// Start every effect at once and wait for the first to complete,
+    /// acting on its answer.
+    Race {
+        steps: Vec<SketchStep>,
+
+        #[serde(rename = "as", default, skip_serializing_if = "Option::is_none")]
+        alias: Option<String>,
+
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        on_ok: Vec<SketchStep>,
+
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        on_error: BTreeMap<Id, Vec<SketchStep>>,
+    },
+
+    /// Start an effect and do not wait for it.
+    Start { step: Box<SketchStep> },
+}
+
+fn unspecified_retry() -> crate::spec::RetrySemantics {
+    crate::spec::RetrySemantics::Unspecified
+}
+
+/// A condition of a `when`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum SketchCondition {
+    /// `[value, value-or-literal]`: a value reference first, then a
+    /// value reference or a literal (string, integer, boolean).
+    Equals(Vec<serde_json::Value>),
+    Present(String),
+    Not(Box<SketchCondition>),
+    All(Vec<SketchCondition>),
+    Any(Vec<SketchCondition>),
 }
 
 fn unspecified_duplicates() -> ExternalIdempotency {
@@ -180,7 +271,38 @@ fn unspecified_replay() -> ExternalResultReplay {
 pub struct CallResult {
     pub ok: Id,
     #[serde(default)]
-    pub errors: BTreeMap<Id, Id>,
+    pub errors: BTreeMap<Id, CallError>,
+}
+
+/// A declared error of an answer: its schema, and — when known — whether
+/// observing it ends the interaction (`terminal`) or admits another
+/// attempt (`retryable`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum CallError {
+    Schema(Id),
+    Declared {
+        schema: Id,
+        disposition: ErrorDisposition,
+    },
+}
+
+impl CallError {
+    fn declared(&self) -> ErrorResultType {
+        match self {
+            Self::Schema(schema) => ErrorResultType {
+                schema: schema.clone(),
+                disposition: ErrorDisposition::Unspecified,
+            },
+            Self::Declared {
+                schema,
+                disposition,
+            } => ErrorResultType {
+                schema: schema.clone(),
+                disposition: *disposition,
+            },
+        }
+    }
 }
 
 /// What compilation reads from the skeleton.
@@ -198,6 +320,9 @@ pub struct Symbols {
 
     /// Outbox → its data model and declaration.
     pub outboxes: BTreeMap<Id, (Id, Outbox)>,
+
+    /// Operation → its request inputs, for requests into it.
+    pub requests: BTreeMap<Id, BTreeMap<Id, crate::spec::RequestInput>>,
 }
 
 impl Symbols {
@@ -226,6 +351,23 @@ impl Symbols {
             machines: workspace.state_machines.clone(),
             topics: workspace.topics.clone(),
             outboxes,
+            requests: workspace
+                .operations
+                .iter()
+                .map(|(operation, draft)| {
+                    (
+                        operation.clone(),
+                        draft
+                            .inputs
+                            .iter()
+                            .filter_map(|(id, input)| match input {
+                                Input::Request(request) => Some((id.clone(), request.clone())),
+                                _ => None,
+                            })
+                            .collect(),
+                    )
+                })
+                .collect(),
         }
     }
 
@@ -315,6 +457,13 @@ struct Found {
     /// Whether its selector rests only on the input: what an inspection
     /// before the main transaction can select.
     input_only: bool,
+
+    /// Whether the transaction that found it is still being built.
+    open: bool,
+
+    /// The output it was exported through when that transaction closed,
+    /// for the steps after it.
+    exported: Option<Id>,
 }
 
 /// The open choices of a sketch, if any.
@@ -352,11 +501,21 @@ pub fn open_choices(
 
                 SketchStep::Call {
                     on_ok, on_error, ..
+                }
+                | SketchStep::Request {
+                    on_ok, on_error, ..
                 } => {
                     visit(on_ok, context, open);
                     for arm in on_error.values() {
                         visit(arm, context, open);
                     }
+                }
+
+                SketchStep::When {
+                    then, otherwise, ..
+                } => {
+                    visit(then, context, open);
+                    visit(otherwise, context, open);
                 }
 
                 _ => {}
@@ -396,6 +555,8 @@ fn transactional(step: &SketchStep) -> bool {
             | SketchStep::Transition { .. }
             | SketchStep::Advance { .. }
             | SketchStep::Enqueue { .. }
+            | SketchStep::Delete { .. }
+            | SketchStep::Fence { .. }
     )
 }
 
@@ -421,6 +582,27 @@ struct Compiler<'a> {
     after_commit: Vec<Id>,
 
     effects: usize,
+
+    /// Records deleted in the open transaction.
+    deleted: Vec<String>,
+
+    /// Whether several transactions and transitions are allowed: the
+    /// general path.
+    general: bool,
+
+    /// Transactions sealed so far, for their ids.
+    segments: usize,
+
+    /// Every refusal a transition of the open transaction names: what
+    /// its rejection returns.
+    refusals: Vec<Id>,
+
+    /// Answers in scope: a call or request `as` → where its fields are.
+    results: BTreeMap<String, ValueSource>,
+
+    /// The `ok` result's output, when the last transaction established
+    /// it.
+    final_output: Option<Id>,
 }
 
 impl Compiler<'_> {
@@ -437,11 +619,11 @@ impl Compiler<'_> {
     }
 
     fn resolve(&self, reference: &str) -> Result<ValueRef, CompileError> {
-        resolve(&self.context, &self.found, reference)
+        resolve(&self.context, &self.found, &self.results, reference)
     }
 
     fn derivation(&self, from: &[String]) -> Result<Derivation, CompileError> {
-        derivation(&self.context, &self.found, from)
+        derivation(&self.context, &self.found, &self.results, from)
     }
 
     /// The trigger's identity carried into a message's own identity, so
@@ -695,6 +877,63 @@ impl Compiler<'_> {
                 "the call to `{name}` is in a sketch that changes records; call outside services \
                  from an operation of their own, triggered by a message"
             )),
+
+            SketchStep::Delete { record } => {
+                let Some(target) = self.found.get(record) else {
+                    return fail(format!(
+                        "delete names `{record}`, which no find before it names"
+                    ));
+                };
+
+                if !target.open {
+                    return fail(format!(
+                        "`{record}` was found in an earlier transaction; find it again to delete it"
+                    ));
+                }
+
+                self.steps
+                    .push(TransactionStep::Delete(crate::spec::Delete {
+                        target: target.selector.clone(),
+                    }));
+
+                self.deleted.push(record.clone());
+
+                Ok(())
+            }
+
+            SketchStep::Fence {
+                record,
+                field,
+                token,
+            } => {
+                let Some(target) = self.found.get(record) else {
+                    return fail(format!(
+                        "fence names `{record}`, which no find before it names"
+                    ));
+                };
+
+                if !target.fields.contains(field) {
+                    return fail(format!("`{}` has no field `{field}`", target.record));
+                }
+
+                let selector = target.selector.clone();
+                let token = self.resolve(token)?;
+
+                self.steps.push(TransactionStep::Fence(crate::spec::Fence {
+                    target: selector,
+                    field: FieldPath(vec![field.clone()]),
+                    token,
+                }));
+
+                self.mutated.push(record.clone());
+
+                Ok(())
+            }
+
+            other => fail(format!(
+                "{} is not a step of a transaction",
+                step_name(other)
+            )),
         }
     }
 
@@ -796,6 +1035,8 @@ impl Compiler<'_> {
                 selector,
                 read,
                 input_only,
+                open: true,
+                exported: None,
             },
         );
 
@@ -837,14 +1078,8 @@ impl Compiler<'_> {
             return fail(format!("`{error}` is not an error the request declares"));
         }
 
-        if self.guarded.is_some() {
+        if self.guarded.is_some() && !self.general {
             return fail("a sketch applies at most one transition");
-        }
-
-        if !declared.effects.is_empty() {
-            return fail(format!(
-                "`{transition}` admits outbox messages, which sketches cannot yet derive"
-            ));
         }
 
         let refusal = otherwise.clone().or_else(|| self.settled.refusal.clone());
@@ -897,13 +1132,34 @@ impl Compiler<'_> {
         // vocabulary has nothing further to check about them here.
         let _: Vec<&TransitionSideEffect> = declared.side_effects.values().collect();
 
-        self.guarded = Some((
-            record.clone(),
-            machine.clone(),
-            transition.clone(),
-            refusal,
-            already_ok,
-        ));
+        // The transition's declared outbox messages are admitted with it,
+        // from the same values.
+        let effects = declared
+            .effects
+            .keys()
+            .map(|effect| {
+                (
+                    effect.clone(),
+                    crate::spec::TransitionEffectApplication {
+                        values: values.clone(),
+                    },
+                )
+            })
+            .collect();
+
+        if let Some(refusal) = &refusal {
+            self.refusals.push(refusal.clone());
+        }
+
+        if self.guarded.is_none() {
+            self.guarded = Some((
+                record.clone(),
+                machine.clone(),
+                transition.clone(),
+                refusal,
+                already_ok,
+            ));
+        }
 
         self.steps
             .push(TransactionStep::Transition(StateTransition {
@@ -911,7 +1167,7 @@ impl Compiler<'_> {
                 transition: transition.clone(),
                 subject,
                 effect_intents,
-                effects: BTreeMap::new(),
+                effects,
             }));
 
         self.mutated.push(record.clone());
@@ -967,15 +1223,7 @@ impl Compiler<'_> {
                     errors: result
                         .errors
                         .iter()
-                        .map(|(class, schema)| {
-                            (
-                                class.clone(),
-                                ErrorResultType {
-                                    schema: schema.clone(),
-                                    disposition: ErrorDisposition::Unspecified,
-                                },
-                            )
-                        })
+                        .map(|(class, error)| (class.clone(), error.declared()))
                         .collect(),
                 });
 
@@ -1060,7 +1308,7 @@ impl Compiler<'_> {
                 Ok(steps)
             }
 
-            other => fail(format!("{other:?} is not an effect step")),
+            other => fail(format!("{} is not an effect step", step_name(other))),
         }
     }
 }
@@ -1098,7 +1346,17 @@ pub fn compile(
         guarded: None,
         after_commit: Vec::new(),
         effects: 0,
+        deleted: Vec::new(),
+        general: false,
+        segments: 0,
+        refusals: Vec::new(),
+        results: BTreeMap::new(),
+        final_output: None,
     };
+
+    if !is_simple(sketch, symbols) {
+        return compiler.general(sketch);
+    }
 
     // A sketch that touches no record is a sequence of effects.
     if !sketch.steps.iter().any(transactional) {
@@ -1142,54 +1400,7 @@ impl Compiler<'_> {
 
         let data_model = data_model.clone();
 
-        // A changed record is protected: a versioned one validates the
-        // version it read and advances it after its last change; an
-        // unversioned one is held under an exclusive lock from before its
-        // read.
-        for alias in self.mutated.iter().collect::<BTreeSet<_>>() {
-            let target = &self.found[alias];
-
-            if target.data.version.is_some() {
-                let last = self
-                    .steps
-                    .iter()
-                    .rposition(|step| match step {
-                        TransactionStep::Write(write) => write.target == target.selector,
-                        TransactionStep::Transition(transition) => {
-                            transition.subject == target.selector
-                        }
-                        TransactionStep::AdvanceCursor(advance) => {
-                            advance.target == target.selector
-                        }
-                        _ => false,
-                    })
-                    .expect("a mutated record has a mutating step");
-
-                self.steps.insert(
-                    last + 1,
-                    TransactionStep::BumpVersion(BumpVersion {
-                        target: target.selector.clone(),
-                    }),
-                );
-            } else {
-                let read = self
-                    .steps
-                    .iter()
-                    .position(|step| {
-                        matches!(step, TransactionStep::Read(read) if read.bind == target.read)
-                    })
-                    .expect("a found record has a read");
-
-                self.steps.insert(
-                    read,
-                    TransactionStep::Lock(Lock {
-                        target: target.selector.clone(),
-                        mode: LockMode::Exclusive,
-                        order: LockOrder::Unspecified,
-                    }),
-                );
-            }
-        }
+        self.protect();
 
         let output = self.output(sketch)?;
 
@@ -1519,6 +1730,7 @@ fn input(context: &Context<'_>, field: &str) -> ValueRef {
 fn resolve(
     context: &Context<'_>,
     found: &BTreeMap<String, Found>,
+    results: &BTreeMap<String, ValueSource>,
     reference: &str,
 ) -> Result<ValueRef, CompileError> {
     let Some((source, field)) = reference.split_once('.') else {
@@ -1544,9 +1756,17 @@ fn resolve(
         });
     }
 
+    if let Some(answer) = results.get(source) {
+        return Ok(ValueRef {
+            source: answer.clone(),
+            path,
+        });
+    }
+
     let Some(target) = found.get(source) else {
         return fail(format!(
-            "`{reference}` names `{source}`, which is neither `input` nor a record found before it"
+            "`{reference}` names `{source}`, which is neither `input`, a record found before it, \
+             nor an answer in scope"
         ));
     };
 
@@ -1554,15 +1774,29 @@ fn resolve(
         return fail(format!("`{}` has no field `{head}`", target.record));
     }
 
-    Ok(ValueRef {
-        source: ValueSource::TransactionRead(target.read.clone()),
-        path,
-    })
+    if target.open {
+        return Ok(ValueRef {
+            source: ValueSource::TransactionRead(target.read.clone()),
+            path,
+        });
+    }
+
+    match &target.exported {
+        Some(output) => Ok(ValueRef {
+            source: ValueSource::TransactionOutput(output.clone()),
+            path,
+        }),
+
+        None => fail(format!(
+            "`{reference}` is used where the transaction that found `{source}` is out of scope"
+        )),
+    }
 }
 
 fn derivation(
     context: &Context<'_>,
     found: &BTreeMap<String, Found>,
+    results: &BTreeMap<String, ValueSource>,
     from: &[String],
 ) -> Result<Derivation, CompileError> {
     if from.is_empty() {
@@ -1572,7 +1806,7 @@ fn derivation(
     Ok(Derivation::Deterministic {
         from: from
             .iter()
-            .map(|reference| resolve(context, found, reference))
+            .map(|reference| resolve(context, found, results, reference))
             .collect::<Result<_, _>>()?,
     })
 }
@@ -1817,6 +2051,1076 @@ fn finish(context: &Context<'_>, output: Option<&Id>) -> OperationStep {
             },
         },
     })
+}
+
+/// A step's kind, for messages.
+fn step_name(step: &SketchStep) -> &'static str {
+    match step {
+        SketchStep::Find { .. } => "find",
+        SketchStep::Update { .. } => "update",
+        SketchStep::Create { .. } => "create",
+        SketchStep::Transition { .. } => "transition",
+        SketchStep::Advance { .. } => "advance",
+        SketchStep::Enqueue { .. } => "enqueue",
+        SketchStep::Publish { .. } => "publish",
+        SketchStep::Call { .. } => "call",
+        SketchStep::Delete { .. } => "delete",
+        SketchStep::Fence { .. } => "fence",
+        SketchStep::Request { .. } => "request",
+        SketchStep::When { .. } => "when",
+        SketchStep::Reject { .. } => "reject",
+        SketchStep::Parallel { .. } => "parallel",
+        SketchStep::Race { .. } => "race",
+        SketchStep::Start { .. } => "start",
+    }
+}
+
+impl Compiler<'_> {
+    /// Protects every record the open transaction changes or deletes.
+    fn protect(&mut self) {
+        // A changed record is protected: a versioned one validates the
+        // version it read and advances it after its last change; an
+        // unversioned one is held under an exclusive lock from before its
+        // read.
+        for alias in self.mutated.iter().collect::<BTreeSet<_>>() {
+            let target = &self.found[alias];
+
+            if target.data.version.is_some() {
+                let last = self
+                    .steps
+                    .iter()
+                    .rposition(|step| match step {
+                        TransactionStep::Write(write) => write.target == target.selector,
+                        TransactionStep::Transition(transition) => {
+                            transition.subject == target.selector
+                        }
+                        TransactionStep::AdvanceCursor(advance) => {
+                            advance.target == target.selector
+                        }
+                        _ => false,
+                    })
+                    .expect("a mutated record has a mutating step");
+
+                self.steps.insert(
+                    last + 1,
+                    TransactionStep::BumpVersion(BumpVersion {
+                        target: target.selector.clone(),
+                    }),
+                );
+            } else {
+                let read = self
+                    .steps
+                    .iter()
+                    .position(|step| {
+                        matches!(step, TransactionStep::Read(read) if read.bind == target.read)
+                    })
+                    .expect("a found record has a read");
+
+                self.steps.insert(
+                    read,
+                    TransactionStep::Lock(Lock {
+                        target: target.selector.clone(),
+                        mode: LockMode::Exclusive,
+                        order: LockOrder::Unspecified,
+                    }),
+                );
+            }
+        }
+
+        // A deleted unversioned record is held from before its read, as a
+        // changed one is; a versioned one was validated when it was read.
+        for alias in self.deleted.iter().collect::<BTreeSet<_>>() {
+            let target = &self.found[alias];
+
+            if target.data.version.is_some() || self.mutated.contains(alias) {
+                continue;
+            }
+
+            let read = self
+                .steps
+                .iter()
+                .position(
+                    |step| matches!(step, TransactionStep::Read(read) if read.bind == target.read),
+                )
+                .expect("a found record has a read");
+
+            self.steps.insert(
+                read,
+                TransactionStep::Lock(Lock {
+                    target: target.selector.clone(),
+                    mode: LockMode::Exclusive,
+                    order: LockOrder::Unspecified,
+                }),
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------
+// The general path
+// ---------------------------------------------------------------------
+
+/// Whether a sketch is one transaction with at most one transition, or
+/// a sequence of effects: the shapes [`Compiler::assemble`] and the
+/// effect-only path compile, with the inspect-then-decide shape where it
+/// applies. Everything else takes the general path.
+fn is_simple(sketch: &OperationSketch, symbols: &Symbols) -> bool {
+    let effects_only = sketch
+        .steps
+        .iter()
+        .all(|step| matches!(step, SketchStep::Publish { .. } | SketchStep::Call { .. }));
+
+    if effects_only {
+        return true;
+    }
+
+    let shapes = sketch.steps.iter().all(|step| {
+        matches!(
+            step,
+            SketchStep::Find { .. }
+                | SketchStep::Update { .. }
+                | SketchStep::Create { .. }
+                | SketchStep::Transition { .. }
+                | SketchStep::Advance { .. }
+                | SketchStep::Enqueue { .. }
+                | SketchStep::Publish { .. }
+        )
+    });
+
+    let transitions = sketch
+        .steps
+        .iter()
+        .filter(|step| matches!(step, SketchStep::Transition { .. }))
+        .count();
+
+    let models: BTreeSet<&Id> = sketch
+        .steps
+        .iter()
+        .filter_map(|step| match step {
+            SketchStep::Find { record, .. } | SketchStep::Create { record, .. } => {
+                symbols.objects.get(record).map(|(model, _)| model)
+            }
+            SketchStep::Enqueue { outbox, .. } => {
+                symbols.outboxes.get(outbox).map(|(model, _)| model)
+            }
+            _ => None,
+        })
+        .collect();
+
+    shapes && transitions <= 1 && models.len() <= 1
+}
+
+/// Everything after a point of a sketch, as text: what a closing
+/// transaction scans for the records later steps still use.
+fn later(steps: &[SketchStep], after: &str) -> String {
+    serde_json::to_string(steps).expect("a sketch serializes") + after
+}
+
+/// The fields of `alias` that `text` references, as `"alias.field`.
+fn referenced_fields(text: &str, alias: &str) -> BTreeSet<String> {
+    let marker = format!("\"{alias}.");
+
+    text.match_indices(&marker)
+        .filter_map(|(at, _)| {
+            let rest = &text[at + marker.len()..];
+            let end = rest.find(['"', '.']).unwrap_or(rest.len());
+
+            (end > 0).then(|| rest[..end].to_string())
+        })
+        .collect()
+}
+
+/// A call's or request's effect, its derivation, and the error classes
+/// its answer may carry (none when it answers nothing).
+struct Answered {
+    alias: Option<String>,
+    effect_id: Id,
+    effect: Effect,
+    values: Derivation,
+    classes: Option<Vec<Id>>,
+    on_ok: Vec<SketchStep>,
+    on_error: BTreeMap<Id, Vec<SketchStep>>,
+}
+
+impl Compiler<'_> {
+    fn general(mut self, sketch: &OperationSketch) -> Result<OperationBlock, CompileError> {
+        self.general = true;
+
+        let returns = serde_json::to_string(&sketch.returns).expect("serializes");
+
+        let (steps, _) = self.block(&sketch.steps, &returns, true, sketch)?;
+
+        Ok(OperationBlock { steps })
+    }
+
+    /// The data model a transactional step works in.
+    fn data_model_of(&self, step: &SketchStep) -> Result<Id, CompileError> {
+        let of_alias = |record: &String| -> Result<Id, CompileError> {
+            let Some(target) = self.found.get(record) else {
+                return fail(format!("`{record}` is used before a find names it"));
+            };
+
+            if !target.open {
+                return fail(format!(
+                    "`{record}` was found in an earlier transaction; find it again where it \
+                     changes"
+                ));
+            }
+
+            Ok(target.data_model.clone())
+        };
+
+        match step {
+            SketchStep::Find { record, .. } | SketchStep::Create { record, .. } => self
+                .symbols
+                .objects
+                .get(record)
+                .map(|(model, _)| model.clone())
+                .ok_or_else(|| CompileError(format!("`{record}` is not a declared data object"))),
+
+            SketchStep::Enqueue { outbox, .. } => self
+                .symbols
+                .outboxes
+                .get(outbox)
+                .map(|(model, _)| model.clone())
+                .ok_or_else(|| CompileError(format!("`{outbox}` is not a declared outbox"))),
+
+            SketchStep::Update { record, .. }
+            | SketchStep::Transition { record, .. }
+            | SketchStep::Advance { record, .. }
+            | SketchStep::Delete { record }
+            | SketchStep::Fence { record, .. } => of_alias(record),
+
+            other => fail(format!(
+                "{} is not a step of a transaction",
+                step_name(other)
+            )),
+        }
+    }
+
+    /// Seals the open transaction, when there is one: the transaction,
+    /// then the intents it established. `later` is everything after it,
+    /// which decides what it exports; `last` is the sketch when this is
+    /// the operation's last transaction, which then establishes the
+    /// `ok` result's output.
+    fn seal(
+        &mut self,
+        later: &str,
+        last: Option<&OperationSketch>,
+    ) -> Result<Vec<OperationStep>, CompileError> {
+        if self.steps.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let [data_model] = self.data_models.iter().collect::<Vec<_>>()[..] else {
+            return fail(format!(
+                "one transaction touches {} data models",
+                self.data_models.len()
+            ));
+        };
+
+        let data_model = data_model.clone();
+
+        self.protect();
+
+        // Each record later steps still use is exported, by its own
+        // schema, from what this transaction read.
+        let mut exports = Vec::new();
+
+        for (alias, target) in &self.found {
+            if !target.open {
+                continue;
+            }
+
+            let fields = referenced_fields(later, alias);
+
+            if fields.is_empty() {
+                continue;
+            }
+
+            let bind = Id(format!("output.{}.{alias}", self.context.name));
+
+            self.steps.push(TransactionStep::EstablishTransactionOutput(
+                EstablishTransactionOutput {
+                    bind: bind.clone(),
+                    schema: target.data.schema.clone(),
+                    values: Derivation::Deterministic {
+                        from: fields
+                            .iter()
+                            .filter(|field| target.fields.contains(*field))
+                            .map(|field| ValueRef {
+                                source: ValueSource::TransactionRead(target.read.clone()),
+                                path: FieldPath(vec![field.clone()]),
+                            })
+                            .collect(),
+                    },
+                },
+            ));
+
+            exports.push((alias.clone(), bind));
+        }
+
+        if let Some(sketch) = last
+            && let Some((bind, schema, from)) = self.output(sketch)?
+        {
+            self.steps.push(TransactionStep::EstablishTransactionOutput(
+                EstablishTransactionOutput {
+                    bind: bind.clone(),
+                    schema,
+                    values: Derivation::Deterministic { from },
+                },
+            ));
+
+            self.final_output = Some(bind);
+        }
+
+        self.segments += 1;
+
+        let id = if self.segments == 1 {
+            format!("tx.{}", self.context.name)
+        } else {
+            format!("tx.{}.{}", self.context.name, self.segments)
+        };
+
+        let mut transaction = Transaction {
+            id: Id(id),
+            data_model: Some(data_model),
+            isolation: TransactionIsolation::ReadCommitted,
+            idempotency: match &self.context.key {
+                Some(key) => IdempotencyGuarantee::DeduplicatedBy { key: key.clone() },
+                None => IdempotencyGuarantee::Unspecified,
+            },
+            requirements: Default::default(),
+            steps: std::mem::take(&mut self.steps),
+        };
+
+        narrow_reads(&mut transaction, &self.found);
+
+        let rejected = transaction.rejects().then(|| OperationBlock {
+            steps: vec![match self.refusals.first() {
+                Some(refusal) if self.context.request => refused(&self.context, refusal),
+                _ => OperationStep::Complete,
+            }],
+        });
+
+        let mut out = vec![OperationStep::Transaction(ExecuteTransaction {
+            transaction,
+            rejected,
+        })];
+
+        out.extend(self.after_commit.drain(..).map(|intent| {
+            OperationStep::ExecuteEffectIntent(ExecuteEffectIntent { intent, bind: None })
+        }));
+
+        for target in self.found.values_mut() {
+            target.open = false;
+        }
+
+        for (alias, bind) in exports {
+            if let Some(target) = self.found.get_mut(&alias) {
+                target.exported = Some(bind);
+            }
+        }
+
+        self.mutated.clear();
+        self.deleted.clear();
+        self.data_models.clear();
+        self.guarded = None;
+        self.refusals.clear();
+
+        Ok(out)
+    }
+
+    /// A call's or request's effect.
+    fn answered(&mut self, step: &SketchStep) -> Result<Answered, CompileError> {
+        match step {
+            SketchStep::Call {
+                name,
+                alias,
+                identity,
+                duplicates,
+                result_replay,
+                result,
+                from,
+                on_ok,
+                on_error,
+            } => {
+                let (effect_id, _) = self.effect_ids("call");
+
+                let identity = match identity {
+                    Some(values) => ExternalIdentity::Keyed {
+                        key: ExternalIdentityKey {
+                            components: values
+                                .iter()
+                                .map(|value| self.resolve(value))
+                                .collect::<Result<_, _>>()?,
+                        },
+                    },
+                    None => ExternalIdentity::Unspecified,
+                };
+
+                let result_type = result.as_ref().map(|result| ResultType {
+                    ok: result.ok.clone(),
+                    errors: result
+                        .errors
+                        .iter()
+                        .map(|(class, error)| (class.clone(), error.declared()))
+                        .collect(),
+                });
+
+                Ok(Answered {
+                    alias: alias.clone(),
+                    classes: result
+                        .as_ref()
+                        .map(|result| result.errors.keys().cloned().collect()),
+                    effect: Effect::External(ExternalEffect {
+                        name: name.clone(),
+                        identity,
+                        idempotency: *duplicates,
+                        result_replay: *result_replay,
+                        result: result_type,
+                    }),
+                    values: self.derivation(from)?,
+                    effect_id,
+                    on_ok: on_ok.clone(),
+                    on_error: on_error.clone(),
+                })
+            }
+
+            SketchStep::Request {
+                operation,
+                input,
+                alias,
+                retry,
+                from,
+                on_ok,
+                on_error,
+            } => {
+                let Some(inputs) = self.symbols.requests.get(operation) else {
+                    return fail(format!("`{operation}` is not a declared operation"));
+                };
+
+                let (input, request) = match input {
+                    Some(input) => match inputs.get(input) {
+                        Some(request) => (input.clone(), request.clone()),
+                        None => {
+                            return fail(format!(
+                                "`{input}` is not a request input of `{operation}`"
+                            ));
+                        }
+                    },
+
+                    None => match inputs.iter().collect::<Vec<_>>()[..] {
+                        [(input, request)] => (input.clone(), request.clone()),
+                        _ => {
+                            return fail(format!(
+                                "`{operation}` has {} request inputs; name the one to invoke",
+                                inputs.len()
+                            ));
+                        }
+                    },
+                };
+
+                let (effect_id, _) = self.effect_ids("request");
+
+                // The trigger's identity carried into the target's own,
+                // so a duplicate of this invocation is one request.
+                let propagation = match (&self.context.key, &request.identity) {
+                    (Some(key), RequestIdentity::Keyed(target))
+                        if target.fields.len() == key.components.len() =>
+                    {
+                        vec![IdempotencyKeyPropagation {
+                            source: key.clone(),
+                            target: IdempotencyKey {
+                                components: target
+                                    .fields
+                                    .iter()
+                                    .map(|field| ValueRef {
+                                        source: ValueSource::Effect(effect_id.clone()),
+                                        path: field.clone(),
+                                    })
+                                    .collect(),
+                            },
+                        }]
+                    }
+                    _ => Vec::new(),
+                };
+
+                Ok(Answered {
+                    alias: alias.clone(),
+                    classes: Some(request.result.errors.keys().cloned().collect()),
+                    effect: Effect::Request(crate::spec::RequestEffect {
+                        target: crate::spec::RequestTarget {
+                            operation: operation.clone(),
+                            input,
+                        },
+                        schema: request.schema.clone(),
+                        retry: *retry,
+                        idempotency_key_propagation: propagation,
+                    }),
+                    values: self.derivation(from)?,
+                    effect_id,
+                    on_ok: on_ok.clone(),
+                    on_error: on_error.clone(),
+                })
+            }
+
+            SketchStep::Publish {
+                topic,
+                schema,
+                from,
+            } => {
+                let (effect_id, _, publication) = self.publication(topic, schema)?;
+
+                Ok(Answered {
+                    alias: None,
+                    classes: None,
+                    effect: Effect::Publication(publication),
+                    values: self.derivation(from)?,
+                    effect_id,
+                    on_ok: Vec::new(),
+                    on_error: BTreeMap::new(),
+                })
+            }
+
+            other => fail(format!("{} is not an effect", step_name(other))),
+        }
+    }
+
+    fn is_reference(&self, text: &str) -> bool {
+        text.split_once('.').is_some_and(|(source, _)| {
+            source == "input"
+                || self.found.contains_key(source)
+                || self.results.contains_key(source)
+        })
+    }
+
+    fn condition(&self, condition: &SketchCondition) -> Result<Condition, CompileError> {
+        Ok(match condition {
+            SketchCondition::Equals(operands) => {
+                let [left, right] = operands.as_slice() else {
+                    return fail("`equals` compares exactly two operands");
+                };
+
+                let Some(left) = left.as_str() else {
+                    return fail("`equals` begins with a value reference");
+                };
+
+                let value = self.resolve(left)?;
+
+                let equals = match right {
+                    serde_json::Value::String(text) if self.is_reference(text) => {
+                        SelectorValue::Value(self.resolve(text)?)
+                    }
+                    serde_json::Value::String(text) => {
+                        SelectorValue::Literal(Literal::String(text.clone()))
+                    }
+                    serde_json::Value::Bool(flag) => SelectorValue::Literal(Literal::Bool(*flag)),
+                    serde_json::Value::Number(number) => match number.as_i64() {
+                        Some(number) => SelectorValue::Literal(Literal::Int(number)),
+                        None => return fail("`equals` compares with integers only"),
+                    },
+                    _ => {
+                        return fail(
+                            "`equals` compares with a value, a string, an integer or a boolean",
+                        );
+                    }
+                };
+
+                Condition::Eq { value, equals }
+            }
+
+            SketchCondition::Present(value) => Condition::Present {
+                value: self.resolve(value)?,
+            },
+
+            SketchCondition::Not(inner) => Condition::Not {
+                condition: Box::new(self.condition(inner)?),
+            },
+
+            SketchCondition::All(all) => Condition::And {
+                conditions: all
+                    .iter()
+                    .map(|condition| self.condition(condition))
+                    .collect::<Result<_, _>>()?,
+            },
+
+            SketchCondition::Any(any) => Condition::Not {
+                condition: Box::new(Condition::And {
+                    conditions: any
+                        .iter()
+                        .map(|condition| {
+                            Ok(Condition::Not {
+                                condition: Box::new(self.condition(condition)?),
+                            })
+                        })
+                        .collect::<Result<_, CompileError>>()?,
+                }),
+            },
+        })
+    }
+
+    /// The end of the operation's successful course.
+    fn finish_general(&self, sketch: &OperationSketch) -> Result<OperationStep, CompileError> {
+        if !self.context.request {
+            return Ok(OperationStep::Complete);
+        }
+
+        if let Some(output) = &self.final_output {
+            return Ok(finish(&self.context, Some(output)));
+        }
+
+        Ok(match &sketch.returns {
+            Some(values) => OperationStep::Return(Return {
+                request: self.context.input.clone(),
+                outcome: ResultOutcome::Ok {
+                    values: self.derivation(values)?,
+                },
+            }),
+            None => ok_from_input(&self.context),
+        })
+    }
+
+    /// Compiles `steps`, which `after` follows. Returns the steps and
+    /// whether every course through them ends the operation.
+    fn block(
+        &mut self,
+        steps: &[SketchStep],
+        after: &str,
+        top: bool,
+        sketch: &OperationSketch,
+    ) -> Result<(Vec<OperationStep>, bool), CompileError> {
+        let in_scope: BTreeSet<String> = self.found.keys().cloned().collect();
+
+        let mut out = Vec::new();
+
+        for (index, step) in steps.iter().enumerate() {
+            let here = later(&steps[index..], after);
+            let rest = later(&steps[index + 1..], after);
+            let last_step = index + 1 == steps.len();
+
+            match step {
+                step if transactional(step) => {
+                    let model = self.data_model_of(step)?;
+
+                    if !self.steps.is_empty() && !self.data_models.contains(&model) {
+                        out.extend(self.seal(&here, None)?);
+                    }
+
+                    self.record_step(step)?;
+                }
+
+                SketchStep::Publish { .. } if !self.steps.is_empty() => self.record_step(step)?,
+
+                SketchStep::Publish { .. }
+                | SketchStep::Call { .. }
+                | SketchStep::Request { .. } => {
+                    out.extend(self.seal(&here, None)?);
+
+                    let answered = self.answered(step)?;
+
+                    let used_later = answered
+                        .alias
+                        .as_ref()
+                        .is_some_and(|alias| !referenced_fields(&rest, alias).is_empty());
+
+                    let acts =
+                        !answered.on_ok.is_empty() || !answered.on_error.is_empty() || used_later;
+
+                    let Some(classes) = answered.classes.clone().filter(|_| acts) else {
+                        if acts {
+                            return fail("a step acts on an answer its effect does not declare");
+                        }
+
+                        out.push(OperationStep::ExecuteEffect(ExecuteEffect {
+                            effect_id: answered.effect_id,
+                            effect: answered.effect,
+                            values: answered.values,
+                            bind: None,
+                        }));
+
+                        continue;
+                    };
+
+                    let name = answered
+                        .alias
+                        .clone()
+                        .unwrap_or_else(|| format!("answer_{}", self.effects));
+
+                    let bind = Id(format!("result.{}.{name}", self.context.name));
+
+                    out.push(OperationStep::ExecuteEffect(ExecuteEffect {
+                        effect_id: answered.effect_id,
+                        effect: answered.effect,
+                        values: answered.values,
+                        bind: Some(bind.clone()),
+                    }));
+
+                    out.push(self.matched(
+                        &bind,
+                        &name,
+                        &answered.alias,
+                        &classes,
+                        &answered.on_ok,
+                        &answered.on_error,
+                        used_later,
+                        &steps[index + 1..],
+                        &rest,
+                        after,
+                        top,
+                        sketch,
+                    )?);
+
+                    if used_later {
+                        self.found.retain(|alias, _| in_scope.contains(alias));
+
+                        return Ok((out, true));
+                    }
+                }
+
+                SketchStep::When {
+                    condition,
+                    then,
+                    otherwise,
+                } => {
+                    out.extend(self.seal(&here, None)?);
+
+                    let condition = self.condition(condition)?;
+
+                    let (then_steps, then_ended) = self.block(then, &rest, false, sketch)?;
+
+                    let otherwise_block = if otherwise.is_empty() {
+                        None
+                    } else {
+                        Some(self.block(otherwise, &rest, false, sketch)?)
+                    };
+
+                    let both_end =
+                        then_ended && otherwise_block.as_ref().is_some_and(|(_, ended)| *ended);
+
+                    out.push(OperationStep::Branch(Branch {
+                        condition,
+                        then: OperationBlock { steps: then_steps },
+                        otherwise: otherwise_block.map(|(steps, _)| OperationBlock { steps }),
+                    }));
+
+                    if both_end {
+                        if !last_step {
+                            return fail("nothing may follow a when whose every course ends");
+                        }
+
+                        self.found.retain(|alias, _| in_scope.contains(alias));
+
+                        return Ok((out, true));
+                    }
+                }
+
+                SketchStep::Reject { error, from } => {
+                    out.extend(self.seal(&here, None)?);
+
+                    if !self.context.request {
+                        return fail("only a request rejects; a message's course just ends");
+                    }
+
+                    if !self.context.errors.contains_key(error) {
+                        return fail(format!("`{error}` is not an error the request declares"));
+                    }
+
+                    if !last_step {
+                        return fail("nothing may follow a reject");
+                    }
+
+                    let values = if from.is_empty() {
+                        payload(&self.context, &self.context.errors[error])
+                    } else {
+                        self.derivation(from)?
+                    };
+
+                    out.push(OperationStep::Return(Return {
+                        request: self.context.input.clone(),
+                        outcome: ResultOutcome::Err {
+                            error: error.clone(),
+                            values,
+                        },
+                    }));
+
+                    self.found.retain(|alias, _| in_scope.contains(alias));
+
+                    return Ok((out, true));
+                }
+
+                SketchStep::Parallel { steps: members } => {
+                    out.extend(self.seal(&here, None)?);
+
+                    if members.is_empty() {
+                        return fail("parallel starts nothing");
+                    }
+
+                    let mut handles = Vec::new();
+
+                    for member in members {
+                        let (handle, launch, _) = self.launch(member, "parallel")?;
+
+                        out.push(launch);
+                        handles.push(handle);
+                    }
+
+                    out.push(OperationStep::JoinAll(crate::spec::JoinAll {
+                        handles: handles
+                            .into_iter()
+                            .map(|handle| crate::spec::AsyncJoin { handle, bind: None })
+                            .collect(),
+                    }));
+                }
+
+                SketchStep::Start { step: member } => {
+                    out.extend(self.seal(&here, None)?);
+
+                    let (_, launch, _) = self.launch(member, "start")?;
+
+                    out.push(launch);
+                }
+
+                SketchStep::Race {
+                    steps: members,
+                    alias,
+                    on_ok,
+                    on_error,
+                } => {
+                    out.extend(self.seal(&here, None)?);
+
+                    if members.is_empty() {
+                        return fail("race starts nothing");
+                    }
+
+                    let mut handles = Vec::new();
+                    let mut classes: Option<Option<Vec<Id>>> = None;
+
+                    for member in members {
+                        let (handle, launch, answers) = self.launch(member, "race")?;
+
+                        match &classes {
+                            None => classes = Some(answers),
+                            Some(seen) if *seen != answers => {
+                                return fail("every racer must answer with the same result type");
+                            }
+                            Some(_) => {}
+                        }
+
+                        out.push(launch);
+                        handles.push(handle);
+                    }
+
+                    let classes = classes.flatten();
+
+                    let used_later = alias
+                        .as_ref()
+                        .is_some_and(|alias| !referenced_fields(&rest, alias).is_empty());
+
+                    let acts = !on_ok.is_empty() || !on_error.is_empty() || used_later;
+
+                    let bind = acts.then(|| {
+                        Id(format!(
+                            "result.{}.{}",
+                            self.context.name,
+                            alias.clone().unwrap_or_else(|| "race".to_string())
+                        ))
+                    });
+
+                    // Fire-and-forget starts written right after the race
+                    // belong before its match, as their authors placed them
+                    // in time.
+                    out.push(OperationStep::Race(crate::spec::Race {
+                        handles,
+                        bind: bind.clone(),
+                    }));
+
+                    if let Some(bind) = bind {
+                        let Some(classes) = classes else {
+                            return fail("a race acts on an answer its racers do not declare");
+                        };
+
+                        let name = alias.clone().unwrap_or_else(|| "race".to_string());
+
+                        let mut remaining_index = index + 1;
+
+                        while let Some(SketchStep::Start { step: member }) =
+                            steps.get(remaining_index)
+                        {
+                            let (_, launch, _) = self.launch(member, "start")?;
+
+                            out.push(launch);
+                            remaining_index += 1;
+                        }
+
+                        let rest = later(&steps[remaining_index..], after);
+
+                        out.push(self.matched(
+                            &bind,
+                            &name,
+                            alias,
+                            &classes,
+                            on_ok,
+                            on_error,
+                            used_later,
+                            &steps[remaining_index..],
+                            &rest,
+                            after,
+                            top,
+                            sketch,
+                        )?);
+
+                        if used_later {
+                            self.found.retain(|alias, _| in_scope.contains(alias));
+
+                            return Ok((out, true));
+                        }
+
+                        // The starts consumed above are not compiled again.
+                        let (tail, ended) =
+                            self.block(&steps[remaining_index..], after, top, sketch)?;
+
+                        out.extend(tail);
+
+                        self.found.retain(|alias, _| in_scope.contains(alias));
+
+                        return Ok((out, ended));
+                    }
+                }
+
+                other => {
+                    return fail(format!("{} cannot appear here", step_name(other)));
+                }
+            }
+        }
+
+        let ended = if top {
+            out.extend(self.seal(after, Some(sketch))?);
+            out.push(self.finish_general(sketch)?);
+            true
+        } else {
+            out.extend(self.seal(after, None)?);
+            false
+        };
+
+        self.found.retain(|alias, _| in_scope.contains(alias));
+
+        Ok((out, ended))
+    }
+}
+
+impl Compiler<'_> {
+    /// The match on an answer bound as `bind`. When later steps use the
+    /// answer (`used_later`), they — `remaining` — continue in its `ok`
+    /// arm, and every error arm ends the operation.
+    #[allow(clippy::too_many_arguments)]
+    fn matched(
+        &mut self,
+        bind: &Id,
+        name: &str,
+        alias: &Option<String>,
+        classes: &[Id],
+        on_ok: &[SketchStep],
+        on_error: &BTreeMap<Id, Vec<SketchStep>>,
+        used_later: bool,
+        remaining: &[SketchStep],
+        rest: &str,
+        after: &str,
+        top: bool,
+        sketch: &OperationSketch,
+    ) -> Result<OperationStep, CompileError> {
+        for class in on_error.keys() {
+            if !classes.contains(class) {
+                return fail(format!(
+                    "an arm acts on the error `{class}`, which the answer does not declare"
+                ));
+            }
+        }
+
+        let mut ok_steps = on_ok.to_vec();
+
+        if used_later {
+            ok_steps.extend(remaining.iter().cloned());
+        }
+
+        if let Some(alias) = alias {
+            self.results
+                .insert(alias.clone(), ValueSource::EffectResultOk(bind.clone()));
+        }
+
+        let (ok, _) = self.block(
+            &ok_steps,
+            if used_later { after } else { rest },
+            top && used_later,
+            sketch,
+        )?;
+
+        let mut errors = BTreeMap::new();
+
+        for class in classes {
+            if let Some(alias) = alias {
+                self.results
+                    .insert(alias.clone(), ValueSource::EffectResultErr(bind.clone()));
+            }
+
+            let arm = on_error.get(class).cloned().unwrap_or_default();
+
+            let (mut block, ended) = self.block(&arm, rest, false, sketch)?;
+
+            if used_later && !ended {
+                if !self.context.request {
+                    block.push(OperationStep::Complete);
+                } else if self.context.errors.contains_key(class) {
+                    block.push(refused(&self.context, class));
+                } else {
+                    return fail(format!(
+                        "the steps after `{name}` use its answer, so its `{class}` arm must end \
+                         the request: add a reject"
+                    ));
+                }
+            }
+
+            errors.insert(class.clone(), OperationBlock { steps: block });
+        }
+
+        if let Some(alias) = alias {
+            self.results.remove(alias);
+        }
+
+        Ok(OperationStep::MatchResult(MatchResult {
+            result: bind.clone(),
+            ok: OperationBlock { steps: ok },
+            errors,
+        }))
+    }
+
+    /// Launches one effect without waiting for it.
+    fn launch(
+        &mut self,
+        member: &SketchStep,
+        of: &str,
+    ) -> Result<(Id, OperationStep, Option<Vec<Id>>), CompileError> {
+        let answered = self.answered(member)?;
+
+        if !answered.on_ok.is_empty() || !answered.on_error.is_empty() {
+            return fail(format!(
+                "an effect started by {of} cannot act on its answer itself; give the {of} its arms"
+            ));
+        }
+
+        let handle = Id(format!("handle.{}.{}", self.context.name, self.effects));
+
+        Ok((
+            handle.clone(),
+            OperationStep::ExecuteEffectAsync(crate::spec::ExecuteEffectAsync {
+                handle,
+                effect_id: answered.effect_id,
+                effect: answered.effect,
+                values: answered.values,
+            }),
+            answered.classes,
+        ))
+    }
 }
 
 #[cfg(test)]

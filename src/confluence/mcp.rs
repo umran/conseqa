@@ -80,8 +80,8 @@ schemas, data models (outboxes included), topics, state machines, and \
 one interface per planned operation (its id, service, inputs, and \
 request, subscription, or outbox contracts). Give every interface a \
 `sketch` — the operation's business actions as typed steps (find, \
-update, create, transition, advance, enqueue, publish, call; see \
-dsl_reference) — whenever its work fits that vocabulary: a sketched program is compiled in code during \
+update, create, delete, transition, advance, fence, enqueue, publish, \
+call, request, when, reject, parallel, race, start; see dsl_reference) — whenever its work fits that vocabulary: a sketched program is compiled in code during \
 the fanout, in seconds, where an unsketched one costs a worker \
 session of minutes. Many small typed patches are normal. The \
 commit gate rejects a structurally broken patch with precise \
@@ -1944,14 +1944,36 @@ PATCH — {"mutations": [<mutation>, ...]}; each mutation {"kind": K, ...}:
                    result_replay: unspecified | unstable | replay_stable,
                    result: {ok: <schema>, errors: {class: <schema>}},
                    from, on_ok: [steps], on_error: {class: [steps]}} — an
-                  outside service, in an operation that changes no record;
-                  its answer's arms may publish or call.
+                  outside service; result errors are a schema, or
+                  {schema, disposition: terminal | retryable};
+       request    {operation, input (when it has several), as,
+                   retry: unspecified | never | may_repeat, from,
+                   on_ok, on_error} — another operation's request input;
+       delete     {record: <a find's as>};
+       fence      {record, field, token};
+       when       {if: <condition>, then: [steps], otherwise: [steps]} —
+                  conditions: {"equals": [value, value-or-literal]},
+                  {"present": value}, {"not": c}, {"all": [c]},
+                  {"any": [c]}; literals are strings (a state id, say),
+                  integers or booleans;
+       reject     {error, from} — end a request with a declared error;
+       parallel   {steps: [publish|call|request]} — start all, wait all;
+       race       {steps, as, on_ok, on_error} — start all, act on the
+                  first answer;
+       start      {step} — start an effect and never wait for it.
      A sketch may also give "returns": [values] when the result's fields
      are not found by name in the input and the records.
-     Values are "input.<field>" or "<find's as>.<field>". All records
-     must belong to one data model; at most one transition per sketch;
-     the operation has exactly one input (a request, a subscription
-     consuming one schema, or an outbox consumer). The gate compiles the
+     Values are "input.<field>", "<find's as>.<field>", or "<as>.<field>"
+     of an answer inside its arms — or after it: when later steps use an
+     answer they run in its ok arm, and each error arm must end the
+     operation (reject, or the error of the same name). Consecutive
+     record steps on one data model are one transaction; a step on
+     another data model, an effect or a when starts the next, and records
+     found earlier are carried into later steps through the transaction's
+     output — change a record only in the transaction that found it
+     (find it again otherwise). The operation has exactly one input (a
+     request, a subscription consuming one schema, or an outbox
+     consumer). The gate compiles the
      sketch when you write it and rejects one that does not compile,
      saying why. Compiled programs carry the version protocol (strict
      locks for unversioned records), keyed commits from the trigger's
