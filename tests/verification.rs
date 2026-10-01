@@ -4367,39 +4367,22 @@ fn a_present_over_a_required_path_is_valid_and_noted() {
     );
 }
 
-/// A retryable error bubbles up a request chain without costing
-/// replayability. `transfer_stock` charges an external boundary whose
-/// decline is retryable and passes it on as its own retryable
-/// `rejected`; `rebalance` requests `transfer_stock` and passes that on
-/// in turn. At every hop the retryable return is an attempt-level
-/// outcome — exempt from result replay — and the decision on it only
-/// returns, so it adds no work for idempotency to judge.
-#[test]
-fn a_retryable_error_bubbles_up_a_request_chain_and_every_hop_still_replays() {
-    use conseqa::spec::{IdempotencyKeyPropagation, RequestEffect, RequestTarget, RetrySemantics};
-
+/// `transfer_stock` charging an external boundary whose decline is
+/// retryable and passing it on as its own retryable `rejected`, and
+/// `rebalance` requesting `transfer_stock` and passing `rejected` on as
+/// its own `rejected`, declared `passed_on`. `rebalance`'s `ok` arm
+/// runs `ok_work` before it returns.
+fn a_request_chain(passed_on: ErrorDisposition, ok_work: Vec<OperationStep>) -> Model {
     let mut model = load_flash_checkout();
 
     charge_transfer_externally(&mut model, ErrorDisposition::Retryable);
 
-    let transfer = model
-        .operations
-        .get_mut(&id("operation.transfer_stock"))
-        .unwrap();
-
-    let Some(Input::Request(request)) = transfer
-        .inputs
-        .get_mut(&id("input.transfer_stock.request"))
-    else {
-        panic!("transfer_stock takes a request");
-    };
-
-    request
-        .result
-        .errors
-        .get_mut(&id("rejected"))
-        .unwrap()
-        .disposition = ErrorDisposition::Retryable;
+    set_disposition(
+        &mut model,
+        "operation.transfer_stock",
+        "input.transfer_stock.request",
+        ErrorDisposition::Retryable,
+    );
 
     let mut caller = model.operations[&id("operation.transfer_stock")].clone();
     let contract = caller
@@ -4411,38 +4394,26 @@ fn a_retryable_error_bubbles_up_a_request_chain_and_every_hop_still_replays() {
         .inputs
         .insert(id("input.rebalance.request"), contract);
 
+    let mut ok = ok_work;
+
+    ok.push(return_ok(
+        "input.rebalance.request",
+        deterministic(vec![ValueRef {
+            source: ValueSource::EffectResultOk(id("result.rebalance.transfer")),
+            path: path(&["accepted"]),
+        }]),
+    ));
+
     caller.program = block(vec![
         execute(
             "effect.rebalance.transfer",
-            Effect::Request(RequestEffect {
-                target: RequestTarget {
-                    operation: id("operation.transfer_stock"),
-                    input: id("input.transfer_stock.request"),
-                },
-                schema: id("schema.TransferStockRequest"),
-                retry: RetrySemantics::MayRepeat,
-                idempotency_key_propagation: vec![IdempotencyKeyPropagation {
-                    source: ikey("input.rebalance.request", &[&["sku"]]),
-                    target: IdempotencyKey {
-                        components: vec![ValueRef {
-                            source: ValueSource::Effect(id("effect.rebalance.transfer")),
-                            path: path(&["sku"]),
-                        }],
-                    },
-                }],
-            }),
+            transfer_request("effect.rebalance.transfer"),
             deterministic(vec![input_key("input.rebalance.request", &["sku"])]),
             Some("result.rebalance.transfer"),
         ),
         OperationStep::MatchResult(MatchResult {
             result: id("result.rebalance.transfer"),
-            ok: block(vec![return_ok(
-                "input.rebalance.request",
-                deterministic(vec![ValueRef {
-                    source: ValueSource::EffectResultOk(id("result.rebalance.transfer")),
-                    path: path(&["accepted"]),
-                }]),
-            )]),
+            ok: block(ok),
             errors: BTreeMap::from([(
                 id("rejected"),
                 block(vec![return_err(
@@ -4465,7 +4436,73 @@ fn a_retryable_error_bubbles_up_a_request_chain_and_every_hop_still_replays() {
 
     model.operations.insert(id("operation.rebalance"), caller);
 
+    set_disposition(
+        &mut model,
+        "operation.rebalance",
+        "input.rebalance.request",
+        passed_on,
+    );
+
     assert!(validation::validate(&model).is_empty());
+
+    model
+}
+
+/// A request from `rebalance` into `transfer_stock`, keyed by the sku.
+fn transfer_request(effect: &str) -> Effect {
+    use conseqa::spec::{IdempotencyKeyPropagation, RequestEffect, RequestTarget, RetrySemantics};
+
+    Effect::Request(RequestEffect {
+        target: RequestTarget {
+            operation: id("operation.transfer_stock"),
+            input: id("input.transfer_stock.request"),
+        },
+        schema: id("schema.TransferStockRequest"),
+        retry: RetrySemantics::MayRepeat,
+        idempotency_key_propagation: vec![IdempotencyKeyPropagation {
+            source: ikey("input.rebalance.request", &[&["sku"]]),
+            target: IdempotencyKey {
+                components: vec![ValueRef {
+                    source: ValueSource::Effect(id(effect)),
+                    path: path(&["sku"]),
+                }],
+            },
+        }],
+    })
+}
+
+/// Declares the disposition of `rejected` in `operation`'s contract.
+fn set_disposition(
+    model: &mut Model,
+    operation: &str,
+    input: &str,
+    disposition: ErrorDisposition,
+) {
+    let Some(Input::Request(request)) = model
+        .operations
+        .get_mut(&id(operation))
+        .unwrap()
+        .inputs
+        .get_mut(&id(input))
+    else {
+        panic!("{operation} takes a request");
+    };
+
+    request
+        .result
+        .errors
+        .get_mut(&id("rejected"))
+        .unwrap()
+        .disposition = disposition;
+}
+
+/// A retryable error bubbles up a request chain without costing
+/// replayability. At every hop the retryable return is an attempt-level
+/// outcome — exempt from result replay — and the decision on it only
+/// returns, so it adds no work for idempotency to judge.
+#[test]
+fn a_retryable_error_bubbles_up_a_request_chain_and_every_hop_still_replays() {
+    let model = a_request_chain(ErrorDisposition::Retryable, Vec::new());
 
     for operation in ["operation.transfer_stock", "operation.rebalance"] {
         let requirement = model.operations[&id(operation)]
@@ -4491,6 +4528,93 @@ fn a_retryable_error_bubbles_up_a_request_chain_and_every_hop_still_replays() {
         assert!(
             matches!(idempotency, IdempotencyVerdict::Proven { .. }),
             "{operation}: {idempotency:#?}"
+        );
+    }
+}
+
+/// The soundness hole the revision closes: a target's retryable error
+/// is not fixed by the target's result-replay proof, which exempts
+/// retryable returns. A caller that turns it into its own terminal
+/// error may resolve one logical request as that error on one attempt
+/// and as `ok` on the next, so its result replay is unproven — and the
+/// gap names the target's retryable class.
+#[test]
+fn a_target_retryable_error_turned_terminal_is_not_replay_stable() {
+    let model = a_request_chain(ErrorDisposition::Terminal, Vec::new());
+
+    let verdict = result_replay_verdict(&model, "operation.rebalance", 0);
+
+    let ResultReplayVerdict::Unproven { obstacles } = &verdict else {
+        panic!("expected an unproven verdict, found {verdict:?}");
+    };
+
+    let retryable_gap = |gap: &ResultGap| {
+        matches!(
+            gap,
+            ResultGap::TargetErrorRetryable { operation, error, .. }
+                if operation == &id("operation.transfer_stock") && error == &id("rejected")
+        )
+    };
+
+    assert!(
+        obstacles.iter().any(|obstacle| matches!(
+            obstacle,
+            ResultReplayObstacle::PathDecisionUnstable {
+                decision: verification::DecisionTaken::Match {
+                    arm: ResultArm::Err { .. },
+                    ..
+                },
+                gap: DecisionGap::ResultUnstable { gap, .. },
+                ..
+            } if retryable_gap(gap)
+        )),
+        "{obstacles:#?}"
+    );
+
+    // The err payload is not a stable root either.
+    assert!(
+        obstacles.iter().any(|obstacle| matches!(
+            obstacle,
+            ResultReplayObstacle::ResultDerivationRootUnstable { roots, .. }
+                if roots.iter().any(|root| matches!(
+                    &root.gap,
+                    StabilityGap::ResultUnstable { gap, .. } if retryable_gap(gap)
+                ))
+        )),
+        "{obstacles:#?}"
+    );
+}
+
+/// A target's terminal, and unspecified, error classes stay stable:
+/// its result-replay proof holds both to the obligation like `ok`.
+#[test]
+fn a_target_error_held_to_its_result_replay_obligation_stays_stable() {
+    for target in [ErrorDisposition::Terminal, ErrorDisposition::Unspecified] {
+        let mut model = a_request_chain(ErrorDisposition::Terminal, Vec::new());
+
+        // The charge's decline is terminal, so the target's own
+        // result replay still proves with `rejected` held to it.
+        charge_transfer_externally(&mut model, ErrorDisposition::Terminal);
+        model
+            .operations
+            .get_mut(&id("operation.transfer_stock"))
+            .unwrap()
+            .requirements
+            .idempotency
+            .pop();
+
+        set_disposition(
+            &mut model,
+            "operation.transfer_stock",
+            "input.transfer_stock.request",
+            target,
+        );
+
+        let verdict = result_replay_verdict(&model, "operation.rebalance", 0);
+
+        assert!(
+            matches!(verdict, ResultReplayVerdict::Proven { .. }),
+            "{target:?}: {verdict:#?}"
         );
     }
 }

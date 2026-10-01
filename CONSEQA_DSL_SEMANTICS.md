@@ -2107,7 +2107,7 @@ A retry traverses declared control. Whether it takes the same arm at a decision 
 - for a `match_result`: the matched result is replay-stable under §18, so the variant — the class, for an error — is fixed across the class;
 - for a rejectable `transaction`: the transaction is `DeduplicatedBy` a key the §18 rules make stable, so a later attempt resolves the prior commit and takes the committed outcome again. Without keyed recovery the outcome is not established: a retry may observe state the first attempt itself changed and reject where it committed.
 
-Otherwise the checker reports the decision as **not established to replay**, naming the gap: the condition is `unspecified`; a condition root is unstable; the result is not bound before the decision on this path; the transaction outcome is unstable; or the result is unstable in the taken arm's variant — its instance not class-fixed, its request's schema not the target's, its target declaring no replay-consistent requirement for the input or one that is unproven, an external boundary declaring `result_replay: unstable` or no replay fact at all, one whose identity key is unstable, or one whose observed `Err` is retryable or of unspecified disposition (§13.3), or a result bound by `race`, whose winner is scheduling nondeterminism (§16). Instability is not proven; a different arm on retry may be legitimate. What that means for each obligation is stated in §9: an obstacle for idempotency and result replay, never for recoverability — with one further admission for idempotency alone. A transaction outcome not established to replay is admitted there (`OutcomeDivergenceAddsNoWork`): a rejected attempt commits nothing and does only its block's work, a committed one only its continuation's, and each path's work is judged duplicate-safe on its own, so the divergence itself cannot duplicate work. Result replay grants no such admission — a rejected attempt may construct a different result.
+Otherwise the checker reports the decision as **not established to replay**, naming the gap: the condition is `unspecified`; a condition root is unstable; the result is not bound before the decision on this path; the transaction outcome is unstable; or the result is unstable in the taken arm's variant — its instance not class-fixed, its request's schema not the target's, its target declaring no replay-consistent requirement for the input or one that is unproven, the target declaring the observed error class `retryable`, an external boundary declaring `result_replay: unstable` or no replay fact at all, one whose identity key is unstable, or one whose observed `Err` is retryable or of unspecified disposition (§13.3), or a result bound by `race`, whose winner is scheduling nondeterminism (§16). Instability is not proven; a different arm on retry may be legitimate. What that means for each obligation is stated in §9: an obstacle for idempotency and result replay, never for recoverability — with one further admission for idempotency alone. A transaction outcome not established to replay is admitted there (`OutcomeDivergenceAddsNoWork`): a rejected attempt commits nothing and does only its block's work, a committed one only its continuation's, and each path's work is judged duplicate-safe on its own, so the divergence itself cannot duplicate work. Result replay grants no such admission — a rejected attempt may construct a different result.
 
 ### Step locations
 
@@ -2405,14 +2405,19 @@ assumed:
    stable wherever it is available.
 6. **Effect results.** A reference through `effect_result_ok` or
    `effect_result_err` to a bound result `r` is judged per variant.
-   For a **request**, both variants are stable at once iff the
-   instance is class-fixed — a direct execution with a
-   replay-deterministic derivation, or an intent replay-available by
-   route A or B — the schema is the targeted input's schema, and the
-   target operation proves `result: replay_consistent` for that input
-   (§9, §13.2): the class then sends one logical request into one
-   class of the target, and receives one variant and a
-   replay-equivalent payload back. For an **external** effect, a
+   For a **request**, a variant is stable iff the instance is
+   class-fixed — a direct execution with a replay-deterministic
+   derivation, or an intent replay-available by route A or B — the
+   schema is the targeted input's schema, the target operation proves
+   `result: replay_consistent` for that input (§9, §13.2), and the
+   variant is one that proof holds to the obligation: `Ok`, or an
+   error class the target's contract does not declare `retryable`.
+   The class then sends one logical request into one class of the
+   target, and every attempt observing such a variant receives the
+   same variant and a replay-equivalent payload back. A retryable
+   class is never stable: the target's proof exempts retryable
+   returns (§9), so it fixes nothing about them, and a later attempt
+   may observe `Ok` where an earlier one observed the error. For an **external** effect, a
    variant is stable iff the effect declares `result_replay:
    replay_stable` over an identity whose key components are all
    replay-stable — equal identities are one logical external
@@ -2435,7 +2440,8 @@ assumed:
    (always, in V1), `effect` payload roots, external effect results
    outside rule 6 — a boundary declaring no terminal-result replay
    guarantee, an unstably keyed identity, a retryable or unspecified
-   `Err` — an artifact available by neither
+   `Err` — request results outside rule 6, a target's retryable error
+   class among them, an artifact available by neither
    route, an artifact or result not in the path context at the point
    of reference, and `transaction_read` results, which additionally
    poison any natural-replay provenance closure that reaches them.

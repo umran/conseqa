@@ -243,6 +243,17 @@ pub(crate) fn result_gap_sentence(gap: &ResultGap) -> String {
                 .to_string()
         }
 
+        ResultGap::TargetErrorRetryable {
+            operation,
+            input,
+            error,
+        } => format!(
+            "`{operation}` declares `{error}` retryable for `{input}`: its \
+             result-replay proof exempts retryable returns, so it fixes \
+             nothing about this variant, and a later attempt may observe a \
+             different result"
+        ),
+
         ResultGap::ExternalErrorDispositionUnspecified => {
             "the error's disposition is unspecified: no declared fact says \
              whether observing it terminally resolves the logical external \

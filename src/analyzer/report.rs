@@ -71,8 +71,10 @@ pub struct ProverReport {
 /// transaction serializability and ordering families: obligations
 /// anchored to a transaction, proven from the model-wide conflict
 /// closure — serializable isolation, strict locks, version validation,
-/// ordered cursors, fences — and never from L1.
-pub const FORMAT: u32 = 7;
+/// ordered cursors, fences — and never from L1. Format 8 judges a
+/// request result per variant: a target's retryable error class is
+/// never replay-stable (`target_error_retryable`).
+pub const FORMAT: u32 = 8;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
