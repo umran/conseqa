@@ -75,7 +75,11 @@ pub struct ProverReport {
 /// request result per variant: a target's retryable error class is
 /// never replay-stable (`target_error_retryable`) — and scopes the
 /// idempotency-inert continuation admission to the path, so
-/// `idempotency_inert_continuation` is cited per path.
+/// `idempotency_inert_continuation` is cited per path. Format 8 also
+/// carries the dsl 5 `abandon` terminal: a recoverability path that
+/// `abandons`, the `every_path_abandons` obstacle, and the
+/// `abandon_without_message_input` and `abandon_without_redelivery`
+/// diagnostics.
 pub const FORMAT: u32 = 8;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1178,6 +1182,14 @@ fn resumption_assumptions(paths: &[verification::PathResumption]) -> Vec<String>
 
     for path in paths {
         let prefix = path_prefix(paths.len(), &path.path);
+
+        if path.abandons {
+            assumptions.push(format!(
+                "{prefix}the attempt abandons, leaving its message for another \
+                 attempt, which re-encounters everything before it; the invocation \
+                 completes on another path"
+            ));
+        }
 
         for transaction in &path.transactions {
             assumptions.push(match &transaction.resolution {

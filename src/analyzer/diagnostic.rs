@@ -79,6 +79,11 @@ pub enum VerificationCode {
     /// vacuously true. Redundant, not unsound — a warning, never an
     /// error.
     RedundantPresenceCheck,
+
+    /// A consumer abandons attempts on a subscription whose runtime
+    /// declares at-most-once delivery: an abandoned message is never
+    /// delivered again, so `abandon` drops it.
+    AbandonWithoutRedelivery,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -180,6 +185,9 @@ pub enum ValidationCode {
     UnknownResultErrorClass,
     MissingResultErrorArm,
     UnexpectedResultErrorArm,
+
+    // Terminals.
+    AbandonWithoutMessageInput,
 
     // L1 — runtime topology.
     EmptyRoutingKey,

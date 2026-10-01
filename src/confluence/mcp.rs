@@ -948,7 +948,9 @@ impl ConseqaMcp {
         // connection: refuse a declared version mismatch by name,
         // before shape validation turns it into serde noise.
         if let Some(declared) = params.dsl
-            && declared != crate::spec::DSL_VERSION.0
+            && !crate::spec::DSL_READS
+                .iter()
+                .any(|readable| readable.0 == declared)
         {
             return json_error(serde_json::json!({
                 "committed": false,
@@ -2063,6 +2065,9 @@ PATCH — {"mutations": [<mutation>, ...]}; each mutation {"kind": K, ...}:
                   {"all": [c]}, {"any": [c]}, {"unspecified": "<a rule the
                   model states no fact about, in words>"};
        reject     {error, from} — end a request with a declared error;
+       abandon    {} — end a message's attempt without completing it,
+                  leaving the message for another attempt (subscription
+                  and outbox operations only);
        parallel   {steps} — start all, wait for all; a member's `as` binds
                   its answer for an `answer` step;
        answer     {of: <a parallel member's as>, on_ok, on_error};
@@ -2292,6 +2297,18 @@ RESULT CONTRACTS name their error classes:
     (arms are exhaustive: exactly one per declared error class. Inside an
      error arm, effect_result_err:<result> resolves to that class's
      schema.)
+  {"kind":"abandon"}
+    (a terminal for a subscription or outbox operation: the attempt ends
+     without completing, so the message stays unacknowledged or pending
+     and is delivered again. It rolls nothing back; every step before it
+     is re-done by the next attempt, so it must be retry-safe.
+PASSING A RETRYABLE ERROR UP keeps every proof: a request returns an
+error class its own contract declares retryable — exempt from result
+replay — and a consumer abandons. Do it from a match arm that does
+nothing else: on that arm the decision then adds no work, whatever the
+ok arm does. A target's retryable error is never a stable result, so
+turning it into a terminal error, or doing work on its arm, leaves the
+operation's replay unproven.)
 An external effect declares three orthogonal boundary facts:
   {"kind":"external","name":"provider.op",
    "identity":{"kind":"keyed","key":{"components":[<value ref>...]}},

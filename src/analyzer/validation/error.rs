@@ -426,6 +426,15 @@ pub enum ValidationError {
         defect: ManagedFieldDefect,
     },
 
+    /// The program reaches `abandon`, but the operation has no
+    /// subscription or outbox input: only a message-triggered attempt
+    /// can be abandoned, and a request passes a retryable error up
+    /// with `return`.
+    AbandonWithoutMessageInput {
+        operation: Id,
+        location: StepLocation,
+    },
+
     /// A `return` names an error class the request's result contract
     /// does not declare.
     UnknownResultErrorClass {
@@ -1985,6 +1994,27 @@ impl From<ValidationError> for Diagnostic {
                     message: "A successor cursor is a non-optional int; a monotonic cursor or \
                               a fence is a non-optional int, decimal, or timestamp; and the \
                               value driving it has the field's type."
+                        .to_string(),
+                }],
+            },
+
+            ValidationError::AbandonWithoutMessageInput {
+                operation,
+                location,
+            } => Diagnostic {
+                code: DiagnosticCode::Validation(ValidationCode::AbandonWithoutMessageInput),
+                severity: Severity::Error,
+                subject: Some(operation.clone()),
+                message: format!(
+                    "Program step `{location}` of `{operation}` abandons the attempt, but \
+                     `{operation}` has no subscription or outbox input."
+                ),
+                evidence: vec![Evidence {
+                    subject: Some(operation),
+                    message: "`abandon` ends a message-triggered attempt with its message \
+                              unacknowledged or pending. A request-triggered attempt passes \
+                              a retryable error up by returning an error class its contract \
+                              declares `retryable`."
                         .to_string(),
                 }],
             },

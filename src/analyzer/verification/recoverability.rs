@@ -177,6 +177,13 @@ pub struct PathResumption {
 
     /// Every artifact a later step consumes, with its replay route.
     pub artifacts: Vec<ArtifactAvailability>,
+
+    /// The path ends at `abandon`: it completes nothing, and is judged
+    /// as an interruption at its end — the re-driven attempt
+    /// re-encounters every transaction on it. The invocation's
+    /// progress rests on the input's other paths.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub abandons: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -250,6 +257,11 @@ pub enum RecoverabilityObstacle {
     /// The path falls off the end of the program without a terminal.
     /// Validation rejects the shape; verification records it.
     PathNotTerminated { path: PathRef },
+
+    /// Every path admitted for the input ends at `abandon`: no attempt
+    /// can complete the invocation, so progress is impossible by
+    /// construction.
+    EveryPathAbandons { input: Id },
 
     /// A committed transaction the resumption re-encounters resolves
     /// by neither route.
@@ -367,13 +379,17 @@ fn check_requirement(
 
     let admitted: Vec<&Path<'_>> = all
         .iter()
-        .filter(|path| path.admitted_for(analysis.input()))
+        .filter(|path| path.admitted_for(analysis.operation(), analysis.input()))
         .collect();
 
     let mut obstacles = Vec::new();
 
     if admitted.is_empty() {
         obstacles.push(RecoverabilityObstacle::NoAdmittedPath {
+            input: analysis.input().clone(),
+        });
+    } else if admitted.iter().all(|path| path.abandons()) {
+        obstacles.push(RecoverabilityObstacle::EveryPathAbandons {
             input: analysis.input().clone(),
         });
     }
@@ -610,7 +626,10 @@ fn analyze_path(
             }
         }
 
-        Terminal::Complete { .. } => {}
+        // An abandoned attempt completes nothing: the path is the
+        // prefix a re-driven attempt re-encounters, with no final-step
+        // exemption (`completes` is false), and nothing to construct.
+        Terminal::Complete { .. } | Terminal::Abandon { .. } => {}
 
         Terminal::None => obstacles.push(RecoverabilityObstacle::PathNotTerminated {
             path: reference.clone(),
@@ -621,6 +640,7 @@ fn analyze_path(
         path: reference,
         transactions,
         artifacts,
+        abandons: path.abandons(),
     })
 }
 
@@ -824,6 +844,7 @@ impl RecoverabilityObstacle {
         match &mut site {
             Self::GoverningKeyInadmissible { .. }
             | Self::NoAdmittedPath { .. }
+            | Self::EveryPathAbandons { .. }
             | Self::PathNotTerminated { .. }
             | Self::NoModeledRetryDriver { .. } => {}
 
@@ -847,11 +868,20 @@ impl RecoverabilityObstacle {
                 ),
             },
 
+            Self::EveryPathAbandons { input } => Evidence {
+                subject: Some(input.clone()),
+                message: format!(
+                    "Every path admitted for `{input}` ends at `abandon`: each attempt \
+                     leaves the message for another, and none can complete the \
+                     invocation."
+                ),
+            },
+
             Self::PathNotTerminated { path } => Evidence {
                 subject: None,
                 message: format!(
                     "{} falls off the end of the program without reaching a \
-                     `return` or `complete` terminal.",
+                     `return`, `complete` or `abandon` terminal.",
                     capitalize(&describe_path(path))
                 ),
             },

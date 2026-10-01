@@ -155,6 +155,11 @@ fn a_broken_sketch_says_what_is_wrong() {
             ], "on_rejected": [ { "kind": "reject", "error": "order_not_found" } ] }),
             "`on_rejected` never applies",
         ),
+        (
+            // A request passes a retryable error up with reject.
+            serde_json::json!({ "steps": [ { "kind": "abandon" } ] }),
+            "only a message's attempt is abandoned",
+        ),
     ] {
         let mut draft: DraftOperation = workspace.operations[&id("operation.ship_order")].clone();
 
@@ -1330,6 +1335,31 @@ fn every_dsl_construct_is_reachable_from_a_sketch() {
         ], "returns": ["read.id"] }),
     );
 
+    // A consumer passing a retryable error up: the engine's `busy`
+    // abandons the delivery, leaving the message for another attempt.
+    let program = compiled(
+        "video_streaming.yaml",
+        none,
+        "operation.transcode_video",
+        serde_json::json!({ "steps": [
+            { "kind": "create", "record": "object.job",
+              "from": ["input.video_id", "input.source_uri"] },
+            { "kind": "find", "as": "job", "record": "object.job",
+              "by": { "video_id": "input.video_id" } },
+            { "kind": "transition", "record": "job", "transition": "transition.job.start" },
+            { "kind": "call", "name": "transcoding-engine.render", "as": "render",
+              "identity": ["input.video_id"], "duplicates": "identical_per_identity",
+              "result_replay": "replay_stable",
+              "result": { "ok": "schema.RenderCompleted",
+                          "errors": { "busy": { "schema": "schema.RenderFailed",
+                                                "disposition": "retryable" } } },
+              "from": ["input.video_id", "input.source_uri"],
+              "on_error": { "busy": [ { "kind": "abandon" } ] } }
+        ]}),
+    );
+
+    assert!(every_kind(&program).contains(&"abandon".to_string()));
+
     // Every kind of operation step, transaction step, effect, selector
     // predicate and condition the DSL has was produced from a sketch.
     let produced = PRODUCED.with(|produced| produced.borrow().clone());
@@ -1347,6 +1377,7 @@ fn every_dsl_construct_is_reachable_from_a_sketch() {
         "branch",
         "return",
         "complete",
+        "abandon",
         // transaction steps
         "read",
         "write",

@@ -576,6 +576,12 @@ fn in_words(program: &OperationBlock, symbols: &sketch::Symbols) -> Vec<String> 
                 }) => {
                     into.insert(format!("returns the error `{error}`"));
                 }
+                OperationStep::Abandon => {
+                    into.insert(
+                        "leaves the message for a later attempt, without completing it"
+                            .to_string(),
+                    );
+                }
                 OperationStep::Branch(branch) => {
                     outcomes(&branch.then, into);
                     if let Some(otherwise) = &branch.otherwise {
@@ -585,6 +591,12 @@ fn in_words(program: &OperationBlock, symbols: &sketch::Symbols) -> Vec<String> 
                 OperationStep::Transaction(execute) => {
                     if let Some(rejected) = &execute.rejected {
                         outcomes(rejected, into);
+                    }
+                }
+                OperationStep::MatchResult(matched) => {
+                    outcomes(&matched.ok, into);
+                    for arm in matched.errors.values() {
+                        outcomes(arm, into);
                     }
                 }
                 _ => {}

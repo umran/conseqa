@@ -29,7 +29,7 @@
 # at-least-once delivery), and receipts emails the customer through a
 # provider that deduplicates sends by event_id. Every declared
 # obligation proves.
-dsl: 4
+dsl: 5
 revision: 1
 services:
   service.payments:

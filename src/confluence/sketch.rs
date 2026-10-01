@@ -332,6 +332,11 @@ pub enum SketchStep {
         from: Values,
     },
 
+    /// End a message's attempt without completing it: the message is
+    /// left unacknowledged, or pending, for another attempt. How a
+    /// consumer passes a retryable error up.
+    Abandon,
+
     /// Start every effect at once and wait for all of them.
     Parallel { steps: Vec<SketchStep> },
 
@@ -2613,6 +2618,7 @@ fn step_name(step: &SketchStep) -> &'static str {
         SketchStep::Request { .. } => "request",
         SketchStep::When { .. } => "when",
         SketchStep::Reject { .. } => "reject",
+        SketchStep::Abandon => "abandon",
         SketchStep::Parallel { .. } => "parallel",
         SketchStep::Race { .. } => "race",
         SketchStep::Start { .. } => "start",
@@ -3572,6 +3578,27 @@ impl Compiler<'_> {
                             values,
                         },
                     }));
+
+                    self.found.retain(|alias, _| in_scope.contains(alias));
+
+                    return Ok((out, true));
+                }
+
+                SketchStep::Abandon => {
+                    out.extend(self.seal(&here, None)?);
+
+                    if self.context.request {
+                        return fail(
+                            "only a message's attempt is abandoned; a request passes a \
+                             retryable error up with reject",
+                        );
+                    }
+
+                    if !last_step {
+                        return fail("nothing may follow an abandon");
+                    }
+
+                    out.push(OperationStep::Abandon);
 
                     self.found.retain(|alias, _| in_scope.contains(alias));
 

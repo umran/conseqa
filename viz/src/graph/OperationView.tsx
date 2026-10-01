@@ -741,6 +741,17 @@ function ProgramBlock({ opId, op, block, hops, nested, startIndex = 0, fill = fa
             </StepCard>
           ),
         };
+
+      case "abandon":
+        return {
+          key: location,
+          element: (
+            <StepCard selKey={`step:${location}`} detailId={opId} ctx={stepCtx(location)} stripe={STEP_STRIPE.terminal}>
+              <Badge variant="warning">abandon</Badge>
+              <div className="mt-1 text-xs text-kumo-subtle">leaves the message for another attempt</div>
+            </StepCard>
+          ),
+        };
     }
   });
 

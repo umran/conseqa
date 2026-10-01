@@ -30,7 +30,7 @@
 # declares none.
 #
 # Every declared obligation proves.
-dsl: 4
+dsl: 5
 revision: 1
 services:
   service.accounts:

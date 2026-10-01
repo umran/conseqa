@@ -1,4 +1,4 @@
-dsl: 4
+dsl: 5
 revision: 24
 services:
   service.shop:

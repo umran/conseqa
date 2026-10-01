@@ -129,6 +129,12 @@ pub enum Terminal<'a> {
         location: StepLocation,
     },
 
+    /// The attempt ends without completing; admitted only for a
+    /// message-triggered invocation (§16).
+    Abandon {
+        location: StepLocation,
+    },
+
     /// The block fell through its last step with no terminal.
     /// Validation rejects this; verification stays conservative on a
     /// model it was not promised.
@@ -171,16 +177,27 @@ impl<'a> Path<'a> {
         }
     }
 
-    /// Whether an invocation triggered by `input` can take this path:
-    /// it ends at `complete`, or at a `return` for that input. A path
-    /// returning another request input's result is not one an
-    /// invocation of `input` completes. An unterminated path is
-    /// admitted conservatively, so its work is still analyzed.
-    pub fn admitted_for(&self, input: &Id) -> bool {
+    /// Whether an invocation of `operation` triggered by `input` can
+    /// take this path: it ends at `complete`, at a `return` for that
+    /// input, or — for a subscription or outbox input — at `abandon`.
+    /// A path returning another request input's result is not one an
+    /// invocation of `input` completes, and a request ends an attempt
+    /// with a retryable error, never by abandoning it. An unterminated
+    /// path is admitted conservatively, so its work is still analyzed.
+    pub fn admitted_for(&self, operation: &crate::spec::Operation, input: &Id) -> bool {
         match &self.terminal {
             Terminal::Return { request, .. } => *request == input,
+            Terminal::Abandon { .. } => !matches!(
+                operation.inputs.get(input),
+                Some(crate::spec::Input::Request(_))
+            ),
             Terminal::Complete { .. } | Terminal::None => true,
         }
+    }
+
+    /// Whether the path ends at `abandon`.
+    pub fn abandons(&self) -> bool {
+        matches!(self.terminal, Terminal::Abandon { .. })
     }
 
     /// Whether the path ends at a `return` for `input`.
@@ -463,6 +480,13 @@ fn walk<'a>(
                 OperationStep::Complete => out.push(Path {
                     steps: prefix,
                     terminal: Terminal::Complete {
+                        location: location.clone(),
+                    },
+                }),
+
+                OperationStep::Abandon => out.push(Path {
+                    steps: prefix,
+                    terminal: Terminal::Abandon {
                         location: location.clone(),
                     },
                 }),

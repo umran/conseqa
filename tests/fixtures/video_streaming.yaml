@@ -24,11 +24,13 @@
 # video_id, which fixes each video's one logical render and its
 # terminal result; a rejected source is a terminal error, so a retried
 # transcode observes the same terminal result and takes the same arm.
-# Were the engine's error retryable — or its disposition undeclared —
-# the retried match would not be established to replay, and the
-# transcoder's idempotency, with the upload's cascade, would be
-# unknown.
-dsl: 4
+# Were the engine's error retryable, failing the job on it would be
+# divergent work — a retry may render instead — and the transcoder's
+# idempotency, with the upload's cascade, would be unknown. A retryable
+# error is passed up instead: its arm abandons the delivery (dsl 5),
+# leaving the message for at-least-once redelivery, and adds no work of
+# its own (tests/abandon.rs).
+dsl: 5
 revision: 1
 services:
   service.ingest:

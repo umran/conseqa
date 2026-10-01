@@ -459,7 +459,10 @@ export type OperationStep =
   | { kind: "match_result"; result: Id; ok: OperationBlock; errors: Record<Id, OperationBlock> }
   | { kind: "branch"; condition: Condition; then: OperationBlock; otherwise: OperationBlock | null }
   | { kind: "return"; request: Id; outcome: ResultOutcome }
-  | { kind: "complete" };
+  | { kind: "complete" }
+  /** Ends a message-triggered attempt without completing it: the
+   *  message stays unacknowledged or pending for another attempt. */
+  | { kind: "abandon" };
 
 export type ResultReplayRequirement = "unspecified" | "replay_consistent";
 

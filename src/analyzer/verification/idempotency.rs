@@ -993,7 +993,7 @@ fn check_requirement(
 
     let admitted: Vec<&Path<'_>> = all
         .iter()
-        .filter(|path| path.admitted_for(analysis.input()))
+        .filter(|path| path.admitted_for(analysis.operation(), analysis.input()))
         .collect();
 
     if admitted.is_empty() {

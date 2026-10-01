@@ -464,6 +464,8 @@ pub fn validate(model: &Model) -> Vec<ValidationError> {
 
     errors.extend(validate_match_arms(model, &index));
 
+    errors.extend(validate_abandon(model));
+
     errors.extend(validate_programs(model, &index));
 
     errors.extend(validate_field_paths(model, &index));
@@ -579,6 +581,7 @@ fn is_program_local_error(error: &ValidationError) -> bool {
         | MissingTransactionRejectedArm { .. }
         | UnexpectedTransactionRejectedArm { .. }
         | UnknownResultErrorClass { .. }
+        | AbandonWithoutMessageInput { .. }
         | DirectWriteToVersionField { .. }
         | MissingVersionBump { .. }
         | DuplicateVersionBump { .. }
@@ -1698,6 +1701,34 @@ fn validate_ordering_positions(model: &Model, index: &ReferenceIndex<'_>) -> Vec
 /// Every `match_result` has exactly one arm per error class its
 /// result's contract declares (§61), and every `return` names a
 /// declared class (§60) — the latter judged by the reference pass.
+/// `abandon` ends a message-triggered attempt (§16), so an operation
+/// whose program reaches it must have a subscription or outbox input.
+fn validate_abandon(model: &Model) -> Vec<ValidationError> {
+    let mut errors = Vec::new();
+
+    for (operation_id, operation) in &model.operations {
+        let consumes = operation
+            .inputs
+            .values()
+            .any(|input| !matches!(input, Input::Request(_)));
+
+        if consumes {
+            continue;
+        }
+
+        for (location, step) in operation.program.steps_with_locations() {
+            if matches!(step, OperationStep::Abandon) {
+                errors.push(ValidationError::AbandonWithoutMessageInput {
+                    operation: operation_id.clone(),
+                    location,
+                });
+            }
+        }
+    }
+
+    errors
+}
+
 fn validate_match_arms(model: &Model, index: &ReferenceIndex<'_>) -> Vec<ValidationError> {
     let mut errors = Vec::new();
 
@@ -3937,7 +3968,7 @@ fn validate_program_references(
                 );
             }
 
-            OperationStep::Complete => {}
+            OperationStep::Complete | OperationStep::Abandon => {}
         }
     }
 }
@@ -5390,7 +5421,7 @@ impl<'a> ProgramValidator<'a> {
                 None
             }
 
-            OperationStep::Complete => None,
+            OperationStep::Complete | OperationStep::Abandon => None,
         }
     }
 

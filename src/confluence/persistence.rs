@@ -70,7 +70,17 @@ const EVENT_SEQ_KEY: &str = "task_event_seq";
 /// execution sites a `rejected` block; result contracts name error
 /// classes; and the stored summaries and proposals speak the
 /// transaction families. None of it reads as a format-5 value.
-const FORMAT: u64 = 6;
+///
+/// Bumped to 7 with dsl 5: a program may now hold the `abandon`
+/// terminal, which a format-6 build cannot read. The change is
+/// additive — every format-6 value reads as a format-7 one — so a
+/// format-6 database is upgraded in place ([`UPGRADES_FROM`]), and
+/// only an older build is refused it.
+const FORMAT: u64 = 7;
+
+/// The earlier formats whose every stored value this build reads
+/// unchanged, so opening one only restamps it.
+const UPGRADES_FROM: [u64; 1] = [6];
 
 #[derive(Debug, thiserror::Error)]
 pub enum PersistenceError {
@@ -182,6 +192,10 @@ impl Persistence {
                 // a workspace shape this build cannot deserialize, and
                 // reporting that as a corrupt value would send a reader
                 // looking for disk damage.
+                Some(found) if UPGRADES_FROM.contains(&found) => {
+                    meta.insert(FORMAT_KEY, FORMAT)?;
+                }
+
                 Some(found) => {
                     if found != FORMAT {
                         return Err(PersistenceError::FormatMismatch { found });
@@ -476,6 +490,18 @@ mod tests {
     /// A database written by an earlier stored-workspace format is
     /// refused by version with the named error — never surfaced as a
     /// corrupt value.
+    /// Stamps a database at `format`, as a binary of that format
+    /// would have left it.
+    fn stamp(path: &std::path::Path, format: u64) {
+        let db = Database::open(path).expect("the database reopens raw");
+        let txn = db.begin_write().expect("write txn");
+        {
+            let mut meta = txn.open_table(META).expect("meta table");
+            meta.insert(FORMAT_KEY, format).expect("stamp old format");
+        }
+        txn.commit().expect("commit");
+    }
+
     #[test]
     fn an_earlier_format_database_is_refused_by_version() {
         let path =
@@ -484,18 +510,13 @@ mod tests {
         // A fresh database stamps the current format.
         drop(Persistence::open_file(&path).expect("a fresh database opens"));
 
-        // Rewind the stamp to the previous format, as an old binary
-        // would have left it.
-        {
-            let db = Database::open(&path).expect("the database reopens raw");
-            let txn = db.begin_write().expect("write txn");
-            {
-                let mut meta = txn.open_table(META).expect("meta table");
-                meta.insert(FORMAT_KEY, FORMAT - 1)
-                    .expect("stamp old format");
-            }
-            txn.commit().expect("commit");
-        }
+        // Rewind the stamp to a format no longer read, as an old
+        // binary would have left it.
+        let old = FORMAT - 2;
+
+        assert!(!UPGRADES_FROM.contains(&old));
+
+        stamp(&path, old);
 
         let error = match Persistence::open_file(&path) {
             Err(error) => error,
@@ -503,7 +524,7 @@ mod tests {
         };
 
         assert!(
-            matches!(error, PersistenceError::FormatMismatch { found } if found == FORMAT - 1),
+            matches!(error, PersistenceError::FormatMismatch { found } if found == old),
             "{error:?}"
         );
 
@@ -513,6 +534,33 @@ mod tests {
                 .contains("start a new run against a fresh database"),
             "{error}"
         );
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// A format whose values this build reads unchanged is upgraded in
+    /// place: opened, and restamped at the current format.
+    #[test]
+    fn an_additive_predecessor_is_upgraded_in_place() {
+        let path =
+            std::env::temp_dir().join(format!("conseqa-format-test-{}.redb", uuid::Uuid::new_v4()));
+
+        drop(Persistence::open_file(&path).expect("a fresh database opens"));
+
+        for previous in UPGRADES_FROM {
+            stamp(&path, previous);
+
+            drop(Persistence::open_file(&path).expect("an additive predecessor opens"));
+
+            let db = Database::open(&path).expect("the database reopens raw");
+            let txn = db.begin_read().expect("read txn");
+            let meta = txn.open_table(META).expect("meta table");
+
+            assert_eq!(
+                meta.get(FORMAT_KEY).expect("read").map(|value| value.value()),
+                Some(FORMAT)
+            );
+        }
 
         std::fs::remove_file(&path).ok();
     }

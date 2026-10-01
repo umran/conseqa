@@ -1,7 +1,7 @@
 # Conseqa DSL Semantics
 
 **Status:** Normative semantic contract for the DSL and the V1 verifiers — the single authoritative semantics document. The design drafts and revision documents that preceded it are retired; their normative content is consolidated here, and what they left open is §27.  
-**DSL contract version:** This document specifies **DSL contract version 4** (`DSL_VERSION`, `src/spec/model.rs`). The version names the normative semantic contract as a whole, not the parse schema: any normative change bumps it — vocabulary, validation, or proof semantics alike — while purely internal changes do not. Every specification document declares the version it is authored in (`dsl: 4`, the model root's first field, stamped at assembly and never authored); a consumer probes it before strict parsing and refuses a mismatch or absence by name. Version 4 is the transaction serializability and ordering revision: both become properties of transactions, declared on the transaction they constrain and proven from transactions alone — serializable isolation across a conflict closure, strict locks, an object version protocol, ordered cursors, and fences — while the runtime topology describes placement, transport, grouping, precedence, and capacity and provides no serializability or ordering guarantee (§7, §9, §10, §16, §17, §20, §22). Transactions are explicitly rejectable, transitions fallible, and request results carry named error classes.
+**DSL contract version:** This document specifies **DSL contract version 5** (`DSL_VERSION`, `src/spec/model.rs`). The version names the normative semantic contract as a whole, not the parse schema: any normative change bumps it — vocabulary, validation, or proof semantics alike — while purely internal changes do not. Every specification document declares the version it is authored in (`dsl: 5`, the model root's first field, stamped at assembly and never authored); a consumer probes it before strict parsing and refuses a mismatch or absence by name — except a version the current one extends without changing what it said, which is read as the current version (`DSL_READS`; today dsl 4). Version 5 is the Retryable Error Propagation revision: the `abandon` terminal lets a message consumer pass a retryable error up, a target's retryable error class is never a stable result, and the idempotency-inert admission is judged per path (§9, §16, §18). Version 4 was the transaction serializability and ordering revision: both become properties of transactions, declared on the transaction they constrain and proven from transactions alone — serializable isolation across a conflict closure, strict locks, an object version protocol, ordered cursors, and fences — while the runtime topology describes placement, transport, grouping, precedence, and capacity and provides no serializability or ordering guarantee (§7, §9, §10, §16, §17, §20, §22). Transactions are explicitly rejectable, transitions fallible, and request results carry named error classes.
 
 | dsl | defined by |
 |---|---|
@@ -9,6 +9,7 @@
 | 2 | the Outbox Semantics revision — exactly one `OutboxInput` per outbox, intrinsic durable re-drive in place of declared delivery and acknowledgement, `OutboxDispatch.routing` in place of a bare member assignment |
 | 3 | the Serialization Semantics revision — the L0 `Operation.invocation_lock` proof route; `MemberAssignment` reduced to stable-epoch affinity, its implicit safe-ownership-transfer rule removed; the explicit `ExecutionPool.execution_handoff` leg required by every topology serialization and ordering proof |
 | 4 | the Transaction Serializability and Ordering revision (specified in `Conseqa_Transaction_Consistency_and_Ordering_Revision__DSL_v4.md`) — operation-level serialization and ordering, `Operation.invocation_lock`, and `ExecutionPool.execution_handoff` removed; `Transaction.requirements` (`SerializableBy`, `OrderedBy`) proven from serializable-isolation closures and serialization graphs over strict locks, the object `version` protocol, ordered cursors, and fences; explicit transaction rejection (`rejected` arm, fallible transitions); transition-scoped outbox effects; named error classes on result contracts |
+| 5 | the Retryable Error Propagation revision (specified in `Conseqa_Retryable_Error_Propagation_Revision_Specification.md`) — the `abandon` terminal for subscription and outbox consumers; request results judged per variant, a target's retryable class never stable; the idempotency-inert continuation admission scoped to the path; external `replay_stable` admitting a later retryable error. Additive: dsl 4 documents are read as dsl 5 |
 
 **Implementation namespace:** `src/spec/` (surface), `src/analyzer/` (validation and verification).
 
@@ -622,7 +623,7 @@ A subscription may declare an acknowledgement semantic:
 
 The field is optional because the semantic postdates existing models: absent is **no declared acknowledgement fact** — how every model written before the field existed reads, and migration must not guess a value the model never stated — while `false` is the explicit negative.
 
-Acknowledgement is an input-level application semantic, deliberately explicit and deliberately not a program statement: there is no `Acknowledge(item)` primitive in `OperationBlock`, and Conseqa does not distinguish "effect succeeded", "ack call began", and "ack call returned" inside the application program — those mechanics are below the abstraction, as is whether the concrete runtime sends one batch ACK, per-message ACKs, or an offset commit. It is consumer-relative: one subscription acknowledging a message says nothing about another subscription on the same topic. If the invocation does not successfully complete, the declaration does not take effect and the item remains logically unacknowledged; whether another delivery attempt occurs is the subscription runtime's delivery semantics (§10.3). Acknowledgement itself implies neither at-most-once nor exactly-once execution, neither eventual redelivery nor eventual success — and it neither closes an idempotency proof nor proves duplicate collapse: under at-least-once delivery, failure or uncertainty *before* acknowledgement may admit another attempt, so consumer idempotency is still needed wherever duplicates are admitted.
+Acknowledgement is an input-level application semantic, deliberately explicit and deliberately not a program statement: there is no `Acknowledge(item)` primitive in `OperationBlock`, and Conseqa does not distinguish "effect succeeded", "ack call began", and "ack call returned" inside the application program — those mechanics are below the abstraction, as is whether the concrete runtime sends one batch ACK, per-message ACKs, or an offset commit. It is consumer-relative: one subscription acknowledging a message says nothing about another subscription on the same topic. If the invocation does not successfully complete — it is interrupted, or it reaches `abandon` (§16), which is never successful completion — the declaration does not take effect and the item remains logically unacknowledged; whether another delivery attempt occurs is the subscription runtime's delivery semantics (§10.3). Acknowledgement itself implies neither at-most-once nor exactly-once execution, neither eventual redelivery nor eventual success — and it neither closes an idempotency proof nor proves duplicate collapse: under at-least-once delivery, failure or uncertainty *before* acknowledgement may admit another attempt, so consumer idempotency is still needed wherever duplicates are admitted.
 
 This semantic is subscription-only. An outbox input carries no acknowledgement field: successful consumption is intrinsic to the outbox abstraction (§8.3), not a declared fact.
 
@@ -642,7 +643,7 @@ It means:
 
 The operation program stays a **per-message logical machine**. No batch payload, batch iterator, or batch index exists at L0, and none is needed: a runtime may retrieve or dispatch several committed messages together, but that is an opaque realization over multiple logical per-message invocations (§10.3.2), never a new invocation shape. `M1 -> Operation(M1); M2 -> Operation(M2)` — not `Batch[M1,M2] -> BatchOperation`.
 
-An outbox input has no synchronous result; its normal terminal is `complete`. How consumption attempts are partitioned, ordered, routed, and batched are realization facts declared by an **outbox runtime** (§10.3.2) against the `(operation, input)` pair.
+An outbox input has no synchronous result; its normal terminal is `complete`. An attempt reaching `abandon` (§16) ends without successful logical completion, so the message remains pending and further attempts are admitted. How consumption attempts are partitioned, ordered, routed, and batched are realization facts declared by an **outbox runtime** (§10.3.2) against the `(operation, input)` pair.
 
 ### Intrinsic consumption semantics
 
@@ -661,7 +662,7 @@ successful logical completion of an attempt
     ->
 M becomes consumed
 
-failed or uncertain attempt
+failed, uncertain, or abandoned attempt
     ->
 M remains pending
 ```
@@ -709,7 +710,7 @@ These mechanisms are not interchangeable. A transaction that merely prevents a s
 
 The requirement is not discharged merely because the operation has a field named `idempotency_key`, because a `TransactionOutput` exists, or because an `EffectIntent` exists.
 
-V1 discharges the requirement over each **admitted path** of the program — a path ending at `complete`, or at a `return` for the triggering input (§16) — under the governing key's population (§12). Three legs must hold on every admitted path:
+V1 discharges the requirement over each **admitted path** of the program — a path ending at `complete`, at a `return` for the triggering input, or, for a subscription or outbox input, at `abandon` (§16) — under the governing key's population (§12). An abandoning path is judged like any other: its attempt's work is done, and the attempt the abandoned message's next delivery starts re-encounters all of it. Three legs must hold on every admitted path:
 
 - **State leg.** Every transaction step must be retry-safe: a keyed commit over a stable key, or naturally replayable. There is no final-step exemption, because a duplicate delivery re-drives the whole program even after terminal completion.
 - **Effect leg.** Every effect-executing step must be duplicate-safe per the §13 rules, since even a recovered intent may be executed again (§14) — and those rules follow the work an attempt causes into other operations: a request is safe only when its target collapses duplicate invocations, a publication only when every modeled consumer of the topic collapses duplicate deliveries, an outbox write only when its containing transaction suppresses a second commit or the outbox's one modeled consumer collapses duplicate deliveries (§13.4), through its own proven requirement. An outbox boundary does not terminate the causal effect graph: the writes staged by a path's transactions are effect occurrences of that path, and the cascade continues through the outbox's consuming input whenever the outbox admits the written schema.
@@ -750,6 +751,8 @@ A recoverability requirement keyed by an `IdempotencyKey` means:
 
 > The logical invocation identified by that key must reach a valid terminal of the operation program — `return` or `complete` — after any modeled interruption.
 
+`abandon` is not such a terminal: it ends an attempt and leaves the invocation for the next one (§16).
+
 Recoverability is a **progress** obligation. Idempotency is a **safety** obligation. They are deliberately separate requirements because neither implies the other.
 
 An idempotency requirement constrains what repeated attempts may do. It is satisfied vacuously by never retrying at all: an invocation that crashes after its transaction commits and is never re-driven produces no duplicate work, and therefore violates nothing. Idempotency consequently says nothing about whether the remaining steps of an interrupted program ever execute.
@@ -787,7 +790,8 @@ V1 discharges this by **same-path continuation**: for every admitted path — on
 
 - every transaction step needs re-encounter resolution, except one that is the final step of a path ending at `complete`, after which no failing prefix exists. A `return` is not such an exemption: constructing the result is itself a step after the transaction, so every transaction on a returning path must resolve;
 - consumed artifacts — an intent the path executes, which must be established at all; a transaction output referenced by a later transaction body or an effect derivation; the outputs the terminal result is derived from — are judged by the replay rules of §17 and §18, with references inside the establishing transaction exempt by atomicity, and a commit key judged by the re-encounter analysis rather than double-counted as consumption;
-- a decision is **never** an obstacle to progress. A retry not established to take the same arm follows whichever admitted path it then takes, and that path is analyzed on its own; the difference in work is idempotency's concern, not recoverability's.
+- a decision is **never** an obstacle to progress. A retry not established to take the same arm follows whichever admitted path it then takes, and that path is analyzed on its own; the difference in work is idempotency's concern, not recoverability's;
+- a path ending at `abandon` completes nothing. It is judged as an interruption at its end: every transaction on it needs re-encounter resolution, with no final-step exemption, and every artifact it consumes is judged as usual — the next attempt re-encounters the whole path. The obligation is discharged by the input's other admitted paths; when **every** admitted path abandons, no attempt can complete the invocation, and the obligation is unproven (`EveryPathAbandons`).
 
 This is a sufficient route and deliberately does not prejudge which other paths a resumed attempt may take (§27 question 7). A program with no path admitted for the triggering input cannot make progress for it, and the obligation is unproven — the deliberate asymmetry with idempotency, for which the same shape is vacuous.
 
@@ -1777,6 +1781,8 @@ There is no response declaration. A request invocation terminates directly with 
 
 `complete` terminates an execution that returns nothing, as is natural for a subscription-driven operation.
 
+`abandon` ends a subscription- or outbox-triggered attempt **without** successful logical completion (§16): the message is left unacknowledged or pending for another attempt. It is a consumer's counterpart of returning a `retryable` error class (§8.1), and how a consumer passes a retryable error up.
+
 Terminal result replay consistency is proven from path and variant stability plus the ordinary provenance of the terminal derivation (§9, §16); no privileged result artifact intervenes between a transaction and the result it informs.
 
 ---
@@ -2018,17 +2024,27 @@ The `then` block executes when the condition holds. `otherwise` is optional; abs
 
 The terminals (§15). `return` constructs the named request input's declared result from `outcome`; `complete` returns nothing. Each ends its block: an invocation reaching it has finished.
 
+### `abandon`
+
+```yaml
+- kind: abandon
+```
+
+A third terminal, for a message-triggered attempt. It conclusively ends the current attempt **without** successful logical completion: a subscription message is not acknowledged (§8.2), an outbox message stays pending (§8.3), and another attempt is semantically admitted. Like `retryable` (§8.1), it does not say that a retry occurs, succeeds, or happens promptly — whether one does is the driver's: the subscription's delivery semantics (§10.3), or the outbox's intrinsic re-drive. It rolls nothing back: a committed transaction stays committed, an executed effect stays executed; it is a terminal, not a compensation, and every step before it is re-encountered by the next attempt. It carries no payload and names no input, and is legal wherever a terminal is — a block, a `match_result` arm, a `branch` arm, a `rejected` block.
+
+The idiom for passing a retryable error up a system: a request handler returns an error class its own contract declares `retryable` — exempt from result replay (§9) — and a consumer abandons. Either is best placed in an arm that does nothing else, where the decision selecting it adds no work (§9, the idempotency-inert admission). Under `delivery: at_most_once` an abandoned message is never delivered again, so `abandon` drops it; the checker warns (`AbandonWithoutRedelivery`).
+
 ### Program validation
 
 Validation establishes that the program is structurally coherent. It performs no replay proof. The rules:
 
-1. **Termination.** Every reachable path ends at a `return` or `complete` (`ProgramNotTerminated`). A block whose last step is a decision terminates only if every arm of that decision terminates; a `branch` without `otherwise` never does.
+1. **Termination.** Every reachable path ends at a `return`, `complete`, or `abandon` (`ProgramNotTerminated`). A block whose last step is a decision terminates only if every arm of that decision terminates; a `branch` without `otherwise` never does.
 2. **Reachability.** No step follows a terminal — or a decision whose every arm terminates — in its block (`UnreachableProgramStep`, reported for the first dead step of a block).
 3. **Definite artifact availability.** A transaction artifact — transaction output or effect intent — may be consumed only at a program point where a transaction on **every** path reaching that point establishes or recovers it (`TransactionArtifactNotAvailable`). Consumers are: an `execute_effect_intent` of the intent; a `transaction_output` reference in an effect derivation, a branch condition, a `return` outcome, another transaction's commit key or body, or an effect contract's own roots at the site where they are evaluated (§13) — an external deduplication key, propagation components. Inside one transaction, a reference to an output that transaction establishes is satisfied by step order.
 4. **Definite result assignment.** A result binding may be matched or referenced only where a step on every path reaching the point has bound it (`EffectResultNotBound`). The binding steps are the synchronous effect executions and the synchronization barriers: an asynchronous launch binds no result, so a result from an asynchronously executed effect is **not** considered bound merely because its launch occurred — it becomes available only where a `join_all` or `race` produces it. This is fundamental to async soundness.
 5. **Variant scope.** `effect_result_ok:<r>` is legal only inside the `ok` arm of a `match_result` on `r`, `effect_result_err:<r>` only inside one of its error-class arms (`EffectResultVariantOutOfScope`). Field paths resolve against the `ok` schema or the enclosing arm's class schema.
 6. **Result-binding contracts.** A binding is declared only by a site observing a result-bearing effect (`EffectHasNoResult`): a request, whose contract resolves through its target input; an external effect declaring `result`; never a publication. For a `join_all` entry, the underlying effect is the joined handle's; for a `race`, every candidate must be result-bearing and all candidates must expose the same logical result contract (`RaceResultContractMismatch`) — absent `bind`, no compatibility requirement is imposed.
-7. **Return target.** `return.request` names an operation-owned **request** input (`InvalidInputKind` for a subscription), and an `err` outcome names an error class the input's contract declares (`UnknownResultErrorClass`). The outcome's derivation roots must be definitely available under rules 3–5.
+7. **Return target.** `return.request` names an operation-owned **request** input (`InvalidInputKind` for a subscription), and an `err` outcome names an error class the input's contract declares (`UnknownResultErrorClass`). The outcome's derivation roots must be definitely available under rules 3–5. An operation whose program reaches `abandon` declares a subscription or outbox input (`AbandonWithoutMessageInput`).
 8. **Identity.** Every inline `Transaction.id`, inline `effect_id`, binding ID, and async handle ID is unique (`DuplicateId`, §7); an `execute_effect_intent` or `execute_effect_intent_async` names an intent binding produced by this operation's program; every value reference respects §11 scope.
 9. **Definite handle availability.** A synchronization step waits only on handles bound by an async launch on every path reaching it (`AsyncHandleNotAvailable`); a handle is consumed by nothing else.
 10. **`join_all` shape.** The handle list is non-empty (`EmptyJoinAll`); every referenced handle exists and is operation-owned; no handle appears twice in one `join_all` (`DuplicateSynchronizationHandle`); every declared result binding is unique; a binding is declared only for a result-bearing underlying effect, its type inferred from the contract and never restated.
@@ -2072,7 +2088,7 @@ An invocation traverses one **synchronous control path** through the program: th
 
 A rejectable `transaction` step is a decision too: its committed path continues after the step, its rejected path continues in the `rejected` block, and the path records which outcome it took (§16, "Decision replay").
 
-A path is **admitted for input `i`** iff its terminal is `complete`, or `return` for `i`. A path returning another request input's result is not one an invocation of `i` completes. Admission is terminal-based; the DSL adds no explicit entry or path-admission concept associating a triggering input with a control entry. That association is open question 10 (§27) and is deliberately not resolved by inventing one: an operation with several request inputs distinguishes their paths by the `return` each takes, and a subscription-triggered invocation is admitted to every path ending at `complete`.
+A path is **admitted for input `i`** iff its terminal is `complete`, `return` for `i`, or `abandon` when `i` is a subscription or outbox input. A path returning another request input's result is not one an invocation of `i` completes, and a request-triggered attempt is never abandoned — it returns a retryable error instead. Admission is terminal-based; the DSL adds no explicit entry or path-admission concept associating a triggering input with a control entry. That association is open question 10 (§27) and is deliberately not resolved by inventing one: an operation with several request inputs distinguishes their paths by the `return` each takes, and a subscription-triggered invocation is admitted to every path ending at `complete`.
 
 A path that falls off the end of its block with no terminal is rejected by validation (rule 1). Verification, which is not promised a valid model, admits such a path conservatively so its work is still analyzed, and recoverability records it as an obstacle.
 
