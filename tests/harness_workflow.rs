@@ -3517,6 +3517,225 @@ mod system_one {
         }
     }
 
+    type Events = Arc<Mutex<Vec<(&'static str, String)>>>;
+
+    /// A scripted session that writes the authored program, without its
+    /// requirements, for a synthesis task, and records when it does and
+    /// when a discovery task arrives. `slow` delays an operation's
+    /// synthesis, or every discovery under the key `discovery`, by
+    /// milliseconds.
+    fn pipeline_script(
+        events: &Events,
+        authored: &conseqa::spec::Model,
+        slow: BTreeMap<&'static str, u64>,
+    ) -> ScriptFn {
+        let events = Arc::clone(events);
+        let authored = authored.clone();
+        let slow = slow.clone();
+
+        Arc::new(move |engine, invocation| {
+            let events = Arc::clone(&events);
+            let authored = authored.clone();
+            let slow = slow.clone();
+
+            Box::pin(async move {
+                let task = engine
+                    .resolve_token(&invocation.task_token)
+                    .expect("token resolves");
+
+                let operation = engine
+                    .task_context(task)
+                    .expect("context")
+                    .write_scope
+                    .grants
+                    .iter()
+                    .find_map(|grant| match grant {
+                        conseqa::confluence::WriteGrant::OperationProgram(operation)
+                        | conseqa::confluence::WriteGrant::OperationRequirements(operation) => {
+                            Some(operation.clone())
+                        }
+                        _ => None,
+                    });
+
+                let Some(operation) = operation else {
+                    return;
+                };
+
+                match invocation.kind {
+                    TaskKind::OperationSynthesis => {
+                        events
+                            .lock()
+                            .expect("not poisoned")
+                            .push(("synthesizing", operation.0.clone()));
+
+                        if let Some(delay) = slow.get(operation.0.as_str()) {
+                            tokio::time::sleep(Duration::from_millis(*delay)).await;
+                        }
+
+                        // Observe what the program references, as a
+                        // session would before committing it.
+                        for kind in [
+                            conseqa::confluence::SymbolKind::DataModel,
+                            conseqa::confluence::SymbolKind::DataObject,
+                            conseqa::confluence::SymbolKind::Schema,
+                            conseqa::confluence::SymbolKind::StateMachine,
+                            conseqa::confluence::SymbolKind::Transition,
+                        ] {
+                            for key in engine
+                                .search_symbols(
+                                    task,
+                                    &conseqa::confluence::SearchSpec {
+                                        kind: Some(kind),
+                                        ..Default::default()
+                                    },
+                                )
+                                .expect("search")
+                            {
+                                engine.read_symbol(task, &key).expect("read");
+                            }
+                        }
+
+                        // The program without its requirements:
+                        // what they are is discovery's to say.
+                        let mut program = authored.operations[&operation].program.clone();
+
+                        let ids: Vec<Id> = program
+                            .transactions()
+                            .into_iter()
+                            .map(|(_, transaction)| transaction.id.clone())
+                            .collect();
+
+                        for transaction in ids {
+                            program
+                                .transaction_mut(&transaction)
+                                .expect("the transaction")
+                                .requirements = Default::default();
+                        }
+
+                        commit(
+                            &engine,
+                            &invocation,
+                            vec![Mutation::ReplaceOperationProgram {
+                                operation: operation.clone(),
+                                program,
+                            }],
+                        )
+                        .await;
+
+                        events
+                            .lock()
+                            .expect("not poisoned")
+                            .push(("synthesized", operation.0));
+                    }
+
+                    TaskKind::RequirementDiscovery => {
+                        if let Some(delay) = slow.get("discovery") {
+                            tokio::time::sleep(Duration::from_millis(*delay)).await;
+                        }
+
+                        events
+                            .lock()
+                            .expect("not poisoned")
+                            .push(("discovering", operation.0));
+                    }
+
+                    _ => {}
+                }
+            })
+        })
+    }
+
+    /// A follow-up never delays a primary: with two slots and three
+    /// programs to write, the third program starts before the first
+    /// operation's discovery does. (Run in the slot it followed, the
+    /// discovery held that slot and the last program — the critical path
+    /// — started minutes late on the benchmark.)
+    #[tokio::test]
+    async fn a_waiting_program_is_written_before_any_discovery() {
+        let authored = authored("shop.yaml");
+
+        let mut workspace = workspace_of(&authored, "A small shop backend.");
+
+        for operation in [
+            "operation.pay_order",
+            "operation.restock",
+            "operation.ship_order",
+        ] {
+            let draft = workspace
+                .operations
+                .get_mut(&id(operation))
+                .expect("the operation");
+
+            draft.program = None;
+            draft.requirements = Default::default();
+        }
+
+        let engine = ConfluenceEngine::in_memory(workspace).expect("engine starts");
+
+        let events: Events = Arc::default();
+
+        let script = pipeline_script(
+            &events,
+            &authored,
+            [("operation.restock", 400), ("discovery", 100)].into(),
+        );
+
+        let backend = Arc::new(ScriptedBackend {
+            engine: engine.clone(),
+            script,
+        });
+
+        let out_dir = scratch();
+
+        let supervisor = Supervisor::new(
+            engine.clone(),
+            backend,
+            "http://127.0.0.1:0/mcp",
+            None,
+            out_dir.join("work"),
+        );
+
+        let scheduler = Scheduler::new(
+            engine.clone(),
+            supervisor,
+            SchedulerPolicy {
+                max_concurrent_agents: 2,
+                ..Default::default()
+            },
+        );
+
+        let workflow = Workflow::new(
+            scheduler,
+            WorkflowConfig {
+                out_dir: out_dir.clone(),
+                analysis_timeout: Duration::from_secs(20),
+                max_iterations: 3,
+                objective: None,
+            },
+        );
+
+        workflow.run().await.expect("the workflow runs");
+
+        let events = events.lock().expect("not poisoned").clone();
+
+        let at = |kind: &str, operation: &str| {
+            events
+                .iter()
+                .position(|(seen, on)| *seen == kind && on == operation)
+                .unwrap_or_else(|| panic!("no {kind} {operation} in {events:?}"))
+        };
+
+        // Submission order is by operation id: pay_order, restock,
+        // ship_order. pay_order finishes first; its discovery must wait
+        // for ship_order's synthesis to start.
+        assert!(
+            at("synthesizing", "operation.ship_order") < at("discovering", "operation.pay_order"),
+            "{events:?}"
+        );
+
+        std::fs::remove_dir_all(&out_dir).ok();
+    }
+
     /// Discovery is pipelined onto synthesis: an operation whose program
     /// lands first has its requirements discovered while a slower peer
     /// is still being written, instead of every discovery waiting at a
@@ -3539,115 +3758,9 @@ mod system_one {
 
         let engine = ConfluenceEngine::in_memory(workspace).expect("engine starts");
 
-        type Events = Arc<Mutex<Vec<(&'static str, String)>>>;
-
         let events: Events = Arc::default();
 
-        let script: ScriptFn = {
-            let events = Arc::clone(&events);
-            let authored = authored.clone();
-
-            Arc::new(move |engine, invocation| {
-                let events = Arc::clone(&events);
-                let authored = authored.clone();
-
-                Box::pin(async move {
-                    let task = engine
-                        .resolve_token(&invocation.task_token)
-                        .expect("token resolves");
-
-                    let operation = engine
-                        .task_context(task)
-                        .expect("context")
-                        .write_scope
-                        .grants
-                        .iter()
-                        .find_map(|grant| match grant {
-                            conseqa::confluence::WriteGrant::OperationProgram(operation)
-                            | conseqa::confluence::WriteGrant::OperationRequirements(operation) => {
-                                Some(operation.clone())
-                            }
-                            _ => None,
-                        });
-
-                    let Some(operation) = operation else {
-                        return;
-                    };
-
-                    match invocation.kind {
-                        TaskKind::OperationSynthesis => {
-                            if operation == id("operation.ship_order") {
-                                tokio::time::sleep(Duration::from_millis(400)).await;
-                            }
-
-                            // Observe what the program references, as a
-                            // session would before committing it.
-                            for kind in [
-                                conseqa::confluence::SymbolKind::DataModel,
-                                conseqa::confluence::SymbolKind::DataObject,
-                                conseqa::confluence::SymbolKind::Schema,
-                                conseqa::confluence::SymbolKind::StateMachine,
-                                conseqa::confluence::SymbolKind::Transition,
-                            ] {
-                                for key in engine
-                                    .search_symbols(
-                                        task,
-                                        &conseqa::confluence::SearchSpec {
-                                            kind: Some(kind),
-                                            ..Default::default()
-                                        },
-                                    )
-                                    .expect("search")
-                                {
-                                    engine.read_symbol(task, &key).expect("read");
-                                }
-                            }
-
-                            // The program without its requirements:
-                            // what they are is discovery's to say.
-                            let mut program = authored.operations[&operation].program.clone();
-
-                            let ids: Vec<Id> = program
-                                .transactions()
-                                .into_iter()
-                                .map(|(_, transaction)| transaction.id.clone())
-                                .collect();
-
-                            for transaction in ids {
-                                program
-                                    .transaction_mut(&transaction)
-                                    .expect("the transaction")
-                                    .requirements = Default::default();
-                            }
-
-                            commit(
-                                &engine,
-                                &invocation,
-                                vec![Mutation::ReplaceOperationProgram {
-                                    operation: operation.clone(),
-                                    program,
-                                }],
-                            )
-                            .await;
-
-                            events
-                                .lock()
-                                .expect("not poisoned")
-                                .push(("synthesized", operation.0));
-                        }
-
-                        TaskKind::RequirementDiscovery => {
-                            events
-                                .lock()
-                                .expect("not poisoned")
-                                .push(("discovering", operation.0));
-                        }
-
-                        _ => {}
-                    }
-                })
-            })
-        };
+        let script = pipeline_script(&events, &authored, [("operation.ship_order", 400)].into());
 
         let backend = Arc::new(ScriptedBackend {
             engine: engine.clone(),

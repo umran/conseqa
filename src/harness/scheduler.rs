@@ -278,8 +278,6 @@ impl Scheduler {
     where
         F: Fn(&LogicalTask, &TaskRun) -> Option<LogicalTask> + Sync,
     {
-        use futures::stream::{self, StreamExt};
-
         let concurrency = self.policy.max_concurrent_agents.max(1);
 
         let snapshot = self.engine.head_snapshot();
@@ -318,32 +316,65 @@ impl Scheduler {
         let mut runs: Vec<Option<TaskRun>> = tasks.iter().map(|_| None).collect();
 
         for wave in waves {
-            let results: Vec<(usize, Result<TaskRun, SchedulerError>)> = stream::iter(wave)
-                .map(|index| {
-                    let task = &tasks[index];
-                    let then = &then;
+            // One queue per wave, primaries first: a follow-up is
+            // pushed behind every primary still waiting, so it fills a
+            // slot no primary needs and never delays one. The worker
+            // that pushes a follow-up loops back to the queue, so none
+            // is stranded when the others have finished.
+            enum Job {
+                Primary(usize),
+                FollowUp(LogicalTask),
+            }
 
-                    async move {
-                        let run = match self.run(task).await {
-                            Ok(run) => run,
-                            Err(error) => return (index, Err(error)),
-                        };
+            let queue: parking_lot::Mutex<std::collections::VecDeque<Job>> =
+                parking_lot::Mutex::new(wave.into_iter().map(Job::Primary).collect());
 
-                        if let Some(follow_up) = then(task, &run)
-                            && let Err(error) = self.run(&follow_up).await
-                        {
-                            return (index, Err(error));
+            let worker = || async {
+                let mut done: Vec<(usize, Result<TaskRun, SchedulerError>)> = Vec::new();
+
+                loop {
+                    let Some(job) = queue.lock().pop_front() else {
+                        return done;
+                    };
+
+                    match job {
+                        Job::Primary(index) => {
+                            let task = &tasks[index];
+                            let run = self.run(task).await;
+
+                            if let Ok(run) = &run
+                                && let Some(follow_up) = then(task, run)
+                            {
+                                queue.lock().push_back(Job::FollowUp(follow_up));
+                            }
+
+                            done.push((index, run));
                         }
 
-                        (index, Ok(run))
+                        Job::FollowUp(task) => {
+                            // A follow-up's run lands in the ledger; its
+                            // failure is the batch's, as a primary's is.
+                            if let Err(error) = self.run(&task).await {
+                                done.push((usize::MAX, Err(error)));
+                            }
+                        }
                     }
-                })
-                .buffer_unordered(concurrency)
-                .collect()
-                .await;
+                }
+            };
+
+            let results: Vec<(usize, Result<TaskRun, SchedulerError>)> =
+                futures::future::join_all((0..concurrency).map(|_| worker()))
+                    .await
+                    .into_iter()
+                    .flatten()
+                    .collect();
 
             for (index, result) in results {
-                runs[index] = Some(result?);
+                let run = result?;
+
+                if let Some(slot) = runs.get_mut(index) {
+                    *slot = Some(run);
+                }
             }
         }
 
