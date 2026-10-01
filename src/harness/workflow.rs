@@ -124,6 +124,11 @@ pub struct Workflow {
     /// the same unsure question — on every pass; once per run is what
     /// discovery is for.
     discovered: parking_lot::Mutex<std::collections::BTreeSet<Id>>,
+
+    /// When set, the run stops at its next phase boundary: a task was
+    /// handed back to the caller, and every later phase would only
+    /// reproduce it.
+    halt: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl Workflow {
@@ -133,7 +138,20 @@ impl Workflow {
             config,
             started: std::sync::OnceLock::new(),
             discovered: Default::default(),
+            halt: None,
         }
+    }
+
+    /// Stops the run at the next phase boundary once `halt` is set.
+    pub fn with_halt(mut self, halt: std::sync::Arc<std::sync::atomic::AtomicBool>) -> Self {
+        self.halt = Some(halt);
+        self
+    }
+
+    fn halted(&self) -> bool {
+        self.halt
+            .as_ref()
+            .is_some_and(|halt| halt.load(std::sync::atomic::Ordering::SeqCst))
     }
 
     fn engine(&self) -> &ConfluenceEngine {
@@ -162,7 +180,7 @@ impl Workflow {
         loop {
             iterations += 1;
 
-            if iterations > self.config.max_iterations {
+            if iterations > self.config.max_iterations || self.halted() {
                 return self.finalize(iterations - 1, None).await;
             }
 

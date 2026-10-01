@@ -13,12 +13,14 @@ pub mod backend;
 pub mod backends;
 #[cfg(feature = "system-one")]
 pub mod executors;
+pub mod handoff;
 pub mod scheduler;
 pub mod supervisor;
 pub mod task_prompt;
 pub mod workflow;
 
 pub use backend::*;
+pub use handoff::{HandOff, HandOffBackend};
 pub use scheduler::*;
 pub use supervisor::*;
 pub use workflow::*;

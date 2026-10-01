@@ -3897,6 +3897,130 @@ mod system_one {
         std::fs::remove_dir_all(&out_dir).ok();
     }
 
+    /// The shop, sketched, through `build_design`'s configuration: one
+    /// task at a time, a hand-off backend in place of agent sessions.
+    /// `break_ship_order` sketches `ship_order` against a record that
+    /// does not exist.
+    async fn build(
+        break_ship_order: bool,
+    ) -> (ConfluenceEngine, conseqa::harness::RunReport, Vec<conseqa::harness::HandOff>) {
+        let mut workspace = workspace_of(&authored("shop.yaml"), "A small shop backend.");
+
+        for (operation, mut sketch) in common::sketches::shop_sketches() {
+            if break_ship_order && operation == "operation.ship_order" {
+                sketch["steps"][0]["record"] = serde_json::json!("object.parcel");
+            }
+
+            let draft = workspace
+                .operations
+                .get_mut(&id(operation))
+                .expect("the operation");
+
+            draft.program = None;
+            draft.sketch = Some(serde_json::from_value(sketch).expect("parses"));
+        }
+
+        let engine = ConfluenceEngine::in_memory(workspace).expect("engine starts");
+        let hand_off = conseqa::harness::HandOffBackend::new(engine.clone());
+
+        let backend = Arc::new(SystemOneBackend::new(
+            engine.clone(),
+            Arc::new(Opinions::default().stating("fidelity", 0.92)),
+            conseqa::harness::executors::BUILDABLE,
+            Arc::new(hand_off.clone()),
+        ));
+
+        let out_dir = scratch();
+
+        let supervisor = Supervisor::new(
+            engine.clone(),
+            backend,
+            "http://127.0.0.1:0/mcp",
+            None,
+            out_dir.join("work"),
+        );
+
+        let scheduler = Scheduler::new(
+            engine.clone(),
+            supervisor,
+            SchedulerPolicy {
+                max_concurrent_agents: 1,
+                ..Default::default()
+            },
+        );
+
+        let workflow = Workflow::new(
+            scheduler,
+            WorkflowConfig {
+                out_dir: out_dir.clone(),
+                analysis_timeout: Duration::from_secs(20),
+                max_iterations: 8,
+                objective: None,
+            },
+        )
+        .with_halt(hand_off.halt());
+
+        let report = workflow.run().await.expect("the workflow runs");
+
+        std::fs::remove_dir_all(&out_dir).ok();
+
+        (engine, report, hand_off.handed())
+    }
+
+    /// A single-threaded build with no sessions settles the whole
+    /// sketched shop and hands nothing back.
+    #[tokio::test]
+    async fn a_build_settles_a_sketched_system_without_handing_anything_back() {
+        let (_, report, handed) = build(false).await;
+
+        assert!(handed.is_empty(), "{handed:#?}");
+        assert!(
+            matches!(report.status, RunStatus::Success { .. }),
+            "{:?}",
+            report.status
+        );
+    }
+
+    /// What code cannot settle is handed back once, with the builder's
+    /// reason, and the build stops there: the other programs are
+    /// compiled, the broken one is left for the caller to fix.
+    #[tokio::test]
+    async fn a_build_hands_a_broken_sketch_back_and_stops() {
+        let (engine, report, handed) = build(true).await;
+
+        assert_eq!(handed.len(), 1, "{handed:#?}");
+        assert_eq!(handed[0].kind, TaskKind::OperationSynthesis);
+        assert!(
+            handed[0].objective.contains("operation.ship_order"),
+            "{}",
+            handed[0].objective
+        );
+        assert!(
+            handed[0]
+                .builder
+                .as_deref()
+                .is_some_and(|builder| builder.contains("does not compile")),
+            "{:?}",
+            handed[0].builder
+        );
+
+        assert!(
+            matches!(report.status, RunStatus::Incomplete { .. }),
+            "{:?}",
+            report.status
+        );
+
+        let head = engine.head_snapshot();
+
+        for (operation, draft) in &head.workspace.operations {
+            assert_eq!(
+                draft.program.is_none(),
+                operation.0 == "operation.ship_order",
+                "{operation}"
+            );
+        }
+    }
+
     /// Discovery runs once per operation per run. A discovery the
     /// decider is unsure of goes to a session, which may propose nothing;
     /// the operation then still looks undiscovered, and every later pass

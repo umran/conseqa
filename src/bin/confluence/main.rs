@@ -28,6 +28,7 @@ use conseqa::confluence::{
 };
 use conseqa::harness::backend::InvocationBudget;
 use conseqa::harness::backends::{ClaudeCliBackend, CodexCliBackend};
+use conseqa::harness::HandOffBackend;
 use conseqa::harness::{
     AgentBackend, RunReport, Scheduler, SchedulerPolicy, Supervisor, Workflow, WorkflowConfig,
 };
@@ -762,15 +763,25 @@ impl DaemonDesignLauncher {
     /// System One builders when they are configured. A builder acts on
     /// one engine, and each run has its own project's.
     fn backend_for(&self, engine: &ConfluenceEngine) -> Arc<dyn AgentBackend> {
+        self.builders_over(engine, Arc::clone(&self.backend))
+    }
+
+    /// `fallback`, behind the System One builders when they are
+    /// configured.
+    fn builders_over(
+        &self,
+        engine: &ConfluenceEngine,
+        fallback: Arc<dyn AgentBackend>,
+    ) -> Arc<dyn AgentBackend> {
         #[cfg(feature = "system-one")]
         if let Some(executor) = &self.executor {
-            return executor.wrap(engine, Arc::clone(&self.backend));
+            return executor.wrap(engine, fallback);
         }
 
         #[cfg(not(feature = "system-one"))]
         let _ = engine;
 
-        Arc::clone(&self.backend)
+        fallback
     }
 }
 
@@ -872,6 +883,130 @@ impl DesignLauncher for DaemonDesignLauncher {
                      it again if it returns finished false) and returns the run's report. \
                      Then call open_project again to refresh your session to the new head \
                      before reading or patching.",
+        }))
+    }
+
+    fn build(
+        &self,
+        engine: ConfluenceEngine,
+        objective: Option<String>,
+    ) -> Result<futures::future::BoxFuture<'static, serde_json::Value>, String> {
+        if self
+            .state
+            .running
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return Err("a design workflow is already running on this server".to_string());
+        }
+
+        // No session is ever started, so no worker needs the endpoint.
+        let hand_off = HandOffBackend::new(engine.clone());
+
+        let supervisor = Supervisor::new(
+            engine.clone(),
+            self.builders_over(&engine, Arc::new(hand_off.clone())),
+            "http://127.0.0.1:0/mcp",
+            None,
+            self.out_dir.join("work"),
+        );
+
+        // One task at a time: the builders take milliseconds to
+        // seconds, and running them in order keeps every one against
+        // the head its predecessor committed.
+        let scheduler = Scheduler::new(
+            engine.clone(),
+            supervisor,
+            SchedulerPolicy {
+                max_concurrent_agents: 1,
+                // A handed-off task commits nothing and would be
+                // retried; one retry still covers a builder that lost an
+                // OCC race.
+                max_attempts: 2,
+                ..Default::default()
+            },
+        );
+
+        let run_name = engine.head_snapshot().workspace.run_meta.run.0.clone();
+
+        let workflow = Workflow::new(
+            scheduler,
+            WorkflowConfig {
+                out_dir: self.out_dir.join(&run_name),
+                analysis_timeout: Duration::from_secs(180),
+                max_iterations: 8,
+                objective,
+            },
+        )
+        .with_halt(hand_off.halt());
+
+        let started_revision = engine.head_revision().0;
+        let state = Arc::clone(&self.state);
+
+        *state.started_at_revision.lock() = Some(started_revision);
+        *state.last_error.lock() = None;
+
+        // Spawned, so a client that gives up on the call does not drop
+        // the run halfway and leave the server marked busy.
+        let run = tokio::spawn(async move {
+            let started = std::time::Instant::now();
+            let result = workflow.run().await;
+
+            let body = match &result {
+                Ok(report) => {
+                    *state.last_report.lock() = Some(report.clone());
+                    serde_json::json!({ "built": true, "report": report })
+                }
+                Err(error) => {
+                    *state.last_error.lock() = Some(error.to_string());
+                    serde_json::json!({ "built": false, "error": error.to_string() })
+                }
+            };
+
+            state.running.store(false, Ordering::SeqCst);
+
+            (body, started.elapsed())
+        });
+
+        Ok(Box::pin(async move {
+            let (mut body, elapsed) = match run.await {
+                Ok(done) => done,
+                Err(error) => (
+                    serde_json::json!({ "built": false, "error": error.to_string() }),
+                    Duration::ZERO,
+                ),
+            };
+
+            let handed = hand_off.handed();
+
+            if let Some(object) = body.as_object_mut() {
+                object.insert(
+                    "started_at_revision".to_string(),
+                    serde_json::json!(started_revision),
+                );
+                object.insert(
+                    "elapsed_secs".to_string(),
+                    serde_json::json!(elapsed.as_secs_f64().round()),
+                );
+                object.insert(
+                    "guidance".to_string(),
+                    serde_json::json!(if handed.is_empty() {
+                        "Nothing was handed back. If the report's status is not success, \
+                         spec_status names what is unproven or invalid: fix it with \
+                         submit_patch and call build_design again."
+                    } else {
+                        "Each hand-off is work code could not settle, with what the builder \
+                         established. Resolve them with submit_patch — fix a sketch that does \
+                         not compile, write a program the vocabulary cannot express, declare \
+                         or decline an unsure requirement, repair an unproven transaction — \
+                         then call build_design again. The build stopped at the first phase \
+                         that handed work back, so later phases have not run yet."
+                    }),
+                );
+                object.insert("hand_offs".to_string(), serde_json::json!(handed));
+            }
+
+            body
         }))
     }
 

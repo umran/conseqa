@@ -82,40 +82,26 @@ request, subscription, or outbox contracts). Give every interface a \
 `sketch` — the operation's business actions as typed steps (find, \
 update, create, delete, transition, advance, fence, enqueue, publish, \
 call, request, when, reject, parallel, answer, race, start; see \
-dsl_reference) — whenever its work fits that vocabulary: a sketched program is compiled in code during \
-the fanout, in seconds, where an unsketched one costs a worker \
-session of minutes. Many small typed patches are normal. The \
-commit gate rejects a structurally broken patch with precise \
-diagnostics; fix it and resubmit in the same session.
-4. Only once that skeleton is complete for the whole system, hand the \
-operation programs to request_design. It runs one coding agent per \
-operation still missing a program, concurrently, each committing \
-through the same gate. This is the intended division of labor: you \
-establish the interfaces callers reason against, the fanout writes the \
-program bodies in parallel. Do not synthesize operation programs one \
-at a time yourself when the system has several — that is what the \
-fanout is for, and it is far slower without it.
-
-Fan out at the right moment, which means neither early nor late. Every \
-worker writes its program against the skeleton as it stands when the \
-run starts, so a missing schema, topic, or operation interface is a \
-mistake made simultaneously by all of them, and one that costs a full \
-round of concurrent sessions to discover. Before calling, check \
-spec_status: `skeleton.ready_to_fan_out` must be true, and the \
-operations it lists must be the whole system you intend to build, not \
-the part you have gotten to so far. The server refuses a run whose \
-skeleton has unresolved references, but it cannot know which \
-operations you still mean to declare — that judgment is yours, so make \
-it deliberately.
-5. While a run is active, do not submit patches: call await_design, \
-which blocks until the run finishes (call it again if it returns \
-finished false) and then returns the run's report. \
-When it finishes, call open_project again to refresh your session to \
-the new head.
+dsl_reference) — whenever its work fits that vocabulary: a sketched \
+program is compiled in code, in milliseconds. Many small typed patches \
+are normal. The commit gate rejects a structurally broken patch with \
+precise diagnostics; fix it and resubmit in the same session.
+4. Once that skeleton is complete for the whole system, call \
+build_design. It runs the whole design in this server, one step after \
+another, with no worker agents: it compiles every sketch, declares the \
+default runtime topology, discovers requirements, verifies, and \
+repairs what its remedy catalogue can prove. It returns within the \
+call, and your session is refreshed to the new head.
+5. Whatever code could not settle comes back as `hand_offs`, each with \
+its objective and what the builder established — a sketch that does \
+not compile, a program the sketch vocabulary cannot express, an unsure \
+requirement, a repair outside the catalogue. Those are yours: resolve \
+them with submit_patch, then call build_design again. Repeat until it \
+returns no hand-offs and a success status.
 6. spec_status is your feedback loop throughout: assembly gaps while \
 drafting, validation errors, or the verification verdict with exactly \
-which obligations are proven and which are not. Fix what it names — \
-narrowly, yourself, or with another request_design pass.
+which obligations are proven and which are not. Fix what it names \
+narrowly, yourself, and build again.
 
 An unproven transaction serializability or ordering obligation \
 carries `remedy: application`, always: the fix is in the L0 model. \
@@ -131,9 +117,9 @@ and dispatch, execution pools and their member concurrency, request \
 routers, storage layouts — describes placement, transport, grouping, \
 precedence, and capacity; it provides no serializability or ordering \
 guarantee, and only the replay families consume its delivery facts. \
-Author it once, after the programs exist and their requirements have \
-settled, because a complete specification needs a runtime \
-realization — not because any obligation is waiting on one. Never \
+build_design declares its weakest defaults once the programs exist; \
+author a runtime declaration yourself only where the prompt states \
+delivery, concurrency, ordering, or batching. Never \
 invent topology to make a proof pass; leaving a requirement unproven \
 is a legitimate outcome.
 7. export_spec delivers the result: the canonical YAML, the \
@@ -141,8 +127,8 @@ verification report, and a self-contained interactive HTML \
 visualization, written to a directory you choose — show these to the \
 user.
 
-Author an operation program yourself only for a one-off change, or \
-when a single operation remains. Invariants: requirements are \
+Write an operation program yourself only when its work does not fit \
+the sketch vocabulary, or when build_design hands it back. Invariants: requirements are \
 obligations, not guarantees; never weaken or remove a requirement to \
 make verification pass; prefer unknown/unspecified over inventing a \
 guarantee the design does not support. Correctness verdicts come only \
@@ -318,6 +304,20 @@ pub trait DesignLauncher: Send + Sync {
     /// such state.
     fn status(&self) -> Option<serde_json::Value> {
         None
+    }
+
+    /// Runs the workflow to completion in one thread, with no agent
+    /// sessions: what the in-process builders cannot settle is handed
+    /// back in the returned report instead. `Err` when the orchestrator
+    /// cannot (a run is already active, or it has no builders).
+    fn build(
+        &self,
+        engine: ConfluenceEngine,
+        objective: Option<String>,
+    ) -> Result<futures::future::BoxFuture<'static, serde_json::Value>, String> {
+        let _ = (engine, objective);
+
+        Err("this server cannot build a design in process".to_string())
     }
 }
 
@@ -539,6 +539,32 @@ impl ConseqaMcp {
 }
 
 impl ProjectHost {
+    /// Gives the active project a fresh session at the current head, so
+    /// the caller's next reads and patches are against what a build just
+    /// committed rather than the snapshot its session opened on.
+    fn renew(&self, engine: &ConfluenceEngine) -> Result<(), String> {
+        let mut active = self.active.write();
+
+        let Some(session) = active.as_mut() else {
+            return Ok(());
+        };
+
+        if !session.engine.same_engine(engine) {
+            return Ok(());
+        }
+
+        let handle = engine
+            .create_session(
+                super::task::WriteScope::of([super::task::WriteGrant::All]),
+                "interactive session, renewed after a build".to_string(),
+            )
+            .map_err(|error| error.to_string())?;
+
+        session.token = handle.token.0;
+
+        Ok(())
+    }
+
     /// Resolves the active project to `(engine, task)`.
     fn active_resolved(&self) -> Result<Resolved, ResolveError> {
         let session = self.active.read().clone().ok_or(ResolveError::NoProject)?;
@@ -1100,10 +1126,90 @@ impl ConseqaMcp {
     }
 
     #[tool(
+        description = "Build the design in one call, with no worker agents: compiles every \
+                       sketched operation still missing a program, declares the default \
+                       runtime topology, discovers requirements, verifies, and repairs what \
+                       the remedy catalogue can prove — all in this server, one step after \
+                       another. Whatever code cannot settle comes back under `hand_offs`, \
+                       each with what it was for and what the builder established: a \
+                       sketch that does not compile, an unsure requirement, a repair outside \
+                       the catalogue. Resolve those yourself with submit_patch (fix the \
+                       sketch, write the program, declare or decline the requirement, \
+                       repair the transaction), then call build_design again, until it \
+                       returns no hand-offs and status success. Author the whole skeleton \
+                       first, with a sketch on every interface. Blocks until the build is \
+                       done, usually seconds to a minute; your session is refreshed to the \
+                       new head afterwards."
+    )]
+    async fn build_design(
+        &self,
+        params: Parameters<RequestDesignParams>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        let resolved = resolved!(self, context);
+        let engine = resolved.engine;
+
+        let Some(launcher) = &self.launcher else {
+            return json_error(serde_json::json!({
+                "built": false,
+                "error": "this server has no design builder",
+            }));
+        };
+
+        let head = engine.head_snapshot();
+
+        if head.workspace.operations.is_empty() {
+            return json_error(serde_json::json!({
+                "built": false,
+                "error": "no operation interfaces are declared",
+                "guidance": "Author the skeleton first — services, schemas, data models, \
+                             topics, machines, and one sketched interface per operation — \
+                             then call build_design.",
+            }));
+        }
+
+        let gaps = super::commit::skeleton_diagnostics(&head.workspace);
+
+        if !gaps.is_empty() {
+            return json_error(serde_json::json!({
+                "built": false,
+                "error": "the skeleton has unresolved references",
+                "skeleton_gaps": gaps,
+                "guidance": "Resolve each gap with submit_patch, then call build_design \
+                             again.",
+            }));
+        }
+
+        match launcher.build(engine.clone(), params.0.objective) {
+            Ok(build) => {
+                let mut report = build.await;
+
+                // The build moved the head; without a fresh session the
+                // caller's next patch would be refused as stale.
+                let renewed = match self.project_host(&context) {
+                    Ok(host) => host.renew(&engine),
+                    Err(_) => Err("open_project to refresh your session".to_string()),
+                };
+
+                if let (Err(note), Some(object)) = (renewed, report.as_object_mut()) {
+                    object.insert("session".to_string(), serde_json::json!(note));
+                }
+
+                json_result(report)
+            }
+
+            Err(error) => json_error(serde_json::json!({
+                "built": false,
+                "error": error,
+            })),
+        }
+    }
+
+    #[tool(
         description = "Fan out concurrent coding agents to write the operation programs. \
-                       This is the normal way to build a system with more than one \
-                       operation, and is far faster than synthesizing them yourself one at \
-                       a time. Author the skeleton FIRST and completely — services, schemas, \
+                       Prefer build_design, which settles the same work in process in \
+                       seconds and hands the rest back to you; use this only when the user \
+                       asks for worker agents. Author the skeleton FIRST and completely — services, schemas, \
                        data models, topics, machines, and an interface per planned \
                        operation — then call this: it skips decomposition when interfaces \
                        already exist and runs one agent per operation still missing a \
@@ -1257,8 +1363,9 @@ impl ConseqaMcp {
                          the read tools, learn the DSL with dsl_guide, change it with \
                          submit_patch, check spec_status for the checker's verdict, and \
                          export_spec to deliver YAML, report, and visualization. \
-                         request_design fans out concurrent agents. Opening another \
-                         project switches the active one.",
+                         Author the skeleton with a sketch on every interface, then \
+                         call build_design. Opening another project switches the \
+                         active one.",
             })),
 
             Err(error) => json_error(serde_json::json!({
@@ -1299,10 +1406,9 @@ impl ConseqaMcp {
                 "note": "New project created and now active. Its prompt is in task_context. \
                          Learn the DSL with dsl_guide and dsl_reference, then author the \
                          skeleton with submit_patch — services, schemas, data models, \
-                         topics, machines, and one interface per planned operation — and \
-                         call request_design to write the operation programs concurrently, \
-                         one agent per operation. (request_design on an empty project \
-                         decomposes as well, if you would rather hand it the whole build.) \
+                         topics, machines, and one sketched interface per planned \
+                         operation — and call build_design, which compiles, verifies and \
+                         repairs in one call and hands back only what code cannot settle. \
                          Check spec_status as you go, and export_spec to deliver.",
             })),
 

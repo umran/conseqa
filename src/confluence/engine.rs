@@ -259,6 +259,11 @@ pub struct ConfluenceEngine {
 }
 
 impl ConfluenceEngine {
+    /// Whether two handles drive the same engine.
+    pub fn same_engine(&self, other: &ConfluenceEngine) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+
     /// An engine over in-memory persistence, for tests and ephemeral
     /// runs.
     pub fn in_memory(initial: WorkspaceState) -> Result<Self, EngineError> {
