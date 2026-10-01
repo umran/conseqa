@@ -19,6 +19,7 @@
 
 pub mod analysis;
 pub mod auth;
+pub mod candidate;
 pub mod commit;
 pub mod engine;
 pub mod events;
@@ -31,6 +32,7 @@ pub mod mcp;
 pub mod patch;
 pub mod persistence;
 pub mod read_set;
+pub mod sketch;
 pub mod snapshot;
 pub mod summary;
 pub mod symbol;
@@ -40,6 +42,7 @@ pub mod workspace_manager;
 
 pub use analysis::*;
 pub use auth::*;
+pub use candidate::{CandidateVerdict, RequirementRef, standing};
 pub use commit::*;
 pub use engine::*;
 pub use events::*;

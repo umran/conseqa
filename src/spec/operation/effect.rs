@@ -178,8 +178,9 @@ pub enum ExternalResultReplay {
 
     /// After one keyed interaction's first terminal outcome, every
     /// later application of that identity observes the same terminal
-    /// variant and a replay-equivalent payload. `Ok` is terminal by
-    /// definition; `Err` only under a declared `terminal` disposition.
+    /// variant and a replay-equivalent payload, or an `Err` of a class
+    /// declared `retryable`. `Ok` is terminal by definition; `Err`
+    /// only under a declared `terminal` disposition.
     /// Requires a keyed identity and a result contract.
     ReplayStable,
 }

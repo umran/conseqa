@@ -88,7 +88,7 @@ export interface ProverReport {
  *  may no longer correspond to the model, so it is refused rather than
  *  rendered. The refusal is shown, never silent: a rendered verdict the
  *  reader cannot see is indistinguishable from no verdict at all. */
-export const REPORT_FORMAT = 7;
+export const REPORT_FORMAT = 8;
 
 export function propertyName(property: Property): string {
   return property.kind === "custom" ? property.name : property.kind;

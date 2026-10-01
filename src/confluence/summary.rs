@@ -171,6 +171,9 @@ fn derive_one(
         service: operation.service.clone(),
         description: operation.description.clone(),
         inputs: operation.inputs.clone(),
+        // A sketch is authoring input, never part of the assembled
+        // model a summary is derived from.
+        sketch: None,
     });
 
     // JSON serializes `Some(program)` exactly as `program`, so this

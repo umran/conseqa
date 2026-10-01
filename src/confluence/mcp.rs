@@ -72,68 +72,63 @@ state lives in this server, never in files you edit.
 The authoring loop:
 1. create_project or open_project selects the model you are building.
 2. Learn the DSL from this server, not from source code: dsl_guide \
-explains the semantics by topic; dsl_reference gives the exact JSON \
-shapes plus a worked program example.
+explains the semantics by topic — pass every section you need as \
+topics in ONE call rather than one call per section; dsl_reference \
+gives the exact JSON shapes plus a worked program example.
 3. Author the shared skeleton yourself with submit_patch: services, \
 schemas, data models (outboxes included), topics, state machines, and \
 one interface per planned operation (its id, service, inputs, and \
-request, subscription, or outbox contracts). Many small typed patches \
-are normal. The \
-commit gate rejects a structurally broken patch with precise \
-diagnostics; fix it and resubmit in the same session.
-4. Only once that skeleton is complete for the whole system, hand the \
-operation programs to request_design. It runs one coding agent per \
-operation still missing a program, concurrently, each committing \
-through the same gate. This is the intended division of labor: you \
-establish the interfaces callers reason against, the fanout writes the \
-program bodies in parallel. Do not synthesize operation programs one \
-at a time yourself when the system has several — that is what the \
-fanout is for, and it is far slower without it.
-
-Fan out at the right moment, which means neither early nor late. Every \
-worker writes its program against the skeleton as it stands when the \
-run starts, so a missing schema, topic, or operation interface is a \
-mistake made simultaneously by all of them, and one that costs a full \
-round of concurrent sessions to discover. Before calling, check \
-spec_status: `skeleton.ready_to_fan_out` must be true, and the \
-operations it lists must be the whole system you intend to build, not \
-the part you have gotten to so far. The server refuses a run whose \
-skeleton has unresolved references, but it cannot know which \
-operations you still mean to declare — that judgment is yours, so make \
-it deliberately.
-5. While a run is active, do not submit patches: poll spec_status, \
-whose design block reports running and then the finished run's report. \
-When it finishes, call open_project again to refresh your session to \
-the new head.
+request, subscription, or outbox contracts). Give every interface a \
+`sketch` — the operation's business actions as typed steps (find, \
+update, create, delete, transition, advance, fence, enqueue, publish, \
+call, request, when, reject, parallel, answer, race, start; see \
+dsl_reference) — whenever its work fits that vocabulary: a sketched \
+program is compiled in code, in milliseconds. Many small typed patches \
+are normal. The commit gate rejects a structurally broken patch with \
+precise diagnostics; fix it and resubmit in the same session.
+4. Once that skeleton is complete for the whole system, call \
+build_design. It runs the whole design in this server, one step after \
+another, with no worker agents: it compiles every sketch, declares the \
+default runtime topology, discovers requirements, verifies, and \
+repairs what its remedy catalogue can prove. It returns within the \
+call, and your session is refreshed to the new head.
+5. Whatever code could not settle comes back as `hand_offs`, each with \
+its objective and what the builder established — a sketch that does \
+not compile, a program the sketch vocabulary cannot express, an unsure \
+requirement, a repair outside the catalogue. Those are yours: resolve \
+them with submit_patch, then call build_design again. Repeat until it \
+returns no hand-offs and a success status.
 6. spec_status is your feedback loop throughout: assembly gaps while \
 drafting, validation errors, or the verification verdict with exactly \
-which obligations are proven and which are not. Fix what it names — \
-narrowly, yourself, or with another request_design pass.
+which obligations are proven and which are not. Fix what it names \
+narrowly, yourself, and build again.
 
-An unproven obligation carries a `remedy` saying which layer the \
-missing facts belong to. `application` means the fix is in the L0 \
-model: transaction serializability and ordering are proven only from \
-transaction primitives — declared isolation, shared and exclusive \
-locks, object versions with validate_version and bump_version, \
-ordered cursors, fences — over the model-wide conflict closure of \
-the transaction, never from runtime topology. `runtime` means no \
-program change can help: the fix is the L1 runtime topology — \
-transport grouping and ordering, subscription delivery and dispatch, \
-outbox partitioning, ordering, and dispatch, execution pools and \
-their member concurrency, request routers, storage layouts. L1 \
-describes placement, transport, grouping, precedence, and capacity; \
-it provides no serializability or ordering guarantee, and only the replay \
-families consume its delivery facts. Author it after the programs \
-exist and verification has said what it has to discharge, not while \
-drafting the skeleton. Never invent topology to make a proof pass; \
-leaving a requirement unproven is a legitimate outcome.
+An unproven transaction serializability or ordering obligation \
+carries `remedy: application`, always: the fix is in the L0 model. \
+Those two families are proven only from transaction primitives — \
+declared isolation, shared and exclusive locks, object versions with \
+validate_version and bump_version, ordered cursors, fences — over the \
+model-wide conflict closure of the transaction, never from runtime \
+topology, so no L1 edit can discharge one. No obligation currently \
+carries `remedy: runtime`, and the replay families carry no remedy at \
+all. The L1 runtime topology — transport grouping and ordering, \
+subscription delivery and dispatch, outbox partitioning, ordering, \
+and dispatch, execution pools and their member concurrency, request \
+routers, storage layouts — describes placement, transport, grouping, \
+precedence, and capacity; it provides no serializability or ordering \
+guarantee, and only the replay families consume its delivery facts. \
+build_design declares its weakest defaults once the programs exist; \
+author a runtime declaration yourself only where the prompt states \
+delivery, concurrency, ordering, or batching. Never \
+invent topology to make a proof pass; leaving a requirement unproven \
+is a legitimate outcome.
 7. export_spec delivers the result: the canonical YAML, the \
 verification report, and a self-contained interactive HTML \
 visualization, written to a directory you choose — show these to the \
 user.
 
-Author an operation program yourself only for a one-off change, or \
-when a single operation remains. Invariants: requirements are \
+Write an operation program yourself only when its work does not fit \
+the sketch vocabulary, or when build_design hands it back. Invariants: requirements are \
 obligations, not guarantees; never weaken or remove a requirement to \
 make verification pass; prefer unknown/unspecified over inventing a \
 guarantee the design does not support. Correctness verdicts come only \
@@ -167,6 +162,12 @@ pub struct SearchSymbolsParams {
     /// Restrict operations to one service id.
     #[serde(default)]
     pub service: Option<String>,
+
+    /// Restrict prompt obligations to those targeting one operation
+    /// id. Prefer it to listing every obligation: mapping another
+    /// operation's obligation then cannot invalidate this session.
+    #[serde(default)]
+    pub targets: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -195,8 +196,9 @@ pub struct RequirementReportParams {
     #[serde(default)]
     pub operation: Option<String>,
 
-    /// Restrict to one requirement family: serialization, ordering,
-    /// idempotency, result_replay, recoverability.
+    /// Restrict to one requirement family: transaction_serializability,
+    /// transaction_ordering, idempotency, result_replay, recoverability.
+    /// Any other value is an error, never an empty report.
     #[serde(default)]
     pub family: Option<String>,
 }
@@ -234,6 +236,17 @@ pub struct RequestDesignParams {
     #[serde(default)]
     pub objective: Option<String>,
 }
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct AwaitDesignParams {
+    /// How long to wait, in seconds; at most 55. Defaults to 50.
+    #[serde(default)]
+    pub wait_secs: Option<u64>,
+}
+
+/// The longest `await_design` holds a call open: under the minute an
+/// MCP client commonly allows a tool call.
+const AWAIT_DESIGN_MAX_SECS: u64 = 55;
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct OpenProjectParams {
@@ -291,6 +304,20 @@ pub trait DesignLauncher: Send + Sync {
     /// such state.
     fn status(&self) -> Option<serde_json::Value> {
         None
+    }
+
+    /// Runs the workflow to completion in one thread, with no agent
+    /// sessions: what the in-process builders cannot settle is handed
+    /// back in the returned report instead. `Err` when the orchestrator
+    /// cannot (a run is already active, or it has no builders).
+    fn build(
+        &self,
+        engine: ConfluenceEngine,
+        objective: Option<String>,
+    ) -> Result<futures::future::BoxFuture<'static, serde_json::Value>, String> {
+        let _ = (engine, objective);
+
+        Err("this server cannot build a design in process".to_string())
     }
 }
 
@@ -512,6 +539,32 @@ impl ConseqaMcp {
 }
 
 impl ProjectHost {
+    /// Gives the active project a fresh session at the current head, so
+    /// the caller's next reads and patches are against what a build just
+    /// committed rather than the snapshot its session opened on.
+    fn renew(&self, engine: &ConfluenceEngine) -> Result<(), String> {
+        let mut active = self.active.write();
+
+        let Some(session) = active.as_mut() else {
+            return Ok(());
+        };
+
+        if !session.engine.same_engine(engine) {
+            return Ok(());
+        }
+
+        let handle = engine
+            .create_session(
+                super::task::WriteScope::of([super::task::WriteGrant::All]),
+                "interactive session, renewed after a build".to_string(),
+            )
+            .map_err(|error| error.to_string())?;
+
+        session.token = handle.token.0;
+
+        Ok(())
+    }
+
     /// Resolves the active project to `(engine, task)`.
     fn active_resolved(&self) -> Result<Resolved, ResolveError> {
         let session = self.active.read().clone().ok_or(ResolveError::NoProject)?;
@@ -601,7 +654,19 @@ fn json_error(value: serde_json::Value) -> Result<CallToolResult, McpError> {
 /// Engine failures surface as tool errors the model can read; they
 /// carry their own do-not-retry guidance where relevant.
 fn engine_error(error: EngineError) -> Result<CallToolResult, McpError> {
-    json_error(serde_json::json!({ "error": error.to_string() }))
+    match error {
+        // Structured, so a caller can correct itself from the accepted
+        // values without parsing prose.
+        EngineError::UnknownRequirementFamily { family, accepted } => {
+            json_error(serde_json::json!({
+                "error": "unknown_requirement_family",
+                "family": family,
+                "accepted": accepted,
+            }))
+        }
+
+        other => json_error(serde_json::json!({ "error": other.to_string() })),
+    }
 }
 
 /// Parses one tool argument, returning an in-band tool-result error on
@@ -681,6 +746,11 @@ pub struct DslGuideParams {
     /// contents.
     #[serde(default)]
     pub topic: Option<String>,
+
+    /// Several topics at once, answered in one response in the order
+    /// given. Prefer this to one call per section.
+    #[serde(default)]
+    pub topics: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -778,6 +848,7 @@ impl ConseqaMcp {
             kind,
             prefix: params.prefix,
             service: params.service.map(|service| id_from(&service)),
+            targets: params.targets.map(|operation| id_from(&operation)),
         };
 
         match engine.search_symbols(task, &spec) {
@@ -877,7 +948,9 @@ impl ConseqaMcp {
         // connection: refuse a declared version mismatch by name,
         // before shape validation turns it into serde noise.
         if let Some(declared) = params.dsl
-            && declared != crate::spec::DSL_VERSION.0
+            && !crate::spec::DSL_READS
+                .iter()
+                .any(|readable| readable.0 == declared)
         {
             return json_error(serde_json::json!({
                 "committed": false,
@@ -1002,10 +1075,143 @@ impl ConseqaMcp {
     }
 
     #[tool(
+        description = "Wait for the running design workflow to finish, instead of polling \
+                       spec_status in a loop. Blocks up to wait_secs (default 50, at most 55) \
+                       and returns the design block: finished true with the run's report, or \
+                       finished false while workers are still committing — then call it \
+                       again. When it finishes, call open_project to refresh your session, \
+                       then spec_status for the verdict."
+    )]
+    async fn await_design(
+        &self,
+        params: Parameters<AwaitDesignParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let Some(launcher) = &self.launcher else {
+            return json_error(serde_json::json!({
+                "error": "concurrent design is not available on this server",
+            }));
+        };
+
+        let wait = std::time::Duration::from_secs(
+            params.0.wait_secs.unwrap_or(50).min(AWAIT_DESIGN_MAX_SECS),
+        );
+        let deadline = tokio::time::Instant::now() + wait;
+
+        let running = |status: &Option<serde_json::Value>| {
+            status
+                .as_ref()
+                .and_then(|status| status.get("running"))
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+        };
+
+        let mut status = launcher.status();
+
+        while running(&status) && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            status = launcher.status();
+        }
+
+        let finished = !running(&status);
+
+        json_result(serde_json::json!({
+            "finished": finished,
+            "design": status,
+            "guidance": if finished {
+                "The run is over. Call open_project to refresh your session to the new \
+                 head, then spec_status for the verdict."
+            } else {
+                "Workers are still committing. Call await_design again; do not submit \
+                 patches meanwhile."
+            },
+        }))
+    }
+
+    #[tool(
+        description = "Build the design in one call, with no worker agents: compiles every \
+                       sketched operation still missing a program, declares the default \
+                       runtime topology, discovers requirements, verifies, and repairs what \
+                       the remedy catalogue can prove — all in this server, one step after \
+                       another. Whatever code cannot settle comes back under `hand_offs`, \
+                       each with what it was for and what the builder established: a \
+                       sketch that does not compile, an unsure requirement, a repair outside \
+                       the catalogue. Resolve those yourself with submit_patch (fix the \
+                       sketch, write the program, declare or decline the requirement, \
+                       repair the transaction), then call build_design again, until it \
+                       returns no hand-offs and status success. Author the whole skeleton \
+                       first, with a sketch on every interface. Blocks until the build is \
+                       done, usually seconds to a minute; your session is refreshed to the \
+                       new head afterwards."
+    )]
+    async fn build_design(
+        &self,
+        params: Parameters<RequestDesignParams>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        let resolved = resolved!(self, context);
+        let engine = resolved.engine;
+
+        let Some(launcher) = &self.launcher else {
+            return json_error(serde_json::json!({
+                "built": false,
+                "error": "this server has no design builder",
+            }));
+        };
+
+        let head = engine.head_snapshot();
+
+        if head.workspace.operations.is_empty() {
+            return json_error(serde_json::json!({
+                "built": false,
+                "error": "no operation interfaces are declared",
+                "guidance": "Author the skeleton first — services, schemas, data models, \
+                             topics, machines, and one sketched interface per operation — \
+                             then call build_design.",
+            }));
+        }
+
+        let gaps = super::commit::skeleton_diagnostics(&head.workspace);
+
+        if !gaps.is_empty() {
+            return json_error(serde_json::json!({
+                "built": false,
+                "error": "the skeleton has unresolved references",
+                "skeleton_gaps": gaps,
+                "guidance": "Resolve each gap with submit_patch, then call build_design \
+                             again.",
+            }));
+        }
+
+        match launcher.build(engine.clone(), params.0.objective) {
+            Ok(build) => {
+                let mut report = build.await;
+
+                // The build moved the head; without a fresh session the
+                // caller's next patch would be refused as stale.
+                let renewed = match self.project_host(&context) {
+                    Ok(host) => host.renew(&engine),
+                    Err(_) => Err("open_project to refresh your session".to_string()),
+                };
+
+                if let (Err(note), Some(object)) = (renewed, report.as_object_mut()) {
+                    object.insert("session".to_string(), serde_json::json!(note));
+                }
+
+                json_result(report)
+            }
+
+            Err(error) => json_error(serde_json::json!({
+                "built": false,
+                "error": error,
+            })),
+        }
+    }
+
+    #[tool(
         description = "Fan out concurrent coding agents to write the operation programs. \
-                       This is the normal way to build a system with more than one \
-                       operation, and is far faster than synthesizing them yourself one at \
-                       a time. Author the skeleton FIRST and completely — services, schemas, \
+                       Prefer build_design, which settles the same work in process in \
+                       seconds and hands the rest back to you; use this only when the user \
+                       asks for worker agents. Author the skeleton FIRST and completely — services, schemas, \
                        data models, topics, machines, and an interface per planned \
                        operation — then call this: it skips decomposition when interfaces \
                        already exist and runs one agent per operation still missing a \
@@ -1016,8 +1222,8 @@ impl ConseqaMcp {
                        skeleton has unresolved references is refused; check \
                        spec_status.skeleton.ready_to_fan_out first, and confirm the \
                        operations it reports are the whole system you intend. Optionally \
-                       pass an objective to steer the workers. Returns immediately; poll \
-                       spec_status (its design block) rather than patching while it runs, \
+                       pass an objective to steer the workers. Returns immediately; call \
+                       await_design (not a polling loop) rather than patching while it runs, \
                        then call open_project to refresh your session to the new head. One \
                        workflow runs at a time."
     )]
@@ -1159,8 +1365,9 @@ impl ConseqaMcp {
                          the read tools, learn the DSL with dsl_guide, change it with \
                          submit_patch, check spec_status for the checker's verdict, and \
                          export_spec to deliver YAML, report, and visualization. \
-                         request_design fans out concurrent agents. Opening another \
-                         project switches the active one.",
+                         Author the skeleton with a sketch on every interface, then \
+                         call build_design. Opening another project switches the \
+                         active one.",
             })),
 
             Err(error) => json_error(serde_json::json!({
@@ -1201,10 +1408,9 @@ impl ConseqaMcp {
                 "note": "New project created and now active. Its prompt is in task_context. \
                          Learn the DSL with dsl_guide and dsl_reference, then author the \
                          skeleton with submit_patch — services, schemas, data models, \
-                         topics, machines, and one interface per planned operation — and \
-                         call request_design to write the operation programs concurrently, \
-                         one agent per operation. (request_design on an empty project \
-                         decomposes as well, if you would rather hand it the whole build.) \
+                         topics, machines, and one sketched interface per planned \
+                         operation — and call build_design, which compiles, verifies and \
+                         repairs in one call and hands back only what code cannot settle. \
                          Check spec_status as you go, and export_spec to deliver.",
             })),
 
@@ -1233,15 +1439,26 @@ impl ConseqaMcp {
                        effects, effect intents, value references, and requirements mean and \
                        how they compose. Call with no topic for the table of contents, then \
                        with a topic — a section name or a few words of it — for the full \
-                       section. Use this instead of reading Conseqa's source code."
+                       section, or with topics to read several sections in one call. Use \
+                       this instead of reading Conseqa's source code."
     )]
     async fn dsl_guide(
         &self,
         params: Parameters<DslGuideParams>,
     ) -> Result<CallToolResult, McpError> {
-        let text = match params.0.topic.as_deref() {
-            None => guide_toc(),
-            Some(topic) => guide_lookup(topic),
+        let params = params.0;
+
+        let mut topics: Vec<&str> = params.topic.iter().map(String::as_str).collect();
+        topics.extend(params.topics.iter().map(String::as_str));
+
+        let text = match topics.as_slice() {
+            [] => guide_toc(),
+            [topic] => guide_lookup(topic),
+            topics => topics
+                .iter()
+                .map(|topic| guide_lookup(topic))
+                .collect::<Vec<_>>()
+                .join("\n\n---\n\n"),
         };
 
         Ok(CallToolResult::success(vec![ContentBlock::text(text)]))
@@ -1799,7 +2016,87 @@ PATCH — {"mutations": [<mutation>, ...]}; each mutation {"kind": K, ...}:
      schema. The applying transaction step supplies each message's
      derivation under the same key.)
   {"kind":"put_operation_interface","operation":"operation.x",
-   "value":{"service":"service.x","description":"...","inputs":{...}}}
+   "value":{"service":"service.x","description":"...","inputs":{...},
+            "sketch":{"steps":[
+              {"kind":"find","as":"order","record":"object.order",
+               "by":{"order_id":"input.order_id"}},
+              {"kind":"transition","record":"order","transition":"transition.order.pay",
+               "otherwise":"not_payable"},
+              {"kind":"find","as":"product","record":"object.product",
+               "by":{"product_id":"order.product_id"}},
+              {"kind":"update","record":"product","set":["stock"],
+               "from":["product.stock","order.quantity"]},
+              {"kind":"create","record":"object.payment",
+               "from":["input.request_id","input.order_id","input.amount"]}]}}}
+    (sketch — optional, and the fastest way to get a program: what the
+     operation does as typed business actions, in order, compiled into
+     the program in code with no worker session. Every construct of the
+     program language is reachable from a sketch. Steps:
+       find       {as, record, by: {field: value-or-literal}, all: true to
+                   select every match instead of one instance by its whole
+                   identity, lock: "shared"|"exclusive", lock_order:
+                   [{field, direction: "ascending"|"descending"}],
+                   isolation: <this transaction's>};
+       update     {record: <a find's as>, set: [fields], from: values};
+       create     {record: <data object>, from: values, isolation};
+       delete     {record: <a find's as>};
+       transition {record, transition, otherwise: <declared error>,
+                   already_ok: true, effects_from: [values] for its
+                   declared side effects and outbox writes};
+       advance    {record, field, to, rule: "successor"|"monotonic_after"
+                   (omit to let the prompt decide), otherwise};
+       fence      {record, field, token, otherwise};
+       enqueue    {outbox, schema, from, key};
+       publish    {topic, schema, from, key, durable, detached} — after
+                  the commit when records change first, directly
+                  otherwise; durable arranges it in a transaction anyway;
+                  detached does not wait for it;
+       call       {name, as, identity: [values], duplicates: unspecified |
+                   distinguishable | identical_per_identity |
+                   side_effect_free, result_replay: unspecified | unstable
+                   | replay_stable, result: {ok: <schema>, errors: {class:
+                   <schema> | {schema, disposition: terminal|retryable}}},
+                   from, on_ok, on_error, durable, detached};
+       request    {operation, input, as, retry: unspecified | never |
+                   may_repeat, from, key, on_ok, on_error, durable,
+                   detached} — another operation's request input;
+       when       {if, then, otherwise} — if: {"equals": [value,
+                  value-or-literal]}, {"present": value}, {"not": c},
+                  {"all": [c]}, {"any": [c]}, {"unspecified": "<a rule the
+                  model states no fact about, in words>"};
+       reject     {error, from} — end a request with a declared error;
+       abandon    {} — end a message's attempt without completing it,
+                  leaving the message for another attempt (subscription
+                  and outbox operations only);
+       parallel   {steps} — start all, wait for all; a member's `as` binds
+                  its answer for an `answer` step;
+       answer     {of: <a parallel member's as>, on_ok, on_error};
+       race       {steps, as, on_ok, on_error} — act on the first answer;
+       start      {step} — start an effect and never wait for it.
+     Values ("from") are a list of references, or a map {target field:
+     reference} whose fields are checked against the target's schema (an
+     update's `set` may then be omitted). References are "input.<field>",
+     "<input id>.<field>" when the operation has several inputs,
+     "<find's as>.<field>", or "<as>.<field>" of an answer — inside its
+     arms, or after it, in which case later steps run in its ok arm and
+     each error arm must end the operation. Literals are strings,
+     integers or booleans. Sketch-level: "returns": [values] for the ok
+     result; "returns_for": <request input> when there are several;
+     "isolation" for every transaction (each defaults to read_committed;
+     repair strengthens where a proof needs it); "commit_key": [values],
+     or [] for no deduplication (the trigger's identity by default);
+     "on_rejected": [steps] a refused transaction runs instead of
+     completing (a request's must reject).
+     Consecutive record steps on one data model are one transaction; a
+     step on another, an effect or a when starts the next; a durable
+     effect with no record before it gets a transaction of its own.
+     Records found earlier are carried forward through the transaction's
+     output — change one only in the transaction that found it. The gate
+     compiles the sketch when you write it and rejects one that does not
+     compile, saying why. Compiled programs carry the version protocol or
+     strict locks, keyed commits, key propagation into messages and
+     requests, and the inspect-then-decide shape a guarded transition
+     needs; requirements are added after, by discovery.)
   {"kind":"replace_operation_program","operation":"operation.x","program":{"steps":[...]}}
   {"kind":"replace_operation_requirements","operation":"operation.x","requirements":{...}}
     (operation requirements are idempotency and recoverability only;
@@ -2000,6 +2297,18 @@ RESULT CONTRACTS name their error classes:
     (arms are exhaustive: exactly one per declared error class. Inside an
      error arm, effect_result_err:<result> resolves to that class's
      schema.)
+  {"kind":"abandon"}
+    (a terminal for a subscription or outbox operation: the attempt ends
+     without completing, so the message stays unacknowledged or pending
+     and is delivered again. It rolls nothing back; every step before it
+     is re-done by the next attempt, so it must be retry-safe.
+PASSING A RETRYABLE ERROR UP keeps every proof: a request returns an
+error class its own contract declares retryable — exempt from result
+replay — and a consumer abandons. Do it from a match arm that does
+nothing else: on that arm the decision then adds no work, whatever the
+ok arm does. A target's retryable error is never a stable result, so
+turning it into a terminal error, or doing work on its arm, leaves the
+operation's replay unproven.)
 An external effect declares three orthogonal boundary facts:
   {"kind":"external","name":"provider.op",
    "identity":{"kind":"keyed","key":{"components":[<value ref>...]}},
@@ -2133,7 +2442,7 @@ fn guide_toc() -> String {
     let mut toc = format!(
         "The Conseqa DSL semantics guide, DSL contract version {}. Call dsl_guide again \
          with a topic — a section name or a few words of it — to read that section in \
-         full.\n\nSections:\n",
+         full, or with topics (a list) to read every section you need in one call.\n\nSections:\n",
         crate::spec::DSL_VERSION,
     );
 
@@ -2256,6 +2565,18 @@ mod tests {
     // and an unmatched topic falls back to the listing — so an agent
     // can always navigate to the semantics it needs without reading
     // crate source.
+
+    // The guidance states the contract as the provers implement it: a
+    // transaction obligation's remedy is always an application edit,
+    // and no agent is told to expect — or to route on — a `runtime` one.
+    #[test]
+    fn the_interactive_instructions_promise_no_runtime_remedy() {
+        let instructions = super::INTERACTIVE_INSTRUCTIONS;
+
+        assert!(instructions.contains("carries `remedy: application`, always"));
+        assert!(instructions.contains("No obligation currently carries `remedy: runtime`"));
+        assert!(!instructions.contains("`runtime` means"));
+    }
 
     #[test]
     fn the_guide_toc_lists_the_semantics_sections() {

@@ -437,6 +437,16 @@ pub enum ResultGap {
     /// different result.
     ExternalErrorRetryable,
 
+    /// The target operation declares the observed error class
+    /// retryable. Its result-replay proof exempts retryable returns,
+    /// so it fixes nothing about this variant: a later attempt may
+    /// observe a different result.
+    TargetErrorRetryable {
+        operation: Id,
+        input: Id,
+        error: Id,
+    },
+
     /// The observed `Err` carries no declared disposition: no usable
     /// fact says whether it terminally resolves the logical
     /// interaction.
@@ -456,9 +466,10 @@ pub enum ResultGap {
 /// The replay judgments of one bound result, per observed arm.
 /// Stability is arm-sensitive (§18 rule 6): a deduplicated external
 /// boundary's terminal `ok` is stable while the same binding's
-/// retryable error class is not. A request result carries one
-/// judgment in every arm — the target's replay-consistent requirement
-/// covers arm and payload together.
+/// retryable error class is not. A request result is judged the same
+/// way against the target's contract: its replay-consistent
+/// requirement fixes `ok` and every error class it does not declare
+/// retryable, and nothing else.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BoundResult {
     pub ok: ResultReplay,
@@ -536,13 +547,13 @@ pub enum DecisionRule {
     /// roots.
     StableCondition { roots: Vec<StableRoot> },
 
-    /// The decision is not established to replay, and every
-    /// continuation from it to a terminal is idempotency-inert: only
-    /// further decisions and terminals follow, so divergence cannot
-    /// add modeled work and may affect only terminal construction.
-    /// A derived structural fact, never an implementation assumption
-    /// — it lapses by itself the moment an effectful step joins any
-    /// continuation. Produced only by the idempotency family; result
+    /// The decision is not established to replay, and its
+    /// continuation on this path is idempotency-inert: only further
+    /// decisions and the terminal follow, so taking it adds no modeled
+    /// work and may affect only terminal construction. Its other arms
+    /// are judged on their own paths. A derived structural fact, never
+    /// an implementation assumption — it lapses by itself the moment
+    /// an effectful step joins the continuation. Produced only by the idempotency family; result
     /// replay continues to require the decision itself to replay,
     /// because divergent terminals may construct divergent results.
     IdempotencyInertContinuation,
@@ -1629,7 +1640,7 @@ impl<'a> ReplayAnalysis<'a> {
             });
         }
 
-        BoundResult::both(ResultReplay::Stable {
+        let stable = ResultReplay::Stable {
             effect: effect.clone(),
             rule: ResultStabilityRule::ReplayConsistentTarget {
                 operation: operation.clone(),
@@ -1637,7 +1648,39 @@ impl<'a> ReplayAnalysis<'a> {
                 requirement,
                 instance,
             },
-        })
+        };
+
+        // The target's proof fixes only what it holds to the
+        // obligation: `Ok` and every error class not declared
+        // retryable. A retryable return is exempt there (§9), so a
+        // later attempt may observe another variant.
+        let errors = declared
+            .result
+            .errors
+            .iter()
+            .map(|(class, declared)| {
+                let replay = if declared.disposition == ErrorDisposition::Retryable {
+                    ResultReplay::Unstable {
+                        effect: effect.clone(),
+                        gap: ResultGap::TargetErrorRetryable {
+                            operation: operation.clone(),
+                            input: input.clone(),
+                            error: class.clone(),
+                        },
+                    }
+                } else {
+                    stable.clone()
+                };
+
+                (class.clone(), replay)
+            })
+            .collect();
+
+        BoundResult {
+            ok: stable.clone(),
+            errors,
+            fallback: stable,
+        }
     }
 
     /// The §13.3 judgment of an external result, per variant.

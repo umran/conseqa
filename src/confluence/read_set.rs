@@ -129,6 +129,14 @@ pub struct SearchSpec {
     /// Restrict operations to one service.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub service: Option<Id>,
+
+    /// Restrict prompt obligations to those targeting one operation;
+    /// no other kind of symbol matches. The observed set is then the
+    /// obligations aimed at that operation, so a task that maps its
+    /// own is not invalidated when a peer maps another's, and still is
+    /// when an obligation is aimed at, or away from, its operation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub targets: Option<Id>,
 }
 
 /// Runs a symbol search against one snapshot's graph, in canonical
@@ -157,6 +165,16 @@ pub fn run_search(
                     .get(operation)
                     .is_some_and(|draft| &draft.service == service),
                 None => matches!(&node.key, SymbolKey::Service(id) if id == service),
+            },
+        })
+        .filter(|node| match &spec.targets {
+            None => true,
+            Some(operation) => match &node.key {
+                SymbolKey::PromptObligation(id) => workspace
+                    .prompt_obligations
+                    .get(id)
+                    .is_some_and(|obligation| obligation.targets.contains(operation)),
+                _ => false,
             },
         })
         .map(|node| node.key.clone())

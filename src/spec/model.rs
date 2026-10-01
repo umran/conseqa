@@ -44,10 +44,21 @@ use super::{
 /// placement, transport, grouping, and capacity facts and proves no
 /// transaction property from them.
 ///
+/// Version 5 adds the `abandon` terminal: a message-triggered attempt
+/// ends without completing, its message unacknowledged or still
+/// pending, so a consumer can pass a retryable error up. It is the
+/// first additive revision — every dsl 4 specification means the same
+/// under dsl 5 — so dsl 4 documents are still read ([`DSL_READS`]).
+///
 /// Independent of the stored-workspace `FORMAT` (a storage-encoding
 /// counter): a DSL bump forces a `FORMAT` bump, never conversely, and
 /// the numbers are not aligned.
-pub const DSL_VERSION: DslVersion = DslVersion(4);
+pub const DSL_VERSION: DslVersion = DslVersion(5);
+
+/// The declared versions this build reads: the current one, and every
+/// earlier one it extends without changing what the earlier one said.
+/// A document declaring one is read as the current version.
+pub const DSL_READS: [DslVersion; 2] = [DslVersion(4), DslVersion(5)];
 
 /// A declared DSL contract version.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]

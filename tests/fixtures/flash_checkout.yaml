@@ -23,7 +23,7 @@
 # charge_payment's match on it is not established to replay; and
 # create_order's idempotency is unknown through the cascade those
 # consumers start.
-dsl: 4
+dsl: 5
 revision: 1
 services:
   service.checkout:

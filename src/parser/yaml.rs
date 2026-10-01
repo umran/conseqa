@@ -2,7 +2,7 @@ use std::fmt;
 
 use serde::Deserialize;
 
-use crate::spec::{DSL_VERSION, DslVersion, Model};
+use crate::spec::{DSL_READS, DSL_VERSION, DslVersion, Model};
 
 /// Why a specification document was refused before or during parsing.
 #[derive(Debug)]
@@ -71,9 +71,17 @@ pub fn parse(source: &str) -> Result<Model, ParseError> {
     let probe: VersionProbe = serde_yaml::from_str(source)?;
 
     match probe.dsl {
-        Some(found) if found != DSL_VERSION => Err(ParseError::DslVersionMismatch { found }),
+        Some(found) if !DSL_READS.contains(&found) => {
+            Err(ParseError::DslVersionMismatch { found })
+        }
         None => Err(ParseError::DslVersionMissing),
-        Some(_) => Ok(serde_yaml::from_str(source)?),
+        Some(_) => {
+            // An earlier version this one extends means the same here.
+            let mut model: Model = serde_yaml::from_str(source)?;
+            model.dsl = DSL_VERSION;
+
+            Ok(model)
+        }
     }
 }
 

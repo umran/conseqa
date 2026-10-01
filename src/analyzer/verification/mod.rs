@@ -266,6 +266,15 @@ pub enum ModelNote {
         location: crate::spec::StepLocation,
         root: crate::spec::ValueRef,
     },
+
+    /// The program abandons attempts, and a subscription input of the
+    /// operation declares at-most-once delivery: an abandoned message
+    /// is never delivered again, so `abandon` drops it (§16).
+    AbandonWithoutRedelivery {
+        operation: Id,
+        input: Id,
+        topic: Id,
+    },
 }
 
 impl ModelNote {
@@ -275,6 +284,8 @@ impl ModelNote {
             | Self::DuplicateOutboxDeliveryUnchecked { input, .. } => Some(input.clone()),
 
             Self::RedundantPresenceCheck { operation, .. } => Some(operation.clone()),
+
+            Self::AbandonWithoutRedelivery { input, .. } => Some(input.clone()),
         }
     }
 
@@ -329,6 +340,16 @@ impl ModelNote {
                     root.source.id()
                 )
             }
+
+            Self::AbandonWithoutRedelivery {
+                operation,
+                input,
+                topic,
+            } => format!(
+                "`{operation}` abandons attempts, but `{input}` subscribes to `{topic}` with \
+                 at-most-once delivery: an abandoned message is never delivered again, so \
+                 `abandon` drops it rather than passing a retryable error up."
+            ),
         }
     }
 
@@ -340,6 +361,8 @@ impl ModelNote {
             }
 
             Self::RedundantPresenceCheck { .. } => VerificationCode::RedundantPresenceCheck,
+
+            Self::AbandonWithoutRedelivery { .. } => VerificationCode::AbandonWithoutRedelivery,
         };
 
         Diagnostic {
@@ -350,6 +373,15 @@ impl ModelNote {
             evidence: Vec::new(),
         }
     }
+}
+
+/// Whether the operation's program reaches `abandon` anywhere.
+fn abandons(operation: &crate::spec::Operation) -> bool {
+    operation
+        .program
+        .steps_with_locations()
+        .into_iter()
+        .any(|(_, step)| matches!(step, crate::spec::OperationStep::Abandon))
 }
 
 /// The model-wide notes: every subscription that admits duplicate
@@ -372,6 +404,14 @@ pub fn notes(model: &Model) -> Vec<ModelNote> {
                     let delivery = model.delivery(operation_id, input_id);
 
                     if delivery == DeliverySemantics::AtMostOnce {
+                        if abandons(operation) {
+                            notes.push(ModelNote::AbandonWithoutRedelivery {
+                                operation: operation_id.clone(),
+                                input: input_id.clone(),
+                                topic: subscription.topic.clone(),
+                            });
+                        }
+
                         continue;
                     }
 

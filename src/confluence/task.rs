@@ -188,12 +188,13 @@ impl WriteScope {
 
     /// The decomposer's scope: the L0 shared skeleton.
     ///
-    /// Deliberately not the runtime topology. L1 exists to discharge
-    /// serialization and ordering requirements, and at decomposition
-    /// no requirement has been discovered yet — authoring topology
-    /// there is guessing at facts the run has not established.
-    /// [`Self::runtime_topology`] holds it instead, once the unproven
-    /// set says what the runtime has to achieve.
+    /// Deliberately not the runtime topology. L1 realizes the
+    /// application model — placement, transport, grouping, capacity —
+    /// and at decomposition there is no application model yet:
+    /// authoring topology there is guessing at facts the run has not
+    /// established. [`Self::runtime_topology`] holds it instead, once,
+    /// after L0 and its requirements have settled. It discharges no
+    /// obligation; a complete specification simply needs one.
     pub fn shared_skeleton() -> Self {
         Self::of([WriteGrant::SharedSkeleton])
     }

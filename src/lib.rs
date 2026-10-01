@@ -5,4 +5,6 @@ pub mod confluence;
 pub mod harness;
 pub mod parser;
 pub mod spec;
+#[cfg(feature = "system-one")]
+pub mod system_one;
 pub mod viz;

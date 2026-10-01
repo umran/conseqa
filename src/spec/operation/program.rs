@@ -14,7 +14,8 @@ use super::{Derivation, Effect, SelectorValue, Transaction, ValueRef, WriteOutbo
 /// ordinary predicate, and the `rejected` block of a rejectable
 /// transaction — nest further blocks, and every reachable path ends at
 /// an explicit terminal: `Return` for a request-driven execution,
-/// `Complete` for one that returns nothing. The structure is acyclic
+/// `Complete` for one that returns nothing, `Abandon` for a
+/// message-triggered attempt that ends without completing. The structure is acyclic
 /// by construction: loops are deliberately deferred.
 ///
 /// Control flow describes causality. It is not a durable workflow, a
@@ -75,6 +76,13 @@ pub enum OperationStep {
     /// Terminates an execution that returns nothing, as is natural for
     /// a subscription-driven operation.
     Complete,
+
+    /// Ends a message-triggered attempt without successful logical
+    /// completion: a subscription message stays unacknowledged, an
+    /// outbox message stays pending, and another attempt is admitted.
+    /// The consumer's counterpart of returning a retryable error. It
+    /// rolls nothing back, and admits no request-triggered path.
+    Abandon,
 }
 
 /// One transaction execution site: the inline transaction and, when

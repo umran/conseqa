@@ -215,8 +215,8 @@ pub fn skeleton_diagnostics(workspace: &WorkspaceState) -> Vec<DraftDiagnostic> 
     }
 
     // Whatever runtime topology already exists is checked here too.
-    // L1 is normally authored after the fan-out, once verification has
-    // said what it must discharge, so usually there is none yet. When
+    // L1 is normally authored once, after the fan-out and after the
+    // requirements have settled, so usually there is none yet. When
     // an interactive author has declared some early, whole-model
     // validation cannot reach it until every operation has a program —
     // so without this it would go unchecked across the whole fan-out
@@ -365,6 +365,7 @@ fn apply_mutation(
                     draft.service = value.service.clone();
                     draft.description = value.description.clone();
                     draft.inputs = value.inputs.clone();
+                    draft.sketch = value.sketch.clone();
                     draft.recompute_stage();
                 }
 
@@ -643,31 +644,21 @@ fn apply_proposals(
                     index,
                 };
 
-                if let RequirementOrigin::ExplicitPrompt { obligation } = &submission.origin
-                    && let Some(obligation) = workspace.prompt_obligations.get_mut(obligation)
-                {
-                    match &mut obligation.status {
-                        PromptObligationStatus::Unmapped => {
-                            obligation.status = PromptObligationStatus::Mapped {
-                                requirements: vec![reference.clone()],
-                            };
-                        }
-
-                        PromptObligationStatus::Mapped { requirements } => {
-                            requirements.push(reference.clone());
-                        }
-
-                        // An unsupported or waived obligation keeps its
-                        // status; the proposal is still recorded.
-                        _ => {}
-                    }
-                }
-
                 ProposalStatus::Adopted { reference }
             } else {
                 ProposalStatus::Advisory
             }
         };
+
+        // An explicit obligation is discharged by the requirement the
+        // proposal names — adopted now, or already declared (by an
+        // author who declared it before mapping the obligation).
+        if let RequirementOrigin::ExplicitPrompt { obligation } = &submission.origin
+            && let ProposalStatus::Adopted { reference } | ProposalStatus::Duplicate { reference } =
+                &status
+        {
+            map_obligation(workspace, obligation, reference);
+        }
 
         workspace.requirement_proposals.push(RequirementProposal {
             operation: operation.clone(),
@@ -679,6 +670,36 @@ fn apply_proposals(
 
     if let Some(draft) = workspace.operations.get_mut(operation) {
         draft.recompute_stage();
+    }
+}
+
+/// Records that `reference` discharges `obligation`. Idempotent: a
+/// reference already recorded is not added twice.
+fn map_obligation(
+    workspace: &mut WorkspaceState,
+    obligation: &super::workspace::PromptObligationId,
+    reference: &RequirementRef,
+) {
+    let Some(obligation) = workspace.prompt_obligations.get_mut(obligation) else {
+        return;
+    };
+
+    match &mut obligation.status {
+        PromptObligationStatus::Unmapped => {
+            obligation.status = PromptObligationStatus::Mapped {
+                requirements: vec![reference.clone()],
+            };
+        }
+
+        PromptObligationStatus::Mapped { requirements } => {
+            if !requirements.contains(reference) {
+                requirements.push(reference.clone());
+            }
+        }
+
+        // An unsupported or waived obligation keeps its status; the
+        // proposal is still recorded.
+        _ => {}
     }
 }
 
@@ -850,6 +871,8 @@ fn check_patch(candidate: &WorkspaceState, patch: &SpecPatch) -> Vec<DraftDiagno
                 for (input_id, input) in &value.inputs {
                     check_input(candidate, operation, input_id, input, &mut diagnostics);
                 }
+
+                check_sketch(candidate, operation, &mut diagnostics);
             }
 
             Mutation::ReplaceOperationProgram { operation, program } => {
@@ -961,6 +984,47 @@ fn probe_model(candidate: &WorkspaceState, operation: &Id) -> Option<Model> {
         operations,
         runtime: (!candidate.runtime.is_empty()).then(|| candidate.runtime.clone()),
     })
+}
+
+/// A sketch is dry-compiled when it is written, so a sketch that names
+/// something the skeleton lacks is fixed by its author in-session rather
+/// than discovered by every synthesis at once. A request's refusal error
+/// left unnamed is a choice made at synthesis time, not a defect: the
+/// dry run stands any declared error in for it.
+fn check_sketch(
+    candidate: &WorkspaceState,
+    operation: &Id,
+    diagnostics: &mut Vec<DraftDiagnostic>,
+) {
+    let Some(draft) = candidate.operations.get(operation) else {
+        return;
+    };
+
+    if draft.sketch.is_none() {
+        return;
+    }
+
+    let refusal = draft.inputs.values().find_map(|input| match input {
+        crate::spec::Input::Request(request) => request.result.errors.keys().next().cloned(),
+        _ => None,
+    });
+
+    let symbols = super::sketch::Symbols::of(candidate);
+
+    if let Err(error) = super::sketch::compile(
+        operation,
+        draft,
+        &symbols,
+        &super::sketch::Settled {
+            refusal,
+            cursor_rule: Some(crate::spec::CursorAdvanceRule::MonotonicAfter),
+        },
+    ) {
+        diagnostics.push(DraftDiagnostic::new(
+            Some(SymbolKey::OperationInterface(operation.clone())),
+            format!("the sketch of {operation} does not compile: {error}"),
+        ));
+    }
 }
 
 fn check_schema(

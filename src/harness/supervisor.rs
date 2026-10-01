@@ -155,6 +155,7 @@ impl Supervisor {
                         version: None,
                         session: None,
                     },
+                    escalation: None,
                 }
             }
         };

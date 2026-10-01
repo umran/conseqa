@@ -83,6 +83,19 @@ pub struct RunReport {
     pub artifacts: Vec<String>,
 }
 
+/// What one executor cost over a run. Task wall times overlap when
+/// tasks run concurrently, so `wall_ms` is work, not elapsed time.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+struct ExecutorTotals {
+    tasks: usize,
+    sessions: usize,
+    wall_ms: u64,
+
+    /// Tasks this executor settled after an in-process builder
+    /// abstained from them.
+    abstentions_received: usize,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum WorkflowError {
     #[error(transparent)]
@@ -101,11 +114,44 @@ pub enum WorkflowError {
 pub struct Workflow {
     scheduler: Scheduler,
     config: WorkflowConfig,
+
+    /// When `run` began, for the manifest's wall time.
+    started: std::sync::OnceLock<std::time::Instant>,
+
+    /// Operations whose requirements were discovered in this run. A
+    /// discovery that proposes nothing leaves the operation looking
+    /// undiscovered, and the fixpoint would schedule it — a session, or
+    /// the same unsure question — on every pass; once per run is what
+    /// discovery is for.
+    discovered: parking_lot::Mutex<std::collections::BTreeSet<Id>>,
+
+    /// When set, the run stops at its next phase boundary: a task was
+    /// handed back to the caller, and every later phase would only
+    /// reproduce it.
+    halt: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl Workflow {
     pub fn new(scheduler: Scheduler, config: WorkflowConfig) -> Self {
-        Self { scheduler, config }
+        Self {
+            scheduler,
+            config,
+            started: std::sync::OnceLock::new(),
+            discovered: Default::default(),
+            halt: None,
+        }
+    }
+
+    /// Stops the run at the next phase boundary once `halt` is set.
+    pub fn with_halt(mut self, halt: std::sync::Arc<std::sync::atomic::AtomicBool>) -> Self {
+        self.halt = Some(halt);
+        self
+    }
+
+    fn halted(&self) -> bool {
+        self.halt
+            .as_ref()
+            .is_some_and(|halt| halt.load(std::sync::atomic::Ordering::SeqCst))
     }
 
     fn engine(&self) -> &ConfluenceEngine {
@@ -114,6 +160,8 @@ impl Workflow {
 
     /// Drives the whole design to a fixpoint.
     pub async fn run(&self) -> Result<RunReport, WorkflowError> {
+        self.started.get_or_init(std::time::Instant::now);
+
         // Phase 2: decomposition establishes the interface epoch before
         // any operation fanout (§62, §96).
         self.decompose().await?;
@@ -132,7 +180,7 @@ impl Workflow {
         loop {
             iterations += 1;
 
-            if iterations > self.config.max_iterations {
+            if iterations > self.config.max_iterations || self.halted() {
                 return self.finalize(iterations - 1, None).await;
             }
 
@@ -380,13 +428,34 @@ impl Workflow {
                     operation: Some(operation.clone()),
                     requirements: Vec::new(),
                     include: Vec::new(),
+                    peers: Vec::new(),
                 },
                 prompt_evidence: self.prompt_evidence(),
                 interactive: false,
             })
             .collect();
 
-        self.scheduler.run_many(tasks).await?;
+        // Discovery is chained onto each synthesis: it needs only that
+        // operation's program and the obligations aimed at it, so it
+        // starts as soon as the program commits instead of waiting for
+        // the slowest peer. Whatever it leaves is picked up by the
+        // fixpoint's discovery phase as before.
+        self.scheduler
+            .run_many_then(tasks, |task, _| {
+                let operation = task.bundle.operation.as_ref()?;
+
+                let head = self.engine().head_snapshot();
+                let draft = head.workspace.operations.get(operation)?;
+
+                draft.program.as_ref()?;
+
+                let wanted = requirements_empty(draft)
+                    || unmapped_obligation_targets(&head.workspace).contains(operation);
+
+                (wanted && self.discovered.lock().insert(operation.clone()))
+                    .then(|| self.discovery_task(operation.clone()))
+            })
+            .await?;
 
         Ok(())
     }
@@ -428,6 +497,7 @@ impl Workflow {
                         operation: Some(operation.clone()),
                         requirements: Vec::new(),
                         include: Vec::new(),
+                        peers: Vec::new(),
                     },
                     prompt_evidence: self.prompt_evidence(),
                     interactive: false,
@@ -572,6 +642,7 @@ impl Workflow {
                 include: crate::confluence::topology_symbols(
                     &self.engine().head_snapshot().workspace,
                 ),
+                peers: Vec::new(),
             },
             prompt_evidence: self.prompt_evidence(),
             interactive: false,
@@ -583,33 +654,32 @@ impl Workflow {
     }
 
     /// Phase 5: one discovery task per operation with no declared
-    /// requirements yet, run concurrently. Returns how many ran.
+    /// requirements yet, or targeted by an explicit prompt obligation
+    /// still unmapped, run concurrently. Returns how many ran.
+    ///
+    /// The second arm matters when requirements were declared before
+    /// the run — by an interactive author or a synthesis worker —
+    /// without mapping the obligations they discharge: nothing else
+    /// maps an obligation, so finalization would stay incomplete.
     async fn requirement_discovery(&self) -> Result<u32, WorkflowError> {
         let candidates: Vec<Id> = {
             let head = self.engine().head_snapshot();
+            let workspace = &head.workspace;
 
-            head.workspace
+            let unmapped = unmapped_obligation_targets(workspace);
+
+            workspace
                 .operations
                 .iter()
-                .filter(|(_, draft)| requirements_empty(draft))
+                .filter(|(id, draft)| requirements_empty(draft) || unmapped.contains(id))
+                .filter(|(id, _)| self.discovered.lock().insert((*id).clone()))
                 .map(|(id, _)| id.clone())
                 .collect()
         };
 
         let tasks: Vec<LogicalTask> = candidates
             .into_iter()
-            .map(|operation| LogicalTask {
-                kind: TaskKind::RequirementDiscovery,
-                objective: format!("Discover the correctness requirements of {operation}."),
-                write_scope: WriteScope::requirement_discovery(operation.clone()),
-                bundle: BundleSpec {
-                    operation: Some(operation),
-                    requirements: Vec::new(),
-                    include: Vec::new(),
-                },
-                prompt_evidence: self.prompt_evidence(),
-                interactive: false,
-            })
+            .map(|operation| self.discovery_task(operation))
             .collect();
 
         let ran = tasks.len() as u32;
@@ -617,6 +687,23 @@ impl Workflow {
         self.scheduler.run_many(tasks).await?;
 
         Ok(ran)
+    }
+
+    /// The requirement discovery task of one operation.
+    fn discovery_task(&self, operation: Id) -> LogicalTask {
+        LogicalTask {
+            kind: TaskKind::RequirementDiscovery,
+            objective: format!("Discover the correctness requirements of {operation}."),
+            write_scope: WriteScope::requirement_discovery(operation.clone()),
+            bundle: BundleSpec {
+                operation: Some(operation),
+                requirements: Vec::new(),
+                include: Vec::new(),
+                peers: Vec::new(),
+            },
+            prompt_evidence: self.prompt_evidence(),
+            interactive: false,
+        }
     }
 
     /// Phase 7: repair every unproven obligation at `revision`.
@@ -677,6 +764,7 @@ impl Workflow {
                 include: crate::confluence::topology_symbols(
                     &self.engine().head_snapshot().workspace,
                 ),
+                peers: Vec::new(),
             },
             prompt_evidence: self.prompt_evidence(),
             interactive: false,
@@ -918,13 +1006,36 @@ impl Workflow {
             })
             .collect();
 
+        // Format 2 (§13.1 of the System One orchestration revision): one
+        // record per logical task, and what each executor cost in total,
+        // so a run says for itself where its time went.
+        let records = self.scheduler.ledger();
+
+        let mut executors: BTreeMap<&'static str, ExecutorTotals> = BTreeMap::new();
+
+        for record in &records {
+            let totals = executors.entry(record.executor).or_default();
+
+            totals.tasks += 1;
+            totals.sessions += record.attempts;
+            totals.wall_ms += record.wall_ms;
+            totals.abstentions_received += usize::from(record.abstained.is_some());
+        }
+
         serde_json::json!({
+            "manifest_format": 2,
             "final_revision": revision.0,
             "run": head.workspace.run_meta.run.0,
             "backend": self.scheduler.backend_name(),
             "status": status,
             "prompt_obligations": obligations,
             "tasks": self.engine().list_tasks().len(),
+            "wall_ms": self
+                .started
+                .get()
+                .map(|started| u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)),
+            "executors": executors,
+            "task_records": records,
         })
     }
 
@@ -1092,13 +1203,21 @@ fn inline_obligations(targets: &[RepairTarget], analysis: &AnalysisSnapshot) -> 
     }
 }
 
-/// One repair task per operation, carrying every unproven obligation
-/// of that operation — never one per obligation. Concurrent tasks over
-/// one program are guaranteed write-write conflicts (the gate
-/// serializes them at the cost of a restarted session each), and the
-/// obligations trade off against each other: one revision often
-/// discharges several, which per-obligation workers cannot see. The
-/// same reasoning the topology author's batching follows.
+/// One repair task per conflict closure, carrying every unproven
+/// obligation of every operation in it — never one per obligation, and
+/// never one per operation when operations share a closure.
+///
+/// Concurrent tasks over one program are guaranteed write-write
+/// conflicts, and the obligations trade off against each other: one
+/// revision often discharges several. The same holds across programs
+/// that conflict: a lock or isolation change in one operation changes
+/// what its closure peers can prove, so peers repaired concurrently
+/// invalidate each other, and a repair of one alone is often refused
+/// because it un-proves a peer. So operations are grouped by the
+/// transactions their unproven obligations' evidence names, and each
+/// group is one task with a program grant per member — including a
+/// member with nothing unproven itself, whose program a proof may need
+/// to change (a strict-lock proof needs the lock on the writer too).
 fn application_repair_tasks(
     targets: Vec<RepairTarget>,
     analysis: &AnalysisSnapshot,
@@ -1113,36 +1232,230 @@ fn application_repair_tasks(
             .push(target);
     }
 
-    by_operation
+    repair_groups(&by_operation, analysis)
         .into_iter()
-        .map(|(operation, targets)| {
-            let listed = targets
+        .map(|group| {
+            let listed = group
                 .iter()
+                .flat_map(|operation| by_operation.get(operation).into_iter().flatten())
                 .map(|target| format!("- the {}", target.label()))
                 .collect::<Vec<_>>()
                 .join("\n");
 
+            let all: Vec<RepairTarget> = group
+                .iter()
+                .flat_map(|operation| by_operation.get(operation).into_iter().flatten())
+                .cloned()
+                .collect();
+
+            let requirements = |operation: &Id| {
+                by_operation
+                    .get(operation)
+                    .into_iter()
+                    .flatten()
+                    .map(|target| (target.family, target.transaction.clone(), target.index))
+                    .collect::<Vec<_>>()
+            };
+
+            // The primary is the first member with something unproven;
+            // every group has one.
+            let primary = group
+                .iter()
+                .find(|operation| by_operation.contains_key(*operation))
+                .expect("a group holds at least one target")
+                .clone();
+
+            let peers: Vec<Id> = group
+                .iter()
+                .filter(|operation| **operation != primary)
+                .cloned()
+                .collect();
+
+            let objective = if peers.is_empty() {
+                format!(
+                    "Make these requirements of {primary} provable, revising its \
+                     program once in a way that resolves them together:\n{listed}\n\n{}",
+                    inline_obligations(&all, analysis)
+                )
+            } else {
+                format!(
+                    "Make these requirements provable. {primary} and {} share one \
+                     conflict closure, so revise their programs together — in one \
+                     patch, with a replace_operation_program per program you change — \
+                     in a way that resolves them all:\n{listed}\n\n{}",
+                    peers
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    inline_obligations(&all, analysis)
+                )
+            };
+
             LogicalTask {
                 kind: TaskKind::RequirementRepair,
-                objective: format!(
-                    "Make these requirements of {operation} provable, revising its \
-                     program once in a way that resolves them together:\n{listed}\n\n{}",
-                    inline_obligations(&targets, analysis)
-                ),
-                write_scope: WriteScope::requirement_repair(operation.clone()),
-                bundle: BundleSpec {
-                    operation: Some(operation),
-                    requirements: targets
+                objective,
+                write_scope: WriteScope::of(
+                    group
                         .iter()
-                        .map(|target| (target.family, target.transaction.clone(), target.index))
-                        .collect(),
+                        .map(|operation| WriteGrant::OperationProgram(operation.clone())),
+                ),
+                bundle: BundleSpec {
+                    operation: Some(primary.clone()),
+                    requirements: requirements(&primary),
                     include: Vec::new(),
+                    peers: peers
+                        .iter()
+                        .map(|operation| (operation.clone(), requirements(operation)))
+                        .collect(),
                 },
                 prompt_evidence: prompt_evidence.clone(),
                 interactive: false,
             }
         })
         .collect()
+}
+
+/// The operations each repair task covers: the connected components of
+/// "an unproven transaction obligation of one names a transaction of
+/// the other in its evidence". Each component holds at least one
+/// operation with a target; components are in operation order.
+fn repair_groups(
+    by_operation: &BTreeMap<Id, Vec<RepairTarget>>,
+    analysis: &AnalysisSnapshot,
+) -> Vec<Vec<Id>> {
+    let mut edges: Vec<(Id, Id)> = Vec::new();
+
+    let report = &analysis.verification;
+
+    let unproven_serializability = report
+        .transaction_serializability
+        .iter()
+        .filter(|check| by_operation.contains_key(&check.operation))
+        .filter(|check| {
+            matches!(
+                check.verdict,
+                crate::analyzer::verification::transaction_serializability::TransactionSerializabilityVerdict::Unproven { .. }
+            )
+        })
+        .map(|check| (&check.operation, serde_json::to_value(&check.verdict)));
+
+    let unproven_ordering = report
+        .transaction_ordering
+        .iter()
+        .filter(|check| by_operation.contains_key(&check.operation))
+        .filter(|check| {
+            matches!(
+                check.verdict,
+                crate::analyzer::verification::transaction_ordering::TransactionOrderingVerdict::Unproven { .. }
+            )
+        })
+        .map(|check| (&check.operation, serde_json::to_value(&check.verdict)));
+
+    for (operation, verdict) in unproven_serializability.chain(unproven_ordering) {
+        let Ok(verdict) = verdict else {
+            continue;
+        };
+
+        let mut named = std::collections::BTreeSet::new();
+
+        referenced_operations(&verdict, &mut named);
+
+        for other in named {
+            if &other != operation {
+                edges.push((operation.clone(), other));
+            }
+        }
+    }
+
+    // Union-find over operation ids.
+    let mut parent: BTreeMap<Id, Id> = BTreeMap::new();
+
+    fn find(parent: &mut BTreeMap<Id, Id>, id: &Id) -> Id {
+        let next = parent.get(id).cloned().unwrap_or_else(|| id.clone());
+
+        if &next == id {
+            return next;
+        }
+
+        let root = find(parent, &next);
+
+        parent.insert(id.clone(), root.clone());
+
+        root
+    }
+
+    for operation in by_operation.keys() {
+        parent
+            .entry(operation.clone())
+            .or_insert_with(|| operation.clone());
+    }
+
+    for (a, b) in &edges {
+        parent.entry(a.clone()).or_insert_with(|| a.clone());
+        parent.entry(b.clone()).or_insert_with(|| b.clone());
+
+        let (ra, rb) = (find(&mut parent, a), find(&mut parent, b));
+
+        if ra != rb {
+            parent.insert(rb, ra);
+        }
+    }
+
+    let members: Vec<Id> = parent.keys().cloned().collect();
+
+    let mut groups: BTreeMap<Id, Vec<Id>> = BTreeMap::new();
+
+    for member in members {
+        let root = find(&mut parent, &member);
+
+        groups.entry(root).or_default().push(member);
+    }
+
+    let mut groups: Vec<Vec<Id>> = groups
+        .into_values()
+        .filter(|group| {
+            group
+                .iter()
+                .any(|operation| by_operation.contains_key(operation))
+        })
+        .collect();
+
+    for group in &mut groups {
+        group.sort();
+    }
+
+    groups.sort();
+
+    groups
+}
+
+/// Every operation a verdict's evidence names, found as the
+/// `{operation, transaction}` pair every transaction reference carries.
+fn referenced_operations(value: &serde_json::Value, into: &mut std::collections::BTreeSet<Id>) {
+    match value {
+        serde_json::Value::Object(map) => {
+            if let (
+                Some(serde_json::Value::String(operation)),
+                Some(serde_json::Value::String(_)),
+            ) = (map.get("operation"), map.get("transaction"))
+            {
+                into.insert(Id(operation.clone()));
+            }
+
+            for nested in map.values() {
+                referenced_operations(nested, into);
+            }
+        }
+
+        serde_json::Value::Array(items) => {
+            for item in items {
+                referenced_operations(item, into);
+            }
+        }
+
+        _ => {}
+    }
 }
 
 /// Open requests grouped by target symbol, in canonical order.
@@ -1194,6 +1507,7 @@ fn dependency_repair_task(
             operation: None,
             requirements: Vec::new(),
             include: vec![target.clone()],
+            peers: Vec::new(),
         },
         prompt_evidence,
         interactive: false,
@@ -1299,6 +1613,31 @@ fn operation_owned_ids(
 
 /// Whether a draft declares no requirement at all — none on the
 /// operation, and none on any inline transaction of its program.
+/// The operations an unmapped prompt obligation concerns. An
+/// obligation naming no operation concerns all of them.
+fn unmapped_obligation_targets(
+    workspace: &crate::confluence::WorkspaceState,
+) -> std::collections::BTreeSet<Id> {
+    let mut targets = std::collections::BTreeSet::new();
+
+    for obligation in workspace.prompt_obligations.values() {
+        if !matches!(
+            obligation.status,
+            crate::confluence::PromptObligationStatus::Unmapped
+        ) {
+            continue;
+        }
+
+        if obligation.targets.is_empty() {
+            targets.extend(workspace.operations.keys().cloned());
+        } else {
+            targets.extend(obligation.targets.iter().cloned());
+        }
+    }
+
+    targets
+}
+
 fn requirements_empty(draft: &crate::confluence::DraftOperation) -> bool {
     let transactional = draft.program.as_ref().is_some_and(|program| {
         program
@@ -1573,6 +1912,7 @@ mod tests {
             service: id("service.x"),
             description: None,
             inputs: BTreeMap::new(),
+            sketch: None,
         });
 
         draft.program = Some(OperationBlock {

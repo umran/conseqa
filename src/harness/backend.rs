@@ -95,6 +95,25 @@ pub struct AgentExit {
     pub usage: AgentUsage,
 
     pub backend: AgentBackendMetadata,
+
+    /// Set when an in-process executor attempted the task first and
+    /// handed it to this session (§16 of the System One orchestration
+    /// revision). Telemetry only.
+    pub escalation: Option<Escalation>,
+}
+
+/// The name an in-process System One executor reports as its backend,
+/// which is how a run's records tell a task a builder settled from one
+/// an agent session did.
+pub const SYSTEM_ONE_EXECUTOR: &str = "system_one";
+
+/// Why an in-process executor handed its task to an agent session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Escalation {
+    /// The executor that abstained.
+    pub from: String,
+
+    pub reason: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

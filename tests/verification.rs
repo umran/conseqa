@@ -4366,3 +4366,357 @@ fn a_present_over_a_required_path_is_valid_and_noted() {
         "{notes:#?}"
     );
 }
+
+/// `transfer_stock` charging an external boundary whose decline is
+/// retryable and passing it on as its own retryable `rejected`, and
+/// `rebalance` requesting `transfer_stock` and passing `rejected` on as
+/// its own `rejected`, declared `passed_on`. `rebalance`'s `ok` arm
+/// runs `ok_work` before it returns.
+fn a_request_chain(passed_on: ErrorDisposition, ok_work: Vec<OperationStep>) -> Model {
+    let mut model = load_flash_checkout();
+
+    charge_transfer_externally(&mut model, ErrorDisposition::Retryable);
+
+    set_disposition(
+        &mut model,
+        "operation.transfer_stock",
+        "input.transfer_stock.request",
+        ErrorDisposition::Retryable,
+    );
+
+    let mut caller = model.operations[&id("operation.transfer_stock")].clone();
+    let contract = caller
+        .inputs
+        .remove(&id("input.transfer_stock.request"))
+        .unwrap();
+
+    caller
+        .inputs
+        .insert(id("input.rebalance.request"), contract);
+
+    let mut ok = ok_work;
+
+    ok.push(return_ok(
+        "input.rebalance.request",
+        deterministic(vec![ValueRef {
+            source: ValueSource::EffectResultOk(id("result.rebalance.transfer")),
+            path: path(&["accepted"]),
+        }]),
+    ));
+
+    caller.program = block(vec![
+        execute(
+            "effect.rebalance.transfer",
+            transfer_request("effect.rebalance.transfer"),
+            deterministic(vec![input_key("input.rebalance.request", &["sku"])]),
+            Some("result.rebalance.transfer"),
+        ),
+        OperationStep::MatchResult(MatchResult {
+            result: id("result.rebalance.transfer"),
+            ok: block(ok),
+            errors: BTreeMap::from([(
+                id("rejected"),
+                block(vec![return_err(
+                    "input.rebalance.request",
+                    "rejected",
+                    deterministic(vec![ValueRef {
+                        source: ValueSource::EffectResultErr(id("result.rebalance.transfer")),
+                        path: path(&["reason"]),
+                    }]),
+                )]),
+            )]),
+        }),
+    ]);
+
+    caller.requirements.idempotency = vec![IdempotencyRequirement {
+        key: ikey("input.rebalance.request", &[&["sku"]]),
+        result: ResultReplayRequirement::ReplayConsistent,
+    }];
+    caller.requirements.recoverability.clear();
+
+    model.operations.insert(id("operation.rebalance"), caller);
+
+    set_disposition(
+        &mut model,
+        "operation.rebalance",
+        "input.rebalance.request",
+        passed_on,
+    );
+
+    assert!(validation::validate(&model).is_empty());
+
+    model
+}
+
+/// A request from `rebalance` into `transfer_stock`, keyed by the sku.
+fn transfer_request(effect: &str) -> Effect {
+    use conseqa::spec::{IdempotencyKeyPropagation, RequestEffect, RequestTarget, RetrySemantics};
+
+    Effect::Request(RequestEffect {
+        target: RequestTarget {
+            operation: id("operation.transfer_stock"),
+            input: id("input.transfer_stock.request"),
+        },
+        schema: id("schema.TransferStockRequest"),
+        retry: RetrySemantics::MayRepeat,
+        idempotency_key_propagation: vec![IdempotencyKeyPropagation {
+            source: ikey("input.rebalance.request", &[&["sku"]]),
+            target: IdempotencyKey {
+                components: vec![ValueRef {
+                    source: ValueSource::Effect(id(effect)),
+                    path: path(&["sku"]),
+                }],
+            },
+        }],
+    })
+}
+
+/// Declares the disposition of `rejected` in `operation`'s contract.
+fn set_disposition(
+    model: &mut Model,
+    operation: &str,
+    input: &str,
+    disposition: ErrorDisposition,
+) {
+    let Some(Input::Request(request)) = model
+        .operations
+        .get_mut(&id(operation))
+        .unwrap()
+        .inputs
+        .get_mut(&id(input))
+    else {
+        panic!("{operation} takes a request");
+    };
+
+    request
+        .result
+        .errors
+        .get_mut(&id("rejected"))
+        .unwrap()
+        .disposition = disposition;
+}
+
+/// A retryable error bubbles up a request chain without costing
+/// replayability. At every hop the retryable return is an attempt-level
+/// outcome — exempt from result replay — and the decision on it only
+/// returns, so it adds no work for idempotency to judge.
+#[test]
+fn a_retryable_error_bubbles_up_a_request_chain_and_every_hop_still_replays() {
+    let model = a_request_chain(ErrorDisposition::Retryable, Vec::new());
+
+    for operation in ["operation.transfer_stock", "operation.rebalance"] {
+        let requirement = model.operations[&id(operation)]
+            .requirements
+            .idempotency
+            .len()
+            - 1;
+
+        let replay = result_replay_verdict(&model, operation, requirement);
+
+        let ResultReplayVerdict::Proven {
+            proof: ResultReplayProof::ClassFixedResult { retryable, .. },
+            ..
+        } = &replay
+        else {
+            panic!("{operation}: {replay:#?}");
+        };
+
+        assert_eq!(retryable.len(), 1, "{operation}: the bubbled return is exempt");
+
+        let idempotency = idempotency_verdict(&model, operation, requirement);
+
+        assert!(
+            matches!(idempotency, IdempotencyVerdict::Proven { .. }),
+            "{operation}: {idempotency:#?}"
+        );
+    }
+}
+
+/// The soundness hole the revision closes: a target's retryable error
+/// is not fixed by the target's result-replay proof, which exempts
+/// retryable returns. A caller that turns it into its own terminal
+/// error may resolve one logical request as that error on one attempt
+/// and as `ok` on the next, so its result replay is unproven — and the
+/// gap names the target's retryable class.
+#[test]
+fn a_target_retryable_error_turned_terminal_is_not_replay_stable() {
+    let model = a_request_chain(ErrorDisposition::Terminal, Vec::new());
+
+    let verdict = result_replay_verdict(&model, "operation.rebalance", 0);
+
+    let ResultReplayVerdict::Unproven { obstacles } = &verdict else {
+        panic!("expected an unproven verdict, found {verdict:?}");
+    };
+
+    let retryable_gap = |gap: &ResultGap| {
+        matches!(
+            gap,
+            ResultGap::TargetErrorRetryable { operation, error, .. }
+                if operation == &id("operation.transfer_stock") && error == &id("rejected")
+        )
+    };
+
+    assert!(
+        obstacles.iter().any(|obstacle| matches!(
+            obstacle,
+            ResultReplayObstacle::PathDecisionUnstable {
+                decision: verification::DecisionTaken::Match {
+                    arm: ResultArm::Err { .. },
+                    ..
+                },
+                gap: DecisionGap::ResultUnstable { gap, .. },
+                ..
+            } if retryable_gap(gap)
+        )),
+        "{obstacles:#?}"
+    );
+
+    // The err payload is not a stable root either.
+    assert!(
+        obstacles.iter().any(|obstacle| matches!(
+            obstacle,
+            ResultReplayObstacle::ResultDerivationRootUnstable { roots, .. }
+                if roots.iter().any(|root| matches!(
+                    &root.gap,
+                    StabilityGap::ResultUnstable { gap, .. } if retryable_gap(gap)
+                ))
+        )),
+        "{obstacles:#?}"
+    );
+}
+
+/// A target's terminal, and unspecified, error classes stay stable:
+/// its result-replay proof holds both to the obligation like `ok`.
+#[test]
+fn a_target_error_held_to_its_result_replay_obligation_stays_stable() {
+    for target in [ErrorDisposition::Terminal, ErrorDisposition::Unspecified] {
+        let mut model = a_request_chain(ErrorDisposition::Terminal, Vec::new());
+
+        // The charge's decline is terminal, so the target's own
+        // result replay still proves with `rejected` held to it.
+        charge_transfer_externally(&mut model, ErrorDisposition::Terminal);
+        model
+            .operations
+            .get_mut(&id("operation.transfer_stock"))
+            .unwrap()
+            .requirements
+            .idempotency
+            .pop();
+
+        set_disposition(
+            &mut model,
+            "operation.transfer_stock",
+            "input.transfer_stock.request",
+            target,
+        );
+
+        let verdict = result_replay_verdict(&model, "operation.rebalance", 0);
+
+        assert!(
+            matches!(verdict, ResultReplayVerdict::Proven { .. }),
+            "{target:?}: {verdict:#?}"
+        );
+    }
+}
+
+/// A second, duplicate-safe request into `transfer_stock` from
+/// `rebalance`: effectful work for a continuation.
+fn more_work(effect: &str) -> OperationStep {
+    execute(
+        effect,
+        transfer_request(effect),
+        deterministic(vec![input_key("input.rebalance.request", &["sku"])]),
+        None,
+    )
+}
+
+/// The common shape: the `ok` arm does work, the retryable arm passes
+/// the error up. The decision on the retryable arm does not replay,
+/// but on its own path nothing follows it but the return, so it adds
+/// no work: the inert-continuation admission is judged per path, and
+/// the `ok` arm's work no longer disqualifies it.
+#[test]
+fn bubbling_beside_an_effectful_arm_is_idempotent() {
+    let model = a_request_chain(
+        ErrorDisposition::Retryable,
+        vec![more_work("effect.rebalance.again")],
+    );
+
+    let verdict = idempotency_verdict(&model, "operation.rebalance", 0);
+
+    let IdempotencyVerdict::Proven {
+        proof: IdempotencyProof::RetrySafePaths { paths },
+        ..
+    } = &verdict
+    else {
+        panic!("expected a proven verdict, found {verdict:#?}");
+    };
+
+    let rules: Vec<(&ResultArm, &DecisionRule)> = paths
+        .iter()
+        .flat_map(|path| &path.decisions)
+        .filter_map(|replay| match &replay.decision {
+            verification::DecisionTaken::Match { arm, .. } => Some((arm, &replay.rule)),
+            _ => None,
+        })
+        .collect();
+
+    assert!(
+        rules.iter().any(|(arm, rule)| matches!(arm, ResultArm::Ok)
+            && matches!(rule, DecisionRule::StableResult { .. })),
+        "{rules:#?}"
+    );
+    assert!(
+        rules.iter().any(|(arm, rule)| matches!(arm, ResultArm::Err { .. })
+            && matches!(rule, DecisionRule::IdempotencyInertContinuation)),
+        "{rules:#?}"
+    );
+}
+
+/// Divergent work is still an obstacle: when the retryable arm does
+/// work of its own, an attempt observing the error and a retry
+/// observing `ok` do different things.
+#[test]
+fn work_on_an_unstable_arm_is_still_an_obstacle() {
+    let mut model = a_request_chain(
+        ErrorDisposition::Retryable,
+        vec![more_work("effect.rebalance.again")],
+    );
+
+    let OperationStep::MatchResult(matched) =
+        &mut program_mut(&mut model, "operation.rebalance").steps[1]
+    else {
+        panic!("expected the match");
+    };
+
+    matched
+        .errors
+        .get_mut(&id("rejected"))
+        .unwrap()
+        .steps
+        .insert(0, more_work("effect.rebalance.compensate"));
+
+    let verdict = idempotency_verdict(&model, "operation.rebalance", 0);
+
+    let IdempotencyVerdict::Unproven { obstacles } = &verdict else {
+        panic!("expected an unproven verdict, found {verdict:#?}");
+    };
+
+    assert!(
+        obstacles.iter().any(|obstacle| matches!(
+            obstacle,
+            IdempotencyObstacle::PathDecisionUnstable {
+                decision: verification::DecisionTaken::Match {
+                    arm: ResultArm::Err { .. },
+                    ..
+                },
+                gap: DecisionGap::ResultUnstable {
+                    gap: ResultGap::TargetErrorRetryable { .. },
+                    ..
+                },
+                ..
+            }
+        )),
+        "{obstacles:#?}"
+    );
+}

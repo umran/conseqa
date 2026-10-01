@@ -36,6 +36,8 @@ export function stepHeadline(step: OperationStep): string {
       return `return ${step.outcome.kind === "ok" ? "ok" : `err:${step.outcome.error}`}`;
     case "complete":
       return "complete";
+    case "abandon":
+      return "abandon";
   }
 }
 

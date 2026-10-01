@@ -2377,21 +2377,33 @@ fn absent_acknowledgement_and_outboxes_stay_absent() {
 
 #[test]
 fn a_declared_dsl_version_mismatch_is_refused_by_name() {
-    let error = yaml::parse("dsl: 5\nrevision: 1\n")
-        .expect_err("a future contract version should be refused");
+    for (declared, refusal) in [(6, "a future contract"), (3, "a superseded contract")] {
+        let error = yaml::parse(&format!("dsl: {declared}\nrevision: 1\n"))
+            .expect_err(refusal);
 
-    assert!(
-        matches!(
-            &error,
-            yaml::ParseError::DslVersionMismatch { found } if found.0 == 5
-        ),
-        "{error:?}"
-    );
+        assert!(
+            matches!(
+                &error,
+                yaml::ParseError::DslVersionMismatch { found } if found.0 == declared
+            ),
+            "{error:?}"
+        );
 
-    let message = error.to_string();
+        let message = error.to_string();
 
-    assert!(message.contains("declares dsl 5"), "{message}");
-    assert!(message.contains("this build reads dsl 4"), "{message}");
+        assert!(message.contains(&format!("declares dsl {declared}")), "{message}");
+        assert!(message.contains("this build reads dsl 5"), "{message}");
+    }
+}
+
+/// dsl 5 only adds the `abandon` terminal, so a dsl 4 specification
+/// means the same under it: it is read, as the current version.
+#[test]
+fn a_dsl_4_specification_is_read_as_dsl_5() {
+    let model = yaml::parse("dsl: 4\nrevision: 1\n").expect("dsl 4 is read");
+
+    assert_eq!(model.dsl, conseqa::spec::DSL_VERSION);
+    assert!(yaml::serialize(&model).expect("serializes").contains("dsl: 5"));
 }
 
 #[test]

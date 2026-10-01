@@ -37,12 +37,16 @@ use super::task_prompt;
 /// Releases an operation's advisory primary-writer claim on drop.
 struct ProgramWriterGuard<'a> {
     writers: &'a Mutex<HashSet<Id>>,
-    operation: Id,
+    operations: Vec<Id>,
 }
 
 impl Drop for ProgramWriterGuard<'_> {
     fn drop(&mut self) {
-        self.writers.lock().remove(&self.operation);
+        let mut writers = self.writers.lock();
+
+        for operation in &self.operations {
+            writers.remove(operation);
+        }
     }
 }
 
@@ -114,6 +118,87 @@ impl TaskRun {
     }
 }
 
+/// What one logical task cost and who settled it: one record of the
+/// run manifest (§13.1 of the System One orchestration revision).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct LogicalTaskRecord {
+    pub kind: TaskKind,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub operation: Option<Id>,
+
+    /// `system_one` when an in-process builder settled the final
+    /// attempt, `agent` when a session did.
+    pub executor: &'static str,
+
+    /// The backend that settled the final attempt.
+    pub backend: String,
+
+    pub attempts: usize,
+    pub final_state: TaskState,
+    pub exhausted: bool,
+
+    /// Creation of the first attempt to the final outcome, including
+    /// every restart.
+    pub wall_ms: u64,
+
+    /// Summed over attempts, where the provider reported them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub turns: Option<u64>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tokens: Option<u64>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usd_cents: Option<u64>,
+
+    /// Why an in-process builder handed the task to a session, when
+    /// one did.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub abstained: Option<String>,
+}
+
+impl LogicalTaskRecord {
+    fn of(logical: &LogicalTask, run: &TaskRun, wall: std::time::Duration) -> Self {
+        let sum = |field: fn(&crate::harness::backend::AgentUsage) -> Option<u64>| {
+            run.attempts
+                .iter()
+                .filter_map(|attempt| field(&attempt.agent_exit.usage))
+                .reduce(|total, next| total + next)
+        };
+
+        let settled = run.attempts.last().map(|attempt| &attempt.agent_exit);
+
+        let backend = settled
+            .map(|exit| exit.backend.name.clone())
+            .unwrap_or_default();
+
+        Self {
+            kind: logical.kind,
+            operation: logical.bundle.operation.clone(),
+            executor: if backend == crate::harness::backend::SYSTEM_ONE_EXECUTOR {
+                "system_one"
+            } else {
+                "agent"
+            },
+            backend,
+            attempts: run.attempts.len(),
+            final_state: run.final_state,
+            exhausted: run.exhausted,
+            wall_ms: u64::try_from(wall.as_millis()).unwrap_or(u64::MAX),
+            turns: sum(|usage| usage.turns),
+            tokens: sum(|usage| usage.tokens),
+            usd_cents: sum(|usage| usage.usd_cents),
+            abstained: run
+                .attempts
+                .iter()
+                .rev()
+                .find_map(|attempt| attempt.agent_exit.escalation.as_ref())
+                .map(|escalation| escalation.reason.clone()),
+        }
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum SchedulerError {
     #[error(transparent)]
@@ -130,6 +215,9 @@ pub struct Scheduler {
     /// shares it; the check is advisory — the OCC gate is the real
     /// safety net (§65), so distinct-operation tasks never contend.
     program_writers: Mutex<HashSet<crate::spec::Id>>,
+
+    /// One record per logical task run, in completion order.
+    ledger: Mutex<Vec<LogicalTaskRecord>>,
 }
 
 impl Scheduler {
@@ -139,7 +227,13 @@ impl Scheduler {
             supervisor,
             policy,
             program_writers: Mutex::new(HashSet::new()),
+            ledger: Mutex::new(Vec::new()),
         }
+    }
+
+    /// Every logical task run so far, for the run manifest.
+    pub fn ledger(&self) -> Vec<LogicalTaskRecord> {
+        self.ledger.lock().clone()
     }
 
     pub fn engine(&self) -> &ConfluenceEngine {
@@ -163,12 +257,27 @@ impl Scheduler {
     ///
     /// Runs are returned in submission order. A task that exhausts its
     /// attempts is reported in its `TaskRun`, never as a batch error.
-    pub async fn run_many(
+    pub async fn run_many(&self, tasks: Vec<LogicalTask>) -> Result<Vec<TaskRun>, SchedulerError> {
+        self.run_many_then(tasks, |_, _| None).await
+    }
+
+    /// [`run_many`](Self::run_many), where a finished task may name a
+    /// follow-up that runs at once, in the same concurrency slot,
+    /// instead of waiting for the whole batch: per-operation pipelining.
+    /// A fanout chains each operation's requirement discovery onto its
+    /// synthesis, so discovery of the fast operations overlaps the
+    /// synthesis of the slow ones rather than starting at a barrier.
+    ///
+    /// Returns the batch's own runs, in submission order; a follow-up's
+    /// run is recorded in the ledger like any other.
+    pub async fn run_many_then<F>(
         &self,
         tasks: Vec<LogicalTask>,
-    ) -> Result<Vec<TaskRun>, SchedulerError> {
-        use futures::stream::{self, StreamExt};
-
+        then: F,
+    ) -> Result<Vec<TaskRun>, SchedulerError>
+    where
+        F: Fn(&LogicalTask, &TaskRun) -> Option<LogicalTask> + Sync,
+    {
         let concurrency = self.policy.max_concurrent_agents.max(1);
 
         let snapshot = self.engine.head_snapshot();
@@ -207,18 +316,65 @@ impl Scheduler {
         let mut runs: Vec<Option<TaskRun>> = tasks.iter().map(|_| None).collect();
 
         for wave in waves {
-            let results: Vec<(usize, Result<TaskRun, SchedulerError>)> = stream::iter(wave)
-                .map(|index| {
-                    let task = &tasks[index];
+            // One queue per wave, primaries first: a follow-up is
+            // pushed behind every primary still waiting, so it fills a
+            // slot no primary needs and never delays one. The worker
+            // that pushes a follow-up loops back to the queue, so none
+            // is stranded when the others have finished.
+            enum Job {
+                Primary(usize),
+                FollowUp(LogicalTask),
+            }
 
-                    async move { (index, self.run(task).await) }
-                })
-                .buffer_unordered(concurrency)
-                .collect()
-                .await;
+            let queue: parking_lot::Mutex<std::collections::VecDeque<Job>> =
+                parking_lot::Mutex::new(wave.into_iter().map(Job::Primary).collect());
+
+            let worker = || async {
+                let mut done: Vec<(usize, Result<TaskRun, SchedulerError>)> = Vec::new();
+
+                loop {
+                    let Some(job) = queue.lock().pop_front() else {
+                        return done;
+                    };
+
+                    match job {
+                        Job::Primary(index) => {
+                            let task = &tasks[index];
+                            let run = self.run(task).await;
+
+                            if let Ok(run) = &run
+                                && let Some(follow_up) = then(task, run)
+                            {
+                                queue.lock().push_back(Job::FollowUp(follow_up));
+                            }
+
+                            done.push((index, run));
+                        }
+
+                        Job::FollowUp(task) => {
+                            // A follow-up's run lands in the ledger; its
+                            // failure is the batch's, as a primary's is.
+                            if let Err(error) = self.run(&task).await {
+                                done.push((usize::MAX, Err(error)));
+                            }
+                        }
+                    }
+                }
+            };
+
+            let results: Vec<(usize, Result<TaskRun, SchedulerError>)> =
+                futures::future::join_all((0..concurrency).map(|_| worker()))
+                    .await
+                    .into_iter()
+                    .flatten()
+                    .collect();
 
             for (index, result) in results {
-                runs[index] = Some(result?);
+                let run = result?;
+
+                if let Some(slot) = runs.get_mut(index) {
+                    *slot = Some(run);
+                }
             }
         }
 
@@ -238,25 +394,46 @@ impl Scheduler {
         // operation on drop, even if the task panics.
         let _guard = self.claim_program_writer(logical);
 
-        self.run_inner(logical).await
+        let started = std::time::Instant::now();
+
+        let run = self.run_inner(logical).await?;
+
+        self.ledger
+            .lock()
+            .push(LogicalTaskRecord::of(logical, &run, started.elapsed()));
+
+        Ok(run)
     }
 
-    /// Advisory claim on an operation's primary-writer slot, released
-    /// when the returned guard drops. `None` for non-program tasks.
+    /// Advisory claim on the primary-writer slot of every program the
+    /// task writes, released when the returned guard drops. `None` for
+    /// non-program tasks.
     fn claim_program_writer(&self, logical: &LogicalTask) -> Option<ProgramWriterGuard<'_>> {
-        let operation = self.program_write_target(logical)?;
+        let operations = self.program_write_targets(logical);
 
-        if !self.program_writers.lock().insert(operation.clone()) {
-            tracing::warn!(
-                %operation,
-                "a primary program writer is already active for this operation; \
-                 running anyway relies on OCC"
-            );
+        if operations.is_empty() {
+            return None;
+        }
+
+        let mut writers = self.program_writers.lock();
+
+        let mut claimed = Vec::new();
+
+        for operation in operations {
+            if writers.insert(operation.clone()) {
+                claimed.push(operation);
+            } else {
+                tracing::warn!(
+                    %operation,
+                    "a primary program writer is already active for this operation; \
+                     running anyway relies on OCC"
+                );
+            }
         }
 
         Some(ProgramWriterGuard {
             writers: &self.program_writers,
-            operation,
+            operations: claimed,
         })
     }
 
@@ -368,15 +545,20 @@ impl Scheduler {
         })
     }
 
-    /// The operation a program-scope task writes, for one-writer
-    /// bookkeeping.
-    fn program_write_target(&self, logical: &LogicalTask) -> Option<crate::spec::Id> {
-        logical.write_scope.grants.iter().find_map(|grant| match grant {
-            WriteGrant::OperationProgram(operation) | WriteGrant::Operation(operation) => {
-                Some(operation.clone())
-            }
-            _ => None,
-        })
+    /// The operations whose programs a task writes, for one-writer
+    /// bookkeeping. A closure-scoped repair writes several.
+    fn program_write_targets(&self, logical: &LogicalTask) -> Vec<crate::spec::Id> {
+        logical
+            .write_scope
+            .grants
+            .iter()
+            .filter_map(|grant| match grant {
+                WriteGrant::OperationProgram(operation) | WriteGrant::Operation(operation) => {
+                    Some(operation.clone())
+                }
+                _ => None,
+            })
+            .collect()
     }
 }
 
@@ -422,8 +604,13 @@ fn footprint(
                 writes.insert(SymbolKey::OperationProgram(operation.clone()));
             }
 
+            // A requirements grant authorizes proposals of every
+            // family, and a transaction-family requirement is adopted
+            // onto an inline transaction: the task may change the
+            // program's fingerprint though it may not replace it.
             WriteGrant::OperationRequirements(operation) => {
                 writes.insert(SymbolKey::OperationRequirements(operation.clone()));
+                writes.insert(SymbolKey::OperationProgram(operation.clone()));
             }
 
             WriteGrant::OperationInterface(operation) => {
@@ -434,7 +621,13 @@ fn footprint(
 
     let mut reads: BTreeSet<SymbolKey> = task.bundle.include.iter().cloned().collect();
 
-    if let Some(operation) = &task.bundle.operation {
+    let focus = task
+        .bundle
+        .operation
+        .iter()
+        .chain(task.bundle.peers.iter().map(|(operation, _)| operation));
+
+    for operation in focus {
         reads.insert(SymbolKey::OperationInterface(operation.clone()));
         reads.insert(SymbolKey::OperationProgram(operation.clone()));
         reads.insert(SymbolKey::OperationRequirements(operation.clone()));
@@ -581,6 +774,7 @@ mod tests {
                 operation: Some(id(operation)),
                 requirements: Vec::new(),
                 include: Vec::new(),
+                peers: Vec::new(),
             },
             prompt_evidence: Vec::new(),
             interactive: false,
@@ -677,6 +871,32 @@ mod tests {
 
         assert_eq!(waves.len(), 2, "{waves:?}");
         assert!(all_indices(&waves, 2));
+    }
+
+    // A transaction requirement is adopted onto the inline transaction
+    // it constrains, so a task that may propose requirements may change
+    // the program's fingerprint: it never shares a wave with a writer
+    // of that program. Discovery across operations stays one wave.
+    #[test]
+    fn requirement_proposers_never_share_a_wave_with_the_programs_writer() {
+        let tasks = vec![
+            op_task(
+                "operation.x",
+                WriteScope::requirement_discovery(id("operation.x")),
+            ),
+            op_task(
+                "operation.x",
+                WriteScope::requirement_repair(id("operation.x")),
+            ),
+            op_task(
+                "operation.y",
+                WriteScope::requirement_discovery(id("operation.y")),
+            ),
+        ];
+
+        let waves = plan_waves(&tasks, &FxHashMap::default(), false);
+
+        assert_eq!(waves, vec![vec![0, 2], vec![1]], "{waves:?}");
     }
 
     // A grant over arbitrary shared symbols (the topology author, the

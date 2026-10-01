@@ -155,7 +155,15 @@ transaction requirement names the transaction it constrains; its key \
 and position must be available when the transaction begins, and a \
 position must be a non-optional int, decimal, or timestamp. Tie each \
 to its origin — an explicit prompt obligation, a strongly implied \
-requirement, or a recommendation. Do not rewrite the program. Prefer \
+requirement, or a recommendation. Find the explicit obligations aimed \
+at this operation with `search_symbols` (`kind: prompt_obligation`, \
+`targets:` this operation) rather than listing them all: a peer \
+mapping its own obligation then cannot invalidate this session. An \
+explicit obligation that a requirement already declared on this \
+operation discharges is mapped by proposing that same requirement \
+again with the obligation as its origin — it is recorded as a \
+duplicate and the obligation becomes mapped. Do \
+not rewrite the program. Prefer \
 the context below and `proof_summary`/`interface` reads over \
 whole-set queries — peers run concurrently and a changed tracked \
 result invalidates this session. Submit each proposal as a \
@@ -167,12 +175,14 @@ result invalidates this session. Submit each proposal as a \
             "\
 ## Your task: requirement repair
 
-Your objective names every unproven requirement of this operation and \
+Your objective names every unproven requirement you repair and \
 carries each one's analyzer obligation verbatim: the structured \
-obstacles tell you exactly which facts are missing. Revise this \
-operation's program once so they become provable together — the \
-obligations interact, and a revision made for one alone can break \
-another — never by deleting or weakening a requirement. Prefer the \
+obstacles tell you exactly which facts are missing. Revise the \
+program — or, when the task grants several operations of one conflict \
+closure, each of their programs, all in one patch — once so they \
+become provable together. The obligations interact, and a revision \
+made for one alone can break another; never delete or weaken a \
+requirement. Prefer the \
 context below over whole-set queries; peers repair concurrently. If \
 the fix needs a downstream or shared change, file a \
 `dependency_request`. Commit one scoped `submit_patch`, or report \
@@ -243,6 +253,20 @@ fn render_bundle(bundle: &ContextBundle) -> String {
         section.push_str("### Your operation\n\n```json\n");
         section.push_str(&pretty(operation));
         section.push_str("\n```\n\n");
+    }
+
+    if !bundle.peer_operations.is_empty() {
+        section.push_str(
+            "### The other operations you repair\n\nThey share a conflict closure with \
+             yours, so one revision across all of them is what proves their obligations \
+             together. Each is yours to rewrite, with replace_operation_program.\n\n",
+        );
+
+        for peer in &bundle.peer_operations {
+            section.push_str("```json\n");
+            section.push_str(&pretty(peer));
+            section.push_str("\n```\n\n");
+        }
     }
 
     if !bundle.shared_symbols.is_empty() {

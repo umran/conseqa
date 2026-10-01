@@ -21,6 +21,7 @@ use crate::spec::{Id, Input, Revision};
 
 use super::analysis::{AnalysisHub, AnalysisPin, AnalysisState};
 use super::auth::{TaskToken, TokenMap};
+use super::candidate::{CandidateVerdict, judge};
 use super::commit::{CommitReceipt, CommitRecord, CommitRejection, CommitRequest, apply_patch};
 use super::events::{EngineEvent, EventBus, InvalidationCause};
 use super::graph_query::{self, GraphQuery, QueryResult};
@@ -59,6 +60,14 @@ pub enum EngineError {
 
     #[error("analysis is not available for revision {} yet", .0.0)]
     AnalysisNotReady(Revision),
+
+    /// An empty report would read as "nothing is open", so a family
+    /// that names nothing is refused rather than matched against none.
+    #[error("unknown requirement family `{family}`; the families are: {}", .accepted.join(", "))]
+    UnknownRequirementFamily {
+        family: String,
+        accepted: Vec<String>,
+    },
 
     #[error("persistence: {0}")]
     Persistence(#[from] PersistenceError),
@@ -143,11 +152,21 @@ pub struct BundleSpec {
     /// obligation becomes bundle evidence. Several, because one repair
     /// task carries every unproven obligation of its operation — they
     /// are discharged by one program and often by one revision.
-    pub requirements: Vec<(super::symbol::RequirementFamily, Option<Id>, usize)>,
+    pub requirements: Vec<BundleRequirement>,
 
     /// Extra shared symbols the scheduler wants included.
     pub include: Vec<SymbolKey>,
+
+    /// Further operations the task writes beside `operation`, each with
+    /// its requirements under repair. A closure-scoped repair edits
+    /// every program of one conflict closure, so each draft enters the
+    /// bundle exactly as `operation`'s does.
+    pub peers: Vec<(Id, Vec<BundleRequirement>)>,
 }
+
+/// A requirement under repair, as a bundle asks for its obligation:
+/// family, the inline transaction for a transaction family, and index.
+pub type BundleRequirement = (super::symbol::RequirementFamily, Option<Id>, usize);
 
 /// A tracked initial context bundle (§23): everything it includes is
 /// recorded in the task's read-set at creation, so prompt context
@@ -160,6 +179,11 @@ pub struct ContextBundle {
     /// The task's operation draft, in full.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub operation: Option<serde_json::Value>,
+
+    /// The drafts of the task's peer operations (`BundleSpec::peers`),
+    /// in full, in the order asked.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub peer_operations: Vec<serde_json::Value>,
 
     pub shared_symbols: Vec<SymbolView>,
 
@@ -235,6 +259,11 @@ pub struct ConfluenceEngine {
 }
 
 impl ConfluenceEngine {
+    /// Whether two handles drive the same engine.
+    pub fn same_engine(&self, other: &ConfluenceEngine) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+
     /// An engine over in-memory persistence, for tests and ephemeral
     /// runs.
     pub fn in_memory(initial: WorkspaceState) -> Result<Self, EngineError> {
@@ -661,6 +690,28 @@ impl ConfluenceEngine {
         let revision = entry.snapshot.revision;
         let state = self.inner.analysis.state(revision);
 
+        // Checked before anything is reported, whatever the analysis
+        // state: a misspelt family must not look like a clean report.
+        // A custom property is a family when the analysis carries it.
+        if let Some(family) = family
+            && !REQUIREMENT_FAMILIES.contains(&family)
+        {
+            let declared = matches!(&state, AnalysisState::Ready(analysis)
+            if analysis.obligations.obligations.iter().any(|obligation| {
+                matches!(&obligation.property, Property::Custom { name } if name == family)
+            }));
+
+            if !declared {
+                return Err(EngineError::UnknownRequirementFamily {
+                    family: family.to_string(),
+                    accepted: REQUIREMENT_FAMILIES
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect(),
+                });
+            }
+        }
+
         let value = match &state {
             AnalysisState::Pending | AnalysisState::Validating | AnalysisState::Verifying => {
                 serde_json::json!({
@@ -990,22 +1041,39 @@ impl ConfluenceEngine {
 
         let mut dependency_summaries = Vec::new();
         let mut operation_view = None;
+        let mut peer_operations = Vec::new();
         let mut analyzer_evidence = Vec::new();
 
-        if let Some(operation) = &spec.operation {
+        let focus = spec
+            .operation
+            .iter()
+            .map(|operation| (operation, &spec.requirements, true))
+            .chain(
+                spec.peers
+                    .iter()
+                    .map(|(operation, requirements)| (operation, requirements, false)),
+            );
+
+        let analysis = self.inner.analysis.state(snapshot.revision);
+
+        for (operation, requirements, primary) in focus {
             let draft = snapshot
                 .workspace
                 .operations
                 .get(operation)
                 .ok_or_else(|| EngineError::UnknownOperation(operation.clone()))?;
 
-            operation_view = Some(serde_json::to_value(draft).expect("draft serializes"));
+            let view = serde_json::to_value(draft).expect("draft serializes");
+
+            if primary {
+                operation_view = Some(view);
+            } else {
+                peer_operations.push(view);
+            }
 
             self.record_operation_inputs(&entry, operation);
 
             shared.extend(slice_shared_symbols(snapshot, operation));
-
-            let analysis = self.inner.analysis.state(snapshot.revision);
 
             let callees: Vec<Id> = snapshot
                 .graph
@@ -1018,6 +1086,13 @@ impl ConfluenceEngine {
                 .collect();
 
             for target in callees {
+                if dependency_summaries
+                    .iter()
+                    .any(|summary: &OperationSummary| summary.operation == target)
+                {
+                    continue;
+                }
+
                 let summary = match &analysis {
                     AnalysisState::Ready(analysis) => analysis.summaries.get(&target).cloned(),
                     _ => None,
@@ -1043,8 +1118,8 @@ impl ConfluenceEngine {
                 }
             }
 
-            if let AnalysisState::Ready(analysis) = self.inner.analysis.state(snapshot.revision) {
-                for (family, transaction, index) in &spec.requirements {
+            if let AnalysisState::Ready(analysis) = &analysis {
+                for (family, transaction, index) in requirements {
                     let id = match transaction {
                         Some(transaction) => {
                             format!("oblig.{operation}.{transaction}.{family}.{index}")
@@ -1096,11 +1171,109 @@ impl ConfluenceEngine {
             task,
             revision: snapshot.revision,
             operation: operation_view,
+            peer_operations,
             shared_symbols,
             dependency_summaries,
             prompt_evidence: entry.spec.prompt_evidence.clone(),
             analyzer_evidence,
         })
+    }
+
+    /// Judges a candidate patch against the task's pinned snapshot
+    /// without committing it (§15 of the System One orchestration
+    /// revision): scope, draft application, assembly, validation and
+    /// verification, exactly as a committed revision would meet them.
+    ///
+    /// Nothing is committed, no event is published, and no task is
+    /// invalidated. The pipeline runs on a blocking worker.
+    ///
+    /// A verdict is a fact its caller relies on, so it is observed like
+    /// any other. `roots` names the transactions, as `(operation,
+    /// transaction)`, whose obligations the caller will read off the
+    /// verdict. For each, the read-set records the program and
+    /// requirements of every operation in its conflict closure, and who
+    /// reads and writes every object that closure accesses — so a
+    /// changed member invalidates the task, and so does a new one. The
+    /// patch's own references are recorded as a context bundle would.
+    pub async fn evaluate_candidate(
+        &self,
+        task: TaskId,
+        patch: &SpecPatch,
+        roots: &[(Id, Id)],
+    ) -> Result<CandidateVerdict, EngineError> {
+        let entry = self.active_entry(task)?;
+
+        if let Some(attempted) = patch
+            .mutations
+            .iter()
+            .find_map(|mutation| entry.spec.write_scope.violation(mutation))
+        {
+            return Ok(CandidateVerdict {
+                scope_violation: Some(attempted),
+                ..Default::default()
+            });
+        }
+
+        let workspace = (*entry.snapshot.workspace).clone();
+
+        let (verdict, footprint) = {
+            let patch = patch.clone();
+            let roots = roots.to_vec();
+
+            match tokio::task::spawn_blocking(move || judge(workspace, &patch, &roots)).await {
+                Ok(judged) => judged,
+
+                Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
+
+                // The runtime is going away under the caller.
+                Err(_) => return Err(EngineError::Shutdown),
+            }
+        };
+
+        let snapshot = &entry.snapshot;
+
+        for operation in &footprint.operations {
+            if snapshot.workspace.operations.contains_key(operation) {
+                self.record_operation_inputs(&entry, operation);
+            }
+        }
+
+        let mut read_set = entry.read_set.lock();
+
+        for (data_model, object) in footprint.objects {
+            for query in [
+                GraphQuery::Readers {
+                    data_model: data_model.clone(),
+                    object: object.clone(),
+                    field: None,
+                },
+                GraphQuery::Writers {
+                    data_model: data_model.clone(),
+                    object: object.clone(),
+                    field: None,
+                },
+            ] {
+                let result = graph_query::run(&snapshot.workspace, &snapshot.graph, &query);
+
+                read_set.record_query(QueryObservation::graph(query, result.fingerprint));
+            }
+        }
+
+        for reference in patch.external_references() {
+            if let Some(node) = snapshot.graph.node(&reference) {
+                read_set.record_symbol(
+                    reference,
+                    SymbolObservation {
+                        version: node.version,
+                        fingerprint: node.fingerprint,
+                    },
+                );
+            }
+        }
+
+        drop(read_set);
+
+        Ok(verdict)
     }
 
     fn entry(&self, task: TaskId) -> Result<Arc<TaskEntry>, EngineError> {
@@ -1849,6 +2022,17 @@ fn requirement_content(
         }
     }
 }
+
+/// The requirement families a report can be restricted to, as
+/// `requirement_report` spells them. They are the DSL's own names: the
+/// v3 `serialization` and `ordering` have no alias.
+pub const REQUIREMENT_FAMILIES: [&str; 5] = [
+    "transaction_serializability",
+    "transaction_ordering",
+    "idempotency",
+    "result_replay",
+    "recoverability",
+];
 
 fn property_matches(property: &Property, family: &str) -> bool {
     match property {

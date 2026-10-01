@@ -28,6 +28,7 @@ use conseqa::confluence::{
 };
 use conseqa::harness::backend::InvocationBudget;
 use conseqa::harness::backends::{ClaudeCliBackend, CodexCliBackend};
+use conseqa::harness::HandOffBackend;
 use conseqa::harness::{
     AgentBackend, RunReport, Scheduler, SchedulerPolicy, Supervisor, Workflow, WorkflowConfig,
 };
@@ -84,6 +85,9 @@ enum Command {
         /// Where a triggered workflow writes its finalized artifacts.
         #[arg(long, default_value = ".conseqa/design")]
         design_out: PathBuf,
+
+        #[command(flatten)]
+        system_one: SystemOne,
     },
 
     /// Run one shared server hosting many projects, for global use from
@@ -115,6 +119,9 @@ enum Command {
         /// Maximum worker agents reasoning concurrently in a fanout.
         #[arg(long, default_value_t = 4)]
         max_agents: usize,
+
+        #[command(flatten)]
+        system_one: SystemOne,
     },
 
     /// Serve one shared multi-project instance over stdio, for the
@@ -137,6 +144,9 @@ enum Command {
         /// Maximum worker agents reasoning concurrently in a fanout.
         #[arg(long, default_value_t = 4)]
         max_agents: usize,
+
+        #[command(flatten)]
+        system_one: SystemOne,
     },
 
     /// Print the persisted head, tasks, and commit count.
@@ -172,7 +182,7 @@ async fn main() -> ExitCode {
         )
         .init();
 
-    let cli = Cli::parse();
+    let cli = Cli::parse_from(with_stdio_args_file(std::env::args().collect()));
 
     let outcome = match cli.command {
         Command::Serve {
@@ -185,6 +195,7 @@ async fn main() -> ExitCode {
             backend_program,
             max_agents,
             design_out,
+            system_one,
         } => {
             serve(ServeOptions {
                 database,
@@ -196,6 +207,7 @@ async fn main() -> ExitCode {
                 backend_program,
                 max_agents,
                 design_out,
+                system_one,
             })
             .await
         }
@@ -206,6 +218,7 @@ async fn main() -> ExitCode {
             backend,
             backend_program,
             max_agents,
+            system_one,
         } => {
             serve_global(GlobalOptions {
                 data_dir: PathBuf::from(data_dir),
@@ -214,6 +227,7 @@ async fn main() -> ExitCode {
                 backend,
                 backend_program,
                 max_agents,
+                system_one,
             })
             .await
         }
@@ -222,12 +236,14 @@ async fn main() -> ExitCode {
             backend,
             backend_program,
             max_agents,
+            system_one,
         } => {
             serve_stdio_cmd(StdioOptions {
                 data_dir: PathBuf::from(data_dir),
                 backend,
                 backend_program,
                 max_agents,
+                system_one,
             })
             .await
         }
@@ -247,6 +263,74 @@ async fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// Where `stdio` reads extra flags from: one flag or value per line,
+/// `#` comments allowed. A desktop client owns its own config file and
+/// may rewrite it at any time, so settings that must survive that live
+/// here instead, in a file only a person writes. `CONSEQA_STDIO_ARGS`
+/// names another file (`/dev/null` for none).
+fn stdio_args_file() -> PathBuf {
+    if let Some(path) = std::env::var_os("CONSEQA_STDIO_ARGS") {
+        return PathBuf::from(path);
+    }
+
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+
+    PathBuf::from(home).join(".conseqa/stdio.args")
+}
+
+/// Appends the flags in [`stdio_args_file`] to a `stdio` invocation.
+/// Flags given on the command line come first; clap rejects a flag
+/// given twice, so a conflict is loud rather than silently resolved.
+fn with_stdio_args_file(mut argv: Vec<String>) -> Vec<String> {
+    if argv.get(1).map(String::as_str) != Some("stdio") {
+        return argv;
+    }
+
+    let path = stdio_args_file();
+
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return argv;
+    };
+
+    let extra: Vec<String> = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(str::to_string)
+        .collect();
+
+    if !extra.is_empty() {
+        eprintln!("note: stdio flags from {}: {}", path.display(), extra.join(" "));
+        argv.extend(extra);
+    }
+
+    argv
+}
+
+/// The `claude` executable when none was named. A desktop app starts
+/// its servers with a minimal PATH that rarely includes the user's
+/// install, so the usual install locations are tried after PATH.
+fn default_claude_program() -> Option<String> {
+    let on_path = std::env::var_os("PATH").is_some_and(|path| {
+        std::env::split_paths(&path).any(|dir| dir.join("claude").is_file())
+    });
+
+    if on_path {
+        return None;
+    }
+
+    let home = std::env::var("HOME").unwrap_or_default();
+
+    [
+        format!("{home}/.local/bin/claude"),
+        format!("{home}/.claude/local/claude"),
+        "/opt/homebrew/bin/claude".to_string(),
+        "/usr/local/bin/claude".to_string(),
+    ]
+    .into_iter()
+    .find(|candidate| std::path::Path::new(candidate).is_file())
 }
 
 fn initial_workspace(
@@ -278,6 +362,36 @@ enum Backend {
     Codex,
 }
 
+/// The System One layer of a triggered design run (§26 of the System
+/// One orchestration revision): the same flags `conseqa-harness design`
+/// takes. Nothing is enabled unless they say so.
+#[cfg(feature = "system-one")]
+type SystemOne = conseqa::harness::executors::cli::SystemOneArgs;
+
+/// Without the feature the flags do not exist, and the layer is off.
+#[cfg(not(feature = "system-one"))]
+#[derive(clap::Args, Debug, Clone)]
+struct SystemOne {}
+
+#[cfg(feature = "system-one")]
+type DesignExecutor = Option<conseqa::harness::executors::cli::Executor>;
+
+#[cfg(not(feature = "system-one"))]
+type DesignExecutor = ();
+
+/// Validates the settings, and says what a design run will send where.
+/// Called before anything is opened or served: a daemon must not come
+/// up on settings that are wrong.
+#[cfg(feature = "system-one")]
+fn design_executor(system_one: &SystemOne) -> Result<DesignExecutor, String> {
+    system_one.configure()
+}
+
+#[cfg(not(feature = "system-one"))]
+fn design_executor(_: &SystemOne) -> Result<DesignExecutor, String> {
+    Ok(())
+}
+
 struct ServeOptions {
     database: PathBuf,
     bind: SocketAddr,
@@ -288,9 +402,12 @@ struct ServeOptions {
     backend_program: Option<String>,
     max_agents: usize,
     design_out: PathBuf,
+    system_one: SystemOne,
 }
 
 async fn serve(options: ServeOptions) -> Result<(), String> {
+    let executor = design_executor(&options.system_one)?;
+
     let initial = initial_workspace(options.model, options.prompt)?;
 
     let engine = ConfluenceEngine::open(&options.database, initial)
@@ -305,6 +422,7 @@ async fn serve(options: ServeOptions) -> Result<(), String> {
 
     let launcher: Arc<dyn DesignLauncher> = Arc::new(DaemonDesignLauncher {
         backend,
+        executor,
         mcp_url: Arc::clone(&mcp_url),
         out_dir: options.design_out,
         max_agents: options.max_agents.max(1),
@@ -364,6 +482,7 @@ struct GlobalOptions {
     backend: Backend,
     backend_program: Option<String>,
     max_agents: usize,
+    system_one: SystemOne,
 }
 
 /// Where design-run artifacts go: a sibling of the projects directory,
@@ -427,6 +546,8 @@ fn load_or_create_api_key(
 }
 
 async fn serve_global(options: GlobalOptions) -> Result<(), String> {
+    let executor = design_executor(&options.system_one)?;
+
     std::fs::create_dir_all(&options.data_dir)
         .map_err(|error| format!("cannot create {}: {error}", options.data_dir.display()))?;
 
@@ -440,6 +561,7 @@ async fn serve_global(options: GlobalOptions) -> Result<(), String> {
 
     let launcher: Arc<dyn DesignLauncher> = Arc::new(DaemonDesignLauncher {
         backend,
+        executor,
         mcp_url: Arc::clone(&mcp_url),
         out_dir: design_runs_root(&options.data_dir),
         max_agents: options.max_agents.max(1),
@@ -527,9 +649,12 @@ struct StdioOptions {
     backend: Backend,
     backend_program: Option<String>,
     max_agents: usize,
+    system_one: SystemOne,
 }
 
 async fn serve_stdio_cmd(options: StdioOptions) -> Result<(), String> {
+    let executor = design_executor(&options.system_one)?;
+
     std::fs::create_dir_all(&options.data_dir)
         .map_err(|error| format!("cannot create {}: {error}", options.data_dir.display()))?;
 
@@ -544,6 +669,7 @@ async fn serve_stdio_cmd(options: StdioOptions) -> Result<(), String> {
 
     let launcher: Arc<dyn DesignLauncher> = Arc::new(DaemonDesignLauncher {
         backend,
+        executor,
         mcp_url: Arc::clone(&mcp_url),
         out_dir: design_runs_root(&options.data_dir),
         max_agents: options.max_agents.max(1),
@@ -583,7 +709,7 @@ fn build_backend(backend: Backend, program: Option<String>) -> Arc<dyn AgentBack
         Backend::Claude => {
             let mut claude = ClaudeCliBackend::new();
 
-            if let Some(program) = program {
+            if let Some(program) = program.or_else(default_claude_program) {
                 claude = claude.with_program(program);
             }
 
@@ -621,10 +747,42 @@ struct DesignState {
 /// workers connecting back to this daemon's MCP endpoint.
 struct DaemonDesignLauncher {
     backend: Arc<dyn AgentBackend>,
+
+    /// The in-process builders put in front of `backend`, per run.
+    /// Without the feature there are none, and nothing reads this.
+    #[cfg_attr(not(feature = "system-one"), allow(dead_code))]
+    executor: DesignExecutor,
     mcp_url: Arc<RwLock<String>>,
     out_dir: PathBuf,
     max_agents: usize,
     state: Arc<DesignState>,
+}
+
+impl DaemonDesignLauncher {
+    /// The backend of one design run: the agent backend, behind the
+    /// System One builders when they are configured. A builder acts on
+    /// one engine, and each run has its own project's.
+    fn backend_for(&self, engine: &ConfluenceEngine) -> Arc<dyn AgentBackend> {
+        self.builders_over(engine, Arc::clone(&self.backend))
+    }
+
+    /// `fallback`, behind the System One builders when they are
+    /// configured.
+    fn builders_over(
+        &self,
+        engine: &ConfluenceEngine,
+        fallback: Arc<dyn AgentBackend>,
+    ) -> Arc<dyn AgentBackend> {
+        #[cfg(feature = "system-one")]
+        if let Some(executor) = &self.executor {
+            return executor.wrap(engine, fallback);
+        }
+
+        #[cfg(not(feature = "system-one"))]
+        let _ = engine;
+
+        fallback
+    }
 }
 
 impl DesignLauncher for DaemonDesignLauncher {
@@ -656,7 +814,7 @@ impl DesignLauncher for DaemonDesignLauncher {
 
         let supervisor = Supervisor::new(
             engine.clone(),
-            Arc::clone(&self.backend),
+            self.backend_for(&engine),
             mcp_url,
             None,
             work_dir,
@@ -721,9 +879,134 @@ impl DesignLauncher for DaemonDesignLauncher {
             "started_at_revision": started_revision,
             "note": "One worker per unfinished operation is now running in the background \
                      against this shared model. Do not submit patches while the run is \
-                     active — poll spec_status, whose design block shows running and, when \
-                     finished, the run's report. Then call open_project again to refresh \
-                     your session to the new head before reading or patching.",
+                     active — call await_design, which blocks until the run finishes (call \
+                     it again if it returns finished false) and returns the run's report. \
+                     Then call open_project again to refresh your session to the new head \
+                     before reading or patching.",
+        }))
+    }
+
+    fn build(
+        &self,
+        engine: ConfluenceEngine,
+        objective: Option<String>,
+    ) -> Result<futures::future::BoxFuture<'static, serde_json::Value>, String> {
+        if self
+            .state
+            .running
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return Err("a design workflow is already running on this server".to_string());
+        }
+
+        // No session is ever started, so no worker needs the endpoint.
+        let hand_off = HandOffBackend::new(engine.clone());
+
+        let supervisor = Supervisor::new(
+            engine.clone(),
+            self.builders_over(&engine, Arc::new(hand_off.clone())),
+            "http://127.0.0.1:0/mcp",
+            None,
+            self.out_dir.join("work"),
+        );
+
+        // One task at a time: the builders take milliseconds to
+        // seconds, and running them in order keeps every one against
+        // the head its predecessor committed.
+        let scheduler = Scheduler::new(
+            engine.clone(),
+            supervisor,
+            SchedulerPolicy {
+                max_concurrent_agents: 1,
+                // A handed-off task commits nothing and would be
+                // retried; one retry still covers a builder that lost an
+                // OCC race.
+                max_attempts: 2,
+                ..Default::default()
+            },
+        );
+
+        let run_name = engine.head_snapshot().workspace.run_meta.run.0.clone();
+
+        let workflow = Workflow::new(
+            scheduler,
+            WorkflowConfig {
+                out_dir: self.out_dir.join(&run_name),
+                analysis_timeout: Duration::from_secs(180),
+                max_iterations: 8,
+                objective,
+            },
+        )
+        .with_halt(hand_off.halt());
+
+        let started_revision = engine.head_revision().0;
+        let state = Arc::clone(&self.state);
+
+        *state.started_at_revision.lock() = Some(started_revision);
+        *state.last_error.lock() = None;
+
+        // Spawned, so a client that gives up on the call does not drop
+        // the run halfway and leave the server marked busy.
+        let run = tokio::spawn(async move {
+            let started = std::time::Instant::now();
+            let result = workflow.run().await;
+
+            let body = match &result {
+                Ok(report) => {
+                    *state.last_report.lock() = Some(report.clone());
+                    serde_json::json!({ "built": true, "report": report })
+                }
+                Err(error) => {
+                    *state.last_error.lock() = Some(error.to_string());
+                    serde_json::json!({ "built": false, "error": error.to_string() })
+                }
+            };
+
+            state.running.store(false, Ordering::SeqCst);
+
+            (body, started.elapsed())
+        });
+
+        Ok(Box::pin(async move {
+            let (mut body, elapsed) = match run.await {
+                Ok(done) => done,
+                Err(error) => (
+                    serde_json::json!({ "built": false, "error": error.to_string() }),
+                    Duration::ZERO,
+                ),
+            };
+
+            let handed = hand_off.handed();
+
+            if let Some(object) = body.as_object_mut() {
+                object.insert(
+                    "started_at_revision".to_string(),
+                    serde_json::json!(started_revision),
+                );
+                object.insert(
+                    "elapsed_secs".to_string(),
+                    serde_json::json!(elapsed.as_secs_f64().round()),
+                );
+                object.insert(
+                    "guidance".to_string(),
+                    serde_json::json!(if handed.is_empty() {
+                        "Nothing was handed back. If the report's status is not success, \
+                         spec_status names what is unproven or invalid: fix it with \
+                         submit_patch and call build_design again."
+                    } else {
+                        "Each hand-off is work code could not settle, with what the builder \
+                         established. Resolve them with submit_patch — fix a sketch that does \
+                         not compile, write a program the vocabulary cannot express, declare \
+                         or decline an unsure requirement, repair an unproven transaction — \
+                         then call build_design again. The build stopped at the first phase \
+                         that handed work back, so later phases have not run yet."
+                    }),
+                );
+                object.insert("hand_offs".to_string(), serde_json::json!(handed));
+            }
+
+            body
         }))
     }
 

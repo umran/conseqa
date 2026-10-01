@@ -164,6 +164,7 @@ export function blockTerminates(block: OperationBlock): boolean {
   switch (last.kind) {
     case "return":
     case "complete":
+    case "abandon":
       return true;
     case "match_result":
       return blockTerminates(last.ok) && Object.values(last.errors).every(blockTerminates);

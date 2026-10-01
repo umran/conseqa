@@ -526,6 +526,13 @@ function ProgramSummary({ opId, block, depth = 0, startIndex = 0 }: {
             <span className="text-kumo-subtle">complete</span>
           </li>
         );
+      case "abandon":
+        return (
+          <li key={i} className="flex items-start gap-2 text-xs">
+            {number}
+            <Tag variant="warning">abandon</Tag>
+          </li>
+        );
     }
   });
 
@@ -1219,6 +1226,11 @@ function StepDetail({ opId, location }: { opId: Id; location: string }) {
       return (
         <Frame kind="program step" title="complete" subtitle={sub}
           description="Terminates the execution without a returned value, as is natural for a subscription-driven operation." />
+      );
+    case "abandon":
+      return (
+        <Frame kind="program step" title="abandon" subtitle={sub}
+          description="Ends a message-triggered attempt without completing it: the message stays unacknowledged or pending, and another attempt is admitted. Nothing before it is rolled back; the next attempt re-encounters it." />
       );
     case "transaction": {
       const tx = step.transaction;

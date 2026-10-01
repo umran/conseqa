@@ -315,6 +315,7 @@ export function operationBindings(opId: Id, op: Operation): OperationBindings {
         derivation(step.outcome.values, location);
         break;
       case "complete":
+      case "abandon":
         break;
     }
   }
