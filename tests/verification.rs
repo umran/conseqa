@@ -4366,3 +4366,131 @@ fn a_present_over_a_required_path_is_valid_and_noted() {
         "{notes:#?}"
     );
 }
+
+/// A retryable error bubbles up a request chain without costing
+/// replayability. `transfer_stock` charges an external boundary whose
+/// decline is retryable and passes it on as its own retryable
+/// `rejected`; `rebalance` requests `transfer_stock` and passes that on
+/// in turn. At every hop the retryable return is an attempt-level
+/// outcome — exempt from result replay — and the decision on it only
+/// returns, so it adds no work for idempotency to judge.
+#[test]
+fn a_retryable_error_bubbles_up_a_request_chain_and_every_hop_still_replays() {
+    use conseqa::spec::{IdempotencyKeyPropagation, RequestEffect, RequestTarget, RetrySemantics};
+
+    let mut model = load_flash_checkout();
+
+    charge_transfer_externally(&mut model, ErrorDisposition::Retryable);
+
+    let transfer = model
+        .operations
+        .get_mut(&id("operation.transfer_stock"))
+        .unwrap();
+
+    let Some(Input::Request(request)) = transfer
+        .inputs
+        .get_mut(&id("input.transfer_stock.request"))
+    else {
+        panic!("transfer_stock takes a request");
+    };
+
+    request
+        .result
+        .errors
+        .get_mut(&id("rejected"))
+        .unwrap()
+        .disposition = ErrorDisposition::Retryable;
+
+    let mut caller = model.operations[&id("operation.transfer_stock")].clone();
+    let contract = caller
+        .inputs
+        .remove(&id("input.transfer_stock.request"))
+        .unwrap();
+
+    caller
+        .inputs
+        .insert(id("input.rebalance.request"), contract);
+
+    caller.program = block(vec![
+        execute(
+            "effect.rebalance.transfer",
+            Effect::Request(RequestEffect {
+                target: RequestTarget {
+                    operation: id("operation.transfer_stock"),
+                    input: id("input.transfer_stock.request"),
+                },
+                schema: id("schema.TransferStockRequest"),
+                retry: RetrySemantics::MayRepeat,
+                idempotency_key_propagation: vec![IdempotencyKeyPropagation {
+                    source: ikey("input.rebalance.request", &[&["sku"]]),
+                    target: IdempotencyKey {
+                        components: vec![ValueRef {
+                            source: ValueSource::Effect(id("effect.rebalance.transfer")),
+                            path: path(&["sku"]),
+                        }],
+                    },
+                }],
+            }),
+            deterministic(vec![input_key("input.rebalance.request", &["sku"])]),
+            Some("result.rebalance.transfer"),
+        ),
+        OperationStep::MatchResult(MatchResult {
+            result: id("result.rebalance.transfer"),
+            ok: block(vec![return_ok(
+                "input.rebalance.request",
+                deterministic(vec![ValueRef {
+                    source: ValueSource::EffectResultOk(id("result.rebalance.transfer")),
+                    path: path(&["accepted"]),
+                }]),
+            )]),
+            errors: BTreeMap::from([(
+                id("rejected"),
+                block(vec![return_err(
+                    "input.rebalance.request",
+                    "rejected",
+                    deterministic(vec![ValueRef {
+                        source: ValueSource::EffectResultErr(id("result.rebalance.transfer")),
+                        path: path(&["reason"]),
+                    }]),
+                )]),
+            )]),
+        }),
+    ]);
+
+    caller.requirements.idempotency = vec![IdempotencyRequirement {
+        key: ikey("input.rebalance.request", &[&["sku"]]),
+        result: ResultReplayRequirement::ReplayConsistent,
+    }];
+    caller.requirements.recoverability.clear();
+
+    model.operations.insert(id("operation.rebalance"), caller);
+
+    assert!(validation::validate(&model).is_empty());
+
+    for operation in ["operation.transfer_stock", "operation.rebalance"] {
+        let requirement = model.operations[&id(operation)]
+            .requirements
+            .idempotency
+            .len()
+            - 1;
+
+        let replay = result_replay_verdict(&model, operation, requirement);
+
+        let ResultReplayVerdict::Proven {
+            proof: ResultReplayProof::ClassFixedResult { retryable, .. },
+            ..
+        } = &replay
+        else {
+            panic!("{operation}: {replay:#?}");
+        };
+
+        assert_eq!(retryable.len(), 1, "{operation}: the bubbled return is exempt");
+
+        let idempotency = idempotency_verdict(&model, operation, requirement);
+
+        assert!(
+            matches!(idempotency, IdempotencyVerdict::Proven { .. }),
+            "{operation}: {idempotency:#?}"
+        );
+    }
+}
