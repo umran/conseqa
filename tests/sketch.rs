@@ -144,6 +144,17 @@ fn a_broken_sketch_says_what_is_wrong() {
             ]}),
             "which no find before it names",
         ),
+        (
+            // The first Desktop run's mistake: a rejection handler that
+            // its transition's own refusal always pre-empts.
+            serde_json::json!({ "steps": [
+                { "kind": "find", "as": "order", "record": "object.order",
+                  "by": { "order_id": "input.order_id" } },
+                { "kind": "transition", "record": "order", "transition": "transition.order.ship",
+                  "otherwise": "not_shippable" }
+            ], "on_rejected": [ { "kind": "reject", "error": "order_not_found" } ] }),
+            "`on_rejected` never applies",
+        ),
     ] {
         let mut draft: DraftOperation = workspace.operations[&id("operation.ship_order")].clone();
 

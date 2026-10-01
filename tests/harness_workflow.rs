@@ -3897,6 +3897,92 @@ mod system_one {
         std::fs::remove_dir_all(&out_dir).ok();
     }
 
+    /// Discovery runs once per operation per run. A discovery the
+    /// decider is unsure of goes to a session, which may propose nothing;
+    /// the operation then still looks undiscovered, and every later pass
+    /// of the fixpoint used to schedule it again — on the first Desktop
+    /// run, the same operation's question was asked ten times.
+    #[tokio::test]
+    async fn an_unsure_discovery_is_not_repeated_on_every_pass() {
+        let mut workspace = workspace_of(&authored("shop.yaml"), "A small shop backend.");
+
+        for (operation, sketch) in common::sketches::shop_sketches() {
+            let draft = workspace
+                .operations
+                .get_mut(&id(operation))
+                .expect("the operation");
+
+            draft.program = None;
+            draft.requirements = Default::default();
+            draft.sketch = Some(serde_json::from_value(sketch).expect("parses"));
+        }
+
+        let opinions = Opinions::default()
+            .stating("fidelity", 0.92)
+            .stating("idempotency", 0.5);
+
+        let engine = ConfluenceEngine::in_memory(workspace).expect("engine starts");
+        let seen = Seen::default();
+        let idle: ScriptFn = Arc::new(|_, _| Box::pin(async {}));
+
+        let backend = Arc::new(SystemOneBackend::new(
+            engine.clone(),
+            Arc::new(opinions.clone()),
+            conseqa::harness::executors::BUILDABLE,
+            Arc::new(ScriptedBackend {
+                engine: engine.clone(),
+                script: recording(idle, seen.clone()),
+            }),
+        ));
+
+        let out_dir = scratch();
+
+        let supervisor = Supervisor::new(
+            engine.clone(),
+            backend,
+            "http://127.0.0.1:0/mcp",
+            None,
+            out_dir.join("work"),
+        );
+
+        let scheduler = Scheduler::new(engine.clone(), supervisor, SchedulerPolicy::default());
+
+        let workflow = Workflow::new(
+            scheduler,
+            WorkflowConfig {
+                out_dir: out_dir.clone(),
+                analysis_timeout: Duration::from_secs(20),
+                max_iterations: 8,
+                objective: None,
+            },
+        );
+
+        workflow.run().await.expect("the workflow runs");
+
+        let manifest = manifest_of(&out_dir);
+
+        let mut per_operation: BTreeMap<String, usize> = BTreeMap::new();
+
+        for record in records(&manifest, "requirement_discovery") {
+            *per_operation
+                .entry(
+                    record["operation"]
+                        .as_str()
+                        .expect("an operation")
+                        .to_string(),
+                )
+                .or_default() += 1;
+        }
+
+        assert_eq!(per_operation.len(), 5, "{manifest}");
+        assert!(
+            per_operation.values().all(|count| *count == 1),
+            "{per_operation:?}"
+        );
+
+        std::fs::remove_dir_all(&out_dir).ok();
+    }
+
     /// The guard: a sketch whose program plainly contradicts the
     /// operation's description goes to a session, told why.
     #[tokio::test]

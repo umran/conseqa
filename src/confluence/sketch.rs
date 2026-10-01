@@ -811,6 +811,9 @@ struct Compiler<'a> {
 
     /// The isolation a step declared for the open transaction.
     segment_isolation: Option<TransactionIsolation>,
+
+    /// Whether any transaction's rejection ran `on_rejected`.
+    on_rejected_used: bool,
 }
 
 impl Compiler<'_> {
@@ -1756,6 +1759,7 @@ fn compile_inner(
         on_rejected: Vec::new(),
         key_override: None,
         segment_isolation: None,
+        on_rejected_used: false,
     };
 
     if !is_simple(sketch, symbols) {
@@ -2812,6 +2816,15 @@ impl Compiler<'_> {
 
         let (steps, _) = self.block(&sketch.steps, &returns, true, sketch)?;
 
+        if !sketch.on_rejected.is_empty() && !self.on_rejected_used {
+            return fail(
+                "`on_rejected` never applies: every transaction that can be refused here already \
+                 returns its transition's `otherwise` error, and a transaction no guard can refuse \
+                 is never rejected (creating a record whose identity exists is not a rejection). \
+                 Drop it, or drop the `otherwise` it would replace",
+            );
+        }
+
         Ok(OperationBlock { steps })
     }
 
@@ -2976,6 +2989,8 @@ impl Compiler<'_> {
                 steps: vec![refused(&self.context, refusal)],
             })
         } else if !self.on_rejected.is_empty() {
+            self.on_rejected_used = true;
+
             let steps = self.on_rejected.clone();
 
             let course = OperationSketch {

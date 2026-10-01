@@ -194,7 +194,7 @@ pub fn refusal(errors: &[(String, String)]) -> Question {
 
 pub const FIDELITY: QuestionSpec = QuestionSpec {
     id: "synthesis.fidelity",
-    version: 1,
+    version: 2,
     decides: "whether a program compiled from its author's sketch does what the operation is \
               described to do",
 };
@@ -206,20 +206,23 @@ pub const FIDELITY: QuestionSpec = QuestionSpec {
 pub fn fidelity() -> Question {
     Question::noul_with_criteria(
         json!({
-            "question": "Does `program` do what `operation.description` says the operation \
-                         does?",
-            "focus": "Compare the work: which records are found, changed or created, and which \
-                      lifecycle change is applied. Ignore wording, and ignore mechanics the \
-                      description does not mention — version checks, deduplication, reading a \
-                      record before deciding.",
+            "question": "Does `program` do the work `operation.description` says the \
+                         operation does?",
+            "focus": "Compare the actions only: which records are found, changed, created or \
+                      deleted, which lifecycle change is applied, which messages are sent and \
+                      which errors are returned. A description also states guarantees — at most \
+                      one, only once, never twice, a retry does not repeat — and those are \
+                      proven separately by a verifier: a guarantee the program does not spell \
+                      out is not missing work. Ignore wording, and mechanics such as version \
+                      checks or reading a record before deciding.",
         }),
         json!({
             "what": "The program does the work the description states, and nothing it \
                      contradicts.",
         }),
         json!({
-            "what": "The program leaves out work the description states, or does work it \
-                     contradicts.",
+            "what": "The program leaves out an action the description states, or does one it \
+                     contradicts — a different record, a missing change, the wrong transition.",
         }),
     )
 }

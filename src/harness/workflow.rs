@@ -117,6 +117,13 @@ pub struct Workflow {
 
     /// When `run` began, for the manifest's wall time.
     started: std::sync::OnceLock<std::time::Instant>,
+
+    /// Operations whose requirements were discovered in this run. A
+    /// discovery that proposes nothing leaves the operation looking
+    /// undiscovered, and the fixpoint would schedule it — a session, or
+    /// the same unsure question — on every pass; once per run is what
+    /// discovery is for.
+    discovered: parking_lot::Mutex<std::collections::BTreeSet<Id>>,
 }
 
 impl Workflow {
@@ -125,6 +132,7 @@ impl Workflow {
             scheduler,
             config,
             started: std::sync::OnceLock::new(),
+            discovered: Default::default(),
         }
     }
 
@@ -426,7 +434,8 @@ impl Workflow {
                 let wanted = requirements_empty(draft)
                     || unmapped_obligation_targets(&head.workspace).contains(operation);
 
-                wanted.then(|| self.discovery_task(operation.clone()))
+                (wanted && self.discovered.lock().insert(operation.clone()))
+                    .then(|| self.discovery_task(operation.clone()))
             })
             .await?;
 
@@ -645,6 +654,7 @@ impl Workflow {
                 .operations
                 .iter()
                 .filter(|(id, draft)| requirements_empty(draft) || unmapped.contains(id))
+                .filter(|(id, _)| self.discovered.lock().insert((*id).clone()))
                 .map(|(id, _)| id.clone())
                 .collect()
         };

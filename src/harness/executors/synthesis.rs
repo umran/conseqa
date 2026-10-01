@@ -500,12 +500,72 @@ fn tracked_symbols(context: &BuildContext<'_>) -> Result<sketch::Symbols, Engine
 
 /// The program, in words: what a fidelity judgment compares with the
 /// description.
-fn in_words(program: &OperationBlock) -> Vec<String> {
+fn in_words(program: &OperationBlock, symbols: &sketch::Symbols) -> Vec<String> {
     let mut words: Vec<String> = program
         .transactions()
         .into_iter()
         .filter_map(|(_, transaction)| super::describe::summarize(transaction))
         .collect();
+
+    // The facts behind the guarantees a description states, so a
+    // guarantee the program keeps is not read as work it leaves out.
+    for (_, transaction) in program.transactions() {
+        if let IdempotencyGuarantee::DeduplicatedBy { key } = &transaction.idempotency {
+            words.push(format!(
+                "a retry with the same {} resolves the earlier commit instead of acting again",
+                key.components
+                    .iter()
+                    .map(|component| format!("`{}`", component.path.0.join(".")))
+                    .collect::<Vec<_>>()
+                    .join(" and ")
+            ));
+        }
+
+        for step in &transaction.steps {
+            // What a transition sends, by its declaration.
+            if let TransactionStep::Transition(applied) = step
+                && let Some(declared) = symbols
+                    .machines
+                    .get(&applied.machine)
+                    .and_then(|machine| machine.transitions.get(&applied.transition))
+            {
+                for effect in declared.effects.values() {
+                    let crate::spec::TransitionEffect::OutboxWrite(write) = effect;
+
+                    words.push(format!(
+                        "applying `{}` admits a `{}` message to `{}`",
+                        applied.transition, write.schema, write.outbox
+                    ));
+                }
+
+                for effect in declared.side_effects.values() {
+                    if let crate::spec::TransitionSideEffect::Publication(publication) = effect {
+                        words.push(format!(
+                            "applying `{}` publishes a `{}` message to `{}`",
+                            applied.transition, publication.schema, publication.topic
+                        ));
+                    }
+                }
+            }
+
+            if let TransactionStep::Insert(insert) = step
+                && let Some((_, data)) = symbols.objects.get(&insert.object)
+            {
+                words.push(format!(
+                    "a `{}` is identified by {}, so a second one with the same values cannot \
+                     be created",
+                    insert.object,
+                    data.identity
+                        .iter()
+                        .map(|field| format!("`{}`", field.0.join(".")))
+                        .collect::<Vec<_>>()
+                        .join(" and ")
+                ));
+            }
+        }
+    }
+
+    words.dedup();
 
     fn outcomes(block: &OperationBlock, into: &mut BTreeSet<String>) {
         for step in &block.steps {
@@ -577,7 +637,7 @@ async fn from_sketch(
     let mut request = DecisionRequest::new(json!({
         "prompt": prompt,
         "operation": { "id": operation, "description": draft.description },
-        "program": in_words(&program),
+        "program": in_words(&program, &symbols),
         "errors": open.iter().flat_map(|choice| match choice {
             sketch::Open::Refusal { errors, .. } => errors.clone(),
             sketch::Open::CursorRule { .. } => Vec::new(),
@@ -648,7 +708,7 @@ async fn from_sketch(
                 "the program compiled from the sketch does not do what the operation is \
                  described to do ({probability:.2})"
             ))
-            .with_findings(in_words(&program)),
+            .with_findings(in_words(&program, &symbols)),
         ));
     }
 
