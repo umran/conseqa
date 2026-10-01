@@ -409,7 +409,26 @@ impl Workflow {
             })
             .collect();
 
-        self.scheduler.run_many(tasks).await?;
+        // Discovery is chained onto each synthesis: it needs only that
+        // operation's program and the obligations aimed at it, so it
+        // starts as soon as the program commits instead of waiting for
+        // the slowest peer. Whatever it leaves is picked up by the
+        // fixpoint's discovery phase as before.
+        self.scheduler
+            .run_many_then(tasks, |task, _| {
+                let operation = task.bundle.operation.as_ref()?;
+
+                let head = self.engine().head_snapshot();
+                let draft = head.workspace.operations.get(operation)?;
+
+                draft.program.as_ref()?;
+
+                let wanted = requirements_empty(draft)
+                    || unmapped_obligation_targets(&head.workspace).contains(operation);
+
+                wanted.then(|| self.discovery_task(operation.clone()))
+            })
+            .await?;
 
         Ok(())
     }
@@ -632,19 +651,7 @@ impl Workflow {
 
         let tasks: Vec<LogicalTask> = candidates
             .into_iter()
-            .map(|operation| LogicalTask {
-                kind: TaskKind::RequirementDiscovery,
-                objective: format!("Discover the correctness requirements of {operation}."),
-                write_scope: WriteScope::requirement_discovery(operation.clone()),
-                bundle: BundleSpec {
-                    operation: Some(operation),
-                    requirements: Vec::new(),
-                    include: Vec::new(),
-                    peers: Vec::new(),
-                },
-                prompt_evidence: self.prompt_evidence(),
-                interactive: false,
-            })
+            .map(|operation| self.discovery_task(operation))
             .collect();
 
         let ran = tasks.len() as u32;
@@ -652,6 +659,23 @@ impl Workflow {
         self.scheduler.run_many(tasks).await?;
 
         Ok(ran)
+    }
+
+    /// The requirement discovery task of one operation.
+    fn discovery_task(&self, operation: Id) -> LogicalTask {
+        LogicalTask {
+            kind: TaskKind::RequirementDiscovery,
+            objective: format!("Discover the correctness requirements of {operation}."),
+            write_scope: WriteScope::requirement_discovery(operation.clone()),
+            bundle: BundleSpec {
+                operation: Some(operation),
+                requirements: Vec::new(),
+                include: Vec::new(),
+                peers: Vec::new(),
+            },
+            prompt_evidence: self.prompt_evidence(),
+            interactive: false,
+        }
     }
 
     /// Phase 7: repair every unproven obligation at `revision`.

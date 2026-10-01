@@ -257,10 +257,27 @@ impl Scheduler {
     ///
     /// Runs are returned in submission order. A task that exhausts its
     /// attempts is reported in its `TaskRun`, never as a batch error.
-    pub async fn run_many(
+    pub async fn run_many(&self, tasks: Vec<LogicalTask>) -> Result<Vec<TaskRun>, SchedulerError> {
+        self.run_many_then(tasks, |_, _| None).await
+    }
+
+    /// [`run_many`](Self::run_many), where a finished task may name a
+    /// follow-up that runs at once, in the same concurrency slot,
+    /// instead of waiting for the whole batch: per-operation pipelining.
+    /// A fanout chains each operation's requirement discovery onto its
+    /// synthesis, so discovery of the fast operations overlaps the
+    /// synthesis of the slow ones rather than starting at a barrier.
+    ///
+    /// Returns the batch's own runs, in submission order; a follow-up's
+    /// run is recorded in the ledger like any other.
+    pub async fn run_many_then<F>(
         &self,
         tasks: Vec<LogicalTask>,
-    ) -> Result<Vec<TaskRun>, SchedulerError> {
+        then: F,
+    ) -> Result<Vec<TaskRun>, SchedulerError>
+    where
+        F: Fn(&LogicalTask, &TaskRun) -> Option<LogicalTask> + Sync,
+    {
         use futures::stream::{self, StreamExt};
 
         let concurrency = self.policy.max_concurrent_agents.max(1);
@@ -304,8 +321,22 @@ impl Scheduler {
             let results: Vec<(usize, Result<TaskRun, SchedulerError>)> = stream::iter(wave)
                 .map(|index| {
                     let task = &tasks[index];
+                    let then = &then;
 
-                    async move { (index, self.run(task).await) }
+                    async move {
+                        let run = match self.run(task).await {
+                            Ok(run) => run,
+                            Err(error) => return (index, Err(error)),
+                        };
+
+                        if let Some(follow_up) = then(task, &run)
+                            && let Err(error) = self.run(&follow_up).await
+                        {
+                            return (index, Err(error));
+                        }
+
+                        (index, Ok(run))
+                    }
                 })
                 .buffer_unordered(concurrency)
                 .collect()

@@ -558,6 +558,13 @@ It reports itself as `system_one+<fallback>`; a session it settles reports the b
 
 The `AgentBackend` contract is restated: an *external* backend never interprets Conseqa semantics; the in-process System One backend does, and is bound by every rule that binds an external agent.
 
+## 14.2.1 Pipelining
+
+The workflow's phases are barriers: each waits for its slowest task. A builder answering in under a second shortens a phase only when it settles every task of it, so the benchmark (5 operations) showed no latency gain from settling one task in three phases. Two changes take phases off the critical path instead:
+
+- discovery is chained onto synthesis per operation (`Scheduler::run_many_then`): an operation's discovery starts as soon as its program commits, in the same concurrency slot, because it needs only that program and the obligations aimed at it. The fixpoint's discovery phase still runs and picks up whatever is left;
+- topology is a builder (§19), so its phase costs no session.
+
 ## 14.3 What binds the executor
 
 - **Capability.** It acts under the task's token and write scope. It holds no `WriteGrant` a session for that task would not hold.
@@ -796,6 +803,8 @@ Against `flash_checkout`, whose `apply_payment` conflicts with two other operati
 
 L1 proves no transaction property, and only the replay families consume its delivery facts. Its authoring is the safest to mechanize.
 
+Implemented as the `topology_synthesis` builder (`src/harness/executors/topology.rs`): the §19.1 defaults under the §19.3 rule, declaring only what is missing, judged by `evaluate_candidate` before submission. Run by agents it took 65–73 s and 24–26 turns on every benchmark run; in process it takes no model call at all. The §19.2 knobs are not yet asked: an unstated knob keeps its conservative default, and a stated one remains a session's to write. Gold test: with the runtime of `shop` and `tenant_ledger` removed, the defaults re-prove every obligation the authors proved, the replay families' delivery facts included.
+
 ## 19.1 Defaults, in code
 
 Derived from L0 alone:
@@ -831,7 +840,7 @@ Enumeration: the operation's single input (request, or a subscription consuming 
 
 - **keyed update** — read the changed fields (and any result field only the record holds), write the changed fields from the reads and the input, advance the version when the object has one, export an output when the result needs record fields;
 - **keyed insert** — insert the record from the input fields it shares;
-- **transition** — apply the transition to the identified record, advance the version when there is one; the `rejected` arm returns the chosen declared error (a request) or completes (a subscription).
+- **transition** — for a keyed request, *inspect then decide*: a keyed transaction reads the state and exports it (with the record's own schema), a branch on the recovered state applies the transition in a second keyed transaction or returns the chosen declared error, and a rejection inside the transition (a race after the inspection) completes. Every attempt of one request then decides alike, so idempotency and result replay are proven as written; the direct shape left result replay unproven (a retry after the record moved commits where the first attempt was refused) and cost the benchmark a 119 s repair session. A subscription, or an unkeyed request, applies the transition directly: its rejection completes or returns the error.
 
 Each ends with `return ok` — payload from the input fields named in the `ok` schema, or the output — or `complete`. Transactions are `read_committed` with an unspecified commit key: requirements and their proofs are discovery's and repair's (a replay requirement gets its keyed commit from repair, §18.2).
 

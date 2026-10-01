@@ -43,11 +43,12 @@ use crate::confluence::{
     SearchSpec, SpecPatch, SymbolKey, SymbolKind, WriteGrant,
 };
 use crate::spec::{
-    BumpVersion, DataObject, Derivation, EstablishTransactionOutput, ExecuteTransaction, FieldPath,
-    FieldSelection, Id, IdempotencyGuarantee, Input, Insert, MessageSelector, ObjectSelector,
-    OperationBlock, OperationStep, Read, ResultOutcome, Return, Schema, SelectorPredicate,
-    SelectorValue, StateMachine, StateMachineSubject, StateTransition, Transaction,
-    TransactionIsolation, TransactionStep, ValueRef, ValueSource, Write,
+    Branch, BumpVersion, Condition, DataObject, Derivation, EstablishTransactionOutput,
+    ExecuteTransaction, FieldPath, FieldSelection, Id, IdempotencyGuarantee, IdempotencyKey, Input,
+    Insert, Literal, MessageSelector, ObjectSelector, OperationBlock, OperationStep, Read,
+    RequestIdentity, ResultOutcome, Return, Schema, SelectorPredicate, SelectorValue, StateMachine,
+    StateMachineSubject, StateTransition, Transaction, TransactionIsolation, TransactionStep,
+    ValueRef, ValueSource, Write,
 };
 use crate::system_one::DecisionRequest;
 use crate::system_one::questions::synthesis as wording;
@@ -144,6 +145,9 @@ struct Lifecycle {
     from: BTreeSet<Id>,
     to: Id,
     record: usize,
+
+    /// The record's field holding its lifecycle state.
+    state: FieldPath,
 }
 
 impl Lifecycle {
@@ -166,6 +170,10 @@ struct Enumerated {
 
     /// The request's declared errors: class, schema fields.
     errors: BTreeMap<Id, BTreeSet<String>>,
+
+    /// The request's declared identity, as a commit key, when it has
+    /// one: what lets a retry recover rather than re-decide.
+    identity: Option<IdempotencyKey>,
 
     records: Vec<Record>,
     lifecycles: Vec<Lifecycle>,
@@ -436,12 +444,27 @@ fn enumerate(
     let input_id = &input_id;
     let input = &input;
 
+    let mut identity = None;
+
     let (request, input_schema, ok, errors) = match input {
         Input::Request(request) => {
             let mut errors = BTreeMap::new();
 
             for (class, error) in &request.result.errors {
                 errors.insert(class.clone(), schema_fields(context, &error.schema)?);
+            }
+
+            if let RequestIdentity::Keyed(key) = &request.identity {
+                identity = Some(IdempotencyKey {
+                    components: key
+                        .fields
+                        .iter()
+                        .map(|field| ValueRef {
+                            source: ValueSource::Input(input_id.clone()),
+                            path: field.clone(),
+                        })
+                        .collect(),
+                });
             }
 
             (
@@ -554,7 +577,7 @@ fn enumerate(
             continue;
         };
 
-        let StateMachineSubject::Object { object, .. } = &state_machine.subject;
+        let StateMachineSubject::Object { object, state } = &state_machine.subject;
 
         let Some(record) = records.iter().position(|record| &record.object == object) else {
             continue;
@@ -573,6 +596,7 @@ fn enumerate(
                 from: transition.from.clone(),
                 to: transition.to.clone(),
                 record,
+                state: state.clone(),
             });
         }
     }
@@ -585,6 +609,7 @@ fn enumerate(
         carries,
         ok,
         errors,
+        identity,
         records,
         lifecycles,
     }))
@@ -1013,9 +1038,13 @@ fn transition(
     lifecycle: &Lifecycle,
     refusal: Option<&Id>,
 ) -> OperationBlock {
-    let name = short(&enumerated.operation);
-    let record = &enumerated.records[lifecycle.record];
+    match (refusal, &enumerated.identity) {
+        (Some(refusal), Some(key)) => inspected_transition(enumerated, lifecycle, refusal, key),
+        _ => direct_transition(enumerated, lifecycle, refusal),
+    }
+}
 
+fn transition_steps(record: &Record, lifecycle: &Lifecycle) -> Vec<TransactionStep> {
     let mut steps = vec![TransactionStep::Transition(StateTransition {
         machine: lifecycle.machine.clone(),
         transition: lifecycle.transition.clone(),
@@ -1030,36 +1059,162 @@ fn transition(
         }));
     }
 
-    // A rejected transition returns the declared error a wrong-state
-    // record means, or — for a subscription — completes: redelivery of
-    // a message whose record has moved on has nothing left to do.
-    let rejected = match refusal {
-        Some(error) => OperationBlock {
-            steps: vec![OperationStep::Return(Return {
-                request: enumerated.input.clone(),
-                outcome: ResultOutcome::Err {
-                    error: error.clone(),
-                    values: payload_from(
-                        enumerated,
-                        enumerated.errors.get(error).unwrap_or(&BTreeSet::new()),
-                        None,
-                    ),
-                },
-            })],
-        },
+    steps
+}
 
-        None => OperationBlock {
-            steps: vec![OperationStep::Complete],
+fn refused(enumerated: &Enumerated, error: &Id) -> OperationStep {
+    OperationStep::Return(Return {
+        request: enumerated.input.clone(),
+        outcome: ResultOutcome::Err {
+            error: error.clone(),
+            values: payload_from(
+                enumerated,
+                enumerated.errors.get(error).unwrap_or(&BTreeSet::new()),
+                None,
+            ),
         },
+    })
+}
+
+/// The transition applied directly: a subscription completes when it
+/// is rejected (redelivery of a message whose record has moved on has
+/// nothing left to do), and an unkeyed request returns the error.
+fn direct_transition(
+    enumerated: &Enumerated,
+    lifecycle: &Lifecycle,
+    refusal: Option<&Id>,
+) -> OperationBlock {
+    let name = short(&enumerated.operation);
+    let record = &enumerated.records[lifecycle.record];
+
+    let rejected = OperationBlock {
+        steps: vec![match refusal {
+            Some(error) => refused(enumerated, error),
+            None => OperationStep::Complete,
+        }],
     };
 
     OperationBlock {
         steps: vec![
             OperationStep::Transaction(ExecuteTransaction {
-                transaction: transaction(format!("tx.{name}.transition"), record, steps),
+                transaction: transaction(
+                    format!("tx.{name}.transition"),
+                    record,
+                    transition_steps(record, lifecycle),
+                ),
                 rejected: Some(rejected),
             }),
             finish(enumerated, None),
+        ],
+    }
+}
+
+/// The replay-safe shape for a keyed request: inspect, then decide.
+///
+/// A transition applied directly is rejected or committed by the state
+/// the record is in when *this* attempt arrives, so a retry after the
+/// record moved — the order paid in between — commits where the first
+/// attempt was refused, and returns a different result. Instead a keyed
+/// inspection exports the state, and the decision rests on that
+/// recovered artifact: every attempt of the request decides the same
+/// way. The transition itself is keyed too, so a retry after it
+/// committed recovers its commit. Its rejection now means only a race
+/// with a concurrent change after the inspection, and completes — the
+/// shape the fixtures' authors use.
+fn inspected_transition(
+    enumerated: &Enumerated,
+    lifecycle: &Lifecycle,
+    refusal: &Id,
+    key: &IdempotencyKey,
+) -> OperationBlock {
+    let name = short(&enumerated.operation);
+    let record = &enumerated.records[lifecycle.record];
+
+    let read = Id(format!("read.{name}.inspect"));
+    let lookup = Id(format!("output.{name}.lookup"));
+
+    let mut exported: Vec<ValueRef> = key.components.clone();
+
+    exported.push(ValueRef {
+        source: ValueSource::TransactionRead(read.clone()),
+        path: lifecycle.state.clone(),
+    });
+
+    let keyed = |mut transaction: Transaction| {
+        transaction.idempotency = IdempotencyGuarantee::DeduplicatedBy { key: key.clone() };
+        transaction
+    };
+
+    let inspect = keyed(transaction(
+        format!("tx.{name}.inspect"),
+        record,
+        vec![
+            TransactionStep::Read(Read {
+                bind: read.clone(),
+                target: record.selector.clone(),
+                fields: FieldSelection::Only([lifecycle.state.clone()].into()),
+            }),
+            TransactionStep::EstablishTransactionOutput(EstablishTransactionOutput {
+                bind: lookup.clone(),
+                schema: record.data.schema.clone(),
+                values: Derivation::Deterministic { from: exported },
+            }),
+        ],
+    ));
+
+    let in_state = |state: &Id| Condition::Eq {
+        value: ValueRef {
+            source: ValueSource::TransactionOutput(lookup.clone()),
+            path: lifecycle.state.clone(),
+        },
+        equals: SelectorValue::Literal(Literal::String(state.0.clone())),
+    };
+
+    // In any `from` state: a disjunction, spelled with the vocabulary's
+    // `not` and `and`.
+    let applies = match lifecycle.from.iter().collect::<Vec<_>>().as_slice() {
+        [only] => in_state(only),
+        many => Condition::Not {
+            condition: Box::new(Condition::And {
+                conditions: many
+                    .iter()
+                    .map(|state| Condition::Not {
+                        condition: Box::new(in_state(state)),
+                    })
+                    .collect(),
+            }),
+        },
+    };
+
+    let apply = keyed(transaction(
+        format!("tx.{name}.transition"),
+        record,
+        transition_steps(record, lifecycle),
+    ));
+
+    OperationBlock {
+        steps: vec![
+            OperationStep::Transaction(ExecuteTransaction {
+                transaction: inspect,
+                rejected: None,
+            }),
+            OperationStep::Branch(Branch {
+                condition: applies,
+                then: OperationBlock {
+                    steps: vec![
+                        OperationStep::Transaction(ExecuteTransaction {
+                            transaction: apply,
+                            rejected: Some(OperationBlock {
+                                steps: vec![OperationStep::Complete],
+                            }),
+                        }),
+                        finish(enumerated, None),
+                    ],
+                },
+                otherwise: Some(OperationBlock {
+                    steps: vec![refused(enumerated, refusal)],
+                }),
+            }),
         ],
     }
 }

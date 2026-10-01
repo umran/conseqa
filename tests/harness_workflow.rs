@@ -3235,11 +3235,15 @@ mod system_one {
         ));
     }
 
-    /// Transition: the builder applies the chosen lifecycle transition to
-    /// the record the input identifies, and a wrong-state record returns
-    /// the declared error chosen for it.
+    /// Transition, for a keyed request: the builder inspects the record
+    /// in a keyed transaction, decides on the recovered state, applies
+    /// the chosen transition (keyed too) or returns the declared error
+    /// chosen for a wrong-state record. Every attempt of one request
+    /// then decides alike, so the operation's idempotency and result
+    /// replay are proven as written — no repair pass needed, where the
+    /// direct shape sent the benchmark to a 119 s session.
     #[tokio::test]
-    async fn a_transition_is_written_from_its_template() {
+    async fn a_transition_is_written_replay_safe_from_its_template() {
         let opinions = Opinions::default()
             .choosing("archetype", "transition", 0.88)
             .choosing(
@@ -3256,25 +3260,68 @@ mod system_one {
 
         let program = program_of(&engine, "operation.ship_order");
 
-        let conseqa::spec::OperationStep::Transaction(execute) = &program.steps[0] else {
-            panic!("a transaction first: {program:?}");
+        let [
+            conseqa::spec::OperationStep::Transaction(inspect),
+            conseqa::spec::OperationStep::Branch(branch),
+        ] = &program.steps[..]
+        else {
+            panic!("inspect, then decide: {program:?}");
         };
 
-        assert!(execute.transaction.steps.iter().any(|step| matches!(
+        assert!(matches!(
+            inspect.transaction.idempotency,
+            conseqa::spec::IdempotencyGuarantee::DeduplicatedBy { .. }
+        ));
+
+        let Some(conseqa::spec::OperationStep::Transaction(apply)) = branch.then.steps.first()
+        else {
+            panic!("the transition first in the arm: {branch:?}");
+        };
+
+        assert!(apply.transaction.steps.iter().any(|step| matches!(
             step,
             conseqa::spec::TransactionStep::Transition(transition)
                 if transition.transition == id("transition.order.ship")
         )));
 
-        let rejected = execute.rejected.as_ref().expect("a rejected arm");
-
         assert!(matches!(
-            &rejected.steps[..],
-            [conseqa::spec::OperationStep::Return(conseqa::spec::Return {
+            branch.otherwise.as_ref().map(|block| &block.steps[..]),
+            Some([conseqa::spec::OperationStep::Return(conseqa::spec::Return {
                 outcome: conseqa::spec::ResultOutcome::Err { error, .. },
                 ..
-            })] if *error == id("not_shippable")
+            })]) if *error == id("not_shippable")
         ));
+
+        let model = engine
+            .head_snapshot()
+            .workspace
+            .assemble_model()
+            .expect("assembles");
+
+        let report = conseqa::analyzer::verification::verify(&model);
+
+        assert!(
+            report
+                .idempotency
+                .iter()
+                .chain([].iter())
+                .filter(|check| check.operation == id("operation.ship_order"))
+                .all(|check| matches!(
+                    check.verdict,
+                    conseqa::analyzer::verification::IdempotencyVerdict::Proven { .. }
+                ))
+        );
+
+        assert!(
+            report
+                .result_replay
+                .iter()
+                .filter(|check| check.operation == id("operation.ship_order"))
+                .all(|check| matches!(
+                    check.verdict,
+                    conseqa::analyzer::verification::ResultReplayVerdict::Proven { .. }
+                ))
+        );
     }
 
     /// Nothing is guessed: a template that matches nothing clearly, or a
@@ -3399,6 +3446,251 @@ mod system_one {
             transaction.idempotency,
             conseqa::spec::IdempotencyGuarantee::DeduplicatedBy { .. }
         ));
+
+        std::fs::remove_dir_all(&out_dir).ok();
+    }
+
+    /// The runtime topology from L0 alone: with every L1 declaration
+    /// taken away, the builder declares the conservative defaults — a
+    /// pool per service, a router per request, `at_least_once` delivery
+    /// per subscription, an outbox runtime per outbox input, a layout
+    /// per object — and every obligation the author proved is proven
+    /// again, the replay families' delivery facts included. No session.
+    #[tokio::test]
+    async fn the_runtime_topology_is_declared_from_defaults() {
+        for (fixture, any_operation) in [
+            ("shop.yaml", "operation.restock"),
+            ("tenant_ledger.yaml", "operation.post_entry"),
+        ] {
+            let mut model = authored(fixture);
+
+            model.runtime = None;
+
+            let (engine, seen, runs) = run_tasks(
+                workspace_of(&model, "A system."),
+                vec![(
+                    TaskKind::TopologySynthesis,
+                    conseqa::confluence::WriteScope::runtime_topology(),
+                    id(any_operation),
+                )],
+                &Opinions::default(),
+            )
+            .await;
+
+            let handed: Vec<String> = seen
+                .lock()
+                .expect("not poisoned")
+                .iter()
+                .map(|(_, prompt)| prompt.clone())
+                .collect();
+
+            assert!(handed.is_empty(), "{fixture}: {handed:?}");
+            assert!(runs[0].committed(), "{fixture}: {:?}", runs[0]);
+            assert!(head_model_is_proven(&engine).await, "{fixture}");
+
+            let runtime = engine.head_snapshot().workspace.runtime.clone();
+            let authored_runtime = authored(fixture).runtime.expect("an authored runtime");
+
+            assert_eq!(
+                runtime.storage_layouts.len(),
+                authored_runtime.storage_layouts.len(),
+                "{fixture}"
+            );
+            assert_eq!(
+                runtime.routers.len(),
+                authored_runtime.routers.len(),
+                "{fixture}"
+            );
+            assert_eq!(
+                runtime
+                    .subscriptions
+                    .values()
+                    .map(BTreeMap::len)
+                    .sum::<usize>(),
+                authored_runtime
+                    .subscriptions
+                    .values()
+                    .map(BTreeMap::len)
+                    .sum::<usize>(),
+                "{fixture}"
+            );
+        }
+    }
+
+    /// Discovery is pipelined onto synthesis: an operation whose program
+    /// lands first has its requirements discovered while a slower peer
+    /// is still being written, instead of every discovery waiting at a
+    /// barrier for the slowest program.
+    #[tokio::test]
+    async fn discovery_starts_before_the_slowest_program_lands() {
+        let authored = authored("shop.yaml");
+
+        let mut workspace = workspace_of(&authored, "A small shop backend.");
+
+        for operation in ["operation.restock", "operation.ship_order"] {
+            let draft = workspace
+                .operations
+                .get_mut(&id(operation))
+                .expect("the operation");
+
+            draft.program = None;
+            draft.requirements = Default::default();
+        }
+
+        let engine = ConfluenceEngine::in_memory(workspace).expect("engine starts");
+
+        type Events = Arc<Mutex<Vec<(&'static str, String)>>>;
+
+        let events: Events = Arc::default();
+
+        let script: ScriptFn = {
+            let events = Arc::clone(&events);
+            let authored = authored.clone();
+
+            Arc::new(move |engine, invocation| {
+                let events = Arc::clone(&events);
+                let authored = authored.clone();
+
+                Box::pin(async move {
+                    let task = engine
+                        .resolve_token(&invocation.task_token)
+                        .expect("token resolves");
+
+                    let operation = engine
+                        .task_context(task)
+                        .expect("context")
+                        .write_scope
+                        .grants
+                        .iter()
+                        .find_map(|grant| match grant {
+                            conseqa::confluence::WriteGrant::OperationProgram(operation)
+                            | conseqa::confluence::WriteGrant::OperationRequirements(operation) => {
+                                Some(operation.clone())
+                            }
+                            _ => None,
+                        });
+
+                    let Some(operation) = operation else {
+                        return;
+                    };
+
+                    match invocation.kind {
+                        TaskKind::OperationSynthesis => {
+                            if operation == id("operation.ship_order") {
+                                tokio::time::sleep(Duration::from_millis(400)).await;
+                            }
+
+                            // Observe what the program references, as a
+                            // session would before committing it.
+                            for kind in [
+                                conseqa::confluence::SymbolKind::DataModel,
+                                conseqa::confluence::SymbolKind::DataObject,
+                                conseqa::confluence::SymbolKind::Schema,
+                                conseqa::confluence::SymbolKind::StateMachine,
+                                conseqa::confluence::SymbolKind::Transition,
+                            ] {
+                                for key in engine
+                                    .search_symbols(
+                                        task,
+                                        &conseqa::confluence::SearchSpec {
+                                            kind: Some(kind),
+                                            ..Default::default()
+                                        },
+                                    )
+                                    .expect("search")
+                                {
+                                    engine.read_symbol(task, &key).expect("read");
+                                }
+                            }
+
+                            // The program without its requirements:
+                            // what they are is discovery's to say.
+                            let mut program = authored.operations[&operation].program.clone();
+
+                            let ids: Vec<Id> = program
+                                .transactions()
+                                .into_iter()
+                                .map(|(_, transaction)| transaction.id.clone())
+                                .collect();
+
+                            for transaction in ids {
+                                program
+                                    .transaction_mut(&transaction)
+                                    .expect("the transaction")
+                                    .requirements = Default::default();
+                            }
+
+                            commit(
+                                &engine,
+                                &invocation,
+                                vec![Mutation::ReplaceOperationProgram {
+                                    operation: operation.clone(),
+                                    program,
+                                }],
+                            )
+                            .await;
+
+                            events
+                                .lock()
+                                .expect("not poisoned")
+                                .push(("synthesized", operation.0));
+                        }
+
+                        TaskKind::RequirementDiscovery => {
+                            events
+                                .lock()
+                                .expect("not poisoned")
+                                .push(("discovering", operation.0));
+                        }
+
+                        _ => {}
+                    }
+                })
+            })
+        };
+
+        let backend = Arc::new(ScriptedBackend {
+            engine: engine.clone(),
+            script,
+        });
+
+        let out_dir = scratch();
+
+        let supervisor = Supervisor::new(
+            engine.clone(),
+            backend,
+            "http://127.0.0.1:0/mcp",
+            None,
+            out_dir.join("work"),
+        );
+
+        let scheduler = Scheduler::new(engine.clone(), supervisor, SchedulerPolicy::default());
+
+        let workflow = Workflow::new(
+            scheduler,
+            WorkflowConfig {
+                out_dir: out_dir.clone(),
+                analysis_timeout: Duration::from_secs(20),
+                max_iterations: 3,
+                objective: None,
+            },
+        );
+
+        workflow.run().await.expect("the workflow runs");
+
+        let events = events.lock().expect("not poisoned").clone();
+
+        let at = |event: (&str, &str)| {
+            events
+                .iter()
+                .position(|(kind, operation)| *kind == event.0 && operation == event.1)
+                .unwrap_or_else(|| panic!("no {event:?} in {events:?}"))
+        };
+
+        assert!(
+            at(("discovering", "operation.restock")) < at(("synthesized", "operation.ship_order")),
+            "{events:?}"
+        );
 
         std::fs::remove_dir_all(&out_dir).ok();
     }

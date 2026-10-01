@@ -40,6 +40,7 @@ pub mod discovery;
 pub mod remedies;
 pub mod repair;
 pub mod synthesis;
+pub mod topology;
 
 pub use discovery::DiscoveryPolicy;
 pub use repair::RepairPolicy;
@@ -119,8 +120,9 @@ pub struct BuildContext<'a> {
 }
 
 /// The task kinds with a builder.
-pub const BUILDABLE: [TaskKind; 3] = [
+pub const BUILDABLE: [TaskKind; 4] = [
     TaskKind::OperationSynthesis,
+    TaskKind::TopologySynthesis,
     TaskKind::RequirementDiscovery,
     TaskKind::RequirementRepair,
 ];
@@ -188,9 +190,9 @@ impl SystemOneBackend {
 
             TaskKind::RequirementRepair => repair::build(context, &self.policy.repair).await,
 
-            TaskKind::OperationSynthesis => {
-                synthesis::build(context, &self.policy.synthesis).await
-            }
+            TaskKind::OperationSynthesis => synthesis::build(context, &self.policy.synthesis).await,
+
+            TaskKind::TopologySynthesis => topology::build(context).await,
 
             _ => Built::Abstained(Abstention::because(format!(
                 "no builder handles {kind} tasks"
