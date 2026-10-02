@@ -21,7 +21,7 @@ use conseqa::spec::{
     IdempotencyRequirement, Input, MessageSelector, ObjectSelector, OperationBlock, OperationStep,
     ResultReplayRequirement, Revision, SelectorPredicate, Service, ServiceKind, SubscriptionInput,
     Transaction, TransactionIsolation, TransactionSerializabilityRequirement, TransactionStep,
-    ValueRef, ValueSource, Write,
+    Update, ValueRef, ValueSource,
 };
 use uuid::Uuid;
 
@@ -197,8 +197,8 @@ fn ping_program() -> OperationBlock {
 }
 
 /// A program writing `object.order.status` directly — a new writer for
-/// phantom tests. The order is versioned, so the write carries the
-/// version bump the protocol requires.
+/// phantom tests. The order is versioned, and the update publishes a
+/// newer version by itself.
 fn status_writer_program() -> OperationBlock {
     OperationBlock {
         steps: vec![
@@ -209,22 +209,14 @@ fn status_writer_program() -> OperationBlock {
                     isolation: TransactionIsolation::ReadCommitted,
                     idempotency: IdempotencyGuarantee::Unspecified,
                     requirements: Default::default(),
-                    steps: vec![
-                        TransactionStep::Write(Write {
-                            target: ObjectSelector {
-                                object: id("object.order"),
-                                predicate: SelectorPredicate::All,
-                            },
-                            fields: BTreeSet::from([path("status")]),
-                            values: Derivation::Unspecified,
-                        }),
-                        TransactionStep::BumpVersion(conseqa::spec::BumpVersion {
-                            target: ObjectSelector {
-                                object: id("object.order"),
-                                predicate: SelectorPredicate::All,
-                            },
-                        }),
-                    ],
+                    steps: vec![TransactionStep::Update(Update {
+                        target: ObjectSelector {
+                            object: id("object.order"),
+                            predicate: SelectorPredicate::All,
+                        },
+                        fields: BTreeSet::from([path("status")]),
+                        values: Derivation::Unspecified,
+                    })],
                 },
                 rejected: None,
             }),

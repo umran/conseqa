@@ -1288,7 +1288,7 @@ async fn the_server_and_its_artifacts_declare_the_dsl_contract_version() {
         .expect("the server declares instructions");
 
     assert!(
-        instructions.contains("DSL contract version 5"),
+        instructions.contains("DSL contract version 6"),
         "{instructions}"
     );
 
@@ -1305,7 +1305,7 @@ async fn the_server_and_its_artifacts_declare_the_dsl_contract_version() {
     assert!(!is_error);
     assert!(
         toc.as_str()
-            .is_some_and(|text| text.contains("DSL contract version 5")),
+            .is_some_and(|text| text.contains("DSL contract version 6")),
         "{toc}"
     );
 
@@ -1315,7 +1315,7 @@ async fn the_server_and_its_artifacts_declare_the_dsl_contract_version() {
     assert!(
         reference
             .as_str()
-            .is_some_and(|text| text.starts_with("DSL contract version 5.")),
+            .is_some_and(|text| text.starts_with("DSL contract version 6.")),
         "{reference}"
     );
 
@@ -1323,14 +1323,14 @@ async fn the_server_and_its_artifacts_declare_the_dsl_contract_version() {
     let (status, is_error) = client.call("spec_status", serde_json::json!({})).await;
 
     assert!(!is_error, "{status}");
-    assert_eq!(status["dsl"], 5, "{status}");
+    assert_eq!(status["dsl"], 6, "{status}");
 
     let (report, is_error) = client
         .call("requirement_report", serde_json::json!({}))
         .await;
 
     assert!(!is_error, "{report}");
-    assert_eq!(report["dsl"], 5, "{report}");
+    assert_eq!(report["dsl"], 6, "{report}");
 
     // Every documented family filters. One that names nothing is an
     // error naming the accepted values — never an empty report, which
@@ -1383,7 +1383,7 @@ async fn the_server_and_its_artifacts_declare_the_dsl_contract_version() {
     let yaml = std::fs::read_to_string(dir.join("conseqa.yaml")).expect("yaml written");
 
     assert!(
-        yaml.starts_with("dsl: 5\n"),
+        yaml.starts_with("dsl: 6\n"),
         "{}",
         &yaml[..40.min(yaml.len())]
     );
@@ -1410,12 +1410,26 @@ async fn the_server_and_its_artifacts_declare_the_dsl_contract_version() {
         "{refused}"
     );
 
+    // dsl 5 meant something else by a transaction program: refused too.
+    let (refused, is_error) = client
+        .call(
+            "submit_patch",
+            serde_json::json!({
+                "dsl": 5,
+                "patch": program_patch("operation.create_order", 7),
+            }),
+        )
+        .await;
+
+    assert!(is_error, "{refused}");
+    assert_eq!(refused["error"], "dsl_version_mismatch", "{refused}");
+
     // A matching declaration commits.
     let (committed, is_error) = client
         .call(
             "submit_patch",
             serde_json::json!({
-                "dsl": 4,
+                "dsl": 6,
                 "patch": program_patch("operation.create_order", 7),
             }),
         )

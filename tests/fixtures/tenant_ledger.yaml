@@ -23,14 +23,14 @@
 # transaction property: a redelivered message, a stale worker, or a
 # rebalance can still present an old event after a newer one at the
 # ledger. What proves that ledger writes apply in sequence order per
-# tenant is the ledger transaction itself — it validates the version of
-# the tenant's ledger row it observed, advances the row's
-# last_applied_sequence by the successor rule, and rejects anything
-# stale, duplicate, or out of order. The notifier needs no order and
+# tenant is the ledger transaction itself — it advances the row's
+# last_applied_sequence by the successor rule, conditioned on the version
+# of the tenant's ledger row it observed, and rejects anything stale,
+# duplicate, or out of order. The notifier needs no order and
 # declares none.
 #
 # Every declared obligation proves.
-dsl: 5
+dsl: 6
 revision: 1
 services:
   service.accounts:
@@ -124,7 +124,8 @@ data_models:
         identity:
         - tenant_id
         # The ledger row's concurrency token: every application
-        # validates the version it read and bumps it.
+        # conditions its cursor advance on the version it read, and each
+        # committed mutation publishes a newer one.
         version:
           field: version
 topics:
@@ -203,7 +204,7 @@ operations:
               fields:
               - last_sequence
           # The next sequence: derived from the one just read.
-          - kind: write
+          - kind: update
             target:
               object: object.tenant
               predicate:
@@ -368,7 +369,7 @@ operations:
               components:
               - source: input:input.apply_entry.posted
                 path: event_id
-          # Serializable per tenant by the version protocol, and ordered
+          # Serializable per tenant by the observed-version guard, and ordered
           # by sequence through the successor cursor on the ledger row:
           # an event that arrives early, late, or twice rejects here,
           # whatever the transport did with it.
@@ -401,18 +402,6 @@ operations:
               - balance
               - last_applied_sequence
               - version
-          - kind: validate_version
-            target:
-              object: object.tenant_ledger
-              predicate:
-                kind: eq
-                field: tenant_id
-                value:
-                  source: input:input.apply_entry.posted
-                  path: tenant_id
-            expected:
-              source: transaction_read:read.apply_entry.ledger
-              path: version
           - kind: advance_cursor
             target:
               object: object.tenant_ledger
@@ -422,12 +411,17 @@ operations:
                 value:
                   source: input:input.apply_entry.posted
                   path: tenant_id
+            compare:
+            - field: version
+              expected:
+                source: transaction_read:read.apply_entry.ledger
+                path: version
             field: last_applied_sequence
             incoming:
               source: input:input.apply_entry.posted
               path: sequence
             rule: successor
-          - kind: write
+          - kind: update
             target:
               object: object.tenant_ledger
               predicate:
@@ -445,15 +439,6 @@ operations:
                 path: balance
               - source: input:input.apply_entry.posted
                 path: amount
-          - kind: bump_version
-            target:
-              object: object.tenant_ledger
-              predicate:
-                kind: eq
-                field: tenant_id
-                value:
-                  source: input:input.apply_entry.posted
-                  path: tenant_id
         # A stale observation, a duplicate, or an out-of-order sequence:
         # nothing applied, and the delivery completes. The transport's
         # redelivery brings the next event round again.

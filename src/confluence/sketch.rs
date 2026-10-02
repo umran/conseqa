@@ -6,7 +6,7 @@
 //! or publish a message, call an outside service. The coordinator writes
 //! it with the operation's interface, where it already knows what the
 //! operation is for. Code compiles it into a program: transaction
-//! grouping, ids, the version protocol or strict locks, keyed commits
+//! grouping, ids, observed-version guards or strict locks, keyed commits
 //! from the trigger's identity, key propagation into messages, the
 //! inspect-then-decide shape a guarded transition needs to replay,
 //! effect intents executed after commit, result matching, outputs,
@@ -27,17 +27,17 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 
 use crate::spec::{
-    AdvanceCursor, Branch, BumpVersion, Condition, CursorAdvanceRule, DataObject, Derivation,
-    Effect, ErrorDisposition, ErrorResultType, EstablishEffectIntent, EstablishTransactionOutput,
-    ExecuteEffect, ExecuteEffectIntent, ExecuteTransaction, ExternalEffect, ExternalIdempotency,
-    ExternalIdentity, ExternalIdentityKey, ExternalResultReplay, FieldPath, FieldSelection, Id,
-    IdempotencyGuarantee, IdempotencyKey, IdempotencyKeyPropagation, Input, Insert, Literal, Lock,
-    LockMode, LockOrder, MatchResult, MessageIdentity, MessageSelector, ObjectSelector,
-    OperationBlock, OperationStep, Outbox, OutboxWriteEffect, PublicationEffect, Read,
-    RequestIdentity, ResultOutcome, ResultType, Return, SelectorPredicate, SelectorValue,
-    StateMachine, StateMachineSubject, StateTransition, Topic, Transaction, TransactionIsolation,
-    TransactionStep, TransitionSideEffect, ValidateVersion, ValueRef, ValueSource, Write,
-    WriteOutboxEffect,
+    AdvanceCursor, Branch, CompareAndSet, CompareCondition, Condition, CursorAdvanceRule,
+    DataObject, Derivation, Effect, ErrorDisposition, ErrorResultType, EstablishEffectIntent,
+    EstablishTransactionOutput, ExecuteEffect, ExecuteEffectIntent, ExecuteTransaction,
+    ExternalEffect, ExternalIdempotency, ExternalIdentity, ExternalIdentityKey,
+    ExternalResultReplay, FieldPath, FieldSelection, Id, IdempotencyGuarantee, IdempotencyKey,
+    IdempotencyKeyPropagation, Input, Insert, Literal, Lock, LockMode, LockOrder, MatchResult,
+    MessageIdentity, MessageSelector, ObjectSelector, OperationBlock, OperationStep, Outbox,
+    OutboxWriteEffect, PublicationEffect, Read, RequestIdentity, ResultOutcome, ResultType, Return,
+    SelectorPredicate, SelectorValue, StateMachine, StateMachineSubject, StateTransition, Topic,
+    Transaction, TransactionIsolation, TransactionStep, TransitionSideEffect, Update, ValueRef,
+    ValueSource, WriteOutboxEffect,
 };
 
 /// What an operation does, in order.
@@ -65,7 +65,7 @@ pub struct OperationSketch {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub returns_for: Option<Id>,
 
-    /// What a transaction refused by its guards — a version conflict, a
+    /// What a transaction refused by its guards — a moved version, a
     /// stale position or token, a transition from the wrong state with
     /// no `otherwise` — does instead of completing: steps that end the
     /// operation (a request's must reject).
@@ -96,7 +96,8 @@ pub enum SketchStep {
 
         /// Hold the selection under a lock from before it is read:
         /// `shared` or `exclusive`. A record that changes is held
-        /// exclusively, or version-guarded, whether or not this is said.
+        /// exclusively, or its change conditioned on the version read,
+        /// whether or not this is said.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         lock: Option<LockMode>,
 
@@ -124,6 +125,29 @@ pub enum SketchStep {
     Create {
         record: Id,
         from: Values,
+
+        /// The isolation of the transaction this step belongs to.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        isolation: Option<TransactionIsolation>,
+    },
+
+    /// Insert the one instance of `record` that `by` identifies, made
+    /// from `from`, or — when it already exists — give its `set` fields
+    /// new values from `update_from`: one atomic insert-or-update,
+    /// arbitrated on the record's identity. Nothing is read first, and
+    /// the upsert protects no read.
+    Upsert {
+        record: Id,
+        /// Record field → value reference or literal, pinning the whole
+        /// identity.
+        by: BTreeMap<String, serde_json::Value>,
+        from: Values,
+        /// The fields an existing instance changes; the map form of
+        /// `update_from` names them itself.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        set: Vec<String>,
+        #[serde(default)]
+        update_from: Values,
 
         /// The isolation of the transaction this step belongs to.
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -753,6 +777,7 @@ fn transactional(step: &SketchStep) -> bool {
         SketchStep::Find { .. }
             | SketchStep::Update { .. }
             | SketchStep::Create { .. }
+            | SketchStep::Upsert { .. }
             | SketchStep::Transition { .. }
             | SketchStep::Advance { .. }
             | SketchStep::Enqueue { .. }
@@ -979,7 +1004,7 @@ impl Compiler<'_> {
                 let selector = target.selector.clone();
                 let values = self.derivation(&from.refs())?;
 
-                self.steps.push(TransactionStep::Write(Write {
+                self.steps.push(TransactionStep::Update(Update {
                     target: selector,
                     fields: set
                         .iter()
@@ -1026,6 +1051,18 @@ impl Compiler<'_> {
                 Ok(())
             }
 
+            SketchStep::Upsert {
+                record,
+                by,
+                from,
+                set,
+                update_from,
+                isolation,
+            } => {
+                self.declare_isolation(*isolation)?;
+                self.upsert(record, by, from, set, update_from)
+            }
+
             SketchStep::Transition {
                 record,
                 transition,
@@ -1069,6 +1106,7 @@ impl Compiler<'_> {
                         field: FieldPath(vec![field.clone()]),
                         incoming,
                         rule,
+                        compare: Vec::new(),
                     }));
 
                 self.mutated.push(record.clone());
@@ -1194,6 +1232,7 @@ impl Compiler<'_> {
                     target: selector,
                     field: FieldPath(vec![field.clone()]),
                     token,
+                    compare: Vec::new(),
                 }));
 
                 self.mutated.push(record.clone());
@@ -1324,24 +1363,14 @@ impl Compiler<'_> {
 
         self.data_models.insert(data_model.clone());
 
+        // Nothing guards a read here: a record that changes is
+        // protected where it changes (`protect`), and one that is only
+        // read is given no imaginary assertion.
         self.steps.push(TransactionStep::Read(Read {
             bind: read.clone(),
             target: selector.clone(),
             fields: FieldSelection::All,
         }));
-
-        // A version guard identifies one instance (§20): a set is
-        // protected by a lock instead.
-        if single && let Some(version) = &data.version {
-            self.steps
-                .push(TransactionStep::ValidateVersion(ValidateVersion {
-                    target: selector.clone(),
-                    expected: ValueRef {
-                        source: ValueSource::TransactionRead(read.clone()),
-                        path: version.field.clone(),
-                    },
-                }));
-        }
 
         self.found.insert(
             alias.to_string(),
@@ -1358,6 +1387,109 @@ impl Compiler<'_> {
                 exported: None,
             },
         );
+
+        Ok(())
+    }
+
+    /// One atomic insert-or-update of the instance `by` identifies.
+    fn upsert(
+        &mut self,
+        record: &Id,
+        by: &BTreeMap<String, serde_json::Value>,
+        from: &Values,
+        set: &[String],
+        update_from: &Values,
+    ) -> Result<(), CompileError> {
+        let Some((data_model, data)) = self.symbols.objects.get(record) else {
+            return fail(format!("`{record}` is not a declared data object"));
+        };
+
+        let (data_model, data) = (data_model.clone(), data.clone());
+        let fields = self.symbols.fields(&data.schema);
+
+        let identity: BTreeSet<&String> = data
+            .identity
+            .iter()
+            .filter_map(|path| path.0.last())
+            .collect();
+
+        if !identity.iter().all(|field| by.contains_key(*field)) {
+            return fail(format!(
+                "the upsert of `{record}` must give every identity field ({}) in `by`",
+                identity
+                    .iter()
+                    .map(|field| format!("`{field}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+
+        let mut predicates = Vec::new();
+
+        for (field, value) in by {
+            if !fields.contains(field) {
+                return fail(format!("`{record}` has no field `{field}` to upsert it by"));
+            }
+
+            predicates.push(SelectorPredicate::Eq {
+                field: FieldPath(vec![field.clone()]),
+                value: self.operand(value)?,
+            });
+        }
+
+        let predicate = match <[_; 1]>::try_from(predicates) {
+            Ok([only]) => only,
+            Err(many) => SelectorPredicate::And { predicates: many },
+        };
+
+        from.check(&fields, &format!("`{record}`"))?;
+        update_from.check(&fields, &format!("`{record}`"))?;
+
+        let set: Vec<String> = match (set.is_empty(), update_from.fields()) {
+            (true, Some(named)) => named.into_iter().collect(),
+            _ => set.to_vec(),
+        };
+
+        if set.is_empty() {
+            return fail(format!(
+                "the upsert of `{record}` sets no field of an existing one"
+            ));
+        }
+
+        for field in &set {
+            if !fields.contains(field) {
+                return fail(format!("`{record}` has no field `{field}`"));
+            }
+
+            if identity.contains(field) {
+                return fail(format!(
+                    "`{field}` is part of `{record}`'s identity and cannot change"
+                ));
+            }
+        }
+
+        let insert_values = self.derivation(&from.refs())?;
+
+        if let Derivation::Deterministic { from: roots } = &insert_values {
+            self.created_from.extend(roots.iter().cloned());
+        }
+
+        self.created.extend(fields);
+        self.data_models.insert(data_model);
+
+        self.steps
+            .push(TransactionStep::Upsert(crate::spec::Upsert {
+                target: ObjectSelector {
+                    object: record.clone(),
+                    predicate,
+                },
+                insert_values,
+                update_fields: set
+                    .iter()
+                    .map(|field| FieldPath(vec![field.clone()]))
+                    .collect(),
+                update_values: self.derivation(&update_from.refs())?,
+            }));
 
         Ok(())
     }
@@ -1504,6 +1636,7 @@ impl Compiler<'_> {
                 machine,
                 transition: transition.clone(),
                 subject,
+                compare: Vec::new(),
                 effect_intents,
                 effects,
             }));
@@ -2360,85 +2493,18 @@ fn derivation(
     })
 }
 
-/// Each read selects exactly the fields later steps use, and the
-/// version it is validated against.
+/// Each read selects exactly the fields later steps use — the version
+/// only when a comparison names it.
 fn narrow_reads(transaction: &mut Transaction, found: &BTreeMap<String, Found>) {
     let mut used: BTreeMap<Id, BTreeSet<FieldPath>> = BTreeMap::new();
 
-    let mut note = |value: &ValueRef| {
-        if let ValueSource::TransactionRead(read) = &value.source {
-            used.entry(read.clone())
-                .or_default()
-                .insert(value.path.clone());
-        }
-    };
-
-    let note_derivation = |values: &Derivation, note: &mut dyn FnMut(&ValueRef)| {
-        if let Derivation::Deterministic { from } = values {
-            from.iter().for_each(note);
-        }
-    };
-
     for step in &transaction.steps {
-        match step {
-            TransactionStep::Read(read) => read
-                .target
-                .predicate
-                .roots()
-                .into_iter()
-                .for_each(&mut note),
-            TransactionStep::Lock(lock) => lock
-                .target
-                .predicate
-                .roots()
-                .into_iter()
-                .for_each(&mut note),
-            TransactionStep::Write(write) => {
-                write
-                    .target
-                    .predicate
-                    .roots()
-                    .into_iter()
-                    .for_each(&mut note);
-                note_derivation(&write.values, &mut note);
+        for value in step.roots() {
+            if let ValueSource::TransactionRead(read) = &value.source {
+                used.entry(read.clone())
+                    .or_default()
+                    .insert(value.path.clone());
             }
-            TransactionStep::Insert(insert) => note_derivation(&insert.values, &mut note),
-            TransactionStep::ValidateVersion(validate) => note(&validate.expected),
-            TransactionStep::EstablishTransactionOutput(output) => {
-                note_derivation(&output.values, &mut note)
-            }
-            TransactionStep::EstablishEffectIntent(intent) => {
-                note_derivation(&intent.values, &mut note)
-            }
-            TransactionStep::WriteOutbox(outbox) => note_derivation(&outbox.values, &mut note),
-            TransactionStep::Transition(transition) => {
-                transition
-                    .subject
-                    .predicate
-                    .roots()
-                    .into_iter()
-                    .for_each(&mut note);
-
-                for intent in transition.effect_intents.values() {
-                    note_derivation(&intent.values, &mut note);
-                }
-            }
-            TransactionStep::AdvanceCursor(advance) => {
-                advance
-                    .target
-                    .predicate
-                    .roots()
-                    .into_iter()
-                    .for_each(&mut note);
-                note(&advance.incoming);
-            }
-            TransactionStep::BumpVersion(bump) => bump
-                .target
-                .predicate
-                .roots()
-                .into_iter()
-                .for_each(&mut note),
-            _ => {}
         }
     }
 
@@ -2458,10 +2524,11 @@ fn narrow_reads(transaction: &mut Transaction, found: &BTreeMap<String, Found>) 
     }
 }
 
-/// The inspection's body: read the state — and validate the version
-/// it was read at, so the inspection is a protected participant of its
-/// record's conflict closure, as every reader of a versioned record
-/// must be for the version route to prove the writers serializable.
+/// The inspection's body: one read of the state, and the output it is
+/// decided by. Nothing guards it, and nothing needs to: a read-only
+/// transaction observing one identified instance once serializes at
+/// that read, so it is a protected participant of its record's conflict
+/// closure without a lock or a comparison it has no mutation to carry.
 fn inspect_steps(
     target: &Found,
     read: &Id,
@@ -2469,39 +2536,18 @@ fn inspect_steps(
     lookup: &Id,
     exported: Vec<ValueRef>,
 ) -> Vec<TransactionStep> {
-    let mut fields: BTreeSet<FieldPath> = [state.clone()].into();
-
-    let mut steps = Vec::new();
-
-    if let Some(version) = &target.data.version {
-        fields.insert(version.field.clone());
-    }
-
-    steps.push(TransactionStep::Read(Read {
-        bind: read.clone(),
-        target: target.selector.clone(),
-        fields: FieldSelection::Only(fields),
-    }));
-
-    if let Some(version) = &target.data.version {
-        steps.push(TransactionStep::ValidateVersion(ValidateVersion {
+    vec![
+        TransactionStep::Read(Read {
+            bind: read.clone(),
             target: target.selector.clone(),
-            expected: ValueRef {
-                source: ValueSource::TransactionRead(read.clone()),
-                path: version.field.clone(),
-            },
-        }));
-    }
-
-    steps.push(TransactionStep::EstablishTransactionOutput(
-        EstablishTransactionOutput {
+            fields: FieldSelection::Only([state.clone()].into()),
+        }),
+        TransactionStep::EstablishTransactionOutput(EstablishTransactionOutput {
             bind: lookup.clone(),
             schema: target.data.schema.clone(),
             values: Derivation::Deterministic { from: exported },
-        },
-    ));
-
-    steps
+        }),
+    ]
 }
 
 fn state_field(symbols: &Symbols, machine: &Id) -> Result<FieldPath, CompileError> {
@@ -2608,6 +2654,7 @@ fn step_name(step: &SketchStep) -> &'static str {
         SketchStep::Find { .. } => "find",
         SketchStep::Update { .. } => "update",
         SketchStep::Create { .. } => "create",
+        SketchStep::Upsert { .. } => "upsert",
         SketchStep::Transition { .. } => "transition",
         SketchStep::Advance { .. } => "advance",
         SketchStep::Enqueue { .. } => "enqueue",
@@ -2629,11 +2676,14 @@ fn step_name(step: &SketchStep) -> &'static str {
 impl Compiler<'_> {
     /// Protects every record the open transaction changes or deletes.
     fn protect(&mut self) {
-        // A changed single record that carries a version validates the
-        // version it read and advances it after its last change.
-        // Everything else that changes or is deleted — an unversioned
-        // record, or a set of instances — is held under an exclusive lock
-        // from before its read.
+        // A changed single record that carries a version conditions its
+        // first change on the version its read observed: an update
+        // becomes a compare-and-set, and a transition or cursor advance
+        // carries the comparison. Every later change then runs under the
+        // write protection that guarded mutation holds. Everything else
+        // that changes or is deleted — an unversioned record, a set of
+        // instances, a record only deleted or fenced — is held under an
+        // exclusive lock from before its read.
         let changed: BTreeSet<&String> = self.mutated.iter().collect();
         let deleted: BTreeSet<&String> = self.deleted.iter().collect();
 
@@ -2645,33 +2695,62 @@ impl Compiler<'_> {
             .collect::<BTreeSet<_>>()
         {
             let target = &self.found[*alias];
-            let versioned = target.single && target.data.version.is_some();
 
-            if versioned {
-                if changed.contains(alias) {
-                    let last = self
-                        .steps
-                        .iter()
-                        .rposition(|step| match step {
-                            TransactionStep::Write(write) => write.target == target.selector,
+            if changed.contains(alias)
+                && target.single
+                && let Some(version) = &target.data.version
+                && self.steps.iter().any(
+                    |step| matches!(step, TransactionStep::Read(read) if read.bind == target.read),
+                )
+            {
+                // A fence is no such guard: on an equal token it writes
+                // nothing and holds no protection.
+                let Some(first) = self.steps.iter().position(|step| {
+                    matches!(
+                        step,
+                        TransactionStep::Update(_)
+                            | TransactionStep::Transition(_)
+                            | TransactionStep::AdvanceCursor(_)
+                    ) && step.selector() == Some(&target.selector)
+                }) else {
+                    held.push((*alias).clone());
+                    continue;
+                };
+
+                let observed = CompareCondition {
+                    field: version.field.clone(),
+                    expected: SelectorValue::Value(ValueRef {
+                        source: ValueSource::TransactionRead(target.read.clone()),
+                        path: version.field.clone(),
+                    }),
+                };
+
+                let guarded = match self.steps[first].clone() {
+                    TransactionStep::Update(update) => {
+                        TransactionStep::CompareAndSet(CompareAndSet {
+                            target: update.target,
+                            compare: vec![observed],
+                            fields: update.fields,
+                            values: update.values,
+                        })
+                    }
+
+                    mut guard => {
+                        match &mut guard {
                             TransactionStep::Transition(transition) => {
-                                transition.subject == target.selector
+                                transition.compare.push(observed)
                             }
                             TransactionStep::AdvanceCursor(advance) => {
-                                advance.target == target.selector
+                                advance.compare.push(observed)
                             }
-                            TransactionStep::Fence(fence) => fence.target == target.selector,
-                            _ => false,
-                        })
-                        .expect("a mutated record has a mutating step");
+                            _ => unreachable!("matched above"),
+                        }
 
-                    self.steps.insert(
-                        last + 1,
-                        TransactionStep::BumpVersion(BumpVersion {
-                            target: target.selector.clone(),
-                        }),
-                    );
-                }
+                        guard
+                    }
+                };
+
+                self.steps[first] = guarded;
 
                 continue;
             }
@@ -2751,6 +2830,7 @@ fn is_simple(sketch: &OperationSketch, symbols: &Symbols) -> bool {
             SketchStep::Find { .. }
                 | SketchStep::Update { .. }
                 | SketchStep::Create { .. }
+                | SketchStep::Upsert { .. }
                 | SketchStep::Transition { .. }
                 | SketchStep::Advance { .. }
                 | SketchStep::Enqueue { .. }
@@ -2768,7 +2848,9 @@ fn is_simple(sketch: &OperationSketch, symbols: &Symbols) -> bool {
         .steps
         .iter()
         .filter_map(|step| match step {
-            SketchStep::Find { record, .. } | SketchStep::Create { record, .. } => {
+            SketchStep::Find { record, .. }
+            | SketchStep::Create { record, .. }
+            | SketchStep::Upsert { record, .. } => {
                 symbols.objects.get(record).map(|(model, _)| model)
             }
             SketchStep::Enqueue { outbox, .. } => {
@@ -2852,7 +2934,9 @@ impl Compiler<'_> {
         };
 
         match step {
-            SketchStep::Find { record, .. } | SketchStep::Create { record, .. } => self
+            SketchStep::Find { record, .. }
+            | SketchStep::Create { record, .. }
+            | SketchStep::Upsert { record, .. } => self
                 .symbols
                 .objects
                 .get(record)

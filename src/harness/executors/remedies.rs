@@ -17,12 +17,18 @@
 //!
 //! The first catalogue covers serializability through the routes that
 //! need no judgment about the application: declared isolation, strict
-//! locks, and the version protocol.
+//! locks, and the observed-state guard.
 //!
-//! The version protocol needs one qualification. A version guard
-//! *rejects*, and what an operation does when its transaction is
-//! rejected is its author's decision, not a mechanical edit. So the
-//! guard is a candidate only where the transaction already declares a
+//! The observed-state guard is a real conditional mutation or nothing.
+//! It conditions a mutation the reader already performs on the same
+//! instance — an update turned compare-and-set, or a comparison added
+//! to a transition or cursor advance — on what the read
+//! observed; where the transaction mutates no such instance, the route
+//! invents no assertion and leaves the gap to a lock or serializable
+//! isolation. It needs one qualification more. A guard *rejects*, and
+//! what an operation does when its transaction is rejected is its
+//! author's decision, not a mechanical edit. So an update becomes a
+//! compare-and-set only where the transaction already declares a
 //! `rejected` arm: the author has then said what a rejection does, and
 //! the regression check (§18.4) holds that arm to every other declared
 //! requirement. Where there is no arm, the route escalates. So do
@@ -31,13 +37,14 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::analyzer::verification::TransactionOrderingObstacle;
+use crate::analyzer::verification::transaction_conflicts::AccessFields;
 use crate::analyzer::verification::transaction_conflicts::{DependencyGap, TransactionRef};
 use crate::analyzer::verification::transaction_serializability::TransactionSerializabilityObstacle;
 use crate::spec::{
-    AdvanceCursor, BumpVersion, CursorAdvanceRule, FieldPath, FieldSelection, Id,
-    IdempotencyGuarantee, IdempotencyKey, Lock, LockMode, LockOrder, ObjectSelector,
-    OperationBlock, TransactionIsolation, TransactionOrderingRequirement, TransactionStep,
-    ValidateVersion, ValueRef, ValueSource,
+    AdvanceCursor, CompareAndSet, CompareCondition, CursorAdvanceRule, FieldPath, FieldSelection,
+    Id, IdempotencyGuarantee, IdempotencyKey, Lock, LockMode, LockOrder, ObjectSelector,
+    OperationBlock, SelectorValue, TransactionIsolation, TransactionOrderingRequirement,
+    TransactionStep, ValueRef, ValueSource,
 };
 
 /// Which route a remedy takes. The order is the catalogue order: the
@@ -57,15 +64,16 @@ pub enum RemedyKind {
     /// first access it protects: the strict-lock route.
     StrictLocks,
 
-    /// Validate at commit the version a read observed, and advance it
-    /// beside the mutation: the version-protocol route.
-    VersionProtocol,
+    /// Condition the reader's own later mutation of the observed
+    /// instance on what the read observed — its version, or the fields
+    /// the conflict touches: the observed-state guard route.
+    ObservedGuard,
 
     /// Point a cursor or fence at the requirement's position.
     OrderingPosition,
 
     /// Persist the position through a cursor advance, where the
-    /// transaction already writes it with an ordinary write.
+    /// transaction already writes it with an update or compare-and-set.
     OrderedCursor,
 
     /// Deduplicate a transaction's commit by the governing key: replay
@@ -130,7 +138,8 @@ fn transaction_mut<'a>(
 /// Besides each route alone, the catalogue offers declared isolation
 /// composed with each step-adding route: an obstacle's gaps can mix an
 /// unspecified isolation on one dependency with a missing lock or
-/// version guard on another, and neither route alone closes both.
+/// observed-state guard on another, and neither route alone closes
+/// both.
 ///
 /// `versions` maps each versioned object to its version field — a fact
 /// of the data model, which a remedy reads and never edits.
@@ -170,17 +179,17 @@ pub fn candidates(
         })
     };
 
-    let version_route =
-        |programs: &Programs, gaps: &[&DependencyGap]| version_protocol(programs, gaps, versions);
+    let guard_route =
+        |programs: &Programs, gaps: &[&DependencyGap]| observed_guard(programs, gaps, versions);
 
     let mut remedies: Vec<Remedy> = [
         isolation.clone(),
         serializable_closure(programs, obstacles),
         strict_locks(programs, &gaps),
-        version_route(programs, &gaps),
+        guard_route(programs, &gaps),
         composed(strict_locks),
         isolation.as_ref().and_then(|base| {
-            let then = version_route(&base.programs, &gaps)?;
+            let then = guard_route(&base.programs, &gaps)?;
 
             Some(Remedy {
                 kind: then.kind,
@@ -338,22 +347,7 @@ fn serializable_closure(
 /// The selector a step accesses. An insert selects nothing: the
 /// instance it creates cannot be locked before it exists.
 fn selector_of(step: &TransactionStep) -> Option<&ObjectSelector> {
-    match step {
-        TransactionStep::Read(read) => Some(&read.target),
-        TransactionStep::Write(write) => Some(&write.target),
-        TransactionStep::Delete(delete) => Some(&delete.target),
-        TransactionStep::Lock(lock) => Some(&lock.target),
-        TransactionStep::Transition(transition) => Some(&transition.subject),
-        TransactionStep::ValidateVersion(validate) => Some(&validate.target),
-        TransactionStep::BumpVersion(bump) => Some(&bump.target),
-        TransactionStep::AdvanceCursor(advance) => Some(&advance.target),
-        TransactionStep::Fence(fence) => Some(&fence.target),
-
-        TransactionStep::Insert(_)
-        | TransactionStep::EstablishEffectIntent(_)
-        | TransactionStep::EstablishTransactionOutput(_)
-        | TransactionStep::WriteOutbox(_) => None,
-    }
+    step.selector()
 }
 
 /// The strict-lock route: the lock is held from before the first access
@@ -473,14 +467,21 @@ fn strict_locks(programs: &Programs, gaps: &[&DependencyGap]) -> Option<Remedy> 
     })
 }
 
-/// The version-protocol route: the reader validates at commit the
-/// version its read observed, and the writer advances it, so a stale
-/// observation rejects instead of committing.
+/// The observed-state guard route: the reader conditions its own first
+/// later mutation of the observed instance on what the read observed,
+/// so a stale observation rejects instead of committing.
 ///
-/// The guard goes directly after the read it guards and reuses that
-/// read's selector, so it identifies the very instance that was
-/// observed; the bump goes after the last step that mutates the object.
-fn version_protocol(
+/// On a versioned object the comparison is the version the read
+/// observed — added to the read where it is narrowed — which covers
+/// every field of the live instance. On an unversioned one it is the
+/// observed fields themselves: those the gap names as uncovered, or
+/// every field the read selects. An update becomes a compare-and-set,
+/// which rejects, so only where the author declared a `rejected` arm; a
+/// transition, cursor advance, or compare-and-set already rejects and
+/// gains the comparison. A fence is passed over — on an equal token it
+/// holds no write protection. Where the transaction performs no
+/// guardable mutation of the read instance, nothing is invented.
+fn observed_guard(
     programs: &Programs,
     gaps: &[&DependencyGap],
     versions: &BTreeMap<Id, FieldPath>,
@@ -490,41 +491,52 @@ fn version_protocol(
     let mut edited: BTreeSet<Tx> = BTreeSet::new();
     let mut added = 0;
 
-    let mut unvalidated: Vec<(Tx, &Id)> = Vec::new();
-    let mut unbumped: Vec<(Tx, &Id)> = Vec::new();
+    // Per guarded read: the fields to compare beyond the version, when
+    // the gap names them.
+    let mut unguarded: Vec<(Tx, usize, Option<BTreeSet<FieldPath>>)> = Vec::new();
 
     for gap in gaps {
-        match gap {
-            DependencyGap::VersionValidationMissing {
+        let (transaction, step, fields) = match gap {
+            DependencyGap::ObservedStateGuardMissing {
+                transaction, step, ..
+            } => (transaction, *step, None),
+
+            DependencyGap::ObservedStateGuardDoesNotCoverConflict {
                 transaction,
-                object,
-            } => {
-                if let Some(id) = in_scope(&programs, transaction)
-                    && !unvalidated.contains(&(id.clone(), object))
-                {
-                    unvalidated.push((id, object));
+                step,
+                fields,
+                ..
+            } => (
+                transaction,
+                *step,
+                match fields {
+                    AccessFields::Only(fields) => Some(fields.clone()),
+                    AccessFields::All | AccessFields::Unknown => None,
+                },
+            ),
+
+            _ => continue,
+        };
+
+        let Some(id) = in_scope(&programs, transaction) else {
+            continue;
+        };
+
+        match unguarded
+            .iter_mut()
+            .find(|(other, other_step, _)| *other == id && *other_step == step)
+        {
+            Some((_, _, existing)) => {
+                if let (Some(existing), Some(fields)) = (existing.as_mut(), fields) {
+                    existing.extend(fields);
                 }
             }
 
-            DependencyGap::VersionBumpMissing {
-                transaction,
-                object,
-            } => {
-                if let Some(id) = in_scope(&programs, transaction)
-                    && !unbumped.contains(&(id.clone(), object))
-                {
-                    unbumped.push((id, object));
-                }
-            }
-
-            _ => {}
+            None => unguarded.push((id, step, fields)),
         }
     }
 
-    for (transaction, object) in unvalidated {
-        let version = versions.get(object)?;
-
-        // A guard rejects. Only an author says what a rejection does.
+    for (transaction, step, fields) in unguarded {
         let declares_rejection =
             programs
                 .get(&transaction.0)?
@@ -534,62 +546,96 @@ fn version_protocol(
                     execution.transaction.id == transaction.1 && execution.rejected.is_some()
                 });
 
-        if !declares_rejection {
-            return None;
-        }
-
         let body = &mut transaction_mut(&mut programs, &transaction)?.steps;
 
-        let position = body.iter().position(
-            |step| matches!(step, TransactionStep::Read(read) if &read.target.object == object),
-        )?;
-
-        let TransactionStep::Read(read) = &mut body[position] else {
+        let TransactionStep::Read(read) = body.get(step)? else {
             return None;
         };
 
-        if let FieldSelection::Only(fields) = &mut read.fields {
-            fields.insert(version.clone());
-        }
+        let (bind, target) = (read.bind.clone(), read.target.clone());
 
-        let guard = TransactionStep::ValidateVersion(ValidateVersion {
-            target: read.target.clone(),
-            expected: ValueRef {
-                source: ValueSource::TransactionRead(read.bind.clone()),
-                path: version.clone(),
+        let compared: BTreeSet<FieldPath> = match versions.get(&target.object) {
+            Some(version) => [version.clone()].into(),
+
+            None => match (fields, &read.fields) {
+                (Some(fields), _) => fields,
+                (None, FieldSelection::Only(fields)) => fields.clone(),
+                (None, FieldSelection::All) => return None,
             },
-        });
+        };
 
-        body.insert(position + 1, guard);
-
-        added += 1;
-
-        edited.insert(transaction);
-    }
-
-    for (transaction, object) in unbumped {
-        if !versions.contains_key(object) {
-            return None;
+        // The read must observe what is compared.
+        if let TransactionStep::Read(read) = &mut body[step]
+            && let FieldSelection::Only(fields) = &mut read.fields
+        {
+            fields.extend(compared.iter().cloned());
         }
 
-        let body = &mut transaction_mut(&mut programs, &transaction)?.steps;
+        let mutation = body
+            .iter()
+            .enumerate()
+            .skip(step + 1)
+            .position(|(_, inner)| {
+                // A fence holds no write protection on an equal token,
+                // so its comparison would guard nothing.
+                matches!(
+                    inner,
+                    TransactionStep::Update(_)
+                        | TransactionStep::CompareAndSet(_)
+                        | TransactionStep::Transition(_)
+                        | TransactionStep::AdvanceCursor(_)
+                ) && inner.selector() == Some(&target)
+            })
+            .map(|offset| offset + step + 1)?;
 
-        let mutation = body.iter().rposition(|step| {
-            matches!(
-                step,
-                TransactionStep::Write(_)
-                    | TransactionStep::Transition(_)
-                    | TransactionStep::AdvanceCursor(_)
-                    | TransactionStep::Fence(_)
-            ) && selector_of(step).is_some_and(|selector| &selector.object == object)
-        })?;
+        let conditions: Vec<CompareCondition> = compared
+            .into_iter()
+            .map(|field| CompareCondition {
+                expected: SelectorValue::Value(ValueRef {
+                    source: ValueSource::TransactionRead(bind.clone()),
+                    path: field.clone(),
+                }),
+                field,
+            })
+            .collect();
 
-        let target = selector_of(&body[mutation])?.clone();
+        let extend = |compare: &mut Vec<CompareCondition>| {
+            for condition in &conditions {
+                if !compare
+                    .iter()
+                    .any(|existing| existing.field == condition.field)
+                {
+                    compare.push(condition.clone());
+                }
+            }
+        };
 
-        body.insert(
-            mutation + 1,
-            TransactionStep::BumpVersion(BumpVersion { target }),
-        );
+        match &mut body[mutation] {
+            TransactionStep::Update(update) => {
+                // A compare-and-set rejects. Only an author says what a
+                // rejection does.
+                if !declares_rejection {
+                    return None;
+                }
+
+                let mut compare = Vec::new();
+
+                extend(&mut compare);
+
+                body[mutation] = TransactionStep::CompareAndSet(CompareAndSet {
+                    target: update.target.clone(),
+                    compare,
+                    fields: update.fields.clone(),
+                    values: update.values.clone(),
+                });
+            }
+
+            TransactionStep::CompareAndSet(cas) => extend(&mut cas.compare),
+            TransactionStep::Transition(transition) => extend(&mut transition.compare),
+            TransactionStep::AdvanceCursor(advance) => extend(&mut advance.compare),
+
+            _ => return None,
+        }
 
         added += 1;
 
@@ -601,13 +647,13 @@ fn version_protocol(
     }
 
     Some(Remedy {
-        kind: RemedyKind::VersionProtocol,
+        kind: RemedyKind::ObservedGuard,
         programs,
         transactions_edited: edited.len(),
         steps_added: added,
         summary: format!(
-            "validate at commit the version each read observed, and advance it beside the \
-             mutation, in {}",
+            "condition the later mutation of each observed instance on the version or state \
+             its read observed, in {}",
             listed(&edited)
         ),
     })
@@ -628,15 +674,15 @@ pub struct OrderingGap<'a> {
 
 /// Every candidate the catalogue offers for unproven ordering: the
 /// position a cursor or fence consumes corrected to the requirement's,
-/// and — where nothing persists the position — the ordinary write of it
+/// and — where nothing persists the position — the update of it
 /// turned into a cursor advance, under each advance rule. (The
 /// serializability an ordering proof rests on is repaired by
 /// [`candidates`], from the obstacles an ordering verdict embeds.)
 ///
 /// A cursor rejects a stale position, and what an operation does when
 /// its transaction is rejected is its author's decision: as with the
-/// version protocol, a cursor is a candidate only where the transaction
-/// already declares a `rejected` arm.
+/// observed-state guard, a cursor is a candidate only where the
+/// transaction already declares a `rejected` arm.
 pub fn ordering_candidates(programs: &Programs, gaps: &[OrderingGap<'_>]) -> Vec<Remedy> {
     let mut remedies: Vec<Remedy> = [ordering_position(programs, gaps)]
         .into_iter()
@@ -758,13 +804,16 @@ fn ordered_cursor(
 
         let body = &mut transaction_mut(&mut programs, &id)?.steps;
 
+        // An update or compare-and-set recording the position: the
+        // comparisons a compare-and-set carries go with the cursor.
         let Some((position, field)) = body.iter().enumerate().find_map(|(index, step)| {
-            let TransactionStep::Write(write) = step else {
-                return None;
+            let fields = match step {
+                TransactionStep::Update(update) => &update.fields,
+                TransactionStep::CompareAndSet(cas) => &cas.fields,
+                _ => return None,
             };
 
-            let mut matching = write
-                .fields
+            let mut matching = fields
                 .iter()
                 .filter(|field| records_position(field, &gap.requirement.position));
 
@@ -777,22 +826,40 @@ fn ordered_cursor(
             continue;
         };
 
-        let TransactionStep::Write(write) = &mut body[position] else {
-            continue;
+        let (target, remaining, compare) = match &mut body[position] {
+            TransactionStep::Update(update) => {
+                update.fields.remove(&field);
+
+                (update.target.clone(), update.fields.len(), Vec::new())
+            }
+
+            TransactionStep::CompareAndSet(cas) => {
+                cas.fields.remove(&field);
+
+                // Where the compare-and-set keeps other fields it keeps
+                // its comparisons; where it dissolves into the cursor,
+                // the cursor carries them.
+                let compare = if cas.fields.is_empty() {
+                    std::mem::take(&mut cas.compare)
+                } else {
+                    Vec::new()
+                };
+
+                (cas.target.clone(), cas.fields.len(), compare)
+            }
+
+            _ => continue,
         };
-
-        let target = write.target.clone();
-
-        write.fields.remove(&field);
 
         let advance = TransactionStep::AdvanceCursor(AdvanceCursor {
             target,
             field,
             incoming: gap.requirement.position.clone(),
             rule,
+            compare,
         });
 
-        if write.fields.is_empty() {
+        if remaining == 0 {
             body[position] = advance;
         } else {
             body.insert(position, advance);
@@ -817,7 +884,7 @@ fn ordered_cursor(
         steps_added: edited.len(),
         summary: format!(
             "persist the position through a {rule} cursor advance instead of an ordinary \
-             write, in {}",
+             update, in {}",
             listed(&edited)
         ),
     })

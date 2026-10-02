@@ -23,8 +23,9 @@ use std::collections::BTreeSet;
 use serde::Serialize;
 
 use crate::analyzer::verification::transaction_conflicts::{
-    AccessFields, CommitOrderEvidence, ConflictIndex, DependencyEvidence, DependencyGap,
-    DependencyKind, DependencySide, SelectorOverlap, TransactionRef, isolation_label,
+    AccessFields, AccessMode, CommitOrderEvidence, ConflictIndex, DependencyEvidence,
+    DependencyGap, DependencyKind, DependencySide, GuardCoverage, SelectorOverlap, TransactionRef,
+    isolation_label,
 };
 use crate::analyzer::verification::transaction_ordering::{
     self, TransactionOrderingProof, TransactionOrderingVerdict,
@@ -117,8 +118,10 @@ pub struct DependencyView {
     pub overlap: String,
     pub constrained: bool,
     /// A short label for the commit-order evidence: `strict lock`,
-    /// `version validation`, `ordered cursor`, `atomic write order`,
-    /// `committed read`. Absent when nothing constrains the edge.
+    /// `conditional mutation`, `observed version guard`, `observed
+    /// field guard`, `locked read`, `ordered cursor`, `atomic write
+    /// order`, `committed read`. Absent when nothing constrains the
+    /// edge.
     pub evidence: Option<String>,
     /// Short labels for what is missing on an unconstrained edge.
     pub gaps: Vec<String>,
@@ -485,7 +488,13 @@ fn dependency_view(
         CommitOrderEvidence::IntrinsicCommittedRead { .. } => Some("committed read"),
         CommitOrderEvidence::AtomicWriteOrder { .. } => Some("atomic write order"),
         CommitOrderEvidence::StrictLock { .. } => Some("strict lock"),
-        CommitOrderEvidence::VersionValidation { .. } => Some("version validation"),
+        CommitOrderEvidence::AtomicConditionalMutation { guard, .. } => Some(match guard {
+            GuardCoverage::Atomic | GuardCoverage::HeldProtection => "conditional mutation",
+            GuardCoverage::ObservedState { .. } => "observed field guard",
+            GuardCoverage::ObservedVersion { .. } => "observed version guard",
+            GuardCoverage::LockedReader { .. } => "locked read",
+        }),
+        CommitOrderEvidence::ReadOnlyObservation { .. } => Some("read-only observation"),
         CommitOrderEvidence::OrderedCursor { .. } => Some("ordered cursor"),
         CommitOrderEvidence::None => None,
     };
@@ -640,8 +649,16 @@ fn gap_label(gap: &DependencyGap) -> String {
         DependencyGap::LockAcquiredAfterProtectedAccess { side, .. } => {
             format!("{side} lock taken after the access")
         }
-        DependencyGap::VersionValidationMissing { .. } => "no version validation".to_string(),
-        DependencyGap::VersionBumpMissing { .. } => "no version bump".to_string(),
+        DependencyGap::ObservedStateGuardMissing { .. } => "no observed-state guard".to_string(),
+        DependencyGap::ObservedStateGuardDoesNotCoverConflict { .. } => {
+            "guard misses the conflicting fields".to_string()
+        }
+        DependencyGap::ObservedStateNotIdentified { .. } => {
+            "observes a set, not one instance".to_string()
+        }
+        DependencyGap::ObservedVersionMayRepeat { .. } => {
+            "version may repeat after delete".to_string()
+        }
         DependencyGap::IsolationUnspecified { .. } => "isolation unspecified".to_string(),
         DependencyGap::TransactionConflictUnknownSelectorOverlap { .. } => {
             "overlap not proven disjoint".to_string()
@@ -654,22 +671,29 @@ fn gap_label(gap: &DependencyGap) -> String {
 
 /// The fields two accesses meet on, from the access index.
 fn fields_label(index: &ConflictIndex<'_>, dependency: &DependencyEvidence) -> String {
-    let access = |reference: &TransactionRef, step: usize| {
+    let access = |reference: &TransactionRef, step: usize, mode: AccessMode| {
         index
             .templates
             .iter()
             .find(|template| template.reference == *reference)
             .and_then(|template| {
-                template
-                    .accesses
-                    .iter()
-                    .find(|access| access.step == step && access.object == dependency.object)
+                template.accesses.iter().find(|access| {
+                    access.step == step && access.object == dependency.object && access.mode == mode
+                })
             })
     };
 
     let (Some(source), Some(target)) = (
-        access(&dependency.source, dependency.source_step),
-        access(&dependency.target, dependency.target_step),
+        access(
+            &dependency.source,
+            dependency.source_step,
+            dependency.source_mode,
+        ),
+        access(
+            &dependency.target,
+            dependency.target_step,
+            dependency.target_mode,
+        ),
     ) else {
         return "unknown fields".to_string();
     };
@@ -817,7 +841,7 @@ mod tests {
             apply
                 .edges
                 .iter()
-                .any(|edge| edge.evidence.as_deref() == Some("version validation")),
+                .any(|edge| edge.evidence.as_deref() == Some("observed version guard")),
             "{:#?}",
             apply.edges
         );
@@ -838,7 +862,7 @@ mod tests {
             to_cancel.edge_ids.len(),
             "{to_cancel:#?}"
         );
-        assert!(to_cancel.evidence.contains(&"version validation".to_string()));
+        assert!(to_cancel.evidence.contains(&"observed version guard".to_string()));
         assert!(to_cancel.summary.contains("all commit-ordered by"), "{}", to_cancel.summary);
         assert!(apply.pairs.iter().any(|pair| pair.self_loop));
         assert_eq!(
@@ -873,7 +897,7 @@ mod tests {
             .expect("reserve_inventory races its own concurrent execution");
 
         assert!(!self_race.constrained);
-        assert!(self_race.gaps.contains(&"no version validation".to_string()));
+        assert!(self_race.gaps.contains(&"no observed-state guard".to_string()));
         assert!(self_race.summary.contains("unconstrained:"), "{}", self_race.summary);
     }
 

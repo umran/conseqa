@@ -252,9 +252,19 @@ pub enum ReplayGap {
     /// outcomes are not defined (§20).
     ContainsDelete,
 
-    /// Route A: the transaction bumps an object version, which
-    /// re-execution would advance a second time.
-    ContainsVersionBump,
+    /// Route A: the transaction mutates a live versioned instance, whose
+    /// intrinsic version publication re-execution would repeat.
+    PublishesVersion,
+
+    /// Route A: the transaction contains a compare-and-set, whose
+    /// comparison re-execution evaluates against the state the first
+    /// commit changed — it may reject instead of reproducing it.
+    ContainsCompareAndSet,
+
+    /// Route A: the transaction contains an upsert, which re-execution
+    /// would take down the update branch where the first attempt
+    /// inserted.
+    ContainsUpsert,
 
     /// Route A: the transaction advances a cursor, which re-execution
     /// with the same incoming position would reject as stale.
@@ -2037,6 +2047,15 @@ impl<'a> ReplayAnalysis<'a> {
         }
     }
 
+    /// Whether the object declares a version token.
+    fn versioned(&self, object: &Id) -> bool {
+        self.model
+            .data_models
+            .values()
+            .filter_map(|data_model| data_model.objects.get(object))
+            .any(|object| object.version.is_some())
+    }
+
     /// Route A precondition: the V1 natural-replay judgment over the
     /// transaction body.
     fn natural_route(
@@ -2060,8 +2079,15 @@ impl<'a> ReplayAnalysis<'a> {
 
                 TransactionStep::Delete(_) => push(&mut gaps, ReplayGap::ContainsDelete),
 
-                TransactionStep::Write(write) => {
-                    for root in write.target.predicate.roots() {
+                TransactionStep::Update(update) => {
+                    // A mutation of a live versioned instance publishes
+                    // a newer token, and re-execution would publish
+                    // another.
+                    if self.versioned(&update.target.object) {
+                        push(&mut gaps, ReplayGap::PublishesVersion);
+                    }
+
+                    for root in update.target.predicate.roots() {
                         if let Err(gap) = self.root_stability(context, root) {
                             push(
                                 &mut gaps,
@@ -2073,7 +2099,7 @@ impl<'a> ReplayAnalysis<'a> {
                         }
                     }
 
-                    match &write.values {
+                    match &update.values {
                         Derivation::Unspecified => {
                             push(&mut gaps, ReplayGap::MutationDerivationUnspecified);
                         }
@@ -2094,6 +2120,12 @@ impl<'a> ReplayAnalysis<'a> {
                     }
                 }
 
+                TransactionStep::CompareAndSet(_) => {
+                    push(&mut gaps, ReplayGap::ContainsCompareAndSet)
+                }
+
+                TransactionStep::Upsert(_) => push(&mut gaps, ReplayGap::ContainsUpsert),
+
                 // An outbox write does not block the natural route:
                 // the state leg judges whether re-execution reproduces
                 // the same DataObject state, and whether the repeated
@@ -2105,20 +2137,22 @@ impl<'a> ReplayAnalysis<'a> {
                 // unjudged.
                 TransactionStep::WriteOutbox(_) => {}
 
-                // Re-execution advances the version again, and
-                // re-presents an already-accepted cursor position,
-                // which the successor and monotonic rules both reject
-                // as stale: neither reproduces the first commit.
-                TransactionStep::BumpVersion(_) => push(&mut gaps, ReplayGap::ContainsVersionBump),
-
+                // Re-execution re-presents an already-accepted cursor
+                // position, which the successor and monotonic rules
+                // both reject as stale: it does not reproduce the first
+                // commit.
                 TransactionStep::AdvanceCursor(_) => {
                     push(&mut gaps, ReplayGap::ContainsCursorAdvance)
                 }
 
-                // A validation re-observes the current version and a
-                // fence re-presents the same token, which an equal
-                // fence accepts: neither changes what commits.
-                TransactionStep::ValidateVersion(_) | TransactionStep::Fence(_) => {}
+                // A fence re-presents the same token, which an equal
+                // fence accepts; on a versioned instance, though, the
+                // fence publishes a newer version each time it commits.
+                TransactionStep::Fence(fence) => {
+                    if self.versioned(&fence.target.object) {
+                        push(&mut gaps, ReplayGap::PublishesVersion);
+                    }
+                }
 
                 TransactionStep::Read(_)
                 | TransactionStep::Lock(_)

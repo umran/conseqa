@@ -51,8 +51,8 @@ pub struct Transaction {
 
 impl Transaction {
     /// Whether any step of the body is a logical commit guard that may
-    /// reject the whole transaction: a state transition, a version
-    /// validation, a cursor advance, or a fence. Such a transaction
+    /// reject the whole transaction: a compare-and-set, a state
+    /// transition, a cursor advance, or a fence. Such a transaction
     /// must carry a `rejected` block at its execution site; one without
     /// any must not.
     pub fn rejects(&self) -> bool {
@@ -128,8 +128,22 @@ pub enum TransactionIsolation {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum TransactionStep {
     Read(Read),
-    Write(Write),
+
+    /// An unconditional mutation of the selected instances.
+    Update(Update),
+
+    /// An atomic conditional update of one identified instance: the
+    /// comparison and the mutation are one storage operation, and a
+    /// failed comparison — or a missing instance — rejects the
+    /// transaction.
+    CompareAndSet(CompareAndSet),
+
     Insert(Insert),
+
+    /// An atomic insert-or-update of one identified instance, arbitrated
+    /// on the object's identity.
+    Upsert(Upsert),
+
     Delete(Delete),
     Lock(Lock),
 
@@ -137,24 +151,6 @@ pub enum TransactionStep {
     /// over the subject's state that rejects the transaction when the
     /// current state is not among the transition's `from` states.
     Transition(StateTransition),
-
-    EstablishEffectIntent(EstablishEffectIntent),
-    EstablishTransactionOutput(EstablishTransactionOutput),
-
-    /// Stages one outbox message for admission atomically with this
-    /// transaction's commit — the one legal execution site of an
-    /// `OutboxWriteEffect`.
-    WriteOutbox(WriteOutboxEffect),
-
-    /// A commit guard over a versioned object: the transaction commits
-    /// only if the object's version at commit arbitration still equals
-    /// the version an earlier read of the same instance observed.
-    ValidateVersion(ValidateVersion),
-
-    /// Advances a versioned object's version by one, atomically with
-    /// the commit. Required beside every write or transition of a live
-    /// versioned instance.
-    BumpVersion(BumpVersion),
 
     /// A commit guard over an ordered cursor field: the transaction
     /// commits only when the incoming position is admissible under the
@@ -165,28 +161,53 @@ pub enum TransactionStep {
     /// the persisted fence rejects the transaction; an equal token
     /// leaves the fence; a newer token advances it atomically.
     Fence(Fence),
+
+    EstablishEffectIntent(EstablishEffectIntent),
+    EstablishTransactionOutput(EstablishTransactionOutput),
+
+    /// Stages one outbox message for admission atomically with this
+    /// transaction's commit — the one legal execution site of an
+    /// `OutboxWriteEffect`.
+    WriteOutbox(WriteOutboxEffect),
 }
 
 impl TransactionStep {
     /// Every value reference the step evaluates: selector roots,
-    /// mutation and artifact derivations, transition intent
-    /// derivations, and the declaration roots of an inline intent's
-    /// effect contract, which is evaluated at its establishment site.
-    /// The transaction's commit key is not a step's and is judged
-    /// separately.
+    /// comparison expectations, mutation and artifact derivations,
+    /// transition intent derivations, and the declaration roots of an
+    /// inline intent's effect contract, which is evaluated at its
+    /// establishment site. The transaction's commit key is not a
+    /// step's and is judged separately.
     pub fn roots(&self) -> Vec<&ValueRef> {
-        match self {
+        let mut roots = match self {
             Self::Read(read) => read.target.predicate.roots(),
 
-            Self::Write(write) => {
-                let mut roots = write.target.predicate.roots();
+            Self::Update(update) => {
+                let mut roots = update.target.predicate.roots();
 
-                roots.extend(write.values.roots());
+                roots.extend(update.values.roots());
+
+                roots
+            }
+
+            Self::CompareAndSet(cas) => {
+                let mut roots = cas.target.predicate.roots();
+
+                roots.extend(cas.values.roots());
 
                 roots
             }
 
             Self::Insert(insert) => insert.values.roots(),
+
+            Self::Upsert(upsert) => {
+                let mut roots = upsert.target.predicate.roots();
+
+                roots.extend(upsert.insert_values.roots());
+                roots.extend(upsert.update_values.roots());
+
+                roots
+            }
 
             Self::Delete(delete) => delete.target.predicate.roots(),
 
@@ -205,16 +226,6 @@ impl TransactionStep {
 
                 roots
             }
-
-            Self::ValidateVersion(validate) => {
-                let mut roots = validate.target.predicate.roots();
-
-                roots.push(&validate.expected);
-
-                roots
-            }
-
-            Self::BumpVersion(bump) => bump.target.predicate.roots(),
 
             Self::AdvanceCursor(advance) => {
                 let mut roots = advance.target.predicate.roots();
@@ -252,7 +263,11 @@ impl TransactionStep {
 
                 roots
             }
-        }
+        };
+
+        roots.extend(self.compare().iter().filter_map(CompareCondition::root));
+
+        roots
     }
 
     /// Whether the step is a logical commit guard that may reject the
@@ -261,21 +276,94 @@ impl TransactionStep {
     /// than becoming infallible by joining the enum.
     pub fn rejects(&self) -> bool {
         match self {
-            Self::Transition(_)
-            | Self::ValidateVersion(_)
+            Self::CompareAndSet(_)
+            | Self::Transition(_)
             | Self::AdvanceCursor(_)
             | Self::Fence(_) => true,
 
+            // An upsert chooses between inserting and updating; neither
+            // branch is a logical refusal.
             Self::Read(_)
-            | Self::Write(_)
+            | Self::Update(_)
             | Self::Insert(_)
+            | Self::Upsert(_)
             | Self::Delete(_)
             | Self::Lock(_)
-            | Self::BumpVersion(_)
             | Self::EstablishEffectIntent(_)
             | Self::EstablishTransactionOutput(_)
             | Self::WriteOutbox(_) => false,
         }
+    }
+
+    /// The comparisons a guarded mutation conjoins with its intrinsic
+    /// condition: a compare-and-set's own, or the optional guard of a
+    /// transition, cursor advance, or fence. Empty for every other
+    /// step.
+    pub fn compare(&self) -> &[CompareCondition] {
+        match self {
+            Self::CompareAndSet(cas) => &cas.compare,
+            Self::Transition(transition) => &transition.compare,
+            Self::AdvanceCursor(advance) => &advance.compare,
+            Self::Fence(fence) => &fence.compare,
+
+            Self::Read(_)
+            | Self::Update(_)
+            | Self::Insert(_)
+            | Self::Upsert(_)
+            | Self::Delete(_)
+            | Self::Lock(_)
+            | Self::EstablishEffectIntent(_)
+            | Self::EstablishTransactionOutput(_)
+            | Self::WriteOutbox(_) => &[],
+        }
+    }
+
+    /// The selector of the persistent instances the step observes,
+    /// mutates, or locks. An insert selects nothing — the instance it
+    /// creates is fixed by its derivation — and artifact steps touch
+    /// no object.
+    pub fn selector(&self) -> Option<&ObjectSelector> {
+        match self {
+            Self::Read(read) => Some(&read.target),
+            Self::Update(update) => Some(&update.target),
+            Self::CompareAndSet(cas) => Some(&cas.target),
+            Self::Upsert(upsert) => Some(&upsert.target),
+            Self::Delete(delete) => Some(&delete.target),
+            Self::Lock(lock) => Some(&lock.target),
+            Self::Transition(transition) => Some(&transition.subject),
+            Self::AdvanceCursor(advance) => Some(&advance.target),
+            Self::Fence(fence) => Some(&fence.target),
+
+            Self::Insert(_)
+            | Self::EstablishEffectIntent(_)
+            | Self::EstablishTransactionOutput(_)
+            | Self::WriteOutbox(_) => None,
+        }
+    }
+
+    /// The object the step touches, if any: its selector's, or an
+    /// insert's.
+    pub fn object(&self) -> Option<&Id> {
+        match self {
+            Self::Insert(insert) => Some(&insert.object),
+            _ => self.selector().map(|selector| &selector.object),
+        }
+    }
+
+    /// Whether the step is an atomic guarded mutation: a compare-and-
+    /// set, a transition, a cursor advance, a fence, or an upsert's
+    /// identity arbitration. Each takes the mutated instance's write
+    /// protection atomically with its condition and holds it to
+    /// commit.
+    pub fn guards(&self) -> bool {
+        matches!(
+            self,
+            Self::CompareAndSet(_)
+                | Self::Transition(_)
+                | Self::AdvanceCursor(_)
+                | Self::Fence(_)
+                | Self::Upsert(_)
+        )
     }
 }
 
@@ -297,14 +385,119 @@ pub struct Read {
     pub fields: FieldSelection,
 }
 
+/// An unconditional mutation of the selected persistent objects.
+///
+/// `update` is not an optimistic-concurrency guard: it never rejects
+/// because something an earlier read observed has since changed. Where
+/// the transaction relies on its read staying true, the mutation is a
+/// [`CompareAndSet`] or a guarded domain primitive instead, or the read
+/// is protected by a lock or by serializable isolation. On a versioned
+/// object the committed mutation publishes a newer version token
+/// intrinsically; `fields` never names the version field.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct Write {
+pub struct Update {
     pub target: ObjectSelector,
     pub fields: BTreeSet<FieldPath>,
 
     /// Provenance of the values written.
     pub values: Derivation,
+}
+
+/// An atomic conditional update of one identified persistent instance.
+///
+/// Conceptually `if every comparison holds: mutate, else reject` — one
+/// storage operation, with no observable interval between a successful
+/// comparison and the acquisition of the mutation's write protection,
+/// which is then held to commit:
+///
+/// ```sql
+/// UPDATE account SET balance = ?, version = version + 1
+///  WHERE account_id = ? AND version = ?;
+/// ```
+///
+/// The target pins the object's whole identity. The transaction
+/// rejects when the instance does not exist or any comparison is
+/// false. A comparison whose `expected` value is
+/// `transaction_read:<bind>.<the same field>` of an earlier read of the
+/// same instance is an *observed-state* comparison: it is what lets the
+/// serializability checker credit that read as unable to go stale
+/// unnoticed. Any other comparison — an input, a literal, another
+/// object's read — is application behaviour, valid but no such
+/// evidence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CompareAndSet {
+    pub target: ObjectSelector,
+
+    /// The conditions conjoined into the guard; at least one, each
+    /// field at most once.
+    pub compare: Vec<CompareCondition>,
+
+    pub fields: BTreeSet<FieldPath>,
+
+    /// Provenance of the values written.
+    pub values: Derivation,
+}
+
+/// One equality condition of a guarded mutation: the instance's
+/// current `field` equals `expected`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CompareCondition {
+    pub field: FieldPath,
+    pub expected: SelectorValue,
+}
+
+impl CompareCondition {
+    /// The value reference the condition compares against, if it is
+    /// not a literal.
+    pub fn root(&self) -> Option<&ValueRef> {
+        match &self.expected {
+            SelectorValue::Value(root) => Some(root),
+            SelectorValue::Literal(_) => None,
+        }
+    }
+
+    /// The transaction-read binding whose same field the condition
+    /// compares against: `expected` is exactly
+    /// `transaction_read:<bind>.<field>`. Whether that read precedes
+    /// the comparison and selects the same instance is the analyzer's
+    /// to judge.
+    pub fn observed_read(&self) -> Option<&Id> {
+        match self.root() {
+            Some(ValueRef {
+                source: super::ValueSource::TransactionRead(bind),
+                path,
+            }) if *path == self.field => Some(bind),
+            _ => None,
+        }
+    }
+}
+
+/// An atomic insert-or-update of one identified instance: absent, it is
+/// inserted from `insert_values`; present, `update_fields` are set from
+/// `update_values`. The choice and the mutation are atomic with respect
+/// to competing operations on the same identity, arbitrated on
+/// `DataObject.identity`, which the target pins whole.
+///
+/// An upsert never rejects, and it protects no earlier read: its only
+/// concurrency evidence is its own identity arbitration and mutation.
+/// On a versioned object the insert branch establishes the initial
+/// version and the update branch publishes a newer one; neither names
+/// the version field.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Upsert {
+    pub target: ObjectSelector,
+
+    /// Provenance of the inserted contents.
+    pub insert_values: Derivation,
+
+    pub update_fields: BTreeSet<FieldPath>,
+
+    /// Provenance of the values the update branch writes.
+    pub update_values: Derivation,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -709,6 +902,12 @@ pub struct StateTransition {
     /// Selects the concrete persistent machine instance.
     pub subject: ObjectSelector,
 
+    /// Observed-state or application comparisons conjoined with the
+    /// transition's intrinsic `from` guard, in the same atomic
+    /// conditional update.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub compare: Vec<CompareCondition>,
+
     /// The intents this application establishes, keyed by the
     /// state-machine transition side-effect ID.
     ///
@@ -755,51 +954,6 @@ pub struct TransitionEffectApplication {
     pub values: Derivation,
 }
 
-/// The observation guard of the version protocol: the transaction
-/// commits only if the selected instance's version at commit
-/// arbitration still *equals* `expected`; otherwise it rejects.
-///
-/// `expected` must be a version this transaction itself observed — a
-/// `transaction_read` binding of the same selected instance whose
-/// field selection included the version field. The guard compares, it
-/// never increments, and it is evaluated at commit wherever it sits in
-/// the step list, never at the step's wall-clock instant. It holds no
-/// lock across the read-to-commit window, which is what makes the route
-/// optimistic.
-///
-/// Validation never requires this step: it is declared where the
-/// transaction relies on what it read staying true until commit, and a
-/// serializability proof over a read-then-write needs it on the
-/// reader's side — together with the writer's `BumpVersion`, without
-/// which there is nothing for the guard to detect. Neither step implies
-/// the other: validating an instance the transaction only reads is a
-/// pure compare; validating and bumping one instance composes into a
-/// compare-and-swap from `expected` to `expected + 1`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ValidateVersion {
-    pub target: ObjectSelector,
-    pub expected: ValueRef,
-}
-
-/// The publishing half of the version protocol: at commit the selected
-/// instance's version becomes one higher than it is at that moment —
-/// unconditionally. The step compares nothing and never rejects; its
-/// purpose is other transactions, whose `ValidateVersion` guards detect
-/// the moved token.
-///
-/// Required beside every `Write` or `Transition` of a live versioned
-/// instance, at most once per selected instance; `Insert` creates the
-/// initial version and `Delete` removes the instance, so neither bumps.
-/// A bump on an instance the transaction never read is a legitimate
-/// blind write. The version field is never assigned through a
-/// derivation.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct BumpVersion {
-    pub target: ObjectSelector,
-}
-
 /// The ordered-cursor commit guard and the only ordinary update of a
 /// cursor field.
 ///
@@ -824,6 +978,12 @@ pub struct AdvanceCursor {
     pub incoming: ValueRef,
 
     pub rule: CursorAdvanceRule,
+
+    /// Comparisons conjoined with the cursor rule in the same atomic
+    /// conditional update. They change nothing about the ordering the
+    /// cursor establishes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub compare: Vec<CompareCondition>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -871,6 +1031,11 @@ pub struct Fence {
 
     /// The incoming authority token, of the fence field's type.
     pub token: ValueRef,
+
+    /// Comparisons conjoined with the fencing condition in the same
+    /// atomic conditional update.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub compare: Vec<CompareCondition>,
 }
 
 /// Declares an effect contract, constructs one concrete logical effect

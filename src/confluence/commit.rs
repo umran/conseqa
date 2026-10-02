@@ -1432,23 +1432,7 @@ fn check_program(
                     }
 
                     for inner in &transaction.steps {
-                        let object = match inner {
-                            TransactionStep::Read(read) => Some(&read.target.object),
-                            TransactionStep::Write(write) => Some(&write.target.object),
-                            TransactionStep::Insert(insert) => Some(&insert.object),
-                            TransactionStep::Delete(delete) => Some(&delete.target.object),
-                            TransactionStep::Lock(lock) => Some(&lock.target.object),
-                            TransactionStep::Transition(transition) => {
-                                Some(&transition.subject.object)
-                            }
-                            TransactionStep::ValidateVersion(validate) => {
-                                Some(&validate.target.object)
-                            }
-                            TransactionStep::BumpVersion(bump) => Some(&bump.target.object),
-                            TransactionStep::AdvanceCursor(advance) => Some(&advance.target.object),
-                            TransactionStep::Fence(fence) => Some(&fence.target.object),
-                            _ => None,
-                        };
+                        let object = inner.object();
 
                         if let (Some(object), Some(data_model)) = (object, data_model)
                             && !data_model.objects.contains_key(object)

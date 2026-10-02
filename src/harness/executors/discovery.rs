@@ -474,8 +474,16 @@ fn work_of(transaction: &Transaction, identities: &BTreeMap<Id, Vec<FieldPath>>)
                 note_keys(&read.target);
             }
 
-            TransactionStep::Write(write) => {
-                note_keys(&write.target);
+            TransactionStep::Update(update) => {
+                note_keys(&update.target);
+            }
+
+            TransactionStep::CompareAndSet(cas) => {
+                note_keys(&cas.target);
+            }
+
+            TransactionStep::Upsert(upsert) => {
+                note_keys(&upsert.target);
             }
 
             TransactionStep::Delete(delete) => {
@@ -506,19 +514,11 @@ fn work_of(transaction: &Transaction, identities: &BTreeMap<Id, Vec<FieldPath>>)
                 }
             }
 
-            // Locks and version guards are not work a prompt would
-            // describe, but what they protect is still what the
-            // transaction is about: the instance they pin is a key.
+            // Locks are not work a prompt would describe, but what they
+            // protect is still what the transaction is about: the
+            // instance they pin is a key.
             TransactionStep::Lock(lock) => {
                 note_keys(&lock.target);
-            }
-
-            TransactionStep::ValidateVersion(validate) => {
-                note_keys(&validate.target);
-            }
-
-            TransactionStep::BumpVersion(bump) => {
-                note_keys(&bump.target);
             }
 
             TransactionStep::Insert(_)

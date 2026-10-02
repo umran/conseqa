@@ -1244,6 +1244,26 @@ impl<'w> Builder<'w> {
         transaction_ref: &TransactionRef,
     ) {
         for step in &transaction.steps {
+            // A guarded mutation's comparisons read their fields of its
+            // target, atomically with the mutation.
+            if let Some(object) = step.object()
+                && !step.compare().is_empty()
+            {
+                self.record_object_access(
+                    transaction.data_model.as_ref(),
+                    object,
+                    transaction_node,
+                    transaction_ref,
+                    EdgeKind::ReadsObject,
+                    FieldAccess::Fields(
+                        step.compare()
+                            .iter()
+                            .map(|condition| condition.field.clone())
+                            .collect(),
+                    ),
+                );
+            }
+
             match step {
                 TransactionStep::Read(read) => {
                     self.record_object_access(
@@ -1261,14 +1281,38 @@ impl<'w> Builder<'w> {
                     );
                 }
 
-                TransactionStep::Write(write) => {
+                TransactionStep::Update(update) => {
                     self.record_object_access(
                         transaction.data_model.as_ref(),
-                        &write.target.object,
+                        &update.target.object,
                         transaction_node,
                         transaction_ref,
                         EdgeKind::WritesObject,
-                        FieldAccess::Fields(write.fields.iter().cloned().collect()),
+                        FieldAccess::Fields(update.fields.iter().cloned().collect()),
+                    );
+                }
+
+                TransactionStep::CompareAndSet(cas) => {
+                    self.record_object_access(
+                        transaction.data_model.as_ref(),
+                        &cas.target.object,
+                        transaction_node,
+                        transaction_ref,
+                        EdgeKind::WritesObject,
+                        FieldAccess::Fields(cas.fields.iter().cloned().collect()),
+                    );
+                }
+
+                // Either branch may run, and the insert branch writes
+                // the whole instance.
+                TransactionStep::Upsert(upsert) => {
+                    self.record_object_access(
+                        transaction.data_model.as_ref(),
+                        &upsert.target.object,
+                        transaction_node,
+                        transaction_ref,
+                        EdgeKind::WritesObject,
+                        FieldAccess::All,
                     );
                 }
 
@@ -1355,31 +1399,8 @@ impl<'w> Builder<'w> {
                     );
                 }
 
-                // The version protocol reads and writes the object's
-                // version field; the cursor and fence guards read and
-                // conditionally write theirs.
-                TransactionStep::ValidateVersion(validate) => {
-                    self.record_object_access(
-                        transaction.data_model.as_ref(),
-                        &validate.target.object,
-                        transaction_node,
-                        transaction_ref,
-                        EdgeKind::ReadsObject,
-                        FieldAccess::All,
-                    );
-                }
-
-                TransactionStep::BumpVersion(bump) => {
-                    self.record_object_access(
-                        transaction.data_model.as_ref(),
-                        &bump.target.object,
-                        transaction_node,
-                        transaction_ref,
-                        EdgeKind::WritesObject,
-                        FieldAccess::All,
-                    );
-                }
-
+                // The cursor and fence guards read and conditionally
+                // write their fields.
                 TransactionStep::AdvanceCursor(advance) => {
                     self.record_object_access(
                         transaction.data_model.as_ref(),

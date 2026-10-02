@@ -30,7 +30,7 @@
 # error is passed up instead: its arm abandons the delivery (dsl 5),
 # leaving the message for at-least-once redelivery, and adds no work of
 # its own (tests/abandon.rs).
-dsl: 5
+dsl: 6
 revision: 1
 services:
   service.ingest:
@@ -430,7 +430,7 @@ operations:
                     source: input:input.transcode_video.uploaded
                     path: video_id
               steps:
-              - kind: write
+              - kind: update
                 target:
                   object: object.job
                   predicate:
@@ -552,7 +552,7 @@ operations:
                 source: input:input.publish_video.completed
                 path: video_id
           steps:
-          - kind: write
+          - kind: update
             target:
               object: object.video
               predicate:

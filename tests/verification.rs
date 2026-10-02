@@ -28,8 +28,8 @@ use conseqa::{
         OperationStep, Race, RecoverabilityRequirement, RequestIdentity, RequestInput, ResultArm,
         ResultOutcome, ResultReplayRequirement, ResultType, Return, RuntimeModel, Schema,
         SchemaFragment, SelectorPredicate, SelectorValue, SubscriptionInput, TopicRuntime,
-        Transaction, TransactionIsolation, TransactionOrderingRequirement, TransactionStep,
-        ValueRef, ValueSource, Write,
+        Transaction, TransactionIsolation, TransactionOrderingRequirement, TransactionStep, Update,
+        ValueRef, ValueSource,
     },
 };
 
@@ -437,7 +437,7 @@ fn make_create_order_natural(model: &mut Model) {
     transaction.idempotency = IdempotencyGuarantee::Unspecified;
 
     transaction.steps = vec![
-        TransactionStep::Write(Write {
+        TransactionStep::Update(Update {
             target: ObjectSelector {
                 object: id("object.order_ledger"),
                 predicate: SelectorPredicate::Eq {

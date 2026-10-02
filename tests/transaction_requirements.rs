@@ -1,11 +1,14 @@
-//! The DSL v4 transaction-requirements matrix (§81 of the revision):
-//! transaction rejection, transition-scoped outbox effects, strict
-//! locks, the version protocol, the serializable-isolation closure,
-//! the serialization-graph route, cursors, fences, ordering, and the
-//! orthogonality of every transaction proof to the runtime topology.
-//! Each test perturbs the flash-checkout fixture, whose `object.order`
-//! is versioned and whose `tx.apply_payment` proves serializability by
-//! version validation and ordering by a successor cursor.
+//! The transaction-requirements matrix (§81 of the DSL v4 revision,
+//! §39 of the DSL 6 atomic-mutation revision): transaction rejection,
+//! transition-scoped outbox effects, strict locks, atomic conditional
+//! mutations — compare-and-set, guarded transitions and cursors, upsert
+//! — with intrinsic version publication, the serializable-isolation
+//! closure, the serialization-graph route, cursors, fences, ordering,
+//! and the orthogonality of every transaction proof to the runtime
+//! topology. Each test perturbs the flash-checkout fixture, whose
+//! `object.order` is versioned and whose `tx.apply_payment` proves
+//! serializability by conditioning its cursor advance on the observed
+//! version, and ordering by that successor cursor.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -26,12 +29,12 @@ use conseqa::{
     },
     parser::yaml,
     spec::{
-        BumpVersion, CursorAdvanceRule, Derivation, ExecuteTransaction, Fence, FieldPath,
-        FieldSelection, Id, IdempotencyGuarantee, Lock, LockMode, LockOrder, MessageIdentity,
-        Model, ObjectSelector, OperationBlock, OperationStep, Outbox, OutboxWriteEffect,
-        ResultOutcome, SelectorPredicate, SelectorValue, Transaction, TransactionIsolation,
-        TransactionOutcome, TransactionStep, TransitionEffect, TransitionEffectApplication,
-        ValueRef, ValueSource, Write,
+        CompareAndSet, CompareCondition, CursorAdvanceRule, Derivation, ExecuteTransaction,
+        Fence, FieldPath, FieldSelection, Id, IdempotencyGuarantee, Literal, Lock, LockMode,
+        LockOrder, MessageIdentity, Model, ObjectSelector, OperationBlock, OperationStep, Outbox,
+        OutboxWriteEffect, ResultOutcome, SelectorPredicate, SelectorValue, Transaction,
+        TransactionIsolation, TransactionOutcome, TransactionStep, TransitionEffect,
+        TransitionEffectApplication, Update, Upsert, ValueRef, ValueSource,
     },
     viz::graph::{EdgeDetail, extract},
 };
@@ -238,8 +241,9 @@ fn dependency_gaps(verdict: &TransactionSerializabilityVerdict) -> Vec<&Dependen
 fn flash_checkout_proves_apply_payment_and_leaves_reserve_inventory_unproven() {
     let model = load_flash_checkout();
 
-    // apply_payment: serializable by version validation against
-    // cancel_order and create_order's insert; ordered by the successor
+    // apply_payment: serializable by its cursor advance conditioned on
+    // the observed version, against cancel_order and create_order's
+    // insert — no writer declares anything; ordered by the successor
     // cursor on the order's last applied sequence.
     let verdict = serializability(&model, "tx.apply_payment");
 
@@ -276,10 +280,17 @@ fn flash_checkout_proves_apply_payment_and_leaves_reserve_inventory_unproven() {
 
     assert!(
         dependencies.iter().any(|dependency| matches!(
-            dependency.evidence,
-            verification::CommitOrderEvidence::VersionValidation { .. }
+            &dependency.evidence,
+            verification::CommitOrderEvidence::AtomicConditionalMutation {
+                guarded_by,
+                mechanism: verification::ConditionalMutationKind::AdvanceCursor,
+                guard: verification::GuardCoverage::ObservedVersion { .. },
+                ..
+            } if guarded_by.transaction == id("tx.apply_payment")
+                && dependency.target.transaction == id("tx.cancel_order")
         )),
-        "the proof should cite version validation:\n{dependencies:#?}"
+        "the proof should cite the observed-version guard against cancel_order:\n\
+         {dependencies:#?}"
     );
 
     let verdict = ordering(&model, "tx.apply_payment");
@@ -299,7 +310,8 @@ fn flash_checkout_proves_apply_payment_and_leaves_reserve_inventory_unproven() {
     );
 
     // reserve_inventory: the read-then-write of the stock row under
-    // read committed with neither lock nor version — write skew.
+    // read committed with neither lock nor guarded mutation — write
+    // skew.
     let verdict = serializability(&model, "tx.reserve_inventory");
 
     let gaps = dependency_gaps(&verdict);
@@ -312,7 +324,7 @@ fn flash_checkout_proves_apply_payment_and_leaves_reserve_inventory_unproven() {
 
     assert!(
         gaps.iter()
-            .any(|gap| matches!(gap, DependencyGap::VersionValidationMissing { .. })),
+            .any(|gap| matches!(gap, DependencyGap::ObservedStateGuardMissing { .. })),
         "{gaps:#?}"
     );
 
@@ -514,7 +526,7 @@ fn admit_order_paid_through_the_transition(model: &mut Model) {
 
     let transaction = transaction_mut(model, "operation.apply_payment", "tx.apply_payment");
 
-    let TransactionStep::Transition(transition) = &mut transaction.steps[3] else {
+    let TransactionStep::Transition(transition) = &mut transaction.steps[2] else {
         panic!("expected the mark_paid transition");
     };
 
@@ -575,7 +587,7 @@ fn a_transition_effect_needs_its_derivation_at_the_applying_site() {
 
     let transaction = transaction_mut(&mut model, "operation.apply_payment", "tx.apply_payment");
 
-    let TransactionStep::Transition(transition) = &mut transaction.steps[3] else {
+    let TransactionStep::Transition(transition) = &mut transaction.steps[2] else {
         panic!("expected the mark_paid transition");
     };
 
@@ -794,172 +806,1001 @@ fn a_shared_lock_covers_the_reader_and_not_the_writer() {
 }
 
 // ---------------------------------------------------------------------
-// Versioning
+// Object versions and atomic conditional mutations
 // ---------------------------------------------------------------------
 
+/// A comparison of the order's version against the one `read` observed.
+fn observed_version(read: &str) -> CompareCondition {
+    CompareCondition {
+        field: path(&["version"]),
+        expected: SelectorValue::Value(read_ref(read, &["version"])),
+    }
+}
+
+/// A comparison of a field against the value `read` observed of it.
+fn observed(read: &str, field: &str) -> CompareCondition {
+    CompareCondition {
+        field: path(&[field]),
+        expected: SelectorValue::Value(read_ref(read, &[field])),
+    }
+}
+
+/// The comparisons apply_payment's cursor advance carries.
+fn apply_payment_guard(model: &mut Model) -> &mut Vec<CompareCondition> {
+    let TransactionStep::AdvanceCursor(advance) =
+        &mut transaction_mut(model, "operation.apply_payment", "tx.apply_payment").steps[1]
+    else {
+        panic!("expected apply_payment's cursor advance");
+    };
+
+    &mut advance.compare
+}
+
+/// The comparisons cancel_order's transition carries.
+fn cancel_order_guard(model: &mut Model) -> &mut Vec<CompareCondition> {
+    let TransactionStep::Transition(transition) =
+        &mut transaction_mut(model, "operation.cancel_order", "tx.cancel_order").steps[1]
+    else {
+        panic!("expected cancel_order's transition");
+    };
+
+    &mut transition.compare
+}
+
+/// Declares `SerializableBy(order_id)` on cancel_order's transaction.
+fn require_cancel_order_serializable(model: &mut Model) {
+    transaction_mut(model, "operation.cancel_order", "tx.cancel_order")
+        .requirements
+        .serializability = vec![conseqa::spec::TransactionSerializabilityRequirement {
+        key: input_key("input.cancel_order.request", &["order_id"]),
+    }];
+}
+
+/// Turns reserve_inventory's update of the stock row it read into a
+/// compare-and-set of `compare`, and says what a rejection does.
+fn reserve_inventory_compares(model: &mut Model, compare: Vec<CompareCondition>) {
+    let transaction = transaction_mut(
+        model,
+        "operation.reserve_inventory",
+        "tx.reserve_inventory",
+    );
+
+    let TransactionStep::Update(update) = transaction.steps[1].clone() else {
+        panic!("expected reserve_inventory's update");
+    };
+
+    transaction.steps[1] = TransactionStep::CompareAndSet(CompareAndSet {
+        target: update.target,
+        compare,
+        fields: update.fields,
+        values: update.values,
+    });
+
+    execution_mut(model, "operation.reserve_inventory", "tx.reserve_inventory").rejected =
+        Some(OperationBlock {
+            steps: vec![OperationStep::Complete],
+        });
+}
+
+/// The stock row a literal identity names.
+fn stock_at(warehouse: &str, sku: &str) -> ObjectSelector {
+    ObjectSelector {
+        object: id("object.stock"),
+        predicate: SelectorPredicate::And {
+            predicates: vec![
+                SelectorPredicate::Eq {
+                    field: path(&["warehouse_id"]),
+                    value: SelectorValue::Literal(Literal::String(warehouse.into())),
+                },
+                SelectorPredicate::Eq {
+                    field: path(&["sku"]),
+                    value: SelectorValue::Literal(Literal::String(sku.into())),
+                },
+            ],
+        },
+    }
+}
+
+fn upsert_stock(target: ObjectSelector, update_fields: &[&str]) -> TransactionStep {
+    TransactionStep::Upsert(Upsert {
+        target,
+        insert_values: deterministic(vec![input_key(
+            "input.reserve_inventory.created",
+            &["quantity"],
+        )]),
+        update_fields: update_fields.iter().map(|field| path(&[field])).collect(),
+        update_values: deterministic(vec![input_key(
+            "input.reserve_inventory.created",
+            &["quantity"],
+        )]),
+    })
+}
+
+/// The constrained dependency evidence of a proven verdict.
+fn proof_dependencies(verdict: &TransactionSerializabilityVerdict) -> &[verification::DependencyEvidence] {
+    match verdict {
+        TransactionSerializabilityVerdict::Proven {
+            proof: TransactionSerializabilityProof::ConflictGraph { dependencies, .. },
+            ..
+        } => dependencies,
+        other => panic!("expected a conflict-graph proof: {other:#?}"),
+    }
+}
+
 #[test]
-fn an_ordinary_write_may_not_name_the_version_field() {
+fn an_application_mutation_may_not_assign_the_version_field() {
+    // Comparing the version is what the fixture does, and it validates.
+    assert!(validation::validate(&load_flash_checkout()).is_empty());
+
+    let version = BTreeSet::from([path(&["version"])]);
+
+    let values = deterministic(vec![input_key("input.cancel_order.request", &["order_id"])]);
+
+    for assigning in [
+        TransactionStep::Update(Update {
+            target: order_selector("input.cancel_order.request"),
+            fields: version.clone(),
+            values: values.clone(),
+        }),
+        TransactionStep::CompareAndSet(CompareAndSet {
+            target: order_selector("input.cancel_order.request"),
+            compare: vec![observed_version("read.cancel_order.order")],
+            fields: version.clone(),
+            values: values.clone(),
+        }),
+        TransactionStep::Upsert(Upsert {
+            target: order_selector("input.cancel_order.request"),
+            insert_values: values.clone(),
+            update_fields: version.clone(),
+            update_values: values.clone(),
+        }),
+    ] {
+        let mut model = load_flash_checkout();
+
+        transaction_mut(&mut model, "operation.cancel_order", "tx.cancel_order")
+            .steps
+            .insert(2, assigning.clone());
+
+        let errors = validation::validate(&model);
+
+        assert!(
+            errors.contains(&ValidationError::DirectWriteToVersionField {
+                transaction: id("tx.cancel_order"),
+                step: 2,
+                object: id("object.order"),
+                field: path(&["version"]),
+            }),
+            "{assigning:?}: {errors:#?}"
+        );
+    }
+}
+
+#[test]
+fn a_mutation_of_a_versioned_instance_publishes_its_version_without_a_step() {
     let mut model = load_flash_checkout();
 
+    // An ordinary update of the versioned order: nothing beside it, and
+    // nothing missing.
     transaction_mut(&mut model, "operation.cancel_order", "tx.cancel_order")
         .steps
         .insert(
             2,
-            TransactionStep::Write(Write {
+            TransactionStep::Update(Update {
                 target: order_selector("input.cancel_order.request"),
-                fields: BTreeSet::from([path(&["version"])]),
-                values: deterministic(vec![input_key("input.cancel_order.request", &["order_id"])]),
+                fields: BTreeSet::from([path(&["amount"])]),
+                values: deterministic(vec![input_key(
+                    "input.cancel_order.request",
+                    &["order_id"],
+                )]),
             }),
         );
 
-    let errors = validation::validate(&model);
+    assert!(validation::validate(&model).is_empty());
 
-    assert!(
-        errors.contains(&ValidationError::DirectWriteToVersionField {
-            transaction: id("tx.cancel_order"),
-            step: 2,
-            object: id("object.order"),
-            field: path(&["version"]),
+    // The conflict index nevertheless has both mutations — the
+    // transition and the update — publishing a newer version.
+    let index = verification::ConflictIndex::build(&model);
+
+    let template = index
+        .templates
+        .iter()
+        .find(|template| template.reference.transaction == id("tx.cancel_order"))
+        .expect("cancel_order is indexed");
+
+    let publications: Vec<usize> = template
+        .accesses
+        .iter()
+        .filter(|access| access.mode == verification::AccessMode::VersionPublish)
+        .inspect(|access| {
+            assert_eq!(
+                access.fields,
+                verification::AccessFields::Only(BTreeSet::from([path(&["version"])]))
+            )
+        })
+        .map(|access| access.step)
+        .collect();
+
+    assert_eq!(publications, vec![1, 2]);
+}
+
+#[test]
+fn a_compare_and_set_identifies_one_instance_and_compares_something() {
+    let valid = || {
+        let mut model = load_flash_checkout();
+
+        reserve_inventory_compares(
+            &mut model,
+            vec![observed("read.reserve_inventory.stock", "reserved")],
+        );
+
+        model
+    };
+
+    assert!(validation::validate(&valid()).is_empty());
+
+    let cas = |model: &mut Model| -> CompareAndSet {
+        let TransactionStep::CompareAndSet(cas) = transaction_mut(
+            model,
+            "operation.reserve_inventory",
+            "tx.reserve_inventory",
+        )
+        .steps[1]
+            .clone()
+        else {
+            panic!("expected the compare-and-set");
+        };
+
+        cas
+    };
+
+    let with = |edit: &dyn Fn(&mut CompareAndSet)| {
+        let mut model = valid();
+        let mut step = cas(&mut model);
+
+        edit(&mut step);
+
+        transaction_mut(
+            &mut model,
+            "operation.reserve_inventory",
+            "tx.reserve_inventory",
+        )
+        .steps[1] = TransactionStep::CompareAndSet(step);
+
+        validation::validate(&model)
+    };
+
+    let unidentified = ValidationError::CompareAndSetWithoutIdentifiedInstance {
+        transaction: id("tx.reserve_inventory"),
+        step: 1,
+        object: id("object.stock"),
+    };
+
+    // Every stock row, and a row named by half its identity: a range.
+    assert_eq!(
+        with(&|cas| cas.target.predicate = SelectorPredicate::All),
+        vec![unidentified.clone()]
+    );
+
+    assert_eq!(
+        with(&|cas| {
+            cas.target.predicate = SelectorPredicate::Eq {
+                field: path(&["warehouse_id"]),
+                value: SelectorValue::Value(input_key(
+                    "input.reserve_inventory.created",
+                    &["warehouse_id"],
+                )),
+            }
         }),
+        vec![unidentified]
+    );
+
+    assert_eq!(
+        with(&|cas| cas.compare.clear()),
+        vec![ValidationError::CompareAndSetWithoutComparison {
+            transaction: id("tx.reserve_inventory"),
+            step: 1,
+            object: id("object.stock"),
+        }]
+    );
+
+    assert_eq!(
+        with(&|cas| cas
+            .compare
+            .push(observed("read.reserve_inventory.stock", "reserved"))),
+        vec![ValidationError::DuplicateCompareField {
+            transaction: id("tx.reserve_inventory"),
+            step: 1,
+            object: id("object.stock"),
+            field: path(&["reserved"]),
+        }]
+    );
+
+    // An unknown field is the ordinary path check's.
+    let errors = with(&|cas| {
+        cas.compare.push(CompareCondition {
+            field: path(&["no_such_field"]),
+            expected: SelectorValue::Literal(Literal::Int(0)),
+        })
+    });
+
+    assert!(
+        !errors.is_empty() && format!("{errors:?}").contains("no_such_field"),
         "{errors:#?}"
     );
 }
 
 #[test]
-fn a_mutation_of_a_versioned_instance_needs_exactly_one_bump() {
+fn a_compare_and_set_rejects_and_needs_a_rejected_arm() {
     let mut model = load_flash_checkout();
 
-    // Without the bump.
-    transaction_mut(&mut model, "operation.cancel_order", "tx.cancel_order")
-        .steps
-        .remove(3);
-
-    assert_eq!(
-        validation::validate(&model),
-        vec![ValidationError::MissingVersionBump {
-            transaction: id("tx.cancel_order"),
-            step: 2,
-            object: id("object.order"),
-        }]
+    reserve_inventory_compares(
+        &mut model,
+        vec![observed("read.reserve_inventory.stock", "reserved")],
     );
 
-    // With two.
+    assert!(validation::validate(&model).is_empty());
+
+    execution_mut(&mut model, "operation.reserve_inventory", "tx.reserve_inventory").rejected =
+        None;
+
+    assert!(
+        validation::validate(&model).iter().any(|error| matches!(
+            error,
+            ValidationError::MissingTransactionRejectedArm { transaction, step: 1, .. }
+                if transaction == &id("tx.reserve_inventory")
+        )),
+        "a compare-and-set is a commit guard"
+    );
+}
+
+/// The direct observed-field route, on the unversioned stock row: no
+/// version is needed when the compare-and-set compares every field the
+/// conflict touches against the value the read observed.
+#[test]
+fn an_observed_field_compare_and_set_constrains_the_anti_dependency() {
     let mut model = load_flash_checkout();
 
-    transaction_mut(&mut model, "operation.cancel_order", "tx.cancel_order")
-        .steps
-        .insert(
-            4,
-            TransactionStep::BumpVersion(BumpVersion {
-                target: order_selector("input.cancel_order.request"),
-            }),
+    assert!(
+        model.data_models[&id("data.inventory")].objects[&id("object.stock")]
+            .version
+            .is_none(),
+        "the stock row is unversioned"
+    );
+
+    reserve_inventory_compares(
+        &mut model,
+        vec![
+            observed("read.reserve_inventory.stock", "on_hand"),
+            observed("read.reserve_inventory.stock", "reserved"),
+        ],
+    );
+
+    assert!(validation::validate(&model).is_empty());
+
+    let verdict = serializability(&model, "tx.reserve_inventory");
+
+    assert!(
+        proof_dependencies(&verdict).iter().any(|dependency| matches!(
+            &dependency.evidence,
+            verification::CommitOrderEvidence::AtomicConditionalMutation {
+                mechanism: verification::ConditionalMutationKind::CompareAndSet,
+                guard: verification::GuardCoverage::ObservedState { .. },
+                ..
+            }
+        )),
+        "{verdict:#?}"
+    );
+
+    // Compare only `reserved`: transfer_stock's update of `on_hand`, which
+    // the read observed too, is no longer covered.
+    let mut model = load_flash_checkout();
+
+    reserve_inventory_compares(
+        &mut model,
+        vec![observed("read.reserve_inventory.stock", "reserved")],
+    );
+
+    let verdict = serializability(&model, "tx.reserve_inventory");
+
+    assert!(
+        dependency_gaps(&verdict).iter().any(|gap| matches!(
+            gap,
+            DependencyGap::ObservedStateGuardDoesNotCoverConflict {
+                fields: verification::AccessFields::Only(fields),
+                ..
+            } if fields == &BTreeSet::from([path(&["on_hand"])])
+        )),
+        "{verdict:#?}"
+    );
+}
+
+/// The version-token route with a compare-and-set: one comparison of the
+/// observed version covers every field of the instance, and the writer —
+/// apply_payment's cursor and transition — declares nothing.
+#[test]
+fn an_observed_version_compare_and_set_needs_no_writer_annotation() {
+    let mut model = load_flash_checkout();
+
+    require_cancel_order_serializable(&mut model);
+
+    transaction_mut(&mut model, "operation.cancel_order", "tx.cancel_order").steps[1] =
+        TransactionStep::CompareAndSet(CompareAndSet {
+            target: order_selector("input.cancel_order.request"),
+            compare: vec![observed_version("read.cancel_order.order")],
+            fields: BTreeSet::from([path(&["amount"])]),
+            values: deterministic(vec![input_key(
+                "input.cancel_order.request",
+                &["order_id"],
+            )]),
+        });
+
+    assert!(validation::validate(&model).is_empty());
+
+    let verdict = serializability(&model, "tx.cancel_order");
+
+    assert!(
+        proof_dependencies(&verdict).iter().any(|dependency| matches!(
+            &dependency.evidence,
+            verification::CommitOrderEvidence::AtomicConditionalMutation {
+                guarded_by,
+                mechanism: verification::ConditionalMutationKind::CompareAndSet,
+                guard: verification::GuardCoverage::ObservedVersion { .. },
+                ..
+            } if guarded_by.transaction == id("tx.cancel_order")
+                && dependency.kind == verification::DependencyKind::ReadWriteAntiDependency
+                && dependency.target.transaction == id("tx.apply_payment")
+        )),
+        "{verdict:#?}"
+    );
+}
+
+/// An expected version from outside the transaction's own read — the
+/// request's, or a literal — is valid application behaviour, and no
+/// evidence that the read stayed true.
+#[test]
+fn an_expected_value_from_outside_the_read_is_no_observation() {
+    for expected in [
+        SelectorValue::Value(input_key("input.cancel_order.request", &["expected_version"])),
+        SelectorValue::Literal(Literal::Int(7)),
+    ] {
+        let mut model = load_flash_checkout();
+
+        require_cancel_order_serializable(&mut model);
+
+        let Some(conseqa::spec::Schema::Canonical(request)) = model
+            .schemas
+            .get_mut(&id("schema.CancelOrderRequest"))
+        else {
+            panic!("expected the request schema");
+        };
+
+        request.fields.insert(
+            "expected_version".into(),
+            conseqa::spec::Field {
+                ty: conseqa::spec::TypeRef::Scalar(conseqa::spec::ScalarType::Int),
+                optional: false,
+            },
         );
 
-    assert_eq!(
-        validation::validate(&model),
-        vec![ValidationError::DuplicateVersionBump {
-            transaction: id("tx.cancel_order"),
-            step: 4,
-            object: id("object.order"),
-        }]
-    );
+        cancel_order_guard(&mut model)[0].expected = expected.clone();
+
+        assert!(validation::validate(&model).is_empty(), "{expected:?}");
+
+        let verdict = serializability(&model, "tx.cancel_order");
+
+        assert!(
+            dependency_gaps(&verdict).iter().any(|gap| matches!(
+                gap,
+                DependencyGap::ObservedStateGuardMissing { transaction, .. }
+                    if transaction.transaction == id("tx.cancel_order")
+            )),
+            "{expected:?}: {verdict:#?}"
+        );
+    }
 }
 
 #[test]
-fn a_version_validation_needs_an_observed_version() {
+fn a_transition_carrying_the_observed_version_constrains_its_read() {
     let mut model = load_flash_checkout();
 
-    let transaction = transaction_mut(&mut model, "operation.cancel_order", "tx.cancel_order");
+    require_cancel_order_serializable(&mut model);
 
-    let TransactionStep::Read(read) = &mut transaction.steps[0] else {
-        panic!("expected the order read");
-    };
+    let verdict = serializability(&model, "tx.cancel_order");
 
-    read.fields = FieldSelection::Only(BTreeSet::from([path(&["order_id"])]));
-
-    // The validation names no observed version, and the `expected`
-    // reference itself reaches a field the read no longer selects.
-    assert_eq!(
-        validation::validate(&model),
-        vec![
-            ValidationError::VersionValidationWithoutObservedVersion {
-                transaction: id("tx.cancel_order"),
-                step: 1,
-                object: id("object.order"),
-            },
-            ValidationError::TransactionReadFieldNotSelected {
-                transaction: id("tx.cancel_order"),
-                read: id("read.cancel_order.order"),
-                path: path(&["version"]),
-            },
-        ]
-    );
-}
-
-#[test]
-fn a_version_validation_needs_an_identified_instance() {
-    let mut model = load_flash_checkout();
-
-    // Broaden cancel_order's version read and validation from the
-    // identified order (`order_id = …`) to every order. The validation
-    // then guards no single instance: a concurrent insert of a new
-    // matching order could not be told from the ones observed, so it is
-    // rejected rather than silently credited as a commit guard — the
-    // phantom write-skew hole this rule closes.
-    let all_orders = ObjectSelector {
-        object: id("object.order"),
-        predicate: SelectorPredicate::All,
-    };
-
-    let transaction = transaction_mut(&mut model, "operation.cancel_order", "tx.cancel_order");
-
-    let TransactionStep::Read(read) = &mut transaction.steps[0] else {
-        panic!("expected the order read");
-    };
-    read.target = all_orders.clone();
-
-    let TransactionStep::ValidateVersion(validate) = &mut transaction.steps[1] else {
-        panic!("expected the version validation");
-    };
-    validate.target = all_orders;
-
-    // The read still binds the version and still matches the validation
-    // target, so `observes_version` holds: the identity defect is the
-    // only one reported.
-    assert_eq!(
-        validation::validate(&model),
-        vec![ValidationError::VersionValidationWithoutIdentifiedInstance {
-            transaction: id("tx.cancel_order"),
-            step: 1,
-            object: id("object.order"),
-        }]
-    );
-}
-
-#[test]
-fn the_version_protocol_needs_a_versioned_object() {
-    let mut model = load_flash_checkout();
-
-    model
-        .data_models
-        .get_mut(&id("data.checkout"))
-        .unwrap()
-        .objects
-        .get_mut(&id("object.order"))
-        .unwrap()
-        .version = None;
-
-    let errors = validation::validate(&model);
-
-    assert!(!errors.is_empty());
     assert!(
-        errors.iter().all(|error| matches!(
-            error,
-            ValidationError::VersionProtocolOnUnversionedObject { object, .. }
-                if object == &id("object.order")
+        proof_dependencies(&verdict).iter().any(|dependency| matches!(
+            &dependency.evidence,
+            verification::CommitOrderEvidence::AtomicConditionalMutation {
+                guarded_by,
+                mechanism: verification::ConditionalMutationKind::Transition,
+                guard: verification::GuardCoverage::ObservedVersion { .. },
+                ..
+            } if guarded_by.transaction == id("tx.cancel_order")
         )),
-        "{errors:#?}"
+        "{verdict:#?}"
     );
+
+    // Without the comparison nothing else protects the read.
+    cancel_order_guard(&mut model).clear();
+
+    assert!(validation::validate(&model).is_empty());
+
+    let verdict = serializability(&model, "tx.cancel_order");
+
+    assert!(
+        dependency_gaps(&verdict).iter().any(|gap| matches!(
+            gap,
+            DependencyGap::ObservedStateGuardMissing { transaction, step: 0, .. }
+                if transaction.transaction == id("tx.cancel_order")
+        )),
+        "{verdict:#?}"
+    );
+}
+
+#[test]
+fn removing_the_observed_version_guard_leaves_the_anti_dependency_unconstrained() {
+    let mut model = load_flash_checkout();
+
+    // apply_payment still reads the version and cancel_order still
+    // publishes a newer one; nothing now fixes the order across that
+    // edge.
+    apply_payment_guard(&mut model).clear();
+
+    assert!(validation::validate(&model).is_empty());
+
+    let verdict = serializability(&model, "tx.apply_payment");
+
+    let gaps = dependency_gaps(&verdict);
+
+    assert!(
+        gaps.iter()
+            .any(|gap| matches!(gap, DependencyGap::ObservedStateGuardMissing { .. })),
+        "{gaps:#?}"
+    );
+
+    // Ordering presupposes serializability.
+    let verdict = ordering(&model, "tx.apply_payment");
+
+    assert!(
+        ordering_obstacles(&verdict).iter().any(|obstacle| matches!(
+            obstacle,
+            TransactionOrderingObstacle::OrderingMissingSerializability { .. }
+        )),
+        "{verdict:#?}"
+    );
+}
+
+#[test]
+fn an_unconstrained_anti_dependency_into_an_insert_names_the_insert() {
+    let mut model = load_flash_checkout();
+
+    // Without apply_payment's observed-version guard, its
+    // anti-dependency onto create_order.new's insert of `object.order`
+    // is unconstrained too — a phantom-shaped conflict, not ordinary
+    // write skew, so the prose must say "inserts a matching instance"
+    // and not "writes it".
+    apply_payment_guard(&mut model).clear();
+
+    assert!(validation::validate(&model).is_empty());
+
+    let verdict = serializability(&model, "tx.apply_payment");
+
+    let message = serializability_obstacles(&verdict)
+        .iter()
+        .find_map(|obstacle| match obstacle {
+            TransactionSerializabilityObstacle::TransactionSerializabilityUnprotectedReadWriteDependency { dependency }
+                if dependency.target.transaction == id("tx.create_order.new") =>
+            {
+                Some(obstacle.evidence().message)
+            }
+            _ => None,
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "expected an unprotected read-write dependency onto \
+                 tx.create_order.new: {verdict:#?}"
+            )
+        });
+
+    assert!(message.contains("inserts a matching instance"), "{message}");
+    assert!(!message.contains("writes it"), "{message}");
+}
+
+/// Insertion establishes a version token afresh. Where the object is
+/// ever deleted, an instance inserted after a deletion may carry the very
+/// token a reader observed of its predecessor, so the observed-version
+/// guard covers no insertion of it.
+#[test]
+fn an_insertion_after_a_deletion_may_repeat_an_observed_version() {
+    let mut model = load_flash_checkout();
+
+    // cancel_order now deletes the order outright.
+    transaction_mut(&mut model, "operation.cancel_order", "tx.cancel_order").steps[1] =
+        TransactionStep::Delete(conseqa::spec::Delete {
+            target: order_selector("input.cancel_order.request"),
+        });
+
+    execution_mut(&mut model, "operation.cancel_order", "tx.cancel_order").rejected = None;
+
+    let verdict = serializability(&model, "tx.apply_payment");
+
+    assert!(
+        dependency_gaps(&verdict).iter().any(|gap| matches!(
+            gap,
+            DependencyGap::ObservedVersionMayRepeat { deleted_by, .. }
+                if deleted_by.transaction == id("tx.cancel_order")
+        )),
+        "{verdict:#?}"
+    );
+}
+
+#[test]
+fn an_upsert_identifies_one_instance_and_leaves_its_identity_alone() {
+    let edit = |step: TransactionStep| {
+        let mut model = load_flash_checkout();
+
+        transaction_mut(
+            &mut model,
+            "operation.reserve_inventory",
+            "tx.reserve_inventory",
+        )
+        .steps[1] = step;
+
+        validation::validate(&model)
+    };
+
+    assert!(edit(upsert_stock(stock_selector("input.reserve_inventory.created"), &["reserved"])).is_empty());
+
+    assert_eq!(
+        edit(upsert_stock(
+            ObjectSelector {
+                object: id("object.stock"),
+                predicate: SelectorPredicate::All,
+            },
+            &["reserved"]
+        )),
+        vec![ValidationError::UpsertWithoutIdentifiedInstance {
+            transaction: id("tx.reserve_inventory"),
+            step: 1,
+            object: id("object.stock"),
+        }]
+    );
+
+    assert_eq!(
+        edit(upsert_stock(
+            stock_selector("input.reserve_inventory.created"),
+            &["reserved", "sku"]
+        )),
+        vec![ValidationError::UpsertMutatesIdentity {
+            transaction: id("tx.reserve_inventory"),
+            step: 1,
+            object: id("object.stock"),
+            field: path(&["sku"]),
+        }]
+    );
+}
+
+/// Two upserts that may name one identity conflict as atomic identity
+/// mutations; upserts of identities proven disjoint do not.
+#[test]
+fn upserts_of_one_identity_conflict_and_of_disjoint_identities_do_not() {
+    let mut model = load_flash_checkout();
+
+    transaction_mut(
+        &mut model,
+        "operation.reserve_inventory",
+        "tx.reserve_inventory",
+    )
+    .steps = vec![upsert_stock(stock_at("w-1", "a"), &["reserved"])];
+
+    transaction_mut(&mut model, "operation.transfer_stock", "tx.transfer_stock").steps =
+        vec![upsert_stock(stock_at("w-1", "b"), &["reserved"])];
+
+    let index = verification::ConflictIndex::build(&model);
+
+    let upsert_of = |transaction: &str| {
+        index
+            .templates
+            .iter()
+            .find(|template| template.reference.transaction == id(transaction))
+            .and_then(|template| {
+                template
+                    .accesses
+                    .iter()
+                    .find(|access| access.mode == verification::AccessMode::UpsertReadWrite)
+            })
+            .expect("the upsert is indexed")
+    };
+
+    let reserve = upsert_of("tx.reserve_inventory");
+    let transfer = upsert_of("tx.transfer_stock");
+
+    // Concurrent executions of one upsert name the same identity.
+    assert!(index.conflict(reserve, reserve).is_some());
+
+    // `sku = a` and `sku = b` never name one row.
+    assert!(index.conflict(reserve, transfer).is_none());
+
+    // An upsert whose identity comes from its input may name either.
+    transaction_mut(&mut model, "operation.transfer_stock", "tx.transfer_stock").steps =
+        vec![upsert_stock(stock_selector("input.transfer_stock.request"), &["reserved"])];
+
+    let index = verification::ConflictIndex::build(&model);
+
+    let reserve = index
+        .templates
+        .iter()
+        .find(|template| template.reference.transaction == id("tx.reserve_inventory"))
+        .map(|template| &template.accesses[0])
+        .expect("indexed");
+
+    let transfer = index
+        .templates
+        .iter()
+        .find(|template| template.reference.transaction == id("tx.transfer_stock"))
+        .map(|template| &template.accesses[0])
+        .expect("indexed");
+
+    assert!(index.conflict(reserve, transfer).is_some());
+}
+
+/// An upsert supplies evidence for its own identity arbitration and
+/// mutation alone: it protects no read before it — not even one of the
+/// instance it upserts.
+#[test]
+fn an_upsert_guards_no_earlier_read() {
+    let mut model = load_flash_checkout();
+
+    transaction_mut(
+        &mut model,
+        "operation.reserve_inventory",
+        "tx.reserve_inventory",
+    )
+    .steps[1] = upsert_stock(stock_selector("input.reserve_inventory.created"), &["reserved"]);
+
+    assert!(validation::validate(&model).is_empty());
+
+    let verdict = serializability(&model, "tx.reserve_inventory");
+
+    assert!(
+        dependency_gaps(&verdict).iter().any(|gap| matches!(
+            gap,
+            DependencyGap::ObservedStateGuardMissing { transaction, step: 0, .. }
+                if transaction.transaction == id("tx.reserve_inventory")
+        )),
+        "{verdict:#?}"
+    );
+}
+
+/// The retired `read A; validate_version A; write B` has no translation:
+/// a read-only observation is protected by a real mechanism — a lock, or
+/// serializable isolation — or the obligation is refused.
+#[test]
+fn a_read_only_observation_needs_a_real_mechanism() {
+    let read_a_write_b = || {
+        let mut model = load_flash_checkout();
+
+        let transaction = transaction_mut(
+            &mut model,
+            "operation.reserve_inventory",
+            "tx.reserve_inventory",
+        );
+
+        let TransactionStep::Update(update) = &mut transaction.steps[1] else {
+            panic!("expected the update");
+        };
+
+        update.target = stock_at("w-1", "b");
+
+        model
+    };
+
+    let model = read_a_write_b();
+
+    assert!(validation::validate(&model).is_empty());
+
+    assert!(
+        dependency_gaps(&serializability(&model, "tx.reserve_inventory"))
+            .iter()
+            .any(|gap| matches!(gap, DependencyGap::ObservedStateGuardMissing { step: 0, .. })),
+        "nothing protects the read of A"
+    );
+
+    // A shared lock on A before its read, and an exclusive one on B.
+    let mut model = read_a_write_b();
+
+    let transaction = transaction_mut(
+        &mut model,
+        "operation.reserve_inventory",
+        "tx.reserve_inventory",
+    );
+
+    transaction.steps.insert(0, lock_stock(LockMode::Shared));
+    transaction.steps.insert(
+        0,
+        TransactionStep::Lock(Lock {
+            target: stock_at("w-1", "b"),
+            mode: LockMode::Exclusive,
+            order: LockOrder::Unspecified,
+        }),
+    );
+
+    assert!(validation::validate(&model).is_empty());
+
+    assert!(matches!(
+        serializability(&model, "tx.reserve_inventory"),
+        TransactionSerializabilityVerdict::Proven { .. }
+    ));
+
+    // Or serializable isolation across the closure.
+    let mut model = read_a_write_b();
+
+    for (operation, transaction) in [
+        ("operation.reserve_inventory", "tx.reserve_inventory"),
+        ("operation.transfer_stock", "tx.transfer_stock"),
+    ] {
+        transaction_mut(&mut model, operation, transaction).isolation =
+            TransactionIsolation::Serializable;
+    }
+
+    assert!(matches!(
+        serializability(&model, "tx.reserve_inventory"),
+        TransactionSerializabilityVerdict::Proven {
+            proof: TransactionSerializabilityProof::SerializableIsolationClosure { .. },
+            ..
+        }
+    ));
+}
+
+/// cancel_order reduced to its read of the order: a read-only
+/// transaction, with nothing after it that needs what it established.
+fn cancel_order_only_reads(model: &mut Model) {
+    let program = program_mut(model, "operation.cancel_order");
+
+    program
+        .steps
+        .retain(|step| !matches!(step, OperationStep::ExecuteEffectIntent(_)));
+
+    let execution = execution_mut(model, "operation.cancel_order", "tx.cancel_order");
+
+    execution.rejected = None;
+    execution.transaction.steps.truncate(1);
+
+    require_cancel_order_serializable(model);
+}
+
+/// A read-only transaction that observes committed state at one instant
+/// serializes at that instant: every write it saw committed before it,
+/// every write it missed commits after it. Its anti-dependencies need no
+/// lock or comparison — but two reads at different instants are not one
+/// observation, unless one snapshot serves both.
+#[test]
+fn a_read_only_observation_at_one_instant_serializes_at_its_read() {
+    let mut model = load_flash_checkout();
+
+    cancel_order_only_reads(&mut model);
+
+    assert!(validation::validate(&model).is_empty());
+
+    let verdict = serializability(&model, "tx.cancel_order");
+
+    assert!(
+        proof_dependencies(&verdict).iter().any(|dependency| matches!(
+            dependency.evidence,
+            verification::CommitOrderEvidence::ReadOnlyObservation {
+                isolation: TransactionIsolation::ReadCommitted
+            }
+        ) && dependency.source.transaction == id("tx.cancel_order")),
+        "{verdict:#?}"
+    );
+
+    // A second read under read committed: read skew can pass between
+    // the two, so neither is covered.
+    let transaction = transaction_mut(&mut model, "operation.cancel_order", "tx.cancel_order");
+
+    let TransactionStep::Read(read) = transaction.steps[0].clone() else {
+        panic!("expected the read");
+    };
+
+    transaction.steps.push(TransactionStep::Read(conseqa::spec::Read {
+        bind: id("read.cancel_order.again"),
+        ..read
+    }));
+
+    assert!(validation::validate(&model).is_empty());
+
+    assert!(
+        dependency_gaps(&serializability(&model, "tx.cancel_order"))
+            .iter()
+            .any(|gap| matches!(gap, DependencyGap::ObservedStateGuardMissing { .. })),
+        "two reads at two instants are not one observation"
+    );
+
+    // One snapshot serves both reads.
+    transaction_mut(&mut model, "operation.cancel_order", "tx.cancel_order").isolation =
+        TransactionIsolation::Snapshot;
+
+    assert!(matches!(
+        serializability(&model, "tx.cancel_order"),
+        TransactionSerializabilityVerdict::Proven { .. }
+    ));
+
+    // Without declared isolation nothing says the read saw only
+    // committed writes.
+    transaction_mut(&mut model, "operation.cancel_order", "tx.cancel_order").isolation =
+        TransactionIsolation::Unspecified;
+
+    assert!(matches!(
+        serializability(&model, "tx.cancel_order"),
+        TransactionSerializabilityVerdict::Unproven { .. }
+    ));
+}
+
+/// A reader that locks the instance before observing it, against a
+/// writer whose mutation is guarded: the guarded mutation must acquire
+/// the instance's write protection, which the reader's lock withholds
+/// until it commits — no exclusive lock on the writer is needed.
+#[test]
+fn a_locked_read_orders_a_guarded_writer() {
+    let locked_reader_against_a_guard = || {
+        let mut model = load_flash_checkout();
+
+        reserve_inventory_compares(
+            &mut model,
+            vec![
+                observed("read.reserve_inventory.stock", "on_hand"),
+                observed("read.reserve_inventory.stock", "reserved"),
+            ],
+        );
+
+        // transfer_stock, which locks the rows before it reads them,
+        // now also reads the `reserved` the compare-and-set writes.
+        let transfer =
+            transaction_mut(&mut model, "operation.transfer_stock", "tx.transfer_stock");
+
+        let TransactionStep::Read(read) = &mut transfer.steps[2] else {
+            panic!("expected transfer_stock's read");
+        };
+
+        let FieldSelection::Only(fields) = &mut read.fields else {
+            panic!("expected a narrowed read");
+        };
+
+        fields.insert(path(&["reserved"]));
+
+        model
+    };
+
+    let model = locked_reader_against_a_guard();
+
+    assert!(validation::validate(&model).is_empty());
+
+    let verdict = serializability(&model, "tx.reserve_inventory");
+
+    assert!(
+        proof_dependencies(&verdict).iter().any(|dependency| matches!(
+            &dependency.evidence,
+            verification::CommitOrderEvidence::AtomicConditionalMutation {
+                guarded_by,
+                guard: verification::GuardCoverage::LockedReader { .. },
+                ..
+            } if guarded_by.transaction == id("tx.reserve_inventory")
+                && dependency.source.transaction == id("tx.transfer_stock")
+        )),
+        "{verdict:#?}"
+    );
+
+    // Without its locks, transfer_stock's read is protected by nothing.
+    let mut model = locked_reader_against_a_guard();
+
+    transaction_mut(&mut model, "operation.transfer_stock", "tx.transfer_stock")
+        .steps
+        .retain(|step| !matches!(step, TransactionStep::Lock(_)));
+
+    assert!(matches!(
+        serializability(&model, "tx.reserve_inventory"),
+        TransactionSerializabilityVerdict::Unproven { .. }
+    ));
 }
 
 #[test]
@@ -1007,77 +1848,6 @@ fn the_version_field_is_a_required_int_outside_the_identity() {
             ),
         }
     }
-}
-
-#[test]
-fn removing_the_validation_leaves_the_anti_dependency_unconstrained() {
-    let mut model = load_flash_checkout();
-
-    // apply_payment still reads the version and cancel_order still
-    // bumps it; nothing now fixes the order across that edge.
-    transaction_mut(&mut model, "operation.apply_payment", "tx.apply_payment")
-        .steps
-        .remove(1);
-
-    assert!(validation::validate(&model).is_empty());
-
-    let verdict = serializability(&model, "tx.apply_payment");
-
-    let gaps = dependency_gaps(&verdict);
-
-    assert!(
-        gaps.iter()
-            .any(|gap| matches!(gap, DependencyGap::VersionValidationMissing { .. })),
-        "{gaps:#?}"
-    );
-
-    // Ordering presupposes serializability.
-    let verdict = ordering(&model, "tx.apply_payment");
-
-    assert!(
-        ordering_obstacles(&verdict).iter().any(|obstacle| matches!(
-            obstacle,
-            TransactionOrderingObstacle::OrderingMissingSerializability { .. }
-        )),
-        "{verdict:#?}"
-    );
-}
-
-#[test]
-fn an_unconstrained_anti_dependency_into_an_insert_names_the_insert() {
-    let mut model = load_flash_checkout();
-
-    // Without apply_payment's version validation, its anti-dependency
-    // onto create_order.new's insert of `object.order` is unconstrained
-    // too — a phantom-shaped conflict, not ordinary write skew, so the
-    // prose must say "inserts a matching instance" and not "writes it".
-    transaction_mut(&mut model, "operation.apply_payment", "tx.apply_payment")
-        .steps
-        .remove(1);
-
-    assert!(validation::validate(&model).is_empty());
-
-    let verdict = serializability(&model, "tx.apply_payment");
-
-    let message = serializability_obstacles(&verdict)
-        .iter()
-        .find_map(|obstacle| match obstacle {
-            TransactionSerializabilityObstacle::TransactionSerializabilityUnprotectedReadWriteDependency { dependency }
-                if dependency.target.transaction == id("tx.create_order.new") =>
-            {
-                Some(obstacle.evidence().message)
-            }
-            _ => None,
-        })
-        .unwrap_or_else(|| {
-            panic!(
-                "expected an unprotected read-write dependency onto \
-                 tx.create_order.new: {verdict:#?}"
-            )
-        });
-
-    assert!(message.contains("inserts a matching instance"), "{message}");
-    assert!(!message.contains("writes it"), "{message}");
 }
 
 // ---------------------------------------------------------------------
@@ -1152,13 +1922,29 @@ fn apply_payment_ordering_mut(
         .ordering[0]
 }
 
+/// Moves apply_payment's observed-version guard from its cursor advance
+/// to its transition, which reads and mutates the same order.
+fn guard_apply_payment_on_its_transition(model: &mut Model) {
+    let guard = std::mem::take(apply_payment_guard(model));
+
+    let TransactionStep::Transition(transition) =
+        &mut transaction_mut(model, "operation.apply_payment", "tx.apply_payment").steps[2]
+    else {
+        panic!("expected apply_payment's transition");
+    };
+
+    transition.compare = guard;
+}
+
 #[test]
 fn ordering_needs_a_cursor_or_fence() {
     let mut model = load_flash_checkout();
 
+    guard_apply_payment_on_its_transition(&mut model);
+
     transaction_mut(&mut model, "operation.apply_payment", "tx.apply_payment")
         .steps
-        .remove(2);
+        .remove(1);
 
     assert!(validation::validate(&model).is_empty());
 
@@ -1179,7 +1965,7 @@ fn a_monotonic_cursor_proves_ordering_too() {
 
     let transaction = transaction_mut(&mut model, "operation.apply_payment", "tx.apply_payment");
 
-    let TransactionStep::AdvanceCursor(advance) = &mut transaction.steps[2] else {
+    let TransactionStep::AdvanceCursor(advance) = &mut transaction.steps[1] else {
         panic!("expected the cursor advance");
     };
 
@@ -1213,7 +1999,7 @@ fn the_cursor_must_advance_by_the_requirement_position() {
     assert!(
         ordering_obstacles(&verdict).iter().any(|obstacle| matches!(
             obstacle,
-            TransactionOrderingObstacle::OrderingPositionMismatch { step: 2, .. }
+            TransactionOrderingObstacle::OrderingPositionMismatch { step: 1, .. }
         )),
         "{verdict:#?}"
     );
@@ -1233,7 +2019,7 @@ fn the_cursor_must_be_keyed_by_the_requirement_key() {
     assert!(
         ordering_obstacles(&verdict).iter().any(|obstacle| matches!(
             obstacle,
-            TransactionOrderingObstacle::OrderingKeyDomainMismatch { step: 2, object }
+            TransactionOrderingObstacle::OrderingKeyDomainMismatch { step: 1, object }
                 if object == &id("object.order")
         )),
         "{verdict:#?}"
@@ -1244,14 +2030,14 @@ fn the_cursor_must_be_keyed_by_the_requirement_key() {
 fn an_uncontrolled_writer_of_the_cursor_field_defeats_ordering() {
     let mut model = load_flash_checkout();
 
-    // A direct write of the cursor field elsewhere: refused by
+    // A direct update of the cursor field elsewhere: refused by
     // validation, and — verification staying total — an ordering
     // obstacle, since accepted positions no longer order every commit.
     transaction_mut(&mut model, "operation.cancel_order", "tx.cancel_order")
         .steps
         .insert(
             2,
-            TransactionStep::Write(Write {
+            TransactionStep::Update(Update {
                 target: order_selector("input.cancel_order.request"),
                 fields: BTreeSet::from([path(&["last_applied_sequence"])]),
                 values: Derivation::Unspecified,
@@ -1299,6 +2085,7 @@ fn a_managed_field_has_one_role() {
                 target: order_selector("input.cancel_order.request"),
                 field: path(&["last_applied_sequence"]),
                 token: read_ref("read.cancel_order.order", &["version"]),
+                compare: Vec::new(),
             }),
         );
 
@@ -1314,13 +2101,19 @@ fn a_managed_field_has_one_role() {
     );
 }
 
+/// Replaces apply_payment's cursor with a fence on the same field. A
+/// fence holds no write protection on an equal token, so the observed-
+/// version guard moves to the transition first.
 fn fence_apply_payment(model: &mut Model) {
+    guard_apply_payment_on_its_transition(model);
+
     let transaction = transaction_mut(model, "operation.apply_payment", "tx.apply_payment");
 
-    transaction.steps[2] = TransactionStep::Fence(Fence {
+    transaction.steps[1] = TransactionStep::Fence(Fence {
         target: order_selector("input.apply_payment.captured"),
         field: path(&["last_applied_sequence"]),
         token: input_key("input.apply_payment.captured", &["sequence"]),
+        compare: Vec::new(),
     });
 }
 
@@ -1347,11 +2140,16 @@ fn a_fence_alone_is_not_commit_order_evidence() {
 
     fence_apply_payment(&mut model);
 
-    // Without the version validation, the fence is all that remains on
-    // the anti-dependency into cancel_order: recorded, and not enough.
-    transaction_mut(&mut model, "operation.apply_payment", "tx.apply_payment")
-        .steps
-        .remove(1);
+    // Without the transition's observed-version guard, the fence is all
+    // that remains: recorded on the edges between fences, and not
+    // enough.
+    let TransactionStep::Transition(transition) =
+        &mut transaction_mut(&mut model, "operation.apply_payment", "tx.apply_payment").steps[2]
+    else {
+        panic!("expected the transition");
+    };
+
+    transition.compare.clear();
 
     assert!(validation::validate(&model).is_empty());
 
@@ -1586,3 +2384,4 @@ fn a_serial_pool_and_affinity_prove_nothing_about_a_transaction() {
         TransactionSerializabilityVerdict::Unproven { .. }
     ));
 }
+

@@ -70,8 +70,8 @@ pub struct ProverReport {
 /// topology and invocation-lock proof, and replaces them with the
 /// transaction serializability and ordering families: obligations
 /// anchored to a transaction, proven from the model-wide conflict
-/// closure — serializable isolation, strict locks, version validation,
-/// ordered cursors, fences — and never from L1. Format 8 judges a
+/// closure — serializable isolation, strict locks, dsl 4's version
+/// validation, ordered cursors, fences — and never from L1. Format 8 judges a
 /// request result per variant: a target's retryable error class is
 /// never replay-stable (`target_error_retryable`) — and scopes the
 /// idempotency-inert continuation admission to the path, so
@@ -79,8 +79,17 @@ pub struct ProverReport {
 /// carries the dsl 5 `abandon` terminal: a recoverability path that
 /// `abandons`, the `every_path_abandons` obstacle, and the
 /// `abandon_without_message_input` and `abandon_without_redelivery`
-/// diagnostics.
-pub const FORMAT: u32 = 8;
+/// diagnostics. Format 9 is dsl 6's atomic-mutation revision: the
+/// `version_validation` commit-order evidence and the
+/// `version_validation_missing` / `version_bump_missing` gaps give way
+/// to `atomic_conditional_mutation` evidence (with the guard coverage
+/// that credits it) and the observed-state guard gaps, access modes
+/// follow the new vocabulary (`update`, `compare_read`,
+/// `compare_write`, `upsert_read_write`, `version_publish`), and the
+/// natural-replay gap `contains_version_bump` becomes
+/// `publishes_version` beside `contains_compare_and_set` and
+/// `contains_upsert`.
+pub const FORMAT: u32 = 9;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -837,8 +846,8 @@ fn transaction_ordering_assumptions(proof: &TransactionOrderingProof) -> Vec<Str
             }
 
             assumptions.push(format!(
-                "no ordinary write touches {cursor}, and every advance of it uses the {rule} \
-                 rule"
+                "no update, compare-and-set, or upsert assigns {cursor}, and every advance of it \
+                 uses the {rule} rule"
             ));
         }
 
@@ -865,7 +874,9 @@ fn transaction_ordering_assumptions(proof: &TransactionOrderingProof) -> Vec<Str
                 step + 1
             ));
 
-            assumptions.push(format!("no ordinary write touches {fence}"));
+            assumptions.push(format!(
+                "no update, compare-and-set, or upsert assigns {fence}"
+            ));
         }
     }
 

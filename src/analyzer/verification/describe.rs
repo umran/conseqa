@@ -81,8 +81,21 @@ fn gap_sentence(gap: &ReplayGap) -> String {
                 .to_string()
         }
 
-        ReplayGap::ContainsVersionBump => {
-            "the transaction bumps an object version, which re-execution would advance again"
+        ReplayGap::PublishesVersion => {
+            "the transaction mutates a versioned instance, whose version re-execution would \
+             publish again"
+                .to_string()
+        }
+
+        ReplayGap::ContainsCompareAndSet => {
+            "the transaction compares and sets an instance, a comparison re-execution would \
+             evaluate against the state its first commit changed"
+                .to_string()
+        }
+
+        ReplayGap::ContainsUpsert => {
+            "the transaction upserts an instance, which re-execution would update where its \
+             first attempt inserted"
                 .to_string()
         }
 

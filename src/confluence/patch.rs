@@ -554,22 +554,6 @@ fn collect_program_refs(operation: &Id, program: &OperationBlock, into: &mut Vec
                             );
                         }
 
-                        TransactionStep::ValidateVersion(validate) => {
-                            push_object_ref(
-                                transaction.data_model.as_ref(),
-                                &validate.target.object,
-                                out,
-                            );
-                        }
-
-                        TransactionStep::BumpVersion(bump) => {
-                            push_object_ref(
-                                transaction.data_model.as_ref(),
-                                &bump.target.object,
-                                out,
-                            );
-                        }
-
                         TransactionStep::AdvanceCursor(advance) => {
                             push_object_ref(
                                 transaction.data_model.as_ref(),
@@ -586,10 +570,26 @@ fn collect_program_refs(operation: &Id, program: &OperationBlock, into: &mut Vec
                             );
                         }
 
-                        TransactionStep::Write(write) => {
+                        TransactionStep::Update(update) => {
                             push_object_ref(
                                 transaction.data_model.as_ref(),
-                                &write.target.object,
+                                &update.target.object,
+                                out,
+                            );
+                        }
+
+                        TransactionStep::CompareAndSet(cas) => {
+                            push_object_ref(
+                                transaction.data_model.as_ref(),
+                                &cas.target.object,
+                                out,
+                            );
+                        }
+
+                        TransactionStep::Upsert(upsert) => {
+                            push_object_ref(
+                                transaction.data_model.as_ref(),
+                                &upsert.target.object,
                                 out,
                             );
                         }

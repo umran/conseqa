@@ -98,9 +98,10 @@ pub use result_replay::{
     RetryableReturn, ReturnedResult,
 };
 pub use transaction_conflicts::{
-    AccessFields, AccessMode, CommitArtifact, CommitOrderEvidence, ConflictIndex,
-    DependencyEvidence, DependencyGap, DependencyKind, DependencySide, FieldOverlap, LockAccess,
-    LockRef, ManagedFieldRef, SelectorOverlap, TransactionAccess, TransactionRef,
+    AccessFields, AccessMode, CommitArtifact, CommitOrderEvidence, ComparisonFact,
+    ConditionalMutation, ConditionalMutationKind, ConflictIndex, DependencyEvidence, DependencyGap,
+    DependencyKind, DependencySide, FieldOverlap, GuardCoverage, LockAccess, LockRef,
+    ManagedFieldRef, ObservedValue, SelectorOverlap, TransactionAccess, TransactionRef,
     TransactionTemplate,
 };
 pub use transaction_ordering::{

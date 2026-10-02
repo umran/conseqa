@@ -18,14 +18,19 @@
 //!   write-write — has no cyclic strongly connected component
 //!   containing a dependency that is not commit-order constrained by
 //!   declared evidence: committed reads and atomic write order under
-//!   declared isolation, strict S/X locking, version validation, or a
-//!   shared ordered cursor. An apparent cycle every edge of which is
-//!   constrained would imply a cycle in strict commit order, so it
-//!   cannot occur in a committed history.
+//!   declared isolation, strict S/X locking, an atomic conditional
+//!   mutation (a compare-and-set, transition, cursor advance, or upsert
+//!   — including one comparing a read's observed state or version), or
+//!   a shared ordered cursor. A read-only transaction that
+//!   observes committed state at one instant takes that instant as its
+//!   serialization point, which orders its anti-dependencies too. An
+//!   apparent cycle every edge of which is constrained would imply a
+//!   cycle in that order, so it cannot occur in a committed history.
 //!
 //! Anti-dependencies are what make the second route necessary:
 //! repeatable or snapshot-stable reads still admit write skew, so
-//! snapshot stability never by itself proves serializability. Every
+//! snapshot stability never by itself proves serializability of a
+//! transaction that writes. Every
 //! refusal names the concrete transaction chain and the unconstrained
 //! dependencies on it. All evidence here is L0: no runtime fact
 //! participates, and no runtime fact could.
@@ -37,7 +42,7 @@ use crate::spec::{Id, Model, StepLocation, TransactionIsolation, ValueRef};
 
 use super::transaction_conflicts::{
     AccessMode, CommitArtifact, CommitOrderEvidence, ConflictIndex, DependencyEvidence,
-    DependencyGap, DependencyKind, TransactionRef, isolation_label,
+    DependencyGap, DependencyKind, GuardCoverage, TransactionRef, isolation_label,
 };
 use super::{ProofScope, RemedyLayer};
 
@@ -148,8 +153,8 @@ pub enum TransactionSerializabilityObstacle {
     /// non-serializable committed history could pass through.
     TransactionSerializabilityUnconstrainedCycle { cycle: Vec<TransactionRef> },
 
-    /// A read-write anti-dependency on such a cycle that neither
-    /// strict locking nor version validation constrains.
+    /// A read-write anti-dependency on such a cycle that neither strict
+    /// locking nor an atomic conditional mutation constrains.
     TransactionSerializabilityUnprotectedReadWriteDependency { dependency: DependencyEvidence },
 
     /// A write-read or write-write dependency on such a cycle with no
@@ -281,7 +286,7 @@ pub fn prove(
 
 impl TransactionSerializabilityCheck {
     /// Every obstacle names an application fact: isolation, a lock, a
-    /// version protocol, a cursor. No runtime declaration can help.
+    /// guarded mutation, a cursor. No runtime declaration can help.
     pub fn remedy(&self) -> Option<RemedyLayer> {
         match &self.verdict {
             TransactionSerializabilityVerdict::Proven { .. } => None,
@@ -378,8 +383,9 @@ impl TransactionSerializabilityObstacle {
                     subject: Some(dependency.source.transaction.clone()),
                     message: format!(
                         "{}: `{}` may read `{}` (step {}) before `{}` {} (step {}), \
-                         and neither strict locking nor version validation constrains \
-                         the commit order — the anti-dependency behind write skew. {}",
+                         and neither strict locking nor an atomic conditional mutation \
+                         constrains the commit order — the anti-dependency behind write \
+                         skew. {}",
                         capitalize(&dependency.kind.to_string()),
                         dependency.source,
                         dependency.object,
@@ -468,20 +474,57 @@ fn gap_sentence(gap: &DependencyGap) -> String {
             access_step + 1
         ),
 
-        DependencyGap::VersionValidationMissing {
+        DependencyGap::ObservedStateGuardMissing {
             transaction,
             object,
+            step,
         } => format!(
-            "`{transaction}` does not validate the version of `{object}` it observed at \
-             commit, so a stale observation can still participate in a successful commit"
+            "`{transaction}` reads this `{object}` instance at step {} and later commits a \
+             decision that can conflict with another writer, but it does not lock the \
+             observation, run in a serializable closure, or condition a mutation of the \
+             instance on the observed state — a stale observation can still participate in \
+             a successful commit",
+            step + 1
         ),
 
-        DependencyGap::VersionBumpMissing {
+        DependencyGap::ObservedStateGuardDoesNotCoverConflict {
             transaction,
             object,
+            step,
+            guard_step,
+            fields,
         } => format!(
-            "`{transaction}` mutates `{object}` without advancing the version the other \
-             side validates"
+            "The guarded mutation of `{transaction}` at step {} compares part of what its \
+             step-{} read of `{object}` observed, but not {fields}, which the conflict \
+             touches; compare those fields against their observed values, or the object's \
+             version against the observed version",
+            guard_step + 1,
+            step + 1
+        ),
+
+        DependencyGap::ObservedStateNotIdentified {
+            transaction,
+            object,
+            step,
+        } => format!(
+            "`{transaction}` observes a set of `{object}` instances at step {}, not one \
+             identified instance, and a conditional mutation guards only the instance it \
+             identifies: a concurrent insert of a new matching instance escapes it, so only \
+             a lock or serializable isolation protects this observation",
+            step + 1
+        ),
+
+        DependencyGap::ObservedVersionMayRepeat {
+            transaction,
+            object,
+            step,
+            deleted_by,
+        } => format!(
+            "`{transaction}` guards its step-{} read of `{object}` by the observed version, \
+             but the conflict is an insertion and `{deleted_by}` deletes `{object}` \
+             instances: an instance inserted after a deletion establishes its token afresh \
+             and may repeat the observed one",
+            step + 1
         ),
 
         DependencyGap::IsolationUnspecified { transaction } => format!(
@@ -550,15 +593,65 @@ pub fn evidence_sentence(dependency: &DependencyEvidence) -> String {
             writer_lock.step + 1
         ),
 
-        CommitOrderEvidence::VersionValidation {
-            validated_by,
+        CommitOrderEvidence::AtomicConditionalMutation {
+            guarded_by,
+            step,
             object,
-            field,
-        } => format!(
-            "{edge} is commit-ordered by version validation: `{validated_by}` validates \
-             `{object}.{field}` at commit against the version it observed, and the \
-             conflicting mutation advances that version, so a stale observation \
-             rejects instead of committing"
+            mechanism,
+            guard,
+            compared_fields,
+        } => {
+            let at = format!(
+                "`{guarded_by}`'s {mechanism} of `{object}` at step {}",
+                step + 1
+            );
+
+            match guard {
+                GuardCoverage::Atomic => format!(
+                    "{edge} is commit-ordered by {at}: the access is part of that atomic \
+                     conditional mutation, whose write protection is held to commit"
+                ),
+
+                GuardCoverage::HeldProtection => format!(
+                    "{edge} is commit-ordered by {at}: the access follows it, under the \
+                     write protection the mutation holds on the instance to commit"
+                ),
+
+                GuardCoverage::ObservedState { read, .. } => format!(
+                    "{edge} is commit-ordered by {at}: it compares {} against the values \
+                     `{read}` observed, atomically with the mutation, so a stale observation \
+                     rejects instead of committing",
+                    field_list(compared_fields)
+                ),
+
+                GuardCoverage::ObservedVersion {
+                    read,
+                    version_field,
+                    ..
+                } => format!(
+                    "{edge} is commit-ordered by {at}: it conditions its mutation on the \
+                     version `{read}` observed (`{version_field}`). Every committed mutation \
+                     of the versioned instance publishes a newer token, so a stale \
+                     observation cannot participate in a successful commit"
+                ),
+
+                GuardCoverage::LockedReader { reader_lock } => format!(
+                    "{edge} is commit-ordered: `{}` locks the instance at step {} before \
+                     observing it and holds the lock to termination, and {at} must acquire \
+                     the instance's write protection, so the reader commits first",
+                    reader_lock.transaction,
+                    reader_lock.step + 1
+                ),
+            }
+        }
+
+        CommitOrderEvidence::ReadOnlyObservation { isolation } => format!(
+            "{edge} needs no mechanism: `{}` only reads, and observes committed state at one \
+             instant under {} isolation, which is its serialization point — every write it \
+             observed committed before it and every write it missed commits after it, so no \
+             cycle passes through it",
+            dependency.source,
+            isolation_label(*isolation)
         ),
 
         CommitOrderEvidence::OrderedCursor {
@@ -576,6 +669,14 @@ pub fn evidence_sentence(dependency: &DependencyEvidence) -> String {
     }
 }
 
+fn field_list(fields: &std::collections::BTreeSet<crate::spec::FieldPath>) -> String {
+    fields
+        .iter()
+        .map(|field| format!("`{field}`"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 fn value_ref_label(value: &ValueRef) -> String {
     format!("{}.{}", value.source.id(), value.path)
 }
@@ -588,6 +689,8 @@ fn write_phrase(mode: AccessMode) -> &'static str {
     match mode {
         AccessMode::Insert => "inserts a matching instance",
         AccessMode::Delete => "deletes the matching instance",
+        AccessMode::UpsertReadWrite => "upserts it",
+        AccessMode::VersionPublish => "publishes a newer version of it",
         _ => "writes it",
     }
 }
