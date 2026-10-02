@@ -526,8 +526,9 @@ fn tenant_ledger_example_proves_everything() {
         "{dependencies:#?}"
     );
 
-    // The ledger writer: serializable per tenant by the version
-    // protocol, and ordered by sequence through the successor cursor.
+    // The ledger writer: serializable per tenant by its cursor advance
+    // conditioned on the observed version, and ordered by sequence
+    // through that successor cursor.
     let apply = verification
         .transaction_serializability
         .iter()
@@ -545,7 +546,10 @@ fn tenant_ledger_example_proves_everything() {
     assert!(
         dependencies.iter().any(|dependency| matches!(
             dependency.evidence,
-            verification::CommitOrderEvidence::VersionValidation { .. }
+            verification::CommitOrderEvidence::AtomicConditionalMutation {
+                guard: verification::GuardCoverage::ObservedVersion { .. },
+                ..
+            }
         )),
         "{dependencies:#?}"
     );

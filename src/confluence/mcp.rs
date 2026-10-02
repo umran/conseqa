@@ -106,8 +106,9 @@ narrowly, yourself, and build again.
 An unproven transaction serializability or ordering obligation \
 carries `remedy: application`, always: the fix is in the L0 model. \
 Those two families are proven only from transaction primitives — \
-declared isolation, shared and exclusive locks, object versions with \
-validate_version and bump_version, ordered cursors, fences — over the \
+declared isolation, shared and exclusive locks, atomic guarded \
+mutations (compare_and_set, transitions and cursor advances comparing \
+an observed version), ordered cursors, fences — over the \
 model-wide conflict closure of the transaction, never from runtime \
 topology, so no L1 edit can discharge one. No obligation currently \
 carries `remedy: runtime`, and the replay families carry no remedy at \
@@ -1991,10 +1992,11 @@ PATCH — {"mutations": [<mutation>, ...]}; each mutation {"kind": K, ...}:
     (objects: {"object.x":{"schema":"schema.X","identity":[["id"]],
      "version":{"field":["version"]}}}. version optional: the object's
      application concurrency token, a non-optional int outside the
-     identity, managed by the version protocol alone — insert creates
-     it, bump_version advances it (required with every write or
-     transition of the instance), validate_version checks it at commit
-     against a preceding read, and no ordinary write may name it.
+     identity, managed by the persistence protocol — insert establishes
+     it and every committed mutation of the live instance publishes a
+     newer one by itself, with no step of its own. No update,
+     compare_and_set, or upsert may assign it; comparing it is how a
+     mutation is conditioned on the version a preceding read observed.
      outboxes optional: {"outbox.x":{"messages":["schema.X"],
      "message_identity":{"kind":"keyed","mapping":{"schema.X":[["event_id"]]}}}}.
      An outbox is a typed transactional message collection of the data
@@ -2039,6 +2041,10 @@ PATCH — {"mutations": [<mutation>, ...]}; each mutation {"kind": K, ...}:
                    isolation: <this transaction's>};
        update     {record: <a find's as>, set: [fields], from: values};
        create     {record: <data object>, from: values, isolation};
+       upsert     {record: <data object>, by: {identity field: value},
+                   from: values, set: [fields], update_from: values,
+                   isolation} — one atomic insert-or-update of the instance
+                   `by` identifies; it reads nothing and protects no read;
        delete     {record: <a find's as>};
        transition {record, transition, otherwise: <declared error>,
                    already_ok: true, effects_from: [values] for its
@@ -2093,10 +2099,13 @@ PATCH — {"mutations": [<mutation>, ...]}; each mutation {"kind": K, ...}:
      Records found earlier are carried forward through the transaction's
      output — change one only in the transaction that found it. The gate
      compiles the sketch when you write it and rejects one that does not
-     compile, saying why. Compiled programs carry the version protocol or
-     strict locks, keyed commits, key propagation into messages and
-     requests, and the inspect-then-decide shape a guarded transition
-     needs; requirements are added after, by discovery.)
+     compile, saying why. Compiled programs condition the first change of
+     a found versioned record on the version its find observed (an update
+     becomes a compare_and_set, a transition or advance gains a compare),
+     hold everything else that changes under a strict lock, and carry
+     keyed commits, key propagation into messages and requests, and the
+     inspect-then-decide shape a guarded transition needs; a record only
+     read gets no guard. Requirements are added after, by discovery.)
   {"kind":"replace_operation_program","operation":"operation.x","program":{"steps":[...]}}
   {"kind":"replace_operation_requirements","operation":"operation.x","requirements":{...}}
     (operation requirements are idempotency and recoverability only;
@@ -2219,42 +2228,66 @@ A TRANSACTION STEP declares and executes one inline transaction:
      position must be available at transaction entry: an input, a prior
      transaction output, or a bound result — never a transaction_read of
      this transaction. Proven from the model-wide conflict closure by
-     serializable isolation, strict S/X locks, version validation, or a
-     shared ordered cursor; never from runtime topology.
+     serializable isolation, strict S/X locks, an atomic conditional
+     mutation (its own comparison, or one of a read's observed state or
+     version), a read-only transaction's single observation, or a shared
+     ordered cursor; never from runtime topology.
      rejected: REQUIRED iff the body contains a commit guard — a
-     transition, validate_version, advance_cursor, or fence — and
+     compare_and_set, transition, advance_cursor, or fence — and
      forbidden otherwise. On rejection nothing commits, no artifact or
      outbox admission exists, and control enters the block; if it falls
      through, control rejoins after the step with the transaction's
      artifacts unavailable. Interruption (crash, deadlock, timeout) never
      enters rejected and is never an Err.)
-Transaction steps beyond read/write/insert/delete/lock/transition/
+Transaction steps beyond read/update/insert/delete/lock/transition/
 establish_effect_intent/establish_transaction_output/write_outbox:
-  {"kind":"validate_version","target":<object selector>,
-   "expected":{"source":"transaction_read:read.x","path":"version"}}
-    (the observation guard: at commit the transaction proceeds only if
-     the selected instance's version STILL EQUALS expected — the version
-     field of a PRECEDING read of the same instance in this transaction.
-     Any change rejects; the guard compares and never increments, holds
-     no lock, and is evaluated at commit wherever it sits. Never required
-     by validation: declare it where the transaction relies on what it
-     read, which a serializability proof of a read-then-write needs on
-     the reader's side.)
-  {"kind":"bump_version","target":<object selector>}
-    (publishes a change: version := version + 1 at commit, unconditional,
-     never rejects. REQUIRED beside every write or transition of a live
-     versioned instance, at most once per instance; insert and delete
-     need none. Neither step implies the other — validate-only guards a
-     read, bump-only is a blind write; both on one instance compose into
-     a compare-and-swap from expected to expected + 1, and a proof over
-     a read-then-write needs the reader's validation AND the writer's
-     bump.)
+  {"kind":"update","target":<object selector>,"fields":[["balance"]],
+   "values":<derivation>}
+    (an unconditional mutation. It never rejects because something read
+     earlier changed: it is not a stale-read guard. On a versioned object
+     it publishes a newer version by itself.)
+  {"kind":"compare_and_set","target":<object selector pinning the whole
+   identity>,
+   "compare":[{"field":["version"],
+               "expected":{"source":"transaction_read:read.x","path":"version"}}],
+   "fields":[["balance"]],"values":<derivation>}
+    (an ATOMIC conditional update of one identified instance — like
+     UPDATE ... WHERE id = ? AND version = ?: the comparison and the
+     mutation are one storage operation, whose write protection is then
+     held to commit. Rejects the transaction when the instance does not
+     exist or any comparison is false. compare: one or more equality
+     conditions, each field at most once; expected is a value reference
+     or a literal. A comparison whose expected value is exactly
+     transaction_read:<bind>.<the same field> of an EARLIER read of the
+     SAME instance is an observed-state comparison: comparing the
+     object's version covers every field that read observed (every
+     committed mutation of the live instance publishes a newer version);
+     comparing fields directly covers those fields. That is what lets a
+     read-then-write prove serializable. Any other comparison — an input,
+     a literal — is valid behaviour but no such evidence. Use it where the
+     transaction relies on what it read; a blind update stays an update.)
+  {"kind":"upsert","target":<object selector pinning the whole identity>,
+   "insert_values":<derivation>,"update_fields":[["balance"]],
+   "update_values":<derivation>}
+    (atomic insert-or-update arbitrated on the object's identity: absent,
+     inserted; present, update_fields set. Never rejects, never names the
+     version or an identity field in update_fields, and protects no
+     earlier read — not even of the instance it upserts.)
+  A transition, advance_cursor, or fence may carry "compare":[...] too:
+  the comparisons are conjoined with its own condition in the same atomic
+  statement. A fence holds no write protection when its token equals the
+  fence, so a fence's comparison guards no read; put the comparison on a
+  compare_and_set, transition, or cursor advance of the instance.
+  There is no validate_version or bump_version: a read the transaction
+  relies on and never mutates is protected by a real mechanism — a lock
+  before the read, serializable isolation, or a guarded mutation of what
+  it read — or the obligation is refused.
   {"kind":"advance_cursor","target":<object selector>,"field":["seq"],
    "incoming":<value ref>,"rule":"successor"}
     (rule: successor — commits only when incoming = stored + 1 — or
      monotonic_after — commits only when incoming > stored — then sets the
      cursor atomically. The field is a non-optional int (successor) or
-     int/decimal/timestamp (monotonic_after); no ordinary write may name
+     int/decimal/timestamp (monotonic_after); no update may name
      it. The route for OrderedBy when incoming is the position.)
   {"kind":"fence","target":<object selector>,"field":["generation"],
    "token":<value ref>}

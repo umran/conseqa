@@ -459,9 +459,9 @@ fn flash_checkout_parses_nested_semantics() {
 
     assert!(matches!(&transfer.steps[2], TransactionStep::Read(_)));
 
-    assert!(matches!(&transfer.steps[3], TransactionStep::Write(_)));
+    assert!(matches!(&transfer.steps[3], TransactionStep::Update(_)));
 
-    assert!(matches!(&transfer.steps[4], TransactionStep::Write(_)));
+    assert!(matches!(&transfer.steps[4], TransactionStep::Update(_)));
 }
 
 #[test]
@@ -545,12 +545,12 @@ fn flash_checkout_parses_transaction_read_provenance() {
 
     assert_eq!(read.bind, Id("read.reserve_inventory.stock".into()));
 
-    let TransactionStep::Write(write) = &reserve.steps[1] else {
-        panic!("second step should be a write");
+    let TransactionStep::Update(write) = &reserve.steps[1] else {
+        panic!("second step should be an update");
     };
 
     let Derivation::Deterministic { from } = &write.values else {
-        panic!("write should declare deterministic value provenance");
+        panic!("the update should declare deterministic value provenance");
     };
 
     assert_eq!(
@@ -588,8 +588,8 @@ fn flash_checkout_parses_transition_side_effect_intent() {
     // a program step can execute it.
     let apply = transaction(&model, "operation.apply_payment", "tx.apply_payment");
 
-    let TransactionStep::Transition(applied) = &apply.steps[3] else {
-        panic!("the fourth step should be the mark_paid transition");
+    let TransactionStep::Transition(applied) = &apply.steps[2] else {
+        panic!("the third step should be the mark_paid transition");
     };
 
     let intent = applied
@@ -618,8 +618,8 @@ fn flash_checkout_parses_unspecified_derivation() {
 
     assert_eq!(transfer.idempotency, IdempotencyGuarantee::Unspecified);
 
-    let TransactionStep::Write(write) = &transfer.steps[4] else {
-        panic!("fifth step should be the destination write");
+    let TransactionStep::Update(write) = &transfer.steps[4] else {
+        panic!("fifth step should be the destination update");
     };
 
     assert_eq!(write.values, Derivation::Unspecified);
@@ -1060,7 +1060,7 @@ transaction: tx.x",
 /// level.
 fn operation_source(extra: &str) -> String {
     let mut source = String::from(
-        "dsl: 4
+        "dsl: 6
 revision: 1
 services:
   service.a:
@@ -1176,8 +1176,8 @@ fn flash_checkout_parses_transition_effect_intents() {
 
     let apply = transaction(&model, "operation.apply_payment", "tx.apply_payment");
 
-    let TransactionStep::Transition(transition) = &apply.steps[3] else {
-        panic!("the fourth step should be the mark_paid transition");
+    let TransactionStep::Transition(transition) = &apply.steps[2] else {
+        panic!("the third step should be the mark_paid transition");
     };
 
     assert_eq!(transition.effect_intents.len(), 1);
@@ -1206,8 +1206,8 @@ fn flash_checkout_parses_transition_effect_intents() {
     // A transition without side effects declares an explicit empty map.
     let cancel = transaction(&model, "operation.cancel_order", "tx.cancel_order");
 
-    let TransactionStep::Transition(transition) = &cancel.steps[2] else {
-        panic!("the third step should be the cancel transition");
+    let TransactionStep::Transition(transition) = &cancel.steps[1] else {
+        panic!("the second step should be the cancel transition");
     };
 
     assert!(transition.effect_intents.is_empty());
@@ -1217,7 +1217,7 @@ fn flash_checkout_parses_transition_effect_intents() {
 /// surface syntax can be exercised without a fixture.
 fn field_source(fields: &str) -> String {
     let mut source = String::from(
-        "dsl: 4
+        "dsl: 6
 revision: 1
 services: {}
 schemas:
@@ -1792,7 +1792,7 @@ fn shorthand_selector_values_serialize_into_the_canonical_form() {
 #[test]
 fn an_l0_only_model_parses_with_no_runtime_block() {
     let source = "
-dsl: 4
+dsl: 6
 revision: 1
 
 topics:
@@ -1828,7 +1828,7 @@ topics:
 #[test]
 fn the_canonical_runtime_block_parses_and_round_trips() {
     let source = "
-dsl: 4
+dsl: 6
 revision: 1
 
 runtime:
@@ -1940,7 +1940,7 @@ runtime:
 #[test]
 fn subscription_scoped_transport_semantics_parse() {
     let source = "
-dsl: 4
+dsl: 6
 revision: 1
 
 schemas:
@@ -2033,7 +2033,7 @@ fn member_assignments_round_trip() {
     ] {
         let source = format!(
             "
-dsl: 4
+dsl: 6
 revision: 1
 
 runtime:
@@ -2070,7 +2070,7 @@ runtime:
 #[test]
 fn parses_asynchronous_effect_steps() {
     let source = r#"
-dsl: 4
+dsl: 6
 revision: 1
 services:
   service.read:
@@ -2377,7 +2377,12 @@ fn absent_acknowledgement_and_outboxes_stay_absent() {
 
 #[test]
 fn a_declared_dsl_version_mismatch_is_refused_by_name() {
-    for (declared, refusal) in [(6, "a future contract"), (3, "a superseded contract")] {
+    for (declared, refusal) in [
+        (7, "a future contract"),
+        (5, "the contract dsl 6 changed"),
+        (4, "the contract dsl 6 changed"),
+        (3, "a superseded contract"),
+    ] {
         let error = yaml::parse(&format!("dsl: {declared}\nrevision: 1\n"))
             .expect_err(refusal);
 
@@ -2392,18 +2397,230 @@ fn a_declared_dsl_version_mismatch_is_refused_by_name() {
         let message = error.to_string();
 
         assert!(message.contains(&format!("declares dsl {declared}")), "{message}");
-        assert!(message.contains("this build reads dsl 5"), "{message}");
+        assert!(message.contains("this build reads dsl 6"), "{message}");
     }
 }
 
-/// dsl 5 only adds the `abandon` terminal, so a dsl 4 specification
-/// means the same under it: it is read, as the current version.
+/// dsl 6 changed what a transaction program means — `write`,
+/// `validate_version`, and `bump_version` are gone — so a dsl 4 or dsl 5
+/// specification is not silently read as dsl 6, however small: it is
+/// re-authored.
 #[test]
-fn a_dsl_4_specification_is_read_as_dsl_5() {
-    let model = yaml::parse("dsl: 4\nrevision: 1\n").expect("dsl 4 is read");
+fn dsl_4_and_5_specifications_are_refused_by_dsl_6() {
+    for declared in [4, 5] {
+        let error = yaml::parse(&format!("dsl: {declared}\nrevision: 1\n"))
+            .expect_err("an earlier contract is refused");
+
+        assert!(
+            matches!(
+                &error,
+                yaml::ParseError::DslVersionMismatch { found } if found.0 == declared
+            ),
+            "{error:?}"
+        );
+
+        assert!(error.to_string().contains("re-author"), "{error}");
+    }
+
+    let model = yaml::parse("dsl: 6\nrevision: 1\n").expect("dsl 6 is read");
 
     assert_eq!(model.dsl, conseqa::spec::DSL_VERSION);
-    assert!(yaml::serialize(&model).expect("serializes").contains("dsl: 5"));
+    assert!(
+        yaml::serialize(&model)
+            .expect("serializes")
+            .contains("dsl: 6")
+    );
+}
+
+/// A dsl 6 transaction body of the new vocabulary, and a body using one
+/// retired step kind in its place.
+fn atomic_mutation_source(steps: &str) -> String {
+    format!(
+        "dsl: 6
+revision: 1
+operations:
+  operation.adjust:
+    service: service.x
+    inputs:
+      input.adjust.request:
+        kind: request
+        schema: schema.Adjust
+        identity:
+          kind: unspecified
+        result:
+          ok: schema.Adjust
+    program:
+      steps:
+      - kind: transaction
+        transaction:
+          id: tx.adjust
+          data_model: data.x
+          isolation: read_committed
+          idempotency:
+            kind: unspecified
+          steps:
+{steps}
+        rejected:
+          steps:
+          - kind: complete
+      - kind: complete
+    requirements:
+      idempotency: []
+      recoverability: []
+"
+    )
+}
+
+#[test]
+fn compare_and_set_upsert_and_guarded_comparisons_parse_and_round_trip() {
+    let source = atomic_mutation_source(
+        "          - kind: read
+            bind: read.adjust.account
+            target:
+              object: object.account
+              predicate:
+                kind: eq
+                field: account_id
+                value:
+                  source: input:input.adjust.request
+                  path: account_id
+            fields:
+              kind: only
+              fields:
+              - balance
+              - version
+          - kind: compare_and_set
+            target:
+              object: object.account
+              predicate:
+                kind: eq
+                field: account_id
+                value:
+                  source: input:input.adjust.request
+                  path: account_id
+            compare:
+            - field: version
+              expected:
+                source: transaction_read:read.adjust.account
+                path: version
+            - field: status
+              expected: open
+            fields:
+            - balance
+            values:
+              kind: deterministic
+              from:
+              - source: transaction_read:read.adjust.account
+                path: balance
+          - kind: upsert
+            target:
+              object: object.account_balance
+              predicate:
+                kind: eq
+                field: account_id
+                value:
+                  source: input:input.adjust.request
+                  path: account_id
+            insert_values:
+              kind: deterministic
+              from:
+              - source: input:input.adjust.request
+                path: account_id
+            update_fields:
+            - balance
+            update_values:
+              kind: unspecified
+          - kind: transition
+            machine: machine.account
+            transition: transition.account.touch
+            subject:
+              object: object.account
+              predicate:
+                kind: eq
+                field: account_id
+                value:
+                  source: input:input.adjust.request
+                  path: account_id
+            compare:
+            - field: version
+              expected:
+                source: transaction_read:read.adjust.account
+                path: version
+            effect_intents: {}",
+    );
+
+    let model = yaml::parse(&source).expect("the dsl 6 vocabulary parses");
+
+    let transaction = model.operations[&Id("operation.adjust".into())]
+        .program
+        .transaction(&Id("tx.adjust".into()))
+        .expect("the transaction");
+
+    let TransactionStep::CompareAndSet(cas) = &transaction.steps[1] else {
+        panic!("expected the compare-and-set: {:?}", transaction.steps[1]);
+    };
+
+    assert_eq!(cas.compare.len(), 2);
+    assert_eq!(
+        cas.compare[0].observed_read(),
+        Some(&Id("read.adjust.account".into())),
+        "the version comparison names the same field of the earlier read"
+    );
+    assert_eq!(
+        cas.compare[1].observed_read(),
+        None,
+        "a literal is no observation"
+    );
+
+    assert!(matches!(&transaction.steps[2], TransactionStep::Upsert(_)));
+
+    let TransactionStep::Transition(transition) = &transaction.steps[3] else {
+        panic!("expected the transition");
+    };
+
+    assert_eq!(transition.compare.len(), 1);
+
+    assert!(
+        transaction.rejects(),
+        "a compare-and-set and a transition reject"
+    );
+    assert!(!transaction.steps[2].rejects(), "an upsert never rejects");
+
+    let reparsed = yaml::parse(&yaml::serialize(&model).expect("serializes")).expect("reparses");
+
+    assert_eq!(model, reparsed);
+}
+
+/// The retired protocol is not aliased: each removed kind fails shape
+/// validation like any other unknown step.
+#[test]
+fn the_retired_version_protocol_and_write_are_unknown_steps() {
+    let selector = "            target:
+              object: object.account
+              predicate:
+                kind: all";
+
+    for retired in [
+        format!("          - kind: bump_version\n{selector}"),
+        format!(
+            "          - kind: validate_version\n{selector}
+            expected:
+              source: transaction_read:read.x
+              path: version"
+        ),
+        format!(
+            "          - kind: write\n{selector}
+            fields:
+            - balance
+            values:
+              kind: unspecified"
+        ),
+    ] {
+        let error = yaml::parse(&atomic_mutation_source(&retired))
+            .expect_err("a retired step kind does not parse");
+
+        assert!(matches!(&error, yaml::ParseError::Yaml(_)), "{error:?}");
+    }
 }
 
 #[test]
@@ -2424,7 +2641,7 @@ fn the_superseded_external_surface_fails_schema_validation() {
     // The clean break: the retired mechanism vocabulary is not
     // detected, canonicalized, or aliased — it fails ordinary shape
     // validation like any other unknown form.
-    let source = "dsl: 4
+    let source = "dsl: 6
 revision: 1
 operations:
   operation.x:
@@ -2457,7 +2674,7 @@ operations:
 
 #[test]
 fn a_present_condition_parses_and_round_trips() {
-    let source = "dsl: 4
+    let source = "dsl: 6
 revision: 1
 schemas:
   schema.Event:
@@ -2538,7 +2755,7 @@ services:
 fn retired_v3_serialization_declarations_are_refused_at_parse() {
     let source = |operation_extra: &str, requirements_extra: &str, runtime: &str| {
         format!(
-            "dsl: 4
+            "dsl: 6
 revision: 1
 schemas:
   schema.Transfer:

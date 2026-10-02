@@ -279,9 +279,9 @@ pub enum ValidationError {
         found: String,
     },
 
-    /// A transaction containing a rejecting step — a transition, a
-    /// version validation, a cursor advance, or a fence — is executed
-    /// without a `rejected` block.
+    /// A transaction containing a rejecting step — a compare-and-set, a
+    /// transition, a cursor advance, or a fence — is executed without a
+    /// `rejected` block.
     MissingTransactionRejectedArm {
         operation: Id,
         location: StepLocation,
@@ -346,8 +346,9 @@ pub enum ValidationError {
         defect: VersionFieldDefect,
     },
 
-    /// An ordinary write names an object's version field, which only
-    /// the version protocol may assign.
+    /// An application mutation — an update, a compare-and-set, or an
+    /// upsert's update — names an object's version field, which the
+    /// persistence protocol alone manages.
     DirectWriteToVersionField {
         transaction: Id,
         step: usize,
@@ -355,47 +356,48 @@ pub enum ValidationError {
         field: FieldPath,
     },
 
-    /// A write or transition of a live versioned instance is not
-    /// accompanied by a `bump_version` of the same instance.
-    MissingVersionBump {
+    /// A `compare_and_set` target does not pin every identity field of
+    /// its object, so it may select more than one instance. A
+    /// conditional mutation is over one identified instance: a partial
+    /// or `all` selector would be a range CAS, which a concurrent
+    /// insert of a new matching instance escapes.
+    CompareAndSetWithoutIdentifiedInstance {
         transaction: Id,
         step: usize,
         object: Id,
     },
 
-    /// One transaction bumps one selected instance more than once.
-    DuplicateVersionBump {
+    /// A `compare_and_set` declares no comparison: an unconditional
+    /// mutation is an `update`.
+    CompareAndSetWithoutComparison {
         transaction: Id,
         step: usize,
         object: Id,
     },
 
-    /// A `validate_version` step's expected version is not a preceding
-    /// read of the same instance's declared version field.
-    VersionValidationWithoutObservedVersion {
+    /// A guarded mutation's `compare` names one field more than once.
+    DuplicateCompareField {
+        transaction: Id,
+        step: usize,
+        object: Id,
+        field: FieldPath,
+    },
+
+    /// An `upsert` target does not pin every identity field of its
+    /// object: insert-or-update is arbitrated on one identity.
+    UpsertWithoutIdentifiedInstance {
         transaction: Id,
         step: usize,
         object: Id,
     },
 
-    /// A `validate_version` step's selector does not pin every identity
-    /// field of its object, so it may select many instances. Version
-    /// validation guards one observed instance's version: a partial or
-    /// `all` selector cannot distinguish a concurrent insert of a new
-    /// matching instance from the ones it observed, so crediting it as a
-    /// commit guard would admit phantom write skew (§20, §24).
-    VersionValidationWithoutIdentifiedInstance {
+    /// An `upsert`'s update branch names a field of the object's
+    /// identity, which the arbitration is over and which never changes.
+    UpsertMutatesIdentity {
         transaction: Id,
         step: usize,
         object: Id,
-    },
-
-    /// A `validate_version` or `bump_version` step targets an object
-    /// that declares no version.
-    VersionProtocolOnUnversionedObject {
-        transaction: Id,
-        step: usize,
-        object: Id,
+        field: FieldPath,
     },
 
     /// One field is used in two managed roles — a version, a cursor
@@ -407,7 +409,8 @@ pub enum ValidationError {
         second: ManagedRole,
     },
 
-    /// An ordinary write names a cursor or fence field, which only its
+    /// An application mutation — an update, a compare-and-set, or an
+    /// upsert's update — names a cursor or fence field, which only its
     /// protocol step may assign.
     DirectWriteToManagedField {
         transaction: Id,
@@ -1624,10 +1627,10 @@ impl From<ValidationError> for Diagnostic {
                 ),
                 evidence: vec![Evidence {
                     subject: Some(transaction),
-                    message: "A transition, version validation, cursor advance, or fence may \
-                              conclusively fail at commit; the operation must say what \
-                              control does then. Declare `rejected` with the block control \
-                              enters when the transaction rejects."
+                    message: "A compare-and-set, transition, cursor advance, or fence may \
+                              conclusively fail; the operation must say what control does \
+                              then. Declare `rejected` with the block control enters when the \
+                              transaction rejects."
                         .to_string(),
                 }],
             },
@@ -1648,8 +1651,8 @@ impl From<ValidationError> for Diagnostic {
                 ),
                 evidence: vec![Evidence {
                     subject: Some(transaction),
-                    message: "Only a transition, version validation, cursor advance, or \
-                              fence rejects; a transaction without one either commits or is \
+                    message: "Only a compare-and-set, transition, cursor advance, or fence \
+                              rejects; a transaction without one either commits or is \
                               interrupted, and interruption never enters `rejected`. Remove \
                               the block."
                         .to_string(),
@@ -1785,7 +1788,9 @@ impl From<ValidationError> for Diagnostic {
                 evidence: vec![Evidence {
                     subject: Some(object),
                     message: "A version field is a non-optional int outside the object's \
-                              identity, managed by the version protocol alone."
+                              identity: a managed concurrency token that insertion \
+                              establishes and every successful mutation of the live instance \
+                              advances."
                         .to_string(),
                 }],
             },
@@ -1800,135 +1805,132 @@ impl From<ValidationError> for Diagnostic {
                 severity: Severity::Error,
                 subject: Some(transaction.clone()),
                 message: format!(
-                    "Step {} of transaction `{transaction}` writes `{field}` of `{object}`, \
+                    "Step {} of transaction `{transaction}` assigns `{field}` of `{object}`, \
                      the object's version field.",
                     step + 1
                 ),
                 evidence: vec![Evidence {
                     subject: Some(object),
-                    message: "A version is never assigned through a derivation: `insert` \
-                              creates the initial version and `bump_version` advances it."
+                    message: "The declared version is a managed concurrency token. \
+                              Application mutations do not assign it directly; insertion \
+                              establishes an initial token and successful mutations of the \
+                              live instance publish a newer token automatically. Comparing \
+                              it is allowed."
                         .to_string(),
                 }],
             },
 
-            ValidationError::MissingVersionBump {
-                transaction,
-                step,
-                object,
-            } => Diagnostic {
-                code: DiagnosticCode::Validation(ValidationCode::MissingVersionBump),
-                severity: Severity::Error,
-                subject: Some(transaction.clone()),
-                message: format!(
-                    "Step {} of transaction `{transaction}` mutates versioned object \
-                     `{object}` without a `bump_version` of the same selected instance.",
-                    step + 1
-                ),
-                evidence: vec![Evidence {
-                    subject: Some(object),
-                    message: "Every write or transition of a live versioned instance must be \
-                              accompanied by a `bump_version` whose selector is exactly the \
-                              mutation's, so a validating reader detects the mutation at \
-                              commit."
-                        .to_string(),
-                }],
-            },
-
-            ValidationError::DuplicateVersionBump {
-                transaction,
-                step,
-                object,
-            } => Diagnostic {
-                code: DiagnosticCode::Validation(ValidationCode::DuplicateVersionBump),
-                severity: Severity::Error,
-                subject: Some(transaction.clone()),
-                message: format!(
-                    "Step {} of transaction `{transaction}` bumps the version of an \
-                     `{object}` instance an earlier step already bumps.",
-                    step + 1
-                ),
-                evidence: vec![Evidence {
-                    subject: Some(object),
-                    message: "One transaction bumps one selected instance at most once: the \
-                              version advances by exactly one per successful commit."
-                        .to_string(),
-                }],
-            },
-
-            ValidationError::VersionValidationWithoutObservedVersion {
+            ValidationError::CompareAndSetWithoutIdentifiedInstance {
                 transaction,
                 step,
                 object,
             } => Diagnostic {
                 code: DiagnosticCode::Validation(
-                    ValidationCode::VersionValidationWithoutObservedVersion,
+                    ValidationCode::CompareAndSetWithoutIdentifiedInstance,
                 ),
                 severity: Severity::Error,
                 subject: Some(transaction.clone()),
                 message: format!(
-                    "Step {} of transaction `{transaction}` validates the version of \
-                     `{object}` against a value that is not a preceding read of that \
-                     instance's version field.",
+                    "Step {} of transaction `{transaction}` compares and sets `{object}` \
+                     through a selector that does not pin its full identity, so it may \
+                     select more than one instance.",
                     step + 1
                 ),
                 evidence: vec![Evidence {
                     subject: Some(object),
-                    message: "`expected` must be `transaction_read:<bind>.<version field>` of \
-                              an earlier read that selects the same instance and covers the \
-                              version field; only an observed version makes the validation a \
-                              commit guard."
+                    message: "A compare_and_set is an atomic conditional update of one \
+                              identified instance: its target must pin every identity field \
+                              of the object by equality, against a literal or a reference. \
+                              Range and set compare-and-set are outside the DSL."
                         .to_string(),
                 }],
             },
 
-            ValidationError::VersionValidationWithoutIdentifiedInstance {
+            ValidationError::CompareAndSetWithoutComparison {
                 transaction,
                 step,
                 object,
             } => Diagnostic {
-                code: DiagnosticCode::Validation(
-                    ValidationCode::VersionValidationWithoutIdentifiedInstance,
-                ),
+                code: DiagnosticCode::Validation(ValidationCode::CompareAndSetWithoutComparison),
                 severity: Severity::Error,
                 subject: Some(transaction.clone()),
                 message: format!(
-                    "Step {} of transaction `{transaction}` validates the version of \
-                     `{object}` through a selector that does not pin its full identity, \
-                     so it may select more than one instance.",
+                    "Step {} of transaction `{transaction}` compares and sets `{object}` \
+                     without any comparison.",
                     step + 1
                 ),
                 evidence: vec![Evidence {
                     subject: Some(object),
-                    message: "A `validate_version` guards one observed instance's version: \
-                              its selector must pin every identity field of the object, by a \
-                              literal or a reference. A partial or `all` selector cannot \
-                              distinguish a concurrent insert of a new matching instance from \
-                              the ones it observed, so it is not a sound commit guard against \
-                              write skew."
+                    message: "`compare` holds at least one condition. A mutation that \
+                              compares nothing is an `update`."
                         .to_string(),
                 }],
             },
 
-            ValidationError::VersionProtocolOnUnversionedObject {
+            ValidationError::DuplicateCompareField {
                 transaction,
                 step,
                 object,
+                field,
             } => Diagnostic {
-                code: DiagnosticCode::Validation(
-                    ValidationCode::VersionProtocolOnUnversionedObject,
-                ),
+                code: DiagnosticCode::Validation(ValidationCode::DuplicateCompareField),
                 severity: Severity::Error,
                 subject: Some(transaction.clone()),
                 message: format!(
-                    "Step {} of transaction `{transaction}` applies the version protocol to \
-                     `{object}`, which declares no version.",
+                    "Step {} of transaction `{transaction}` compares `{field}` of `{object}` \
+                     more than once.",
                     step + 1
                 ),
                 evidence: vec![Evidence {
                     subject: Some(object),
-                    message: "Declare `version` on the data object before validating or \
-                              bumping it."
+                    message: "Each field appears in a `compare` list at most once; equality \
+                              conditions on one field either repeat each other or can never \
+                              hold together."
+                        .to_string(),
+                }],
+            },
+
+            ValidationError::UpsertWithoutIdentifiedInstance {
+                transaction,
+                step,
+                object,
+            } => Diagnostic {
+                code: DiagnosticCode::Validation(ValidationCode::UpsertWithoutIdentifiedInstance),
+                severity: Severity::Error,
+                subject: Some(transaction.clone()),
+                message: format!(
+                    "Step {} of transaction `{transaction}` upserts `{object}` through a \
+                     selector that does not pin its full identity.",
+                    step + 1
+                ),
+                evidence: vec![Evidence {
+                    subject: Some(object),
+                    message: "An upsert is arbitrated on the object's declared identity: its \
+                              target must pin every identity field by equality, so that one \
+                              logical instance is inserted or updated."
+                        .to_string(),
+                }],
+            },
+
+            ValidationError::UpsertMutatesIdentity {
+                transaction,
+                step,
+                object,
+                field,
+            } => Diagnostic {
+                code: DiagnosticCode::Validation(ValidationCode::UpsertMutatesIdentity),
+                severity: Severity::Error,
+                subject: Some(transaction.clone()),
+                message: format!(
+                    "Step {} of transaction `{transaction}` upserts `{object}` with an update \
+                     branch that assigns `{field}`, part of the object's identity.",
+                    step + 1
+                ),
+                evidence: vec![Evidence {
+                    subject: Some(object),
+                    message: "The update branch of an upsert assigns fields of the instance \
+                              its identity selects; the identity itself is what the \
+                              arbitration is over and never changes."
                         .to_string(),
                 }],
             },
@@ -1971,8 +1973,9 @@ impl From<ValidationError> for Diagnostic {
                 evidence: vec![Evidence {
                     subject: Some(object),
                     message: "A cursor advances only through `advance_cursor` and a fence \
-                              only through `fence`; an ordinary write would break the order \
-                              their proofs rest on. Insert initialization remains permitted."
+                              only through `fence`; an update, compare-and-set, or upsert \
+                              update would break the order their proofs rest on. Insert \
+                              initialization remains permitted."
                         .to_string(),
                 }],
             },

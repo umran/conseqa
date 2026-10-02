@@ -1253,7 +1253,7 @@ mod tests {
         assert_eq!(refs.len(), 1);
         assert_eq!(refs[0].operation.0, "operation.cancel_order");
         assert_eq!(refs[0].transaction.0, "tx.cancel_order");
-        assert_eq!(refs[0].step, 2);
+        assert_eq!(refs[0].step, 1);
     }
 
     #[test]

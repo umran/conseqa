@@ -456,7 +456,7 @@ pub fn validate(model: &Model) -> Vec<ValidationError> {
 
     errors.extend(validate_transactions(model, &index));
 
-    errors.extend(validate_version_protocol(model, &index));
+    errors.extend(validate_guarded_mutations(model, &index));
 
     errors.extend(validate_managed_fields(model, &index));
 
@@ -531,10 +531,11 @@ pub fn program_local_diagnostics(
         });
     }
 
-    // The version protocol is judged from the program and the data
+    // Guarded mutations are judged from the program and the data
     // objects it touches — shared symbols the probe carries — so a
-    // missing bump or a direct version write is fixed in-session too.
-    errors.extend(validate_version_protocol(model, &index));
+    // compare-and-set without an identified instance or a direct
+    // version write is fixed in-session too.
+    errors.extend(validate_guarded_mutations(model, &index));
 
     errors
         .into_iter()
@@ -583,11 +584,11 @@ fn is_program_local_error(error: &ValidationError) -> bool {
         | UnknownResultErrorClass { .. }
         | AbandonWithoutMessageInput { .. }
         | DirectWriteToVersionField { .. }
-        | MissingVersionBump { .. }
-        | DuplicateVersionBump { .. }
-        | VersionValidationWithoutObservedVersion { .. }
-        | VersionValidationWithoutIdentifiedInstance { .. }
-        | VersionProtocolOnUnversionedObject { .. }
+        | CompareAndSetWithoutIdentifiedInstance { .. }
+        | CompareAndSetWithoutComparison { .. }
+        | DuplicateCompareField { .. }
+        | UpsertWithoutIdentifiedInstance { .. }
+        | UpsertMutatesIdentity { .. }
         | InvalidReferenceOwner { .. } => true,
 
         UnknownReference { expected, .. } | InvalidReferenceKind { expected, .. } => {
@@ -969,11 +970,20 @@ fn validate_transactions(model: &Model, index: &ReferenceIndex<'_>) -> Vec<Valid
                         );
                     }
 
-                    TransactionStep::Write(write) => {
+                    TransactionStep::Update(update) => {
                         validate_transaction_object(
                             index,
                             transaction,
-                            &write.target.object,
+                            &update.target.object,
+                            &mut errors,
+                        );
+                    }
+
+                    TransactionStep::CompareAndSet(cas) => {
+                        validate_transaction_object(
+                            index,
+                            transaction,
+                            &cas.target.object,
                             &mut errors,
                         );
                     }
@@ -983,6 +993,15 @@ fn validate_transactions(model: &Model, index: &ReferenceIndex<'_>) -> Vec<Valid
                             index,
                             transaction,
                             &insert.object,
+                            &mut errors,
+                        );
+                    }
+
+                    TransactionStep::Upsert(upsert) => {
+                        validate_transaction_object(
+                            index,
+                            transaction,
+                            &upsert.target.object,
                             &mut errors,
                         );
                     }
@@ -1030,24 +1049,6 @@ fn validate_transactions(model: &Model, index: &ReferenceIndex<'_>) -> Vec<Valid
 
                     TransactionStep::WriteOutbox(write) => {
                         validate_transaction_outbox(model, index, transaction, write, &mut errors);
-                    }
-
-                    TransactionStep::ValidateVersion(validate) => {
-                        validate_transaction_object(
-                            index,
-                            transaction,
-                            &validate.target.object,
-                            &mut errors,
-                        );
-                    }
-
-                    TransactionStep::BumpVersion(bump) => {
-                        validate_transaction_object(
-                            index,
-                            transaction,
-                            &bump.target.object,
-                            &mut errors,
-                        );
                     }
 
                     TransactionStep::AdvanceCursor(advance) => {
@@ -1250,10 +1251,11 @@ fn object_identity<'a>(
 
 /// Whether a selector pins every identity field of its object, so it
 /// selects a single instance. An empty identity is treated as pinned
-/// (its own `EmptyObjectIdentity` defect is reported apart). A version
-/// validation needs this: it guards one observed instance's version,
-/// and a partial or `all` selector cannot tell a concurrent insert of a
-/// new matching instance from the ones it observed.
+/// (its own `EmptyObjectIdentity` defect is reported apart). A
+/// compare-and-set and an upsert need this: each is over one
+/// identified instance, and a partial or `all` selector would be a
+/// range operation a concurrent insert of a new matching instance
+/// escapes.
 fn selector_identifies_instance(identity: &[FieldPath], predicate: &SelectorPredicate) -> bool {
     fn pinned_fields<'a>(predicate: &'a SelectorPredicate, into: &mut Vec<&'a FieldPath>) {
         match predicate {
@@ -1273,135 +1275,109 @@ fn selector_identifies_instance(identity: &[FieldPath], predicate: &SelectorPred
     identity.iter().all(|field| pinned.contains(&field))
 }
 
-/// The version protocol of every transaction (§25–§27): no direct
-/// write of a version field, a bump beside every write or transition
-/// of a versioned instance, at most one bump per instance, a
-/// validation against an observed version, and no protocol step on an
-/// unversioned object.
-fn validate_version_protocol(model: &Model, index: &ReferenceIndex<'_>) -> Vec<ValidationError> {
+/// The structure of every atomic conditional mutation (§29 of the DSL
+/// 6 revision): no application mutation assigns a version field, a
+/// compare-and-set identifies one instance and compares something, no
+/// `compare` list repeats a field, and an upsert identifies one
+/// instance and leaves its identity alone. Unknown comparison fields
+/// and unavailable expected values are the path and reference passes'
+/// to report; a comparison need not name a prior read to be valid.
+fn validate_guarded_mutations(model: &Model, index: &ReferenceIndex<'_>) -> Vec<ValidationError> {
     let mut errors = Vec::new();
 
     for operation in model.operations.values() {
         for (_, transaction) in operation.program.transactions() {
-            let bumps: Vec<&ObjectSelector> = transaction
-                .steps
-                .iter()
-                .filter_map(|step| match step {
-                    TransactionStep::BumpVersion(bump) => Some(&bump.target),
-                    _ => None,
-                })
-                .collect();
-
-            let mut seen_bumps: Vec<&ObjectSelector> = Vec::new();
-
             for (step, inner) in transaction.steps.iter().enumerate() {
+                let assigned: Option<(&ObjectSelector, &BTreeSet<FieldPath>)> = match inner {
+                    TransactionStep::Update(update) => Some((&update.target, &update.fields)),
+                    TransactionStep::CompareAndSet(cas) => Some((&cas.target, &cas.fields)),
+                    TransactionStep::Upsert(upsert) => {
+                        Some((&upsert.target, &upsert.update_fields))
+                    }
+                    _ => None,
+                };
+
+                if let Some((target, fields)) = assigned
+                    && let Some(version) = version_field(model, index, &target.object)
+                    && fields.iter().any(|field| paths_related(field, version))
+                {
+                    errors.push(ValidationError::DirectWriteToVersionField {
+                        transaction: transaction.id.clone(),
+                        step,
+                        object: target.object.clone(),
+                        field: version.clone(),
+                    });
+                }
+
+                let identified = |selector: &ObjectSelector| {
+                    object_identity(model, index, &selector.object).is_none_or(|identity| {
+                        selector_identifies_instance(identity, &selector.predicate)
+                    })
+                };
+
                 match inner {
-                    TransactionStep::Write(write) => {
-                        let Some(version) = version_field(model, index, &write.target.object)
-                        else {
-                            continue;
-                        };
+                    TransactionStep::CompareAndSet(cas) => {
+                        if !identified(&cas.target) {
+                            errors.push(ValidationError::CompareAndSetWithoutIdentifiedInstance {
+                                transaction: transaction.id.clone(),
+                                step,
+                                object: cas.target.object.clone(),
+                            });
+                        }
 
-                        if write
-                            .fields
-                            .iter()
-                            .any(|field| paths_related(field, version))
+                        if cas.compare.is_empty() {
+                            errors.push(ValidationError::CompareAndSetWithoutComparison {
+                                transaction: transaction.id.clone(),
+                                step,
+                                object: cas.target.object.clone(),
+                            });
+                        }
+                    }
+
+                    TransactionStep::Upsert(upsert) => {
+                        if !identified(&upsert.target) {
+                            errors.push(ValidationError::UpsertWithoutIdentifiedInstance {
+                                transaction: transaction.id.clone(),
+                                step,
+                                object: upsert.target.object.clone(),
+                            });
+                        }
+
+                        if let Some(identity) = object_identity(model, index, &upsert.target.object)
                         {
-                            errors.push(ValidationError::DirectWriteToVersionField {
-                                transaction: transaction.id.clone(),
-                                step,
-                                object: write.target.object.clone(),
-                                field: version.clone(),
-                            });
-                        }
-
-                        if !bumps.iter().any(|selector| **selector == write.target) {
-                            errors.push(ValidationError::MissingVersionBump {
-                                transaction: transaction.id.clone(),
-                                step,
-                                object: write.target.object.clone(),
-                            });
-                        }
-                    }
-
-                    TransactionStep::Transition(transition) => {
-                        if version_field(model, index, &transition.subject.object).is_some()
-                            && !bumps
-                                .iter()
-                                .any(|selector| **selector == transition.subject)
-                        {
-                            errors.push(ValidationError::MissingVersionBump {
-                                transaction: transaction.id.clone(),
-                                step,
-                                object: transition.subject.object.clone(),
-                            });
-                        }
-                    }
-
-                    TransactionStep::BumpVersion(bump) => {
-                        if version_field(model, index, &bump.target.object).is_none() {
-                            errors.push(ValidationError::VersionProtocolOnUnversionedObject {
-                                transaction: transaction.id.clone(),
-                                step,
-                                object: bump.target.object.clone(),
-                            });
-                        } else if seen_bumps.contains(&&bump.target) {
-                            errors.push(ValidationError::DuplicateVersionBump {
-                                transaction: transaction.id.clone(),
-                                step,
-                                object: bump.target.object.clone(),
-                            });
-                        } else {
-                            seen_bumps.push(&bump.target);
-                        }
-                    }
-
-                    TransactionStep::ValidateVersion(validate) => {
-                        match version_field(model, index, &validate.target.object) {
-                            None => errors.push(ValidationError::VersionProtocolOnUnversionedObject {
-                                transaction: transaction.id.clone(),
-                                step,
-                                object: validate.target.object.clone(),
-                            }),
-
-                            Some(version) => {
-                                if !crate::analyzer::verification::transaction_conflicts::observes_version(
-                                    transaction,
-                                    step,
-                                    &validate.target,
-                                    version,
-                                    &validate.expected,
-                                ) {
-                                    errors.push(
-                                        ValidationError::VersionValidationWithoutObservedVersion {
-                                            transaction: transaction.id.clone(),
-                                            step,
-                                            object: validate.target.object.clone(),
-                                        },
-                                    );
-                                }
-
-                                if object_identity(model, index, &validate.target.object)
-                                    .is_some_and(|identity| {
-                                        !selector_identifies_instance(
-                                            identity,
-                                            &validate.target.predicate,
-                                        )
-                                    })
+                            for field in &upsert.update_fields {
+                                if identity
+                                    .iter()
+                                    .any(|identity_field| paths_related(field, identity_field))
                                 {
-                                    errors.push(
-                                        ValidationError::VersionValidationWithoutIdentifiedInstance {
-                                            transaction: transaction.id.clone(),
-                                            step,
-                                            object: validate.target.object.clone(),
-                                        },
-                                    );
+                                    errors.push(ValidationError::UpsertMutatesIdentity {
+                                        transaction: transaction.id.clone(),
+                                        step,
+                                        object: upsert.target.object.clone(),
+                                        field: field.clone(),
+                                    });
                                 }
                             }
                         }
                     }
 
                     _ => {}
+                }
+
+                let mut compared: BTreeSet<&FieldPath> = BTreeSet::new();
+
+                for condition in inner.compare() {
+                    if !compared.insert(&condition.field) {
+                        errors.push(ValidationError::DuplicateCompareField {
+                            transaction: transaction.id.clone(),
+                            step,
+                            object: inner
+                                .object()
+                                .cloned()
+                                .expect("a guarded mutation has a target"),
+                            field: condition.field.clone(),
+                        });
+                    }
                 }
             }
         }
@@ -1411,7 +1387,7 @@ fn validate_version_protocol(model: &Model, index: &ReferenceIndex<'_>) -> Vec<V
 }
 
 /// The model-wide index of managed monotonic fields (§34): one role
-/// per field, the type each role requires, and no ordinary write to
+/// per field, the type each role requires, and no application mutation to
 /// any of them.
 fn validate_managed_fields(model: &Model, index: &ReferenceIndex<'_>) -> Vec<ValidationError> {
     let mut errors = Vec::new();
@@ -1533,7 +1509,7 @@ fn validate_managed_fields(model: &Model, index: &ReferenceIndex<'_>) -> Vec<Val
     }
 
     // The value driving each cursor or fence has the field's type, and
-    // no ordinary write names a managed field.
+    // no application mutation names a managed field.
     for (operation_id, operation) in &model.operations {
         walk_scoped(
             &operation.program,
@@ -1567,17 +1543,28 @@ fn validate_managed_fields(model: &Model, index: &ReferenceIndex<'_>) -> Vec<Val
                             ManagedRole::Fence,
                         ),
 
-                        TransactionStep::Write(write) => {
-                            for written in &write.fields {
+                        TransactionStep::Update(_)
+                        | TransactionStep::CompareAndSet(_)
+                        | TransactionStep::Upsert(_) => {
+                            let (target, fields) = match inner {
+                                TransactionStep::Update(update) => (&update.target, &update.fields),
+                                TransactionStep::CompareAndSet(cas) => (&cas.target, &cas.fields),
+                                TransactionStep::Upsert(upsert) => {
+                                    (&upsert.target, &upsert.update_fields)
+                                }
+                                _ => unreachable!("matched above"),
+                            };
+
+                            for written in fields {
                                 for ((managed_object, managed_field), role) in &roles {
-                                    if managed_object == &write.target.object
+                                    if managed_object == &target.object
                                         && *role != ManagedRole::Version
                                         && paths_related(written, managed_field)
                                     {
                                         errors.push(ValidationError::DirectWriteToManagedField {
                                             transaction: transaction.id.clone(),
                                             step: step_index,
-                                            object: write.target.object.clone(),
+                                            object: target.object.clone(),
                                             field: managed_field.clone(),
                                             role: *role,
                                         });
@@ -2666,6 +2653,32 @@ fn validate_transaction_paths(
     for (step_index, step) in transaction.steps.iter().enumerate() {
         let context = operation.in_transaction(transaction_id, transaction, step_index);
 
+        // A guarded mutation's comparisons name fields of its own
+        // target and values available at the step.
+        if let Some(object) = step.object() {
+            for condition in step.compare() {
+                validate_object_path(
+                    model,
+                    index,
+                    transaction_id,
+                    object,
+                    &condition.field,
+                    errors,
+                );
+
+                if let Some(expected) = condition.root() {
+                    validate_value_ref_path(
+                        model,
+                        index,
+                        transaction_id,
+                        context,
+                        expected,
+                        errors,
+                    );
+                }
+            }
+        }
+
         match step {
             TransactionStep::Read(read) => {
                 validate_selector_paths(
@@ -2691,22 +2704,22 @@ fn validate_transaction_paths(
                 }
             }
 
-            TransactionStep::Write(write) => {
+            TransactionStep::Update(update) => {
                 validate_selector_paths(
                     model,
                     index,
                     transaction_id,
                     context,
-                    &write.target,
+                    &update.target,
                     errors,
                 );
 
-                for field in &write.fields {
+                for field in &update.fields {
                     validate_object_path(
                         model,
                         index,
                         transaction_id,
-                        &write.target.object,
+                        &update.target.object,
                         field,
                         errors,
                     );
@@ -2717,7 +2730,71 @@ fn validate_transaction_paths(
                     index,
                     transaction_id,
                     context,
-                    &write.values,
+                    &update.values,
+                    errors,
+                );
+            }
+
+            TransactionStep::CompareAndSet(cas) => {
+                validate_selector_paths(model, index, transaction_id, context, &cas.target, errors);
+
+                for field in &cas.fields {
+                    validate_object_path(
+                        model,
+                        index,
+                        transaction_id,
+                        &cas.target.object,
+                        field,
+                        errors,
+                    );
+                }
+
+                validate_derivation_paths(
+                    model,
+                    index,
+                    transaction_id,
+                    context,
+                    &cas.values,
+                    errors,
+                );
+            }
+
+            TransactionStep::Upsert(upsert) => {
+                validate_selector_paths(
+                    model,
+                    index,
+                    transaction_id,
+                    context,
+                    &upsert.target,
+                    errors,
+                );
+
+                for field in &upsert.update_fields {
+                    validate_object_path(
+                        model,
+                        index,
+                        transaction_id,
+                        &upsert.target.object,
+                        field,
+                        errors,
+                    );
+                }
+
+                validate_derivation_paths(
+                    model,
+                    index,
+                    transaction_id,
+                    context,
+                    &upsert.insert_values,
+                    errors,
+                );
+
+                validate_derivation_paths(
+                    model,
+                    index,
+                    transaction_id,
+                    context,
+                    &upsert.update_values,
                     errors,
                 );
             }
@@ -2799,37 +2876,6 @@ fn validate_transaction_paths(
                         errors,
                     );
                 }
-            }
-
-            TransactionStep::ValidateVersion(validate) => {
-                validate_selector_paths(
-                    model,
-                    index,
-                    transaction_id,
-                    context,
-                    &validate.target,
-                    errors,
-                );
-
-                validate_value_ref_path(
-                    model,
-                    index,
-                    transaction_id,
-                    context,
-                    &validate.expected,
-                    errors,
-                );
-            }
-
-            TransactionStep::BumpVersion(bump) => {
-                validate_selector_paths(
-                    model,
-                    index,
-                    transaction_id,
-                    context,
-                    &bump.target,
-                    errors,
-                );
             }
 
             TransactionStep::AdvanceCursor(advance) => {
@@ -3561,31 +3607,15 @@ fn validate_transaction_references(
             step_index,
         );
 
+        for condition in step.compare() {
+            if let Some(expected) = condition.root() {
+                validate_value_ref_reference(index, transaction_id, context, expected, errors);
+            }
+        }
+
         match step {
             TransactionStep::Read(read) => {
                 validate_selector_references(index, transaction_id, context, &read.target, errors);
-            }
-
-            TransactionStep::ValidateVersion(validate) => {
-                validate_selector_references(
-                    index,
-                    transaction_id,
-                    context,
-                    &validate.target,
-                    errors,
-                );
-
-                validate_value_ref_reference(
-                    index,
-                    transaction_id,
-                    context,
-                    &validate.expected,
-                    errors,
-                );
-            }
-
-            TransactionStep::BumpVersion(bump) => {
-                validate_selector_references(index, transaction_id, context, &bump.target, errors);
             }
 
             TransactionStep::AdvanceCursor(advance) => {
@@ -3612,14 +3642,52 @@ fn validate_transaction_references(
                 validate_value_ref_reference(index, transaction_id, context, &fence.token, errors);
             }
 
-            TransactionStep::Write(write) => {
-                validate_selector_references(index, transaction_id, context, &write.target, errors);
+            TransactionStep::Update(update) => {
+                validate_selector_references(
+                    index,
+                    transaction_id,
+                    context,
+                    &update.target,
+                    errors,
+                );
 
                 validate_derivation_references(
                     index,
                     transaction_id,
                     context,
-                    &write.values,
+                    &update.values,
+                    errors,
+                );
+            }
+
+            TransactionStep::CompareAndSet(cas) => {
+                validate_selector_references(index, transaction_id, context, &cas.target, errors);
+
+                validate_derivation_references(index, transaction_id, context, &cas.values, errors);
+            }
+
+            TransactionStep::Upsert(upsert) => {
+                validate_selector_references(
+                    index,
+                    transaction_id,
+                    context,
+                    &upsert.target,
+                    errors,
+                );
+
+                validate_derivation_references(
+                    index,
+                    transaction_id,
+                    context,
+                    &upsert.insert_values,
+                    errors,
+                );
+
+                validate_derivation_references(
+                    index,
+                    transaction_id,
+                    context,
+                    &upsert.update_values,
                     errors,
                 );
             }

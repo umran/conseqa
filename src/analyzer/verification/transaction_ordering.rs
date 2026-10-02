@@ -17,7 +17,7 @@
 //!   selector the key identifies, advanced under one rule by every
 //!   template that mutates it and by nothing else; or
 //! - **fence** (§56): a `fence` step whose `token` is the position,
-//!   over a fence field no ordinary write touches. Equal tokens
+//!   over a fence field no ordinary update touches. Equal tokens
 //!   establish no order, which is the fence's declared limit.
 //!
 //! No runtime fact is ever a route (§57): transport precedence, member
@@ -25,6 +25,12 @@
 //! arrives, and none of them survives redelivery, worker replacement,
 //! or reordering after failure. The cursor or fence does, because an
 //! out-of-order or stale execution rejects before it can commit.
+//!
+//! Nor is a `compare_and_set` a route (§28 of the DSL 6 revision): a
+//! version token or an observed field detects interference, it does not
+//! order commits by an external position. Comparisons a cursor or fence
+//! carries are conjoined with its rule and change nothing about the
+//! order it establishes.
 
 use serde::{Deserialize, Serialize};
 
@@ -153,7 +159,8 @@ pub enum TransactionOrderingObstacle {
     OrderingKeyDomainMismatch { step: usize, object: Id },
 
     /// The managed field is written outside the protocol — by an
-    /// ordinary write, or by a cursor advance under another rule —
+    /// update, a compare-and-set, an upsert's update, or a cursor
+    /// advance under another rule —
     /// so accepted positions do not order every commit.
     OrderingUncontrolledManagedFieldWriter {
         transaction: TransactionRef,
@@ -512,7 +519,8 @@ impl TransactionOrderingObstacle {
                 subject: Some(transaction.transaction.clone()),
                 message: format!(
                     "`{transaction}` writes the managed field `{field}` at step {} outside \
-                     the protocol — an ordinary write, or an advance under another rule — \
+                     the protocol — an update, a compare-and-set, an upsert, or an advance \
+                     under another rule — \
                      so accepted positions do not order every commit of the domain.",
                     step + 1
                 ),

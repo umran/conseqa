@@ -1,7 +1,7 @@
 # Conseqa DSL Semantics
 
 **Status:** Normative semantic contract for the DSL and the V1 verifiers — the single authoritative semantics document. The design drafts and revision documents that preceded it are retired; their normative content is consolidated here, and what they left open is §27.  
-**DSL contract version:** This document specifies **DSL contract version 5** (`DSL_VERSION`, `src/spec/model.rs`). The version names the normative semantic contract as a whole, not the parse schema: any normative change bumps it — vocabulary, validation, or proof semantics alike — while purely internal changes do not. Every specification document declares the version it is authored in (`dsl: 5`, the model root's first field, stamped at assembly and never authored); a consumer probes it before strict parsing and refuses a mismatch or absence by name — except a version the current one extends without changing what it said, which is read as the current version (`DSL_READS`; today dsl 4). Version 5 is the Retryable Error Propagation revision: the `abandon` terminal lets a message consumer pass a retryable error up, a target's retryable error class is never a stable result, and the idempotency-inert admission is judged per path (§9, §16, §18). Version 4 was the transaction serializability and ordering revision: both become properties of transactions, declared on the transaction they constrain and proven from transactions alone — serializable isolation across a conflict closure, strict locks, an object version protocol, ordered cursors, and fences — while the runtime topology describes placement, transport, grouping, precedence, and capacity and provides no serializability or ordering guarantee (§7, §9, §10, §16, §17, §20, §22). Transactions are explicitly rejectable, transitions fallible, and request results carry named error classes.
+**DSL contract version:** This document specifies **DSL contract version 6** (`DSL_VERSION`, `src/spec/model.rs`). The version names the normative semantic contract as a whole, not the parse schema: any normative change bumps it — vocabulary, validation, or proof semantics alike — while purely internal changes do not. Every specification document declares the version it is authored in (`dsl: 6`, the model root's first field, stamped at assembly and never authored); a consumer probes it before strict parsing and refuses a mismatch or absence by name — except a version the current one extends without changing what it said, which is read as the current version (`DSL_READS`; today none, so dsl 4 and 5 documents are refused by name and re-authored). Version 6 is the Atomic Mutation and Serialization Primitives revision: `validate_version` and `bump_version` are removed and `write` is renamed `update`; `compare_and_set` (an atomic conditional update of one identified instance) and `upsert` (an atomic identity-arbitrated insert-or-update) join the vocabulary, and `transition`, `advance_cursor`, and `fence` may carry comparisons of their own; version publication is intrinsic to every mutation of a live versioned instance; and the serializability checker credits a stale read only where a real storage mechanism — a lock, serializable isolation, or an atomic guarded mutation comparing the observed state or version — keeps it from participating in a successful commit (§5, §16, §17, §20, §22). Version 5 was the Retryable Error Propagation revision: the `abandon` terminal lets a message consumer pass a retryable error up, a target's retryable error class is never a stable result, and the idempotency-inert admission is judged per path (§9, §16, §18). Version 4 was the transaction serializability and ordering revision: both become properties of transactions, declared on the transaction they constrain and proven from transactions alone — serializable isolation across a conflict closure, strict locks, an object version protocol (retired by version 6), ordered cursors, and fences — while the runtime topology describes placement, transport, grouping, precedence, and capacity and provides no serializability or ordering guarantee (§7, §9, §10, §16, §17, §20, §22). Transactions are explicitly rejectable, transitions fallible, and request results carry named error classes.
 
 | dsl | defined by |
 |---|---|
@@ -10,6 +10,7 @@
 | 3 | the Serialization Semantics revision — the L0 `Operation.invocation_lock` proof route; `MemberAssignment` reduced to stable-epoch affinity, its implicit safe-ownership-transfer rule removed; the explicit `ExecutionPool.execution_handoff` leg required by every topology serialization and ordering proof |
 | 4 | the Transaction Serializability and Ordering revision (specified in `Conseqa_Transaction_Consistency_and_Ordering_Revision__DSL_v4.md`) — operation-level serialization and ordering, `Operation.invocation_lock`, and `ExecutionPool.execution_handoff` removed; `Transaction.requirements` (`SerializableBy`, `OrderedBy`) proven from serializable-isolation closures and serialization graphs over strict locks, the object `version` protocol, ordered cursors, and fences; explicit transaction rejection (`rejected` arm, fallible transitions); transition-scoped outbox effects; named error classes on result contracts |
 | 5 | the Retryable Error Propagation revision (specified in `Conseqa_Retryable_Error_Propagation_Revision_Specification.md`) — the `abandon` terminal for subscription and outbox consumers; request results judged per variant, a target's retryable class never stable; the idempotency-inert continuation admission scoped to the path; external `replay_stable` admitting a later retryable error. Additive: dsl 4 documents are read as dsl 5 |
+| 6 | the Atomic Mutation and Serialization Primitives revision (specified in `Conseqa_Atomic_Mutation_and_Serialization_Primitives_Revision_Specification_DSL_v6.md`) — `validate_version` and `bump_version` removed and `write` renamed `update`; `compare_and_set` and `upsert`; optional comparisons on `transition`, `advance_cursor`, and `fence`; intrinsic object version publication; serialization-graph evidence from atomic conditional mutations — observed-state and observed-version guards, held write protection — and from read-only observations, in place of version validation. Incompatible: dsl 4 and 5 documents are refused by name and re-authored, and a stored workspace of the previous `FORMAT` is not upgraded in place, since its programs changed meaning |
 
 **Implementation namespace:** `src/spec/` (surface), `src/analyzer/` (validation and verification).
 
@@ -53,7 +54,7 @@ Independently of layer, a declaration belongs to one of three semantic categorie
 | Category | Meaning | Examples |
 |---|---|---|
 | **Structural fact** | Describes what the modeled program can do or how entities relate. | operations, programs, effects, transactions, transaction outputs, result contracts, schemas, execution-pool identity |
-| **Implementation guarantee / assumption** | A fact the model claims the implementation or external system provides. The verifier may rely on it, subject to implementation conformance. | topic transport ordering, delivery semantics, member assignment, member concurrency, transaction isolation, locks, the object version protocol, cursors and fences, effect idempotency, request/message identity |
+| **Implementation guarantee / assumption** | A fact the model claims the implementation or external system provides. The verifier may rely on it, subject to implementation conformance. | topic transport ordering, delivery semantics, member assignment, member concurrency, transaction isolation, locks, atomic conditional mutations, intrinsic object version publication, cursors and fences, effect idempotency, request/message identity |
 | **Requirement / obligation** | A property the architecture says must hold. It is **not** a guarantee merely because it is declared. The verifier must prove it from facts and structure. | transaction serializability, transaction ordering, operation idempotency, result replay consistency, recoverability |
 
 A structurally valid model is therefore not necessarily a safe model. Validation establishes that declarations are coherent and references are meaningful. Verification establishes whether the declared requirements follow from the declared facts and architecture.
@@ -342,13 +343,17 @@ object.order:
     field: version
 ```
 
-The field must be a non-optional `int` on the object's canonical schema and must not be part of the identity (`InvalidObjectVersionField`). It is **managed**: no ordinary `Write` may name it (`DirectWriteToVersionField`); only the protocol moves it. `Insert` creates the initial version, `bump_version` advances it, `Delete` removes the instance, and `validate_version` checks it at commit. The token changes whenever the instance changes, so a transaction that checks the token it read cannot commit over a change it did not see. What the two steps promise, when each is required, and why a proof needs both, is §20 — read it before using either.
+The field must be a non-optional `int` on the object's canonical schema and must not be part of the identity (`InvalidObjectVersionField`). It is **managed**: no application mutation assigns it — `update.fields`, `compare_and_set.fields`, and `upsert.update_fields` may not name it (`DirectWriteToVersionField`) — though a comparison may name it.
 
-Absence is epistemic. An object without a version carries no version protocol — the absence of the OCC route, not a claim that concurrent mutation of it is safe.
+Publication is an invariant of the object, not a transaction step. Insertion establishes an initial token; every committed transaction that mutates a live instance leaves its token strictly greater than it was before that mutation; deletion removes the instance, token and all. The precise increment is not observable — once per transaction, once per statement, by an ORM or by a trigger all conform — and neither is the initial value, so an instance inserted after a deletion may carry a token its predecessor carried (§17). No step publishes the version, and none is required to.
+
+A token is what lets one comparison guard everything an earlier read of the instance observed. A `compare_and_set` — or a `transition` or `advance_cursor` carrying the comparison — that requires the version an earlier read of the same identified instance observed cannot succeed once any other committed transaction has mutated or deleted that instance, so the stale observation cannot participate in a successful commit. No writer-side annotation is involved: every conflicting writer publishes by the invariant. How such a guard is written, what it covers, and why a fence's comparison guards nothing, is §20 — read it before relying on a version.
+
+Absence is epistemic. An object without a version carries no token — the observed-version guard is unavailable for it, though an observed-field comparison is not (§20) — and its absence is not a claim that concurrent mutation of it is safe.
 
 ### Managed fields
 
-A field advanced by `AdvanceCursor` or guarded by `Fence` (§20) is managed in the same way as the version field: one role per field (`ManagedFieldRoleConflict`), never written by an ordinary `Write` (`DirectWriteToManagedField`), and typed for its role (`InvalidManagedFieldType`) — a cursor field is a non-optional `int`, `decimal`, or `timestamp` of the same type as the positions advanced through it, a fence field a non-optional `int`. The protocol step is the only ordinary update mechanism for such a field, which is what lets a proof read the field's committed history as the order of the commits that advanced it.
+A field advanced by `AdvanceCursor` or guarded by `Fence` (§20) is managed in the same way as the version field: one role per field (`ManagedFieldRoleConflict`), never assigned by an application mutation — an `update` or `compare_and_set` naming it among its `fields`, or an `upsert` naming it among its `update_fields` (`DirectWriteToManagedField`) — and typed for its role (`InvalidManagedFieldType`) — a cursor field is a non-optional `int`, `decimal`, or `timestamp` of the same type as the positions advanced through it, a fence field a non-optional `int`. The protocol step is the only mechanism that moves such a field, which is what lets a proof read the field's committed history as the order of the commits that advanced it.
 
 ### Object-history requirements are deferred
 
@@ -360,7 +365,7 @@ Nothing else is weakened by the removal:
 
 - transaction isolation, explicit locks, lock ordering, object identity, selector overlap, transaction conflicts, transaction serializability, and transaction ordering keep their declared meanings;
 - `serializable` continues to mean transaction serializability under §17 and must **not** be reinterpreted as linearizability;
-- no V1 verifier emits a verdict on object linearizability, and none infers it — from serializable isolation, locks, the version protocol, transaction serializability, or transport ordering. Those facts retain only their own semantics.
+- no V1 verifier emits a verdict on object linearizability, and none infers it — from serializable isolation, locks, atomic conditional mutations, object versions, transaction serializability, or transport ordering. Those facts retain only their own semantics.
 
 The scope rule for this iteration is:
 
@@ -493,7 +498,7 @@ An operation declares **no execution-concurrency fact**. Runtime concurrency is 
 
 ### Serializability and ordering are properties of transactions
 
-An operation declares no serialization, ordering, or entry-exclusion fact of its own. What the architecture must get right is the **committed state history** of the transactions its invocations run, and that is what a transaction's own requirements state — `SerializableBy(K)` and `OrderedBy(K, P)` (§17) — and what its isolation, its locks, the object version protocol, and its cursors prove. Two invocations of one operation may run concurrently and still commit a serializable history; one invocation running alone, on a stale worker after a redelivery, may still commit a stale one. The runtime topology (§10) says where invocations execute and never whether the transactions they commit are consistent, which is why no operation-level or topology-level declaration can stand in for the transaction's own.
+An operation declares no serialization, ordering, or entry-exclusion fact of its own. What the architecture must get right is the **committed state history** of the transactions its invocations run, and that is what a transaction's own requirements state — `SerializableBy(K)` and `OrderedBy(K, P)` (§17) — and what its isolation, its locks, its atomic conditional mutations, and its cursors prove. Two invocations of one operation may run concurrently and still commit a serializable history; one invocation running alone, on a stale worker after a redelivery, may still commit a stale one. The runtime topology (§10) says where invocations execute and never whether the transactions they commit are serializable or ordered, which is why no operation-level or topology-level declaration can stand in for the transaction's own.
 
 ### Multiple inputs
 
@@ -836,7 +841,7 @@ The governing rule of the layer:
 
 > **L1 describes placement, transport, grouping, precedence, and runtime capacity. It provides no serializability or ordering guarantee: no L1 fact is commit-order evidence.**
 
-No serializability or ordering proof consumes an L1 fact. A routing key, a member assignment, and a serial pool member say where same-key invocations ordinarily execute; they never say that the transactions those invocations commit are serializable, because a stale worker, a redelivery, or a member replacement can put two of them side by side whatever the topology declares, and the committed history is decided by the database under the transactions' own isolation, locks, and version protocol (§17). What L1 still discharges is a progress fact: `delivery: at_least_once` is a retry driver for `completion: guaranteed` (§9). Everything else it declares serves the reader and the external analysis (§10.9).
+No serializability or ordering proof consumes an L1 fact. A routing key, a member assignment, and a serial pool member say where same-key invocations ordinarily execute; they never say that the transactions those invocations commit are serializable, because a stale worker, a redelivery, or a member replacement can put two of them side by side whatever the topology declares, and the committed history is decided by the database under the transactions' own isolation, locks, and atomic conditional mutations (§17). What L1 still discharges is a progress fact: `delivery: at_least_once` is a retry driver for `completion: guaranteed` (§9). Everything else it declares serves the reader and the external analysis (§10.9).
 
 ```
 runtime:
@@ -1829,7 +1834,7 @@ Declares and executes one atomic transaction at that point in the operation prog
 A transaction execution has exactly one of three outcomes:
 
 - **committed** — the body applied atomically. The program continues with the step after this one, and the transaction's artifacts are available there.
-- **rejected** — a rejecting step of the body refused the transaction under its declared semantics: a `transition` whose subject is not in one of its `from` states (§22), a `validate_version` whose expected version is stale, an `advance_cursor` whose incoming position is out of order, or a `fence` whose token is stale (§20). Nothing committed and no artifact of the transaction exists; the invocation continues in the `rejected` block, which either reaches a terminal or falls through to the join after the step like any other arm.
+- **rejected** — a rejecting step of the body refused the transaction under its declared semantics: a `compare_and_set` whose instance does not exist or one of whose comparisons is false, a `transition` whose subject is not in one of its `from` states (§22), an `advance_cursor` whose incoming position is out of order, or a `fence` whose token is stale — or a `transition`, `advance_cursor`, or `fence` one of whose comparisons is false (§20). Nothing committed and no artifact of the transaction exists; the invocation continues in the `rejected` block, which either reaches a terminal or falls through to the join after the step like any other arm.
 - **interrupted** — crash, timeout, connectivity loss, an aborted commit, or an indeterminate one. Not a program outcome: nothing continues, and what a later attempt finds is the idempotency and recoverability question of §9. An engine-level serialization failure or deadlock abort is interrupted, never rejected.
 
 The `rejected` arm is required exactly when the body contains a rejecting step and forbidden otherwise (`MissingTransactionRejectedArm`, `UnexpectedTransactionRejectedArm`): a transaction that cannot reject has no rejected outcome to handle. The arm is generic — the rejection cause is not exposed as a value — and a rejection is not an `Err` result: it is a fact about state the transaction observed, and the program decides in the arm what the boundary reports, if anything.
@@ -2049,8 +2054,8 @@ Validation establishes that the program is structurally coherent. It performs no
 9. **Definite handle availability.** A synchronization step waits only on handles bound by an async launch on every path reaching it (`AsyncHandleNotAvailable`); a handle is consumed by nothing else.
 10. **`join_all` shape.** The handle list is non-empty (`EmptyJoinAll`); every referenced handle exists and is operation-owned; no handle appears twice in one `join_all` (`DuplicateSynchronizationHandle`); every declared result binding is unique; a binding is declared only for a result-bearing underlying effect, its type inferred from the contract and never restated.
 12. **Match arms.** A `match_result` declares the `ok` arm and exactly one arm per error class of the matched result's contract (`MissingResultErrorArm`, `UnexpectedResultErrorArm`).
-13. **Rejected arm.** A `transaction` step declares a `rejected` block iff its body contains a rejecting step — `transition`, `validate_version`, `advance_cursor`, or `fence` (`MissingTransactionRejectedArm`, `UnexpectedTransactionRejectedArm`). The block is a decision arm under rules 1–5: it terminates or falls through to the join after the step, and no artifact of the rejected transaction is available inside it.
-14. **Version protocol and managed fields.** A `Write` never names a version or managed field (`DirectWriteToVersionField`, `DirectWriteToManagedField`); every `Write` or `Transition` of a versioned instance is matched by exactly one `bump_version` of the same selected instance in its transaction (`MissingVersionBump`, `DuplicateVersionBump`); `validate_version` names a version the transaction observed (`VersionValidationWithoutObservedVersion`) and selects a single identified instance — its selector pins every identity field of the object (`VersionValidationWithoutIdentifiedInstance`), since a partial or `all` selector guards no one instance's version and could not tell a concurrent insert of a new matching instance from the ones observed; version steps target versioned objects only (`VersionProtocolOnUnversionedObject`).
+13. **Rejected arm.** A `transaction` step declares a `rejected` block iff its body contains a rejecting step — `compare_and_set`, `transition`, `advance_cursor`, or `fence`; never an `update`, `insert`, `upsert`, `delete`, `read`, `lock`, or artifact step (`MissingTransactionRejectedArm`, `UnexpectedTransactionRejectedArm`). The block is a decision arm under rules 1–5: it terminates or falls through to the join after the step, and no artifact of the rejected transaction is available inside it.
+14. **Managed fields and guarded mutations.** No `update` or `compare_and_set` names a version or managed field among its `fields`, and no `upsert` among its `update_fields` (`DirectWriteToVersionField`, `DirectWriteToManagedField`); comparing one is allowed. A `compare_and_set` selects a single identified instance — its selector pins every identity field of the object (`CompareAndSetWithoutIdentifiedInstance`), since a partial or `all` selector conditions no one instance and could not tell a concurrent insert of a new matching instance from the ones observed — and compares at least one field (`CompareAndSetWithoutComparison`). An `upsert` pins every identity field (`UpsertWithoutIdentifiedInstance`), and its `update_fields` name no identity field (`UpsertMutatesIdentity`). No `compare` list — of a `compare_and_set`, `transition`, `advance_cursor`, or `fence` — names one field twice (`DuplicateCompareField`). A compared field resolves by ordinary path validation and an `expected` reference by ordinary value-reference validation; a comparison need not name a read to be valid — whether it is observation evidence is the checker's question (§17, §20).
 15. **Transaction requirement roots.** Every requirement key and ordering position is available at transaction entry (`TransactionRequirementKeyUnavailable`, `TransactionOrderingPositionUnavailable`), and a position is a non-optional `int`, `decimal`, or `timestamp` (`TransactionOrderingPositionNotOrderedScalar`).
 11. **`race` shape.** At least two handles (`RaceRequiresTwoHandles`); every referenced handle exists and is operation-owned; no handle occurs twice in one race (`DuplicateSynchronizationHandle`); the result binding, when present, is unique and subject to rule 6's compatibility requirement.
 
@@ -2243,7 +2248,7 @@ No isolation fact may be assumed.
 
 Reads do not observe uncommitted writes from other transactions.
 
-The verifier must still consider anomalies permitted by read-committed execution, including non-repeatable reads and concurrent read/modify/write races — the write-skew shape — unless prevented by stronger facts: a strict lock covering the access, or a version validated at commit (below).
+The verifier must still consider anomalies permitted by read-committed execution, including non-repeatable reads and concurrent read/modify/write races — the write-skew shape — unless prevented by stronger facts: a strict lock covering the access, or an atomic conditional mutation comparing what the read observed (below).
 
 Read committed is not serializable.
 
@@ -2267,7 +2272,7 @@ Serializable execution also does not imply that a transaction is replayable acro
 
 The declared step sequence represents logical program order inside the transaction.
 
-This is especially important for lock-order/deadlock analysis, lock coverage (a lock protects only accesses after it), transaction-read provenance, state transitions, and reasoning about when transaction artifacts are established relative to application state.
+This is especially important for lock-order/deadlock analysis, lock coverage (a lock protects only accesses after it), guard coverage (a guarded mutation protects only accesses at or after it, and compares only reads before it), transaction-read provenance, state transitions, and reasoning about when transaction artifacts are established relative to application state.
 
 ### Transaction requirements
 
@@ -2302,20 +2307,36 @@ Keys and positions are evaluated when the transaction is entered, so each must b
 
 ### Proving serializability
 
-The checker builds, model-wide, an index of every transaction's accesses — reads with their field selections; writes; inserts and deletes, which touch every field; transitions, which read and write the state field; version validations and bumps; cursor advances and fences, which read and write their managed field — and judges every pair of accesses for conflict. Two accesses conflict when they may select overlapping instances and touch overlapping fields, and at least one writes. **Unknown overlap is never disjoint**: two selectors over one object are proven disjoint only by distinct literals or by identities pinned to different canonical values; anything else may overlap, and `fields: all` overlaps everything. Transition-scoped outbox admissions (§22) create no conflict edge.
+The checker builds, model-wide, an index of every transaction's accesses — reads with their field selections; updates and compare-and-set mutations over the fields they name, an unknown footprint when they name none; the comparisons of a guarded mutation, which read their fields; inserts, deletes, and upserts, which touch every field — an upsert's insert branch writes the whole instance; transitions, which read and write the state field; cursor advances and fences, which read and write their managed field; and, on a versioned object, a write of the version field by every update, compare-and-set, transition, cursor advance, and fence — the intrinsic publication of §5, indexed although no step names it — and judges every pair of accesses for conflict. Two accesses conflict when they may select overlapping instances and touch overlapping fields, and at least one writes. **Unknown overlap is never disjoint**: two selectors over one object are proven disjoint only by distinct literals or by identities pinned to different canonical values; anything else may overlap, and `fields: all` overlaps everything. Transition-scoped outbox admissions (§22) create no conflict edge.
 
 The obligation's population is the closure of transactions reachable from the requiring one through conflicts. Two routes discharge it, and both are `l0_only`:
 
 **Serializable-isolation closure.** Every transaction in the closure declares `isolation: serializable`. The database then orders the whole closure itself, and nothing more is asked. One serializable transaction beside a weaker conflicting one is insufficient (`IsolationUnspecified`, or the weaker levels named), since serializability holds only among serializable transactions.
 
-**Serialization graph.** Otherwise the checker constructs the potential dependency graph over the closure — `wr` (a read that may observe a write), `rw` (a read a later write may invalidate: the anti-dependency behind write skew), and `ww` — and asks of every edge whether a declared fact fixes the commit order across it:
+**Serialization graph.** Otherwise the checker constructs the potential dependency graph over the closure — `wr` (a read that may observe a write), `rw` (a read a later write may invalidate: the anti-dependency behind write skew), and `ww` — and asks of every edge whether a declared fact fixes the commit order across it. Evidence and gaps are named as the report spells their `kind`. The facts it accepts:
 
-- a **strict lock** covering the access on each side, acquired before the access and held to transaction end (§21): the reader under a `shared` or `exclusive` lock, the writer under an `exclusive` one — the two-phase-locking argument (`LockCoverageMissing`, `LockAcquiredAfterProtectedAccess`);
-- **version validation**: the reader's selector names a single identified instance (`VersionValidationWithoutIdentifiedInstance`) whose version it observed through a read that selected the version field and validates it at commit, and the writer bumps it — or inserts or deletes the instance — so a stale observation cannot commit: the optimistic-concurrency argument (`VersionValidationMissing`, `VersionBumpMissing`). A wider selector could not tell a concurrent insert of a new matching instance from the ones observed, so it is not sound evidence here;
-- an **ordered cursor** on the accessed field (§20), whose accepted positions fix the order of the commits that advanced it;
-- for a `wr` edge, the intrinsic order of a committed read behind the write it observes, and for a `ww` edge, atomic write order.
+- the **intrinsic order** of a committed read behind the write it observes, for a `wr` edge whose reader declares an isolation (`intrinsic_committed_read`), and **atomic write order**, for a `ww` edge both of whose transactions declare one (`atomic_write_order`);
+- a **strict lock** covering the access on each side, acquired before the access and held to transaction end (§21): the reader under a `shared` or `exclusive` lock, the writer under an `exclusive` one — the two-phase-locking argument (`strict_lock`; gaps `lock_coverage_missing`, `lock_acquired_after_protected_access`);
+- an **atomic conditional mutation** (§20) — a `compare_and_set`, a `transition`, an `advance_cursor`, or an `upsert`'s identity arbitration, whose target pins the object's whole identity (`atomic_conditional_mutation`). Its condition and its mutation are one storage operation, every success mutates the instance, and from that step to commit the transaction holds the instance's write protection. An access that is part of the guarded mutation's own statement is covered (`guard: atomic`), and so is one that follows it on the same identified instance (`held_protection`); a comparison of what an earlier read observed covers that observation (`observed_state`, `observed_version`, below);
+- a **read-only observation** (`read_only_observation`), below;
+- an **ordered cursor** on the accessed field (§20), whose accepted positions fix the order of the commits that advanced it (`ordered_cursor`).
 
-A fence is recorded but is not commit-order evidence on its own: equal tokens do not order same-generation transactions.
+A fence is recorded but is not commit-order evidence on its own: equal tokens do not order same-generation transactions, and on an equal token a fence writes nothing and holds no write protection — so neither its fencing condition nor a comparison it carries is credited as a guard. A guard whose target does not pin the object's whole identity is credited nothing: it cannot see a concurrent insert of a new matching instance.
+
+Each edge is judged in a fixed order, and the first fact that applies is cited. Two cursor advances of one field under one rule are ordered by the cursor, whatever the edge. Otherwise:
+
+- **`wr`.** The reader declares an isolation: `intrinsic_committed_read`. Otherwise, the read is covered by the reader's own guarded mutation of the instance (`atomic` or `held_protection`) and the writer holds its write until it terminates — under declared isolation, or under a guarded mutation of its own: the reader observes only once it holds the write protection the writer withholds, so what it reads has committed (`atomic_conditional_mutation`). Otherwise the gap `isolation_unspecified`.
+- **`ww`.** Both transactions declare an isolation: `atomic_write_order`. Otherwise, the earlier write is covered by its transaction's guarded mutation, which withholds the instance from the later writer until it commits; or the later write is covered by its own, and the earlier writer holds its write under declared isolation (`atomic_conditional_mutation`). Otherwise `isolation_unspecified`, for each transaction declaring none.
+- **`rw`**, reader access `a`, writer access `b`:
+  1. *Strict lock* on both sides, as above.
+  2. *Observation guard.* `a` is part of, or follows, a guarded mutation of the same identified instance (`atomic`, `held_protection`). Otherwise a later guarded mutation of that instance, in the reader's transaction, compares what was read — an *observed-state comparison* (§20), whose `expected` is exactly the same field of an earlier read of the same instance:
+     - **observed version** — it compares the object's version against the version observed by a read at or before `a` (`observed_version`). Every committed mutation of the live instance publishes a newer token and a deletion leaves none to match, so the token covers every observation of the instance from that read up to the guard, whatever fields they read. One exception: when `b` is an insert or an upsert and some transaction of the model deletes the object, an instance inserted after a deletion establishes its token afresh and may repeat the one observed (`observed_version_may_repeat`);
+     - **observed state** — it compares fields against the values observed by `a` itself, and the compared fields cover every conflicting region of `a`'s read footprint and `b`'s write footprint (`observed_state`). A compared field covers itself and every path nested in it; an unknown footprint, or two whole-instance footprints, is never covered. Only the very read is credited: a field can change and change back, so an intervening observation may have seen a value the comparison no longer holds. A guard comparing too little leaves `observed_state_guard_does_not_cover_conflict`, naming the uncovered fields.
+  3. *Read-only observation.* The reader's transaction writes nothing, declares an isolation, and observes at one instant: either all its reads are one read step of one identified instance, under `read_committed` or `serializable`, or its isolation is `snapshot`, under which one snapshot serves every read. That instant is its serialization point — every write it observed committed before it, every write it missed commits after it — so a cycle through it whose other edges are commit-ordered would order a writer's commit both before and after the observation, and its anti-dependencies need no mechanism of their own. Two reads at different instants are not one observation: read skew passes between them. Several reads under `serializable` do not qualify either — the engine may hold read locks rather than read one snapshot, and a writer of unspecified isolation need not respect them.
+  4. *Locked reader.* The reader holds a covering lock from before `a`, its selector identifies one instance, and `b` is covered by the writer's guarded mutation: that mutation must acquire the instance's write protection, which the reader's lock withholds until the reader commits (`atomic_conditional_mutation`, `guard: locked_reader`).
+  5. Otherwise the edge is unconstrained, with the lock gaps and one guard gap: `observed_state_guard_missing` — the read selects one identified instance and nothing later compares what it observed; `observed_state_guard_does_not_cover_conflict`; `observed_state_not_identified` — the read selects a set or a range, for which no guard of one instance can stand, since a concurrent insert of a new matching instance escapes it, so only a lock or a serializable closure covers it; or `observed_version_may_repeat`.
+
+Nothing else is a guard. A comparison against an input, a literal, another object's read, a different instance's read, or a later read is valid application behaviour and no observation evidence. An `update` guards nothing: it never rejects. An `upsert` protects no earlier read — not even of its own instance — though, like a compare-and-set or a transition, it covers the accesses that are part of or follow it. And no writer-side annotation is ever consulted: the version route rests on the object's intrinsic publication (§5), which every conflicting writer performs.
 
 The graph's strongly connected components are then computed. A cycle every edge of which is constrained cannot produce a non-serializable committed history; a cycle containing an unconstrained edge can, and the obligation is unproven — citing the cycle, the dependency, and the gap on the edge. Nothing here consumes a routing key, a member assignment, a member concurrency bound, a transport fact, or an operation boundary.
 
@@ -2326,7 +2347,7 @@ The graph's strongly connected components are then computed. A cycle every edge 
 - an `advance_cursor` on a managed field of an object whose identity the selector pins to `K` — equal keys select one guarded instance and different keys never share one (`OrderingKeyDomainMismatch`) — whose `incoming` carries `P` (`OrderingPositionMismatch`): under `successor` every committed execution applies exactly the next position, under `monotonic_after` any greater one, and a stale, duplicate, or out-of-order position rejects; or
 - a `fence` on such an object whose `token` carries `P`: a stale token rejects, which excludes stale-generation histories.
 
-The managed field must be advanced through that protocol alone — no ordinary write, and no cursor advance under another rule, anywhere in the model (`OrderingUncontrolledManagedFieldWriter`) — since otherwise the accepted positions do not order every commit. Transport precedence, dispatch, batching, and pool facts play no part: ordered delivery still leaves a stale worker or a redelivery free to apply an earlier position later, and it is the cursor in the committed state that refuses it.
+The managed field must be advanced through that protocol alone — no `update` or `compare_and_set` naming it, no `upsert` whose `update_fields` name it, no cursor advance under another rule, and no fence of a cursor's field, anywhere in the model (`OrderingUncontrolledManagedFieldWriter`) — since otherwise the accepted positions do not order every commit. A `compare_and_set` is never an ordering route: a version or an observed field detects interference, it does not order commits by a position. Comparisons a cursor or fence carries are conjoined with its rule and change nothing about the order it establishes. Transport precedence, dispatch, batching, and pool facts play no part: ordered delivery still leaves a stale worker or a redelivery free to apply an earlier position later, and it is the cursor in the committed state that refuses it.
 
 ---
 
@@ -2470,7 +2491,7 @@ stability; instability is not proven.
 Why rule 3 requires a declaration rather than following from the key:
 with `K = [input.idempotency_key]` and no declared identity, attempts
 `{idempotency_key: k, amount: 100}` and `{idempotency_key: k, amount:
-200}` are both admitted and share a class. A write derived
+200}` are both admitted and share a class. An update derived
 `deterministic_from(input.amount)` is deterministic yet produces
 different values across the class. Only a boundary fact excludes the
 conflicting attempt.
@@ -2511,7 +2532,7 @@ In particular, a transaction can read a field and then deterministically write a
 
 ```text
 Read A.counter -> r
-Write A.counter = f(r.counter)
+Update A.counter = f(r.counter)
 ```
 
 For deterministic `f(x) = x + 1`, the first execution may observe `5` and commit `6`, while the retry observes `6` and commits `7`. The computation is deterministic but the transaction is not naturally replayable.
@@ -2584,7 +2605,7 @@ A verifier must not treat partial identity coverage as single-object selection.
 
 ---
 
-## 20. Read, write, insert, and delete steps
+## 20. Read, update, insert, and delete steps
 
 ### `Read`
 
@@ -2604,15 +2625,53 @@ If that schema is partial, the verifier must not silently treat this as proof th
 
 Reads only the listed field paths for the modeled semantics.
 
-### `Write`
+### `Update`
 
-Mutates the listed fields of the selected object instances. It may not name the object's version field or a managed cursor or fence field (§5); those move only through their protocol steps below.
+Mutates the listed fields of the selected object instances, unconditionally. It compares nothing and never rejects, and it is not a stale-read guard: an update computed from a value the transaction read earlier commits whether or not that value has changed since. Where the decision must not rest on a stale observation, the transaction conditions a mutation on what it observed (`compare_and_set`, or a guarded domain step — below), locks before it reads (§21), or runs in a serializable closure (§17). An update may not name the object's version field or a managed cursor or fence field (§5): the version moves only by the object's own invariant, the others only through their protocol steps below. An update naming no fields declares an unknown footprint, which may overlap every field (§17).
 
 The step declares the provenance of the values written through `Derivation` (§18).
 
 A deterministic derivation describes value computation, not replayability by itself. Natural replay analysis must additionally establish replay stability of the selected target and all derivation roots (§18).
 
-A write whose derivation is `Unspecified` normally leaves natural replayability `Unknown` when that mutation matters to the proof.
+An update whose derivation is `Unspecified` normally leaves natural replayability `Unknown` when that mutation matters to the proof. An update of a versioned object publishes a newer version (§5), and re-execution would publish another, so a transaction containing one is not naturally replayable (`publishes_version`).
+
+### `CompareAndSet`
+
+`compare_and_set { target, compare, fields, values }` is an atomic conditional update of one identified instance:
+
+```yaml
+- kind: compare_and_set
+  target:
+    object: object.account
+    predicate:
+      kind: eq
+      field: account_id
+      value:
+        source: input:input.adjust.request
+        path: account_id
+  compare:
+    - field: version
+      expected:
+        source: transaction_read:read.adjust.account
+        path: version
+  fields:
+    - balance
+  values:
+    kind: deterministic
+    from:
+      - source: transaction_read:read.adjust.account
+        path: balance
+      - source: input:input.adjust.request
+        path: amount
+```
+
+If every comparison holds, the listed fields are set from `values`; otherwise — or when the instance does not exist — the transaction **rejects**, so the step needs a `rejected` arm (§16). The comparison and the mutation are one storage operation (below). The target pins every identity field of the object by equality against a literal or a value reference (`CompareAndSetWithoutIdentifiedInstance`): there is no set or range compare-and-set. `compare` holds at least one condition (`CompareAndSetWithoutComparison`) and names each field at most once (`DuplicateCompareField`). A condition is `{ field, expected }`, where `expected` is a selector value (§19) — a value reference or a literal — and comparison is equality; inequalities belong to the domain primitives, a cursor's rule and a fence's token. `fields` may not name the version or a managed field; `compare` may name any field of the object's schema.
+
+### `Upsert`
+
+`upsert { target, insert_values, update_fields, update_values }` is an atomic insert-or-update of one identity: when the instance is absent it is inserted from `insert_values`, and when it is present `update_fields` are set from `update_values`. The choice and the mutation are atomic with respect to competing operations on the same identity, arbitrated on `DataObject.identity`, which the target pins whole (`UpsertWithoutIdentifiedInstance`); alternate unique keys do not arbitrate. `update_fields` name no identity field (`UpsertMutatesIdentity`) and no version or managed field (§5).
+
+Neither branch is a refusal, so an upsert never rejects. On a versioned object the insert branch establishes the initial version and the update branch publishes a newer one. An upsert's concurrency evidence is its own arbitration and mutation, nothing more: it protects no earlier read, not even of its own instance. `read Inventory; derive a value; upsert Invoice` leaves the Inventory observation exactly as unguarded as it was.
 
 ### `Insert`
 
@@ -2622,6 +2681,8 @@ The step declares inserted-value provenance through `Derivation` but does **not*
 
 `DataObject.identity` already defines the strict non-empty logical identity of every object instance. Two distinct successful inserts cannot create two logical instances with the same complete identity; no separate unique-claim primitive exists.
 
+On a versioned object the insertion establishes the initial version (§5).
+
 Whether retrying a conflicting insert can participate in a natural replayability proof depends on duplicate-identity insert outcome semantics that are deliberately undefined — open question 4 (§27). Until they are defined, V1 must not infer transaction replayability merely from object identity uniqueness, and a transaction containing an `Insert` is never proven naturally replayable.
 
 ### `Delete`
@@ -2630,48 +2691,77 @@ Deletes the instances selected by the object selector.
 
 Deletion replay behavior depends on what the model guarantees when the selected instance is already absent. Unless sufficient semantics establish a reproducible outcome, the verifier must not silently treat deletion as naturally replayable merely because applying deletion twice leaves no object.
 
-### Version protocol steps
+Deleting a versioned instance publishes no version: no live instance remains, and a later `compare_and_set` against it fails because the instance does not exist.
 
-Two steps use a versioned object's token, and they make different promises. Neither is evaluated where it is written: both take effect at **commit arbitration**, atomically with the commit.
+### Atomic conditional mutations
 
-**`bump_version { target }` publishes a change.** At commit, the selected instance's version becomes one higher than it is at that moment — unconditionally. The step compares nothing and never rejects. Its purpose is other transactions: a version that moved is what their guards detect.
+A guarded mutation conditions a mutation of one instance on that instance's current state, and the condition and the mutation are **one storage operation**. The condition is evaluated where the step is written, atomically with the mutation: there is no deferred check at commit, and no observable interval between a condition that holds and the acquisition of the mutation's write protection, which the transaction then holds to commit. A failed condition rejects the whole transaction (§16), and nothing it wrote earlier commits. The guarded mutations are `compare_and_set`, `transition` (§22), `advance_cursor` and `fence` (below), and an `upsert`'s identity arbitration; the checker normalizes them into one form and credits them alike (§17), with the fence exception below.
 
-**`validate_version { target, expected }` guards an observation.** The transaction commits only if the selected instance's version at commit still **equals** `expected`; otherwise the transaction **rejects** (§16). `expected` must be a version this transaction itself observed: a `transaction_read` binding of the same selected instance whose field selection included the version field (`VersionValidationWithoutObservedVersion`). The target selector must also pin every identity field of the object, naming the single instance whose version is guarded (`VersionValidationWithoutIdentifiedInstance`): a partial or `all` selector cannot tell a concurrent insert of a new matching instance from the ones it observed. The guard checks equality, not an increment — a version moved by one or by fifty rejects alike — and it performs no increment of its own.
+**Comparisons on the domain steps.** `transition`, `advance_cursor`, and `fence` keep their intrinsic conditions — the `from` states, the cursor rule, the fencing token — and each may carry an optional `compare` list, omitted when empty, of the same `{ field, expected }` conditions a `compare_and_set` declares. The comparisons are conjoined with the intrinsic condition in the same atomic statement, so the step rejects when either fails, and they change nothing about the order a cursor or fence establishes (§17):
 
-When each is required:
+```yaml
+- kind: transition
+  machine: machine.order_lifecycle
+  transition: transition.order.cancel
+  subject: ...
+  compare:
+    - field: version
+      expected:
+        source: transaction_read:read.cancel_order.order
+        path: version
+  effect_intents: {}
+```
 
-- Every `Write` or `Transition` of a live versioned instance must be accompanied by exactly one `bump_version` of the same selected instance in the same transaction (`MissingVersionBump`, `DuplicateVersionBump`). `Insert` creates the initial version and `Delete` removes the instance, so neither bumps. This is a validation rule: a mutation nobody can detect is not a versioned mutation.
-- `validate_version` is never required by validation. It is declared where the transaction relies on an observation staying true until commit, and a serializability proof over a read-then-write needs it on the reader's side (below).
-- Both steps require the object to declare a version (`VersionProtocolOnUnversionedObject`).
+**Observed-state comparisons.** A comparison is an *observed-state* comparison when its `expected` is exactly `transaction_read:<bind>.<the compared field>`, where `<bind>` is a read that precedes the guarded mutation, selects the same instance — a structurally equal selector — and whose field selection covers the field. Only such a comparison is serializability evidence (§17): it says the value the read observed is still the value at the instant the mutation succeeds. Comparing the version so observed covers everything an earlier read of the instance observed, since every committed mutation of the live instance moves the token (§5); comparing fields directly covers the fields compared, for the read whose values they name. A comparison against an input, a literal, another object's read, a different instance's read, or a later read is legitimate application behaviour — `status = pending`, an `expected_version` the caller supplied — and valid, but it proves nothing about an observation.
 
-**Neither step implies the other.** A transaction may validate an instance it only reads — the revision's own example validates a global limit it never writes while it writes and bumps an account — which is a pure compare. A transaction may bump an instance it never read — a blind write still publishes — which is a pure increment. When one transaction validates and bumps the same instance, the two compose into the familiar compare-and-swap: commit only if the version is still `expected`, and in that same commit set it to `expected + 1`. That composition is the common shape, not the definition of either half.
+**`update`, `compare_and_set`, `upsert`.**
 
-**Why a proof needs both halves.** Take two executions of one transaction that reads a row's `balance` and `version`, computes a new balance, writes it, and bumps:
+| Step | Condition | Rejects | Guards an earlier read |
+|---|---|---|---|
+| `update` | none | never | never |
+| `compare_and_set` | its comparisons, on one identified instance that must exist | when the instance is absent or a comparison is false | when it compares the observed state or version |
+| `upsert` | whether the identified instance exists, arbitrated atomically | never | never |
+
+Use a compare-and-set where the transaction relies on what it read staying true, and leave a blind mutation an `update`: a version on the object is no reason by itself to compare it.
+
+**Why a fence's comparison guards nothing.** Every success of a compare-and-set, a transition, a cursor advance — whose rules admit only a different position — and an upsert mutates the instance, so it acquires the instance's write protection and holds it to commit; the held protection is what keeps a conflicting writer from committing between the guard and the commit. A fence does not always mutate: on a token equal to the stored one it leaves the instance as it was and acquires nothing. Its fencing condition, and any comparison it carries, then hold at an instant after which nothing is held, and a conflicting writer may commit before the fencing transaction does. So a fence is never commit-order evidence on its own, and a comparison it carries is never credited as an observation guard — it is still evaluated, and still rejects.
+
+**A lost update, and the guard that refuses it.** Take two executions of one transaction that reads a row's `balance` and `version`, computes a new balance, and writes it with an unconditional `update`:
 
 ```text
 A reads  version 7, balance 100          B reads  version 7, balance 100
-A commits: balance 100 + a, version 8
-                                         B at commit: validate(7) finds 8 → rejects
+A: update balance = 100 + a; commits     (the row now carries version 8)
+                                         B: update balance = 100 + b; commits
 ```
 
-Without B's validation, B commits `100 + b` and bumps 8 to 9: A's amount is lost, and nothing objected. Without A's bump, B's validation finds 7 = 7 and commits the same stale balance. So the serialization-graph route (§17) cites version validation on a read-write dependency only when the reader validates the version it observed **and** the writer bumps it; missing either is a named gap (`VersionValidationMissing`, `VersionBumpMissing`). Note what the cursor of the next section does not do here: an `advance_cursor` compares the incoming position against the *stored* one at commit, so B's cursor can pass while B's balance is stale. The cursor orders positions; the version guards observations.
+B's update commits over A's: A's amount is lost, and nothing objected. Write the mutation as a `compare_and_set` requiring `version = transaction_read:read.account.version` instead:
 
-**Realization.** A conforming implementation makes the check and the advance atomic with the commit. On a relational store that is one conditional statement, with the transaction rejecting when it affects no row:
+```text
+A reads  version 7, balance 100          B reads  version 7, balance 100
+A: compare_and_set where version = 7
+   sets balance = 100 + a; commits       (the row now carries version 8)
+                                         B: compare_and_set where version = 7
+                                            finds 8 → rejects
+```
+
+B's guard rejects, and its `rejected` arm decides what happens next. Nothing on A's side is annotated: A's commit moved the version because every committed mutation of a live versioned instance publishes a newer token (§5), whichever step made it — an `update`, a `transition`, a cursor advance, or another compare-and-set. Comparing the observed `balance` itself would refuse B as well, and works on an unversioned object; the version's advantage is that one comparison covers every field the read observed. Note what a cursor does not do here: an `advance_cursor` compares the incoming position against the *stored* one, so B's cursor can pass while B's balance is stale. The cursor orders positions; an observed-state comparison guards observations — and a cursor carrying one does both.
+
+**Realization.** A conforming implementation makes the comparison and the mutation one conditional statement, with the transaction rejecting when it affects no row:
 
 ```sql
 UPDATE ledger SET balance = ?, version = version + 1
 WHERE id = ? AND version = ?;
 ```
 
-A conditional put, an ETag or `If-Match` precondition, or a compare-and-swap column realize the same guarantee. The DSL names the guarantee and none of the mechanisms; in particular the guard holds no lock across the read-to-commit window, which is what makes the route optimistic and distinguishes it from a `lock` step (§21).
+A conditional put, an ETag or `If-Match` precondition, or a compare-and-swap column realize the same guarantee, and a transition carrying a comparison lowers to one conditional state update. The DSL names the guarantee and none of the mechanisms. Nothing is held between the read and the guard, which is what makes the route optimistic and distinguishes it from a `lock` step (§21); from the guard to commit, the row's write protection is.
 
-**Placement.** `validate_version` carries no timing meaning; it is evaluated at commit wherever it sits. It must follow the read whose binding it names, and it reads best beside that read, before the work that depends on the observation.
+**Placement.** Condition the first mutation of the instance after the read. A version comparison covers every observation of the instance from the read that observed it up to the guard, and the protection the guard acquires covers every access of the instance after it; it does not reach back to an unguarded mutation of the instance made before it.
 
-A bump depends on the state it advances, so it is not naturally replayable; a transaction containing one recovers its artifacts only through a keyed commit.
+**Replay.** A compare-and-set evaluates its comparison against state the first commit changed, so a re-execution may reject where the first attempt committed; an upsert takes the update branch where the first attempt inserted; and every mutation of a versioned instance publishes another version. None of them is naturally replayable (`contains_compare_and_set`, `contains_upsert`, `publishes_version`): a transaction containing one recovers its artifacts only through a keyed commit (§17).
 
 ### Cursor and fence steps
 
-`advance_cursor { target, field, incoming, rule }` is the only mechanism that writes a cursor field. Under `successor` the transaction commits only if `incoming` is exactly the next position after the stored one; under `monotonic_after` only if it is greater. A stale or duplicate position, or a gap under `successor`, **rejects** the transaction. `fence { target, field, token }` commits only if `token` is not older than the stored fencing token, and stores it; a stale token rejects. Each step reads and writes its managed field, each is the ordering evidence of §17, and, like a bump, neither is naturally replayable.
+`advance_cursor { target, field, incoming, rule, compare }` is the only mechanism that writes a cursor field. Under `successor` the transaction commits only if `incoming` is exactly the next position after the stored one; under `monotonic_after` only if it is greater. A stale or duplicate position, or a gap under `successor`, **rejects** the transaction. `fence { target, field, token, compare }` commits only if `token` is not older than the stored fencing token, and stores it; a stale token rejects. Either step also rejects when a comparison it carries is false (above). Each step reads and writes its managed field, and each is the ordering evidence of §17. A cursor advance is not naturally replayable: re-execution re-presents an accepted position, which the rule rejects as stale (`contains_cursor_advance`). A fence re-presents its token, which an equal fence accepts, so it does not block natural replay by itself — except on a versioned object, where it is counted as a mutation publishing the version (`publishes_version`).
 
 ---
 
@@ -2721,7 +2811,7 @@ The current DSL therefore cannot declare a deadlock-safe acquisition of several 
 
 ### Locks as commit-order evidence
 
-What a lock does prove is commit order. A strict lock — acquired before the access it protects and held to transaction end — covering an access on each side of a conflict fixes which of the two transactions commits first, and is cited as such by the serialization-graph route of §17: the reader under `shared` or `exclusive`, the writer under `exclusive`. A lock acquired after the access it should protect covers nothing (`LockAcquiredAfterProtectedAccess`). There are two modes and no update mode: a `shared` lock followed by an `exclusive` one on the same target is the classic upgrade deadlock, written without semantics until question 8 settles it.
+What a lock does prove is commit order. A strict lock — acquired before the access it protects and held to transaction end — covering an access on each side of a conflict fixes which of the two transactions commits first, and is cited as such by the serialization-graph route of §17: the reader under `shared` or `exclusive`, the writer under `exclusive`. A reader's lock on one identified instance also orders a writer whose access is covered by its own guarded mutation of that instance (§20), with no lock on the writer's side: the guarded mutation must acquire the instance's write protection, which the reader's lock withholds until the reader commits. A lock acquired after the access it should protect covers nothing (`LockAcquiredAfterProtectedAccess`). There are two modes and no update mode: a `shared` lock followed by an `exclusive` one on the same target is the classic upgrade deadlock, written without semantics until question 8 settles it.
 
 ---
 
@@ -2761,9 +2851,9 @@ Selects a concrete persistent machine instance and applies the named transition.
 
 The transition's `from` condition and update to `to` are interpreted as one logical state transition within the surrounding transaction.
 
-A transition is **fallible**: when the selected instance is not in one of the transition's `from` states, the transition rejects, and with it the containing transaction (§16) — the transaction step's `rejected` arm is where the program says what happens then.
+A transition is **fallible**: when the selected instance is not in one of the transition's `from` states, the transition rejects, and with it the containing transaction (§16) — the transaction step's `rejected` arm is where the program says what happens then. A transition may also carry comparisons (`compare`, §20), conjoined with its `from` condition in the same atomic guard: it rejects, too, when one is false.
 
-The state machine declares legality, not concurrency safety. Two individually legal transitions can still race — two attempts observing `pending` and each moving it to `paid` — unless the transactions carry the facts that order them: serializable isolation across the closure, a strict lock on the subject, or the version protocol, under which a transition of a versioned instance bumps its version and a stale observer rejects. That is what a `SerializableBy` requirement on the transaction asks the checker to establish (§17).
+The state machine declares legality, not concurrency safety. Two individually legal transitions can still race — two attempts observing `pending` and each moving it to `paid` — unless the transactions carry the facts that order them: serializable isolation across the closure, a strict lock on the subject, or an atomic conditional mutation comparing what was observed — a transition carrying the version an earlier read of the subject observed, say. Every committed transition of a versioned instance publishes a newer version (§5), so a stale observer's guard rejects. A transition is itself a guarded mutation of its subject, holding the subject's write protection from the transition to commit — credited as evidence where its selector pins the subject's whole identity (§17). That is what a `SerializableBy` requirement on the transaction asks the checker to establish (§17).
 
 ### Transition transaction replay
 
@@ -2904,12 +2994,16 @@ The solver must preserve these distinctions:
 | **Semantic layer vs semantic category** | L0 versus L1 says which layer a fact belongs to; structural/guarantee/requirement says what kind of claim it makes. Correctness relevance decides neither. |
 | **Transport ordering vs execution ordering** | Ordered delivery can still lead to concurrent/overtaking execution. |
 | **Ordering vs serializability** | Serializability admits *some* serial order of the committed history; ordering fixes *which* — the order of the declared positions. |
-| **Placement vs commit order** | Routing, member assignment, and member concurrency say where invocations execute; what their transactions commit is decided by isolation, locks, the version protocol, and cursors. No L1 fact is commit-order evidence. |
+| **Placement vs commit order** | Routing, member assignment, and member concurrency say where invocations execute; what their transactions commit is decided by isolation, locks, atomic conditional mutations, and cursors. No L1 fact is commit-order evidence. |
 | **Operation vs transaction as the subject** | Invocations may overlap or not; only committed transactions have a history, so serializability and ordering are declared and proven on transactions. |
 | **Transport order vs semantic order** | A broker can serialize concurrent producers without establishing a business-level happens-before relation. |
 | **Routing domain vs pool member** | A routing key names a semantic domain; `MemberAssignment` maps it onto a member. The domain keeps its identity across rebalances. |
 | **Serializable vs serializable closure** | A serializable transaction is serializable only with respect to other serializable ones; one beside a weaker conflicting transaction is ordered by nothing. |
-| **Version validation vs version bump** | Validation guards the reader's commit against a stale observation; the bump is what makes the writer's commit observable to it. The OCC argument needs both sides. |
+| **`update` vs `compare_and_set`** | An update mutates unconditionally and guards nothing; a compare-and-set mutates only while its comparisons hold, and rejects otherwise, in one storage operation. Only the second can keep a stale observation out of a commit. |
+| **Observed-state comparison vs application comparison** | A comparison is observation evidence only when `expected` is the same field of an earlier read of the same identified instance; one against an input, a literal, or any other read is valid behaviour and proves nothing about an observation. |
+| **Object version vs version step** | The version is a token every committed mutation of a live instance advances by the object's invariant; no step publishes it, so a guard on the observed version needs no writer-side annotation. |
+| **Upsert vs guard** | An upsert arbitrates insert-or-update on one identity atomically; it never rejects and protects no earlier read, even of its own instance. |
+| **Mutating guard vs fence** | A compare-and-set, transition, cursor advance, or upsert always mutates its instance and holds its write protection to commit; a fence on an equal token writes nothing and holds nothing, so neither it nor a comparison it carries guards an observation. |
 | **Cursor vs fence** | A cursor orders commits along accepted positions; a fence only excludes stale generations — equal tokens order nothing. |
 | **Rejected vs interrupted** | A rejection is a program outcome the `rejected` arm handles, with nothing committed; an interruption is no outcome at all and is judged by idempotency and recoverability. |
 | **Rejection vs `Err` result** | A rejected transaction is a fact about observed state; an `Err` is a logical result a boundary returned. The program decides in the rejected arm which, if any, error class the boundary reports. |
@@ -3005,12 +3099,17 @@ Evidence:
     conflict closure over object.order:
         tx.apply_payment, tx.cancel_order, tx.create_order.new
     rw  tx.apply_payment -> tx.cancel_order
-        version validation: read.apply_payment.order selects version,
-        validate_version at step 2; tx.cancel_order bumps at step 4
+        atomic conditional mutation, observed version: the cursor
+        advance at step 2 compares version against the one
+        read.apply_payment.order observed at step 1
     rw  tx.cancel_order -> tx.apply_payment
-        version validation: the symmetric argument
+        atomic conditional mutation, observed version: the transition
+        at step 2 compares version against read.cancel_order.order
+    rw  tx.apply_payment -> tx.create_order.new
+        the same observed-version guard; no transaction deletes an
+        order, so an inserted token cannot repeat an observed one
     ww  tx.create_order.new -> tx.apply_payment
-        atomic write order; the insert creates the version
+        atomic write order; the insert establishes the version
 ```
 
 A serializable closure cites less:
@@ -3063,7 +3162,7 @@ Serializable isolation, explicit locks, message identity, and `retry: may_repeat
 
 When declaring transport semantics, ask which of the two facts you actually have. Grouping and ordering are separate on purpose: a transport that groups by a key without ordering within it is an ordinary thing, and saying so earns a serialization proof without claiming an order that does not exist. Declaring `within_group` to reach a grouping key would be exactly the false statement §26 warns against.
 
-When declaring runtime topology, declare only what the architecture genuinely provides — and know that no topology fact makes a serializability or ordering proof pass. A serial pool member, a consistent-hash assignment, and an ordered transport describe where invocations land; the transactions carry the proof. When a `SerializableBy` or `OrderedBy` obligation is unproven, the honest fixes are on the transaction: serializable isolation the database genuinely provides across the whole closure, a strict lock the transaction genuinely takes before the access, a version the object genuinely carries and the transaction validates, or a cursor the keyed object genuinely advances. Declaring `isolation: serializable` on a transaction the database runs at read committed is the same error as declaring a guarantee the implementation does not offer. If the architecture does not constrain the history that way, leave the requirement unproven.
+When declaring runtime topology, declare only what the architecture genuinely provides — and know that no topology fact makes a serializability or ordering proof pass. A serial pool member, a consistent-hash assignment, and an ordered transport describe where invocations land; the transactions carry the proof. When a `SerializableBy` or `OrderedBy` obligation is unproven, the honest fixes are on the transaction: serializable isolation the database genuinely provides across the whole closure, a strict lock the transaction genuinely takes before the access, an atomic conditional mutation the transaction genuinely performs — a `compare_and_set`, or a guarded `transition` or `advance_cursor`, comparing the version or the fields its read observed, lowered to one conditional statement — or a cursor the keyed object genuinely advances. A transaction that reads one instance and mutates only another has no such mutation to condition; it needs a lock or the serializable closure. And do not add a comparison merely because the object has a version: an update whose decision rests on no observation stays an `update`. Declaring `isolation: serializable` on a transaction the database runs at read committed is the same error as declaring a guarantee the implementation does not offer. If the architecture does not constrain the history that way, leave the requirement unproven.
 
 ---
 
@@ -3092,7 +3191,7 @@ What the DSL deliberately does not yet decide. Every entry is scoped so that res
    - *Order-domain compatibility.* §21 permits deadlock reasoning only between "compatible order domains" without defining them. Needs a definition: same object, one declared order a common prefix of the other, same directions; or one declared total order per object.
    - *Preconditions and distinctness.* Selectors reference input values, so whether two of them address one instance or two depends on the inputs, and nothing can state `source_warehouse_id ≠ destination_warehouse_id`. Needs a decision on input preconditions; without them the degenerate same-instance case of a transfer is unstatable and its two writes conflict.
    - *Upgrades.* A `shared` then `exclusive` lock on one target within a transaction is the classic deadlock (two holders both upgrading); the DSL allows writing it and gives it no semantics. Needs one: conversion or a second lock.
-   - *Implicit locks.* Engines take row locks on `Write`/`Delete` and gap locks on `Insert` under the stronger isolation levels; the DSL models only explicit `Lock` steps. Needs either implicit-lock facts per isolation level (a `Write` acquires `exclusive` on its selector at its program point) or a stated assumption that only declared locks count — which makes every proof conditional on the engine's conformance to that assumption.
+   - *Implicit locks.* Engines take row locks on `Update`/`Delete` and gap locks on `Insert` under the stronger isolation levels; the DSL models only explicit `Lock` steps. Needs either implicit-lock facts per isolation level (an `Update` acquires `exclusive` on its selector at its program point) or a stated assumption that only declared locks count — which makes every proof conditional on the engine's conformance to that assumption. The write protection a guarded mutation of one identified instance holds from its step to commit (§20) is not such an implicit lock: it is part of that step's own declared contract, which is why the serialization-graph route may credit it, and it says nothing about an ordinary `update`.
    - *Predicate versus instance locks.* Whether a lock on `all` or on a partial identity covers instances inserted later (a predicate lock) or only current ones is unspecified; serialization and deadlock reasoning both depend on it.
    - *Wait policy.* No lock-wait timeout, `nowait`, or `skip locked` fact; these decide whether a circular wait deadlocks or aborts. Absent one, a checker must treat every cycle as a deadlock.
 
@@ -3112,7 +3211,7 @@ What the DSL deliberately does not yet decide. Every entry is scoped so that res
 
 11. **External effect result replay** — *Resolved.* For a result-bearing external effect, `result_replay: replay_stable` over a keyed identity fixes the interaction's terminal result (§13.3), and each error class of `ResultType.errors` declares its own `ErrorDisposition` (§8.1), so heterogeneous dispositions inside one contract are expressible; a terminal external result over a class-fixed identity is a replay-stable root (§18 rule 6). Still open: any retry-execution vocabulary that would consume `retryable`.
 
-12. **Transaction requirements: deferred surfaces** — *Open; V1 stance adopted.* The serializability and ordering proofs of §17 are deliberately conservative where the model cannot yet say more: unknown selector overlap is a conflict, so a proof over a partially pinned selector needs a lock covering the widest instance set it may touch — version validation is not a substitute there, since it guards one identified instance's version and cannot cover a set against a concurrent insert of a new matching instance; predicate and phantom conflicts are read as instance conflicts over the selector's object, with no gap-lock vocabulary; there is no update lock mode; a rejection exposes no cause; and the `rejected` arm is one generic block. Each of these can gain precision — typed rejection causes, a disjointness precondition on inputs, predicate-lock facts, an upgrade mode — by adding what can be stated, and no V1 verdict rests on their absence being read as anything but unknown.
+12. **Transaction requirements: deferred surfaces** — *Open; V1 stance adopted.* The serializability and ordering proofs of §17 are deliberately conservative where the model cannot yet say more: unknown selector overlap is a conflict, so a proof over a partially pinned selector needs a lock covering the widest instance set it may touch — a guarded mutation is not a substitute there, since it conditions one identified instance and cannot cover a set against a concurrent insert of a new matching instance (`observed_state_not_identified`); `compare_and_set` and `upsert` act on one identified instance, comparisons are equalities outside cursors and fences, and upserts arbitrate on `DataObject.identity` alone, with no set or range guard, alternate unique key, or compare-and-delete; predicate and phantom conflicts are read as instance conflicts over the selector's object, with no gap-lock vocabulary; there is no update lock mode; a rejection exposes no cause; and the `rejected` arm is one generic block. Each of these can gain precision — typed rejection causes, a disjointness precondition on inputs, predicate-lock facts, an upgrade mode, set or range guards — by adding what can be stated, and no V1 verdict rests on their absence being read as anything but unknown.
 
 ### Deferred surfaces
 

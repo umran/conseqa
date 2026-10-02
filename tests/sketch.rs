@@ -58,10 +58,12 @@ fn recompiled() -> conseqa::spec::Model {
 /// compiled from a sketch of a few lines, with no session and no model,
 /// validates — and with the authors' own requirements declared on it
 /// (the operation-level ones as authored, the serializability keys on
-/// the compiled transactions), every obligation is proven: the version
-/// protocol for the conflicts over shared stock and orders, keyed
-/// commits for retries, and the inspect-then-decide shape for the
-/// guarded transitions' result replay.
+/// the compiled transactions), every obligation is proven: mutations
+/// conditioned on the observed version for the conflicts over shared
+/// stock and orders, keyed commits for retries, and the
+/// inspect-then-decide shape for the guarded transitions' result replay
+/// — whose read-only inspection serializes at its one read, with no
+/// assertion invented for it.
 #[test]
 fn shop_compiles_from_sketches_and_proves_what_its_authors_proved() {
     let mut model = recompiled();
@@ -1296,6 +1298,20 @@ fn every_dsl_construct_is_reachable_from_a_sketch() {
         ]}),
     );
 
+    // An atomic insert-or-update, arbitrated on the ledger row's
+    // identity, with nothing read first.
+    compiled(
+        "tenant_ledger.yaml",
+        none,
+        "operation.apply_entry",
+        serde_json::json!({ "steps": [
+            { "kind": "upsert", "record": "object.tenant_ledger",
+              "by": { "tenant_id": "input.tenant_id" },
+              "from": ["input.tenant_id", "input.amount"],
+              "set": ["balance"], "update_from": ["input.amount"] }
+        ]}),
+    );
+
     compiled(
         "shop.yaml",
         none,
@@ -1380,16 +1396,16 @@ fn every_dsl_construct_is_reachable_from_a_sketch() {
         "abandon",
         // transaction steps
         "read",
-        "write",
+        "update",
+        "compare_and_set",
         "insert",
+        "upsert",
         "delete",
         "lock",
         "transition",
         "establish_effect_intent",
         "establish_transaction_output",
         "write_outbox",
-        "validate_version",
-        "bump_version",
         "advance_cursor",
         "fence",
         // effects
