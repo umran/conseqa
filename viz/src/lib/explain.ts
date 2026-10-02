@@ -110,7 +110,8 @@ export function isolation(level: "unspecified" | "read_committed" | "snapshot" |
         tone: "neutral",
         summary:
           "Reads see only committed data, but a value may change between two reads, and " +
-          "read-then-write races are possible unless a lock or the version protocol constrains them.",
+          "read-then-write races are possible unless a lock or a guarded mutation of what was read " +
+          "constrains them.",
       };
     case "snapshot":
       return {
@@ -349,18 +350,18 @@ export function memberConcurrency(value: MemberConcurrency): Explanation {
 }
 
 /** A data object's declared version field: its application concurrency
- *  token, managed only by the version protocol. */
+ *  token, published by every mutation of a live instance. */
 export function objectVersion(field: FieldPath): Explanation {
   return {
     label: `versioned by ${pathText(field)}`,
     tone: "success",
     summary:
-      "The object's application concurrency token, moved only by the protocol. bump_version " +
-      "publishes a change: an unconditional increment at commit, required with every write or " +
-      "transition of a live instance. validate_version guards an observation: the transaction " +
-      "commits only if the version still equals the one its own earlier read saw, else it " +
-      "rejects. Neither implies the other; a proof over a read-then-write needs the reader's " +
-      "validation and the writer's bump. Never assigned directly, and no part of the identity.",
+      "The object's application concurrency token. Insertion establishes it, and every " +
+      "committed mutation of a live instance publishes a newer one by itself — no step does. " +
+      "A compare-and-set, transition, or cursor advance that compares it against the version an " +
+      "earlier read of the same instance observed cannot succeed once any other transaction has " +
+      "mutated or deleted that instance, so the stale observation cannot commit — no writer " +
+      "declares anything. Never assigned directly, and no part of the identity.",
   };
 }
 
@@ -373,8 +374,8 @@ export function serializabilityRequirement(key: ValueRef): Explanation {
       "Within each key value, committed executions of this transaction and of every transaction " +
       "that may conflict with it are equivalent to some serial order — proven from the " +
       "transactions alone: serializable isolation across the whole conflict closure, or a " +
-      "conflict-graph argument with commit-order evidence from strict locks and the version " +
-      "protocol. Never from runtime topology.",
+      "conflict-graph argument with commit-order evidence from strict locks and atomic guarded " +
+      "mutations. Never from runtime topology.",
   };
 }
 
@@ -413,8 +414,10 @@ export function serializabilityRoute(route: SerializabilityRoute | null): Explan
         summary:
           "Every potential dependency among the closure's members that could close a cycle — " +
           "write→read, read→write anti-dependency, write→write — is commit-ordered by a declared " +
-          "fact: a strict lock, a version validation against a bumped version, an ordered cursor, " +
-          "atomic write order, or a committed read. With no cycle left unconstrained, every " +
+          "fact: a strict lock, an atomic guarded mutation (a compare-and-set, transition, or " +
+          "cursor advance — comparing, where a read is stale, the observed version or fields), a " +
+          "read-only observation at one instant, an ordered cursor, atomic write order, or a " +
+          "committed read. With no cycle left unconstrained, every " +
           "committed history is equivalent to a serial one. Runtime topology is never a route.",
       };
     case null:
@@ -476,7 +479,7 @@ export function transactionRejection(hasRejectedArm: boolean): Explanation {
       label: "can reject",
       tone: "warning",
       summary:
-        "The body contains a commit guard — a transition, a version validation, a cursor " +
+        "The body contains a commit guard — a compare-and-set, a transition, a cursor " +
         "advance, or a fence — so an attempt commits, rejects, or is interrupted. On rejection " +
         "nothing commits, no artifact or admission is established, and control enters the " +
         "rejected block; if that block falls through, control rejoins after the step with the " +
