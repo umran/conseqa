@@ -8,7 +8,7 @@
 // draw a name the same way at both ends.
 
 import type {
-  Condition, Derivation, Effect, FieldPath, Id, IdempotencyKey, IdempotencyKeyPropagation, Model,
+  CompareCondition, Condition, Derivation, Effect, FieldPath, Id, IdempotencyKey, IdempotencyKeyPropagation, Model,
   ObjectSelector, Operation, OperationStep, OutboxWriteEffect, ResultVariant, SelectorPredicate,
   SelectorValue, Transaction, ValueRef,
 } from "../types/model";
@@ -171,6 +171,9 @@ export function operationBindings(opId: Id, op: Operation): OperationBindings {
     }
   };
   const selector = (s: ObjectSelector, location: string, txStep?: number) => predicate(s.predicate, location, txStep);
+  const compare = (conditions: CompareCondition[], location: string, txStep?: number) => {
+    for (const c of conditions) selectorValue(c.expected, location, "guard expected", txStep);
+  };
   const condition = (c: Condition, location: string) => {
     switch (c.kind) {
       case "unspecified":
@@ -207,20 +210,30 @@ export function operationBindings(opId: Id, op: Operation): OperationBindings {
           def({ ...scoped, name: step.bind, kind: "read", txStep, scope: "transaction", producer: `read of ${step.target.object}` });
           selector(step.target, location, txStep);
           return;
-        case "write":
+        case "update":
           selector(step.target, location, txStep);
+          derivation(step.values, location, txStep);
+          return;
+        case "compare_and_set":
+          selector(step.target, location, txStep);
+          compare(step.compare, location, txStep);
           derivation(step.values, location, txStep);
           return;
         case "insert":
           derivation(step.values, location, txStep);
           return;
+        case "upsert":
+          selector(step.target, location, txStep);
+          derivation(step.insert_values, location, txStep);
+          derivation(step.update_values, location, txStep);
+          return;
         case "delete":
         case "lock":
-        case "bump_version":
           selector(step.target, location, txStep);
           return;
         case "transition":
           selector(step.subject, location, txStep);
+          compare(step.compare ?? [], location, txStep);
           for (const [effectId, intent] of Object.entries(step.effect_intents)) {
             def({
               ...scoped, name: intent.bind, kind: "intent", txStep, scope: "program",
@@ -246,16 +259,14 @@ export function operationBindings(opId: Id, op: Operation): OperationBindings {
           derivation(step.values, location, txStep);
           effect(step.effect, location, txStep);
           return;
-        case "validate_version":
-          selector(step.target, location, txStep);
-          ref(step.expected, location, "guard expected", txStep);
-          return;
         case "advance_cursor":
           selector(step.target, location, txStep);
+          compare(step.compare ?? [], location, txStep);
           ref(step.incoming, location, "cursor position", txStep);
           return;
         case "fence":
           selector(step.target, location, txStep);
+          compare(step.compare ?? [], location, txStep);
           ref(step.token, location, "fence token", txStep);
           return;
       }

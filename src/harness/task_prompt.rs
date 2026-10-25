@@ -76,8 +76,9 @@ object. L1 describes placement, transport, grouping, precedence, and \
 runtime capacity; it proves no transaction property. Transaction \
 serializability and ordering are discharged only from the L0 \
 transaction primitives — declared isolation, shared and exclusive \
-locks, object versions with `validate_version` and `bump_version`, \
-ordered cursors, fences — because no transport or topology fact \
+locks, atomic guarded mutations (`compare_and_set`, and transitions or \
+cursor advances comparing an observed version), ordered cursors, \
+fences — because no transport or topology fact \
 survives redelivery, timeout, worker replacement, or reordering after \
 failure. No obligation is aimed at you, and none should be aimed at \
 the topology: if `requirement_report` shows an unproven \
@@ -118,15 +119,18 @@ Synthesize this operation's program: inline transactions, bindings, \
 effects, branches/matches, returns or completion. Reason about causal \
 behavior, state access, and control flow — not about proof \
 obligations, which come later, and not about runtime topology, which is \
-the coordinator's. A transaction that applies a transition, validates \
-a version, advances a cursor, or fences can reject at commit and must \
-carry a `rejected` block saying what control does then; one that \
-cannot reject must not. A write or transition of a versioned object \
-must be accompanied by a `bump_version` of the same instance (the \
-unconditional increment that publishes the change), and a transaction \
-that relies on what it read of a versioned instance declares a \
-`validate_version` naming that read (the commit-time equality check \
-that rejects a stale observation) — neither implies the other. A \
+the coordinator's. A transaction that compares and sets, applies a \
+transition, advances a cursor, or fences can reject and must carry a \
+`rejected` block saying what control does then; one that cannot reject \
+must not. A mutation of a versioned object publishes a newer version \
+by itself — never write the version field. If a decision depends on \
+an identified object the transaction read and the transaction later \
+mutates that object, use an atomic conditional mutation comparing \
+either the observed fields or the object's observed version: a \
+`compare_and_set` in place of the `update`, or a `compare` on the \
+transition or cursor advance. Do not introduce a compare-and-set \
+merely because an object has a version: use it where the transaction \
+relies on a stale-read check, and leave a blind update an `update`. A \
 `match_result` needs one arm per error class of the matched result's \
 contract. An operation declares no concurrency of its own: \
 where its invocations execute and how many run at once are facts about \

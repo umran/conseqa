@@ -3,12 +3,16 @@
 # keyed topic.
 #
 # Serializability and ordering are properties of transactions here,
-# proven from the transactions themselves. The order object is versioned: applying a
-# payment and cancelling an order both observe the order's version,
-# validate it at commit, apply their transition, and bump it, so a
-# stale observation rejects rather than commits — the OCC route that
-# constrains every read-write anti-dependency between them, with
-# create_order's insert in the same closure. apply_payment additionally
+# proven from the transactions themselves. The order object is versioned:
+# applying a payment and cancelling an order both read the order's
+# version and condition their first mutation of it — a cursor advance, a
+# transition — on that observed version, so a stale observation rejects
+# rather than commits. Every committed mutation of a live order publishes
+# a newer version by itself, so no writer declares anything: the
+# observed-version guard constrains every read-write anti-dependency
+# between them, with create_order's insert in the same closure (no
+# order is ever deleted, so an inserted order's version is never one a
+# reader observed of another). apply_payment additionally
 # persists the captured sequence through a successor cursor, which is
 # what proves that payments apply to an order in sequence order. The
 # runtime topology at the foot of the file describes placement and
@@ -16,14 +20,14 @@
 #
 # The model keeps its deliberate gaps, and the checker reports each:
 # tx.reserve_inventory reads stock and writes it back under read
-# committed with neither a lock nor a version — the write-skew shape —
+# committed with neither a lock nor a guarded mutation — the write-skew shape —
 # so its serializability is unproven and its idempotency and
 # recoverability with it; the card charge is explicitly not
 # deduplicated, so no same-key terminal result is fixed and
 # charge_payment's match on it is not established to replay; and
 # create_order's idempotency is unknown through the cascade those
 # consumers start.
-dsl: 5
+dsl: 6
 revision: 1
 services:
   service.checkout:
@@ -162,9 +166,9 @@ data_models:
         schema: schema.OrderRecord
         identity:
         - order_id
-        # The order's application concurrency token: every mutation of
-        # a live order bumps it, and a transaction that observed it
-        # validates it at commit.
+        # The order's application concurrency token: every committed
+        # mutation of a live order publishes a newer one, and a
+        # transaction that observed it conditions its mutation on it.
         version:
           field: version
   data.inventory:
@@ -352,7 +356,7 @@ operations:
           idempotency:
             kind: not_deduplicated
           # The read-then-write of the stock row under read committed,
-          # with neither a lock nor a version protocol: the write-skew
+          # with neither a lock nor a guarded mutation: the write-skew
           # shape. The serializability obligation is deliberately left
           # unproven, and the checker names the unprotected
           # anti-dependency.
@@ -384,7 +388,7 @@ operations:
               fields:
               - on_hand
               - reserved
-          - kind: write
+          - kind: update
             target:
               object: object.stock
               predicate:
@@ -596,18 +600,6 @@ operations:
               fields:
               - order_id
               - version
-          - kind: validate_version
-            target:
-              object: object.order
-              predicate:
-                kind: eq
-                field: order_id
-                value:
-                  source: input:input.cancel_order.request
-                  path: order_id
-            expected:
-              source: transaction_read:read.cancel_order.order
-              path: version
           - kind: transition
             machine: machine.order_lifecycle
             transition: transition.order.cancel
@@ -619,16 +611,12 @@ operations:
                 value:
                   source: input:input.cancel_order.request
                   path: order_id
+            compare:
+            - field: version
+              expected:
+                source: transaction_read:read.cancel_order.order
+                path: version
             effect_intents: {}
-          - kind: bump_version
-            target:
-              object: object.order
-              predicate:
-                kind: eq
-                field: order_id
-                value:
-                  source: input:input.cancel_order.request
-                  path: order_id
           - kind: establish_effect_intent
             bind: intent.cancel_order.publish_cancelled
             effect_id: effect.cancel_order.publish_cancelled
@@ -694,9 +682,9 @@ operations:
               components:
               - source: input:input.apply_payment.captured
                 path: event_id
-          # Serializable by order through the version protocol below,
-          # and ordered by the captured sequence through the successor
-          # cursor on the order.
+          # Serializable by order through the observed-version guard on
+          # the cursor advance below, and ordered by the captured
+          # sequence through that successor cursor on the order.
           requirements:
             serializability:
             - key:
@@ -726,18 +714,6 @@ operations:
               - order_id
               - version
               - last_applied_sequence
-          - kind: validate_version
-            target:
-              object: object.order
-              predicate:
-                kind: eq
-                field: order_id
-                value:
-                  source: input:input.apply_payment.captured
-                  path: order_id
-            expected:
-              source: transaction_read:read.apply_payment.order
-              path: version
           - kind: advance_cursor
             target:
               object: object.order
@@ -747,6 +723,11 @@ operations:
                 value:
                   source: input:input.apply_payment.captured
                   path: order_id
+            compare:
+            - field: version
+              expected:
+                source: transaction_read:read.apply_payment.order
+                path: version
             field: last_applied_sequence
             incoming:
               source: input:input.apply_payment.captured
@@ -773,15 +754,6 @@ operations:
                     path: order_id
                   - source: input:input.apply_payment.captured
                     path: event_id
-          - kind: bump_version
-            target:
-              object: object.order
-              predicate:
-                kind: eq
-                field: order_id
-                value:
-                  source: input:input.apply_payment.captured
-                  path: order_id
         # A stale or out-of-sequence capture, or an order no longer
         # pending, rejects: nothing is applied, and the delivery
         # completes without announcing anything.
@@ -892,7 +864,7 @@ operations:
               kind: only
               fields:
               - on_hand
-          - kind: write
+          - kind: update
             target:
               object: object.stock
               predicate:
@@ -917,7 +889,7 @@ operations:
                 path: on_hand
               - source: input:input.transfer_stock.request
                 path: quantity
-          - kind: write
+          - kind: update
             target:
               object: object.stock
               predicate:
@@ -966,8 +938,9 @@ operations:
 #
 #   * None of it proves a transaction property. The serial worker pools
 #     and the consistent-hash routing describe where same-order work
-#     ordinarily lands; the version protocol and the sequence cursor on
-#     the order are what make apply_payment serializable and ordered,
+#     ordinarily lands; the observed-version guard and the sequence
+#     cursor on the order are what make apply_payment serializable and
+#     ordered,
 #     and they hold under redelivery, worker replacement, and a stale
 #     worker that the topology cannot see.
 # ---------------------------------------------------------------------

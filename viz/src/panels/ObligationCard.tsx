@@ -52,7 +52,7 @@ function layerNote(ob: Obligation): { label: string; hint: string } | null {
           label: "needs L0 fact",
           hint:
             "At least one obstacle names an application fact — the program, the transaction's " +
-            "isolation, locks, version protocol, cursors or fences, the interface, or the " +
+            "isolation, locks, guarded mutations, cursors or fences, the interface, or the " +
             "requirement itself — so no runtime declaration alone can discharge this.",
         };
   }

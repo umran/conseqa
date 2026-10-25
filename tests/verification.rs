@@ -19,17 +19,17 @@ use conseqa::{
     },
     parser::yaml,
     spec::{
-        Arm, AsyncJoin, Branch, CompletionRequirement, Condition, Derivation, Effect,
-        ErrorDisposition, ErrorResultType, EstablishTransactionOutput, ExecuteEffect,
+        Arm, AsyncJoin, Branch, CompareCondition, CompletionRequirement, Condition, Derivation,
+        Effect, ErrorDisposition, ErrorResultType, EstablishTransactionOutput, ExecuteEffect,
         ExecuteEffectAsync, ExecuteTransaction, ExternalEffect, ExternalIdempotency,
-        ExternalIdentity, ExternalIdentityKey, ExternalResultReplay, FieldPath, Id,
+        ExternalIdentity, ExternalIdentityKey, ExternalResultReplay, Fence, FieldPath, Id,
         IdempotencyGuarantee, IdempotencyKey, IdempotencyRequirement, Input, JoinAll, Literal,
         MatchResult, MessageIdentity, MessageSelector, Model, ObjectSelector, OperationBlock,
         OperationStep, Race, RecoverabilityRequirement, RequestIdentity, RequestInput, ResultArm,
         ResultOutcome, ResultReplayRequirement, ResultType, Return, RuntimeModel, Schema,
         SchemaFragment, SelectorPredicate, SelectorValue, SubscriptionInput, TopicRuntime,
-        Transaction, TransactionIsolation, TransactionOrderingRequirement, TransactionStep,
-        ValueRef, ValueSource, Write,
+        Transaction, TransactionIsolation, TransactionOrderingRequirement, TransactionStep, Update,
+        ValueRef, ValueSource,
     },
 };
 
@@ -437,7 +437,7 @@ fn make_create_order_natural(model: &mut Model) {
     transaction.idempotency = IdempotencyGuarantee::Unspecified;
 
     transaction.steps = vec![
-        TransactionStep::Write(Write {
+        TransactionStep::Update(Update {
             target: ObjectSelector {
                 object: id("object.order_ledger"),
                 predicate: SelectorPredicate::Eq {
@@ -574,6 +574,56 @@ fn natural_reconstruction_proves_result_replay() {
             rule: StabilityRule::IdentifiedPayload,
         }]
     ));
+}
+
+#[test]
+fn a_fence_comparison_defeats_natural_reconstruction() {
+    let mut model = load_flash_checkout();
+
+    make_create_order_natural(&mut model);
+
+    create_order_transaction(&mut model).steps.insert(
+        1,
+        TransactionStep::Fence(Fence {
+            target: ObjectSelector {
+                object: id("object.order_ledger"),
+                predicate: SelectorPredicate::Eq {
+                    field: path(&["order_id"]),
+                    value: SelectorValue::Value(input_key(
+                        "input.create_order.request",
+                        &["order_id"],
+                    )),
+                },
+            },
+            field: path(&["last_applied_sequence"]),
+            token: input_key("input.create_order.request", &["quantity"]),
+            compare: vec![CompareCondition {
+                field: path(&["status"]),
+                expected: SelectorValue::Literal(Literal::String("created".into())),
+            }],
+        }),
+    );
+
+    let OperationStep::Transaction(execute) =
+        &mut program_mut(&mut model, "operation.create_order").steps[0]
+    else {
+        panic!("expected create_order's transaction execution");
+    };
+
+    execute.rejected = Some(OperationBlock {
+        steps: vec![OperationStep::Complete],
+    });
+
+    assert!(validation::validate(&model).is_empty());
+
+    let verdict = result_replay_verdict(&model, "operation.create_order", 0);
+    let (recovery, reconstruction) = unavailable_result_root(&verdict);
+
+    assert_eq!(recovery, &vec![ReplayGap::NoKeyedCommit]);
+    assert!(
+        reconstruction.contains(&ReplayGap::ContainsFenceComparison),
+        "{reconstruction:#?}"
+    );
 }
 
 #[test]

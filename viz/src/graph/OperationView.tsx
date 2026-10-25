@@ -38,7 +38,7 @@ import { propertyMatchesRequirement, worstStatus } from "../lib/obligations";
 import { hashes } from "../lib/route";
 import { requirementKey, useApp, type DetailContext } from "../state/AppState";
 import {
-  BindingChip, BindingKindTag, BindingRoots, ConditionView, Fact, FactBadge, IdLink, KeyComponents, Mono, Muted,
+  BindingChip, BindingKindTag, BindingRoots, CompareView, ConditionView, Fact, FactBadge, IdLink, KeyComponents, Mono, Muted,
   PredicateView, RefText, SectionCard, SectionEmpty, StatusBadge, StatusChips, selectableRow, useProgramNavigation,
 } from "../panels/parts";
 import type { Effect, Id, Operation, OperationBlock, RequirementKind, ResultType, SelectorPredicate, Transaction, TransactionStep, TransitionSideEffect } from "../types/model";
@@ -181,13 +181,36 @@ export function TxStepRow({ step, index, txId, opId }: { step: TransactionStep; 
         </>
       );
       break;
-    case "write":
-      kind = "write"; title = <Mono className="text-kumo-strong">{shortId(step.target.object)}</Mono>;
+    case "update":
+      kind = "update"; title = <Mono className="text-kumo-strong">{shortId(step.target.object)}</Mono>;
       note = <><span>{step.fields.map(pathText).join(", ")} · {step.values.kind}</span><BindingRoots value={step.values} /></>;
+      break;
+    case "compare_and_set":
+      // One atomic statement: the guard and the mutation read as one.
+      kind = "compare-and-set"; title = <Mono className="text-kumo-strong">{shortId(step.target.object)}</Mono>;
+      note = (
+        <>
+          <CompareView compare={step.compare} />
+          <span>· sets {step.fields.map(pathText).join(", ")} · {step.values.kind}</span>
+          <BindingRoots value={step.values} />
+          <span>·</span>{where(step.target)}
+        </>
+      );
       break;
     case "insert":
       kind = "insert"; title = <Mono className="text-kumo-strong">{shortId(step.object)}</Mono>;
       note = <><span>values: {step.values.kind}</span><BindingRoots value={step.values} /></>;
+      break;
+    case "upsert":
+      kind = "upsert"; title = <Mono className="text-kumo-strong">{shortId(step.target.object)}</Mono>;
+      note = (
+        <>
+          <span>inserts ({step.insert_values.kind}), or updates {step.update_fields.map(pathText).join(", ")} ({step.update_values.kind}) ·</span>
+          <BindingRoots value={step.insert_values} />
+          <BindingRoots value={step.update_values} />
+          {where(step.target)}
+        </>
+      );
       break;
     case "delete":
       kind = "delete"; title = <Mono className="text-kumo-strong">{shortId(step.target.object)}</Mono>;
@@ -204,6 +227,7 @@ export function TxStepRow({ step, index, txId, opId }: { step: TransactionStep; 
       note = (
         <>
           <span>{shortId(step.machine)}</span>
+          {(step.compare?.length ?? 0) > 0 && <><span>·</span><CompareView compare={step.compare ?? []} /></>}
           {intents.map((intent) => (
             <Fragment key={intent.bind}>
               <span className="text-kumo-inactive">· binds</span>
@@ -250,21 +274,25 @@ export function TxStepRow({ step, index, txId, opId }: { step: TransactionStep; 
         </>
       );
       break;
-    case "validate_version":
-      kind = "validate version"; title = <Mono className="text-kumo-strong">{shortId(step.target.object)}</Mono>;
-      note = <><span>expects</span><RefText value={step.expected} /><span>at commit ·</span>{where(step.target)}</>;
-      break;
-    case "bump_version":
-      kind = "bump version"; title = <Mono className="text-kumo-strong">{shortId(step.target.object)}</Mono>;
-      note = <><span>version + 1 atomically with the commit ·</span>{where(step.target)}</>;
-      break;
     case "advance_cursor":
       kind = "advance cursor"; title = <Mono className="text-kumo-strong">{shortId(step.target.object)}.{pathText(step.field)}</Mono>;
-      note = <><span className="text-kumo-inactive">←</span><RefText value={step.incoming} /><span>· {step.rule} ·</span>{where(step.target)}</>;
+      note = (
+        <>
+          <span className="text-kumo-inactive">←</span><RefText value={step.incoming} /><span>· {step.rule} ·</span>
+          {(step.compare?.length ?? 0) > 0 && <><CompareView compare={step.compare ?? []} /><span>·</span></>}
+          {where(step.target)}
+        </>
+      );
       break;
     case "fence":
       kind = "fence"; title = <Mono className="text-kumo-strong">{shortId(step.target.object)}.{pathText(step.field)}</Mono>;
-      note = <><span>token</span><RefText value={step.token} /><span>·</span>{where(step.target)}</>;
+      note = (
+        <>
+          <span>token</span><RefText value={step.token} /><span>·</span>
+          {(step.compare?.length ?? 0) > 0 && <><CompareView compare={step.compare ?? []} /><span>·</span></>}
+          {where(step.target)}
+        </>
+      );
       break;
   }
   const guard = stepRejects(step);

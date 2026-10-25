@@ -13,7 +13,7 @@
 # serial pool, and order-preserving batching describe how the relay is
 # realized; they are placement and transport facts, and no requirement
 # rests on them.
-dsl: 5
+dsl: 6
 revision: 1
 services:
   service.orders:

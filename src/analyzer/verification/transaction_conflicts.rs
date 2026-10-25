@@ -9,10 +9,12 @@
 //!
 //! - **the access index** — every persistent-state access of every
 //!   inline transaction template, with its object, selector domain,
-//!   field footprint, and mode; lock declarations, version validations
-//!   and bumps, and commit artifacts (outbox admissions, intent
-//!   establishments, outputs) are indexed beside it and never counted
-//!   as conflict accesses;
+//!   field footprint, and mode, including the intrinsic version
+//!   publication of every mutation of a live versioned instance; lock
+//!   declarations, atomic conditional mutations (compare-and-set,
+//!   transition, cursor advance, fence, upsert arbitration), and commit
+//!   artifacts (outbox admissions, intent establishments, outputs) are
+//!   indexed beside it and never counted as conflict accesses;
 //! - **selector and field overlap** — two accesses conflict only where
 //!   their selected domains may overlap and their fields may overlap;
 //!   unknown overlap is never treated as disjoint;
@@ -30,8 +32,9 @@
 //!
 //! Everything here is conservative (§70): an unknown selector overlap
 //! is potentially overlapping, an unknown field footprint potentially
-//! conflicting, an unspecified isolation no isolation, and incomplete
-//! version, cursor, or fence coverage no credit at all. One inline
+//! conflicting, an unspecified isolation no isolation, and a guard that
+//! does not identify one instance, or does not compare what the
+//! conflict touches, no credit at all. One inline
 //! declaration is one template, and concurrent executions of the same
 //! template are analyzed as two, so a template may conflict with
 //! itself.
@@ -42,8 +45,8 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 
 use crate::spec::{
-    CursorAdvanceRule, DataObject, FieldPath, FieldSelection, Id, Input, Literal, LockMode,
-    MessageSelector, Model, ObjectSelector, Operation, SelectorPredicate, SelectorValue,
+    CompareCondition, CursorAdvanceRule, DataObject, FieldPath, FieldSelection, Id, Input, Literal,
+    LockMode, MessageSelector, Model, ObjectSelector, Operation, SelectorPredicate, SelectorValue,
     StateMachineSubject, StepLocation, Transaction, TransactionIsolation, TransactionStep,
     ValueRef, ValueSource,
 };
@@ -87,15 +90,31 @@ impl fmt::Display for ManagedFieldRef {
 #[serde(rename_all = "snake_case")]
 pub enum AccessMode {
     Read,
-    Write,
+    Update,
+
+    /// The fields a guarded mutation's comparisons read, atomically
+    /// with its mutation.
+    CompareRead,
+
+    /// The fields a compare-and-set mutates.
+    CompareWrite,
+
     Insert,
+
+    /// An upsert's identity arbitration and either branch's mutation,
+    /// one atomic access.
+    UpsertReadWrite,
+
     Delete,
     TransitionRead,
     TransitionWrite,
-    VersionValidate,
-    VersionBump,
     CursorReadWrite,
     FenceReadWrite,
+
+    /// The intrinsic publication of a newer version token by a
+    /// mutation of a live versioned instance — not a step of its own,
+    /// but a write of the version field every such mutation performs.
+    VersionPublish,
 }
 
 impl AccessMode {
@@ -104,8 +123,9 @@ impl AccessMode {
         matches!(
             self,
             Self::Read
+                | Self::CompareRead
+                | Self::UpsertReadWrite
                 | Self::TransitionRead
-                | Self::VersionValidate
                 | Self::CursorReadWrite
                 | Self::FenceReadWrite
         )
@@ -115,13 +135,15 @@ impl AccessMode {
     pub fn writes(self) -> bool {
         matches!(
             self,
-            Self::Write
+            Self::Update
+                | Self::CompareWrite
                 | Self::Insert
+                | Self::UpsertReadWrite
                 | Self::Delete
                 | Self::TransitionWrite
-                | Self::VersionBump
                 | Self::CursorReadWrite
                 | Self::FenceReadWrite
+                | Self::VersionPublish
         )
     }
 }
@@ -130,15 +152,17 @@ impl fmt::Display for AccessMode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
             Self::Read => "read",
-            Self::Write => "write",
+            Self::Update => "update",
+            Self::CompareRead => "comparison",
+            Self::CompareWrite => "compare-and-set",
             Self::Insert => "insert",
+            Self::UpsertReadWrite => "upsert",
             Self::Delete => "delete",
             Self::TransitionRead => "transition read",
             Self::TransitionWrite => "transition write",
-            Self::VersionValidate => "version validation",
-            Self::VersionBump => "version bump",
             Self::CursorReadWrite => "cursor advance",
             Self::FenceReadWrite => "fence",
+            Self::VersionPublish => "version publication",
         })
     }
 }
@@ -153,10 +177,26 @@ pub enum AccessFields {
 
     Only(BTreeSet<FieldPath>),
 
-    /// The footprint is not declared — a write naming no fields — so
+    /// The footprint is not declared — an update naming no fields — so
     /// its provenance is unknown and it is treated as potentially
     /// conflicting with everything.
     Unknown,
+}
+
+impl fmt::Display for AccessFields {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::All => f.write_str("every field"),
+            Self::Unknown => f.write_str("an undeclared footprint"),
+            Self::Only(fields) => f.write_str(
+                &fields
+                    .iter()
+                    .map(|field| format!("`{field}`"))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            ),
+        }
+    }
 }
 
 /// One persistent-state access of one transaction template.
@@ -173,7 +213,8 @@ pub struct TransactionAccess {
     pub fields: AccessFields,
     pub mode: AccessMode,
 
-    /// The managed field a version, cursor, or fence access is over.
+    /// The managed field a version publication, cursor, or fence access
+    /// is over.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub field: Option<FieldPath>,
 
@@ -203,15 +244,87 @@ pub struct LockRef {
     pub mode: LockMode,
 }
 
-/// A `ValidateVersion` step of a template, with whether its expected
-/// version is a preceding observation of the same instance's declared
-/// version field — the only shape that makes it a commit guard the
-/// prover may credit.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct VersionValidation {
+/// The mechanism of one atomic conditional mutation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConditionalMutationKind {
+    CompareAndSet,
+    Transition,
+    AdvanceCursor,
+    Fence,
+    UpsertIdentityArbitration,
+}
+
+impl ConditionalMutationKind {
+    /// Whether every success of the mechanism mutates its instance, and
+    /// so takes the instance's write protection and holds it to commit.
+    /// A compare-and-set, a transition, a cursor advance (whose rules
+    /// admit only a different position), and an upsert always do. A
+    /// fence does not: on an equal token it leaves the instance as it
+    /// was, so neither its fencing condition nor a comparison it carries
+    /// keeps an observation from going stale — which is why a fence is
+    /// never commit-order evidence on its own (§51).
+    pub fn holds_protection(self) -> bool {
+        !matches!(self, Self::Fence)
+    }
+}
+
+impl fmt::Display for ConditionalMutationKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::CompareAndSet => "compare-and-set",
+            Self::Transition => "transition",
+            Self::AdvanceCursor => "cursor advance",
+            Self::Fence => "fence",
+            Self::UpsertIdentityArbitration => "upsert",
+        })
+    }
+}
+
+/// The earlier read of the same instance whose same field a comparison
+/// names: what makes it an observed-state comparison.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ObservedValue {
+    pub read: Id,
     pub step: usize,
-    pub selector: ObjectSelector,
-    pub observed: bool,
+}
+
+/// One comparison of a guarded mutation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ComparisonFact {
+    pub field: FieldPath,
+    pub expected: SelectorValue,
+
+    /// Set when `expected` is exactly the same field of an earlier read
+    /// of the same instance in the same transaction — the only shape
+    /// the prover credits as observed-state evidence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed: Option<ObservedValue>,
+}
+
+/// One atomic conditional mutation of a template: a compare-and-set, a
+/// transition, a cursor advance, a fence, or an upsert's identity
+/// arbitration, normalized (§15). Its condition and its mutation are
+/// one storage operation, and once it succeeds the transaction holds
+/// the instance's write protection to commit — which is why it is
+/// commit-order evidence, and why a stale observation it compares
+/// cannot participate in a successful commit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConditionalMutation {
+    pub transaction: TransactionRef,
+    pub step: usize,
+    pub target: ObjectSelector,
+    pub mechanism: ConditionalMutationKind,
+    pub comparisons: Vec<ComparisonFact>,
+    pub writes: AccessFields,
+    pub publishes_version: Option<FieldPath>,
+
+    /// Whether the target pins the object's whole identity. Every
+    /// credit the mechanism earns rests on it: a guard over a set or a
+    /// range cannot see a concurrent insert of a new matching instance.
+    pub identified: bool,
 }
 
 /// An artifact a transaction commits beside its state mutations.
@@ -246,11 +359,7 @@ pub struct TransactionTemplate<'a> {
     pub transaction: &'a Transaction,
     pub accesses: Vec<TransactionAccess>,
     pub locks: Vec<LockAccess>,
-    pub validations: Vec<VersionValidation>,
-
-    /// `BumpVersion` steps: step index and selected instance.
-    pub bumps: Vec<(usize, ObjectSelector)>,
-
+    pub conditional_mutations: Vec<ConditionalMutation>,
     pub artifacts: Vec<CommitArtifact>,
 }
 
@@ -324,6 +433,34 @@ impl<'a> ConflictIndex<'a> {
             .map(|object| object.identity.as_slice())
     }
 
+    /// Whether a selector pins every field of its object's (non-empty)
+    /// identity by equality, so it selects at most one instance.
+    pub fn identifies_instance(&self, selector: &ObjectSelector) -> bool {
+        let Some(identity) = self.identity(&selector.object) else {
+            return false;
+        };
+
+        let pinned = pins(&selector.predicate);
+
+        !identity.is_empty()
+            && identity
+                .iter()
+                .all(|field| pinned.iter().any(|(pinned, _)| *pinned == field))
+    }
+
+    /// A template that deletes some instance of the object, if any:
+    /// after which an insertion may establish a version token a deleted
+    /// instance already carried.
+    pub fn deleter(&self, object: &Id) -> Option<&TransactionRef> {
+        self.templates.iter().find_map(|template| {
+            template
+                .accesses
+                .iter()
+                .any(|access| access.mode == AccessMode::Delete && &access.object == object)
+                .then_some(&template.reference)
+        })
+    }
+
     /// The position of the template declared by `operation` under the
     /// transaction id.
     pub fn position(&self, operation: &Id, transaction: &Id) -> Option<usize> {
@@ -340,8 +477,7 @@ impl<'a> ConflictIndex<'a> {
     ) -> TransactionTemplate<'a> {
         let mut accesses = Vec::new();
         let mut locks = Vec::new();
-        let mut validations = Vec::new();
-        let mut bumps = Vec::new();
+        let mut conditional_mutations = Vec::new();
         let mut artifacts = Vec::new();
 
         let access = |step: usize,
@@ -362,6 +498,67 @@ impl<'a> ConflictIndex<'a> {
 
         let managed = |field: &FieldPath| AccessFields::Only(BTreeSet::from([field.clone()]));
 
+        let declared = |fields: &BTreeSet<FieldPath>| {
+            if fields.is_empty() {
+                AccessFields::Unknown
+            } else {
+                AccessFields::Only(fields.clone())
+            }
+        };
+
+        // Every committed mutation of a live versioned instance
+        // publishes a newer token (§18): an effective write of the
+        // version field, whether or not the step names it.
+        let publication = |step: usize, selector: &ObjectSelector| {
+            self.version_field(&selector.object).map(|version| {
+                access(
+                    step,
+                    selector,
+                    managed(version),
+                    AccessMode::VersionPublish,
+                    Some(version.clone()),
+                    None,
+                )
+            })
+        };
+
+        // A guarded mutation's comparisons read their fields atomically
+        // with the mutation.
+        let comparison = |step: usize, selector: &ObjectSelector, compare: &[CompareCondition]| {
+            (!compare.is_empty()).then(|| {
+                access(
+                    step,
+                    selector,
+                    AccessFields::Only(compare.iter().map(|c| c.field.clone()).collect()),
+                    AccessMode::CompareRead,
+                    None,
+                    None,
+                )
+            })
+        };
+
+        let guarded = |step: usize,
+                       target: &ObjectSelector,
+                       mechanism: ConditionalMutationKind,
+                       compare: &[CompareCondition],
+                       writes: AccessFields| ConditionalMutation {
+            transaction: reference.clone(),
+            step,
+            target: target.clone(),
+            mechanism,
+            comparisons: compare
+                .iter()
+                .map(|condition| ComparisonFact {
+                    field: condition.field.clone(),
+                    expected: condition.expected.clone(),
+                    observed: observation(transaction, step, target, condition),
+                })
+                .collect(),
+            writes,
+            publishes_version: self.version_field(&target.object).cloned(),
+            identified: self.identifies_instance(target),
+        };
+
         for (step, inner) in transaction.steps.iter().enumerate() {
             match inner {
                 TransactionStep::Read(read) => {
@@ -380,20 +577,39 @@ impl<'a> ConflictIndex<'a> {
                     ));
                 }
 
-                TransactionStep::Write(write) => {
-                    let fields = if write.fields.is_empty() {
-                        AccessFields::Unknown
-                    } else {
-                        AccessFields::Only(write.fields.clone())
-                    };
+                TransactionStep::Update(update) => {
+                    accesses.push(access(
+                        step,
+                        &update.target,
+                        declared(&update.fields),
+                        AccessMode::Update,
+                        None,
+                        None,
+                    ));
+
+                    accesses.extend(publication(step, &update.target));
+                }
+
+                TransactionStep::CompareAndSet(cas) => {
+                    accesses.extend(comparison(step, &cas.target, &cas.compare));
 
                     accesses.push(access(
                         step,
-                        &write.target,
-                        fields,
-                        AccessMode::Write,
+                        &cas.target,
+                        declared(&cas.fields),
+                        AccessMode::CompareWrite,
                         None,
                         None,
+                    ));
+
+                    accesses.extend(publication(step, &cas.target));
+
+                    conditional_mutations.push(guarded(
+                        step,
+                        &cas.target,
+                        ConditionalMutationKind::CompareAndSet,
+                        &cas.compare,
+                        declared(&cas.fields),
                     ));
                 }
 
@@ -414,6 +630,28 @@ impl<'a> ConflictIndex<'a> {
                         AccessMode::Insert,
                         None,
                         None,
+                    ));
+                }
+
+                TransactionStep::Upsert(upsert) => {
+                    // Either branch may run, and the insert branch
+                    // writes the whole instance — the version token
+                    // with it.
+                    accesses.push(access(
+                        step,
+                        &upsert.target,
+                        AccessFields::All,
+                        AccessMode::UpsertReadWrite,
+                        None,
+                        None,
+                    ));
+
+                    conditional_mutations.push(guarded(
+                        step,
+                        &upsert.target,
+                        ConditionalMutationKind::UpsertIdentityArbitration,
+                        &[],
+                        AccessFields::All,
                     ));
                 }
 
@@ -454,16 +692,28 @@ impl<'a> ConflictIndex<'a> {
                         None,
                     ));
 
+                    accesses.extend(comparison(step, &transition.subject, &transition.compare));
+
                     accesses.push(access(
                         step,
                         &transition.subject,
-                        fields,
+                        fields.clone(),
                         AccessMode::TransitionWrite,
                         None,
                         None,
                     ));
 
-                    for (effect_id, effect) in &transition.effects {
+                    accesses.extend(publication(step, &transition.subject));
+
+                    conditional_mutations.push(guarded(
+                        step,
+                        &transition.subject,
+                        ConditionalMutationKind::Transition,
+                        &transition.compare,
+                        fields,
+                    ));
+
+                    for effect_id in transition.effects.keys() {
                         let write = self
                             .model
                             .state_machines
@@ -471,8 +721,6 @@ impl<'a> ConflictIndex<'a> {
                             .and_then(|machine| machine.transitions.get(&transition.transition))
                             .and_then(|declared| declared.effects.get(effect_id))
                             .map(|declared| declared.outbox_write());
-
-                        let _ = effect;
 
                         if let Some(write) = write {
                             artifacts.push(CommitArtifact::OutboxWrite {
@@ -485,52 +733,6 @@ impl<'a> ConflictIndex<'a> {
                     }
                 }
 
-                TransactionStep::ValidateVersion(validate) => {
-                    let field = self.version_field(&validate.target.object);
-
-                    let fields = field.map(managed).unwrap_or(AccessFields::All);
-
-                    accesses.push(access(
-                        step,
-                        &validate.target,
-                        fields,
-                        AccessMode::VersionValidate,
-                        field.cloned(),
-                        None,
-                    ));
-
-                    validations.push(VersionValidation {
-                        step,
-                        selector: validate.target.clone(),
-                        observed: field.is_some_and(|field| {
-                            observes_version(
-                                transaction,
-                                step,
-                                &validate.target,
-                                field,
-                                &validate.expected,
-                            )
-                        }),
-                    });
-                }
-
-                TransactionStep::BumpVersion(bump) => {
-                    let field = self.version_field(&bump.target.object);
-
-                    let fields = field.map(managed).unwrap_or(AccessFields::All);
-
-                    accesses.push(access(
-                        step,
-                        &bump.target,
-                        fields,
-                        AccessMode::VersionBump,
-                        field.cloned(),
-                        None,
-                    ));
-
-                    bumps.push((step, bump.target.clone()));
-                }
-
                 TransactionStep::AdvanceCursor(advance) => {
                     accesses.push(access(
                         step,
@@ -539,6 +741,17 @@ impl<'a> ConflictIndex<'a> {
                         AccessMode::CursorReadWrite,
                         Some(advance.field.clone()),
                         Some(advance.rule),
+                    ));
+
+                    accesses.extend(comparison(step, &advance.target, &advance.compare));
+                    accesses.extend(publication(step, &advance.target));
+
+                    conditional_mutations.push(guarded(
+                        step,
+                        &advance.target,
+                        ConditionalMutationKind::AdvanceCursor,
+                        &advance.compare,
+                        managed(&advance.field),
                     ));
                 }
 
@@ -550,6 +763,17 @@ impl<'a> ConflictIndex<'a> {
                         AccessMode::FenceReadWrite,
                         Some(fence.field.clone()),
                         None,
+                    ));
+
+                    accesses.extend(comparison(step, &fence.target, &fence.compare));
+                    accesses.extend(publication(step, &fence.target));
+
+                    conditional_mutations.push(guarded(
+                        step,
+                        &fence.target,
+                        ConditionalMutationKind::Fence,
+                        &fence.compare,
+                        managed(&fence.field),
                     ));
                 }
 
@@ -592,8 +816,7 @@ impl<'a> ConflictIndex<'a> {
             transaction,
             accesses,
             locks,
-            validations,
-            bumps,
+            conditional_mutations,
             artifacts,
         }
     }
@@ -802,8 +1025,14 @@ impl<'a> ConflictIndex<'a> {
                         CommitOrderEvidence::IntrinsicCommittedRead {
                             isolation: target.transaction.isolation,
                         }
-                    } else if self.validates(target, b) && self.bumps(source, a) {
-                        self.version_evidence(target, &b.object)
+                    } else if let Some((guard, coverage)) = self.protection(target, b)
+                        && self.holds_write(source, a)
+                    {
+                        // The reader observes at or after acquiring the
+                        // instance's write protection, which the
+                        // writer's own held write withholds until it
+                        // terminates: what it reads has committed.
+                        guard_evidence(target, guard, coverage, BTreeSet::new())
                     } else {
                         gaps.push(DependencyGap::IsolationUnspecified {
                             transaction: target.reference.clone(),
@@ -824,10 +1053,19 @@ impl<'a> ConflictIndex<'a> {
                             source_isolation,
                             target_isolation,
                         }
-                    } else if self.validates(target, b) && self.bumps(source, a) {
-                        self.version_evidence(target, &b.object)
-                    } else if self.validates(source, a) && self.bumps(target, b) {
-                        self.version_evidence(source, &a.object)
+                    } else if let Some((guard, coverage)) = self.protection(source, a) {
+                        // The earlier writer holds the instance's write
+                        // protection from its guard to commit, so no
+                        // later conflicting write commits before it.
+                        guard_evidence(source, guard, coverage, BTreeSet::new())
+                    } else if let Some((guard, coverage)) = self.protection(target, b)
+                        && source_isolation != TransactionIsolation::Unspecified
+                    {
+                        // The later writer acquires the instance's
+                        // write protection only once the earlier one,
+                        // which holds its write under declared
+                        // isolation, has terminated.
+                        guard_evidence(target, guard, coverage, BTreeSet::new())
                     } else {
                         for (template, isolation) in
                             [(source, source_isolation), (target, target_isolation)]
@@ -853,33 +1091,48 @@ impl<'a> ConflictIndex<'a> {
                             writer_lock,
                         },
 
-                        (reader_lock, writer_lock) => {
-                            if self.validates(source, a) && self.bumps(target, b) {
-                                self.version_evidence(source, &a.object)
-                            } else {
-                                if let Err(gap) = reader_lock {
-                                    gaps.push(gap);
-                                }
+                        (reader_lock, writer_lock) => match self.observation_guard(source, a, b) {
+                            Ok(evidence) => evidence,
 
-                                if let Err(gap) = writer_lock {
-                                    gaps.push(gap);
+                            Err(_) if self.serializes_at_its_read(source) => {
+                                CommitOrderEvidence::ReadOnlyObservation {
+                                    isolation: source.transaction.isolation,
                                 }
-
-                                if !self.validates(source, a) {
-                                    gaps.push(DependencyGap::VersionValidationMissing {
-                                        transaction: source.reference.clone(),
-                                        object: a.object.clone(),
-                                    });
-                                } else {
-                                    gaps.push(DependencyGap::VersionBumpMissing {
-                                        transaction: target.reference.clone(),
-                                        object: b.object.clone(),
-                                    });
-                                }
-
-                                CommitOrderEvidence::None
                             }
-                        }
+
+                            Err(guard_gap) => {
+                                // A reader lock is held from before the
+                                // observation to commit; a writer whose
+                                // mutation is guarded must acquire the
+                                // instance's write protection, which
+                                // that lock withholds.
+                                if let Ok(lock) = &reader_lock
+                                    && let Some((guard, _)) = self.protection(target, b)
+                                    && self.identifies_instance(&a.selector)
+                                {
+                                    guard_evidence(
+                                        target,
+                                        guard,
+                                        GuardCoverage::LockedReader {
+                                            reader_lock: lock.clone(),
+                                        },
+                                        BTreeSet::new(),
+                                    )
+                                } else {
+                                    if let Err(gap) = reader_lock {
+                                        gaps.push(gap);
+                                    }
+
+                                    if let Err(gap) = writer_lock {
+                                        gaps.push(gap);
+                                    }
+
+                                    gaps.push(guard_gap);
+
+                                    CommitOrderEvidence::None
+                                }
+                            }
+                        },
                     }
                 }
             }
@@ -916,47 +1169,237 @@ impl<'a> ConflictIndex<'a> {
         }
     }
 
-    fn version_evidence(
+    /// The guarded mutation of the template whose write protection
+    /// covers the access: one of the same identified instance at the
+    /// access's own step — the access is part of its atomic statement
+    /// — or at an earlier step, whose protection is held to commit.
+    pub fn protection<'t>(
         &self,
-        validated_by: &TransactionTemplate<'_>,
-        object: &Id,
-    ) -> CommitOrderEvidence {
-        CommitOrderEvidence::VersionValidation {
-            validated_by: validated_by.reference.clone(),
-            object: object.clone(),
-            field: self.version_field(object).cloned().unwrap_or_default(),
+        template: &'t TransactionTemplate<'_>,
+        access: &TransactionAccess,
+    ) -> Option<(&'t ConditionalMutation, GuardCoverage)> {
+        let guards = || {
+            template.conditional_mutations.iter().filter(|guard| {
+                guard.identified
+                    && guard.mechanism.holds_protection()
+                    && guard.target == access.selector
+            })
+        };
+
+        guards()
+            .find(|guard| guard.step == access.step)
+            .map(|guard| (guard, GuardCoverage::Atomic))
+            .or_else(|| {
+                guards()
+                    .find(|guard| guard.step < access.step)
+                    .map(|guard| (guard, GuardCoverage::HeldProtection))
+            })
+    }
+
+    /// Whether the template is a read-only observation that serializes
+    /// at the instant it reads: it mutates nothing, reads only committed
+    /// state under declared isolation, and observes at one instant — one
+    /// read of one identified instance, or any reads under snapshot
+    /// isolation, which see one snapshot. Serializable isolation is not
+    /// enough for several reads: it may hold read locks rather than read
+    /// a snapshot, and a writer of unspecified isolation need not
+    /// respect them.
+    ///
+    /// Such a transaction's position in any serial order can be taken
+    /// as that instant: every write it observed committed before it
+    /// (its incoming dependencies are all write-read, and committed
+    /// reads constrain them), and every write it missed commits after
+    /// it. So its outgoing anti-dependencies need no mechanism of their
+    /// own: a cycle through it whose other dependencies are all
+    /// commit-ordered would order a writer's commit both before and
+    /// after the observation. Two reads at different instants are not
+    /// one observation — read skew passes between them — so under read
+    /// committed only a single read qualifies.
+    pub fn serializes_at_its_read(&self, template: &TransactionTemplate<'_>) -> bool {
+        if template.accesses.iter().any(|access| access.mode.writes()) {
+            return false;
+        }
+
+        match template.transaction.isolation {
+            TransactionIsolation::Unspecified => false,
+
+            TransactionIsolation::Snapshot => true,
+
+            TransactionIsolation::ReadCommitted | TransactionIsolation::Serializable => {
+                let mut reads = template
+                    .accesses
+                    .iter()
+                    .filter(|access| access.mode.reads());
+
+                let Some(first) = reads.next() else {
+                    return true;
+                };
+
+                self.identifies_instance(&first.selector)
+                    && reads.all(|access| {
+                        access.step == first.step && access.selector == first.selector
+                    })
+            }
         }
     }
 
-    /// Whether the template validates the selected instance's version
-    /// against a preceding observation of it.
-    fn validates(&self, template: &TransactionTemplate<'_>, access: &TransactionAccess) -> bool {
-        template
-            .validations
-            .iter()
-            .any(|validation| validation.observed && validation.selector == access.selector)
+    /// Whether the template holds its write until it terminates: under
+    /// declared isolation, or under a guarded mutation's protection.
+    fn holds_write(&self, template: &TransactionTemplate<'_>, access: &TransactionAccess) -> bool {
+        template.transaction.isolation != TransactionIsolation::Unspecified
+            || self.protection(template, access).is_some()
     }
 
-    /// Whether the template's mutation of the selected instance cannot
-    /// escape a validated observation of it: a `BumpVersion` of the
-    /// same instance, the access being that bump, a delete of the
-    /// instance (the validation finds no version to match), or an
-    /// insert (the validated instance either already exists, so the
-    /// insert fails uniqueness, or does not, so the validation had no
-    /// version to observe).
-    fn bumps(&self, template: &TransactionTemplate<'_>, access: &TransactionAccess) -> bool {
-        matches!(
-            access.mode,
-            AccessMode::VersionBump | AccessMode::Delete | AccessMode::Insert
-        ) || template
-            .bumps
-            .iter()
-            .any(|(_, selector)| *selector == access.selector)
+    /// Why the reader's observation `a` cannot go stale under the
+    /// writer's access `b` and still participate in a successful
+    /// commit (§22–§25), or the gap that leaves it unprotected.
+    ///
+    /// The observation is covered when it is part of, or follows, a
+    /// guarded mutation of the same identified instance; or when a
+    /// later guarded mutation of that instance compares what the read
+    /// observed. The version token covers every observation of the
+    /// instance from the read that observed it up to the guard: a live
+    /// instance's token only ever grows, so any committed mutation in
+    /// that window moves it. A direct comparison of fields covers only
+    /// the read whose values it names — a field can change and change
+    /// back, so an intervening observation may have seen a value the
+    /// comparison no longer holds — and only the fields the conflict
+    /// touches.
+    #[allow(clippy::result_large_err)]
+    pub fn observation_guard(
+        &self,
+        reader: &TransactionTemplate<'_>,
+        a: &TransactionAccess,
+        b: &TransactionAccess,
+    ) -> Result<CommitOrderEvidence, DependencyGap> {
+        if let Some((guard, coverage)) = self.protection(reader, a) {
+            return Ok(guard_evidence(reader, guard, coverage, BTreeSet::new()));
+        }
+
+        if !self.identifies_instance(&a.selector) {
+            return Err(DependencyGap::ObservedStateNotIdentified {
+                transaction: reader.reference.clone(),
+                object: a.object.clone(),
+                step: a.step,
+            });
+        }
+
+        let version = self.version_field(&a.object);
+        let mut shortfall = None;
+
+        for guard in reader.conditional_mutations.iter().filter(|guard| {
+            guard.identified
+                && guard.mechanism.holds_protection()
+                && guard.step > a.step
+                && guard.target == a.selector
+        }) {
+            // The version route: a comparison of the version some read at
+            // or before the observation saw.
+            let version_observed = version.and_then(|version| {
+                guard.comparisons.iter().find_map(|comparison| {
+                    comparison
+                        .observed
+                        .as_ref()
+                        .filter(|observed| &comparison.field == version && observed.step <= a.step)
+                        .map(|observed| (version, observed))
+                })
+            });
+
+            if let Some((version, observed)) = version_observed {
+                // An insertion after a deletion establishes its token
+                // afresh and may repeat the one observed, so where the
+                // object is ever deleted the token covers no insertion.
+                let repeats = matches!(b.mode, AccessMode::Insert | AccessMode::UpsertReadWrite)
+                    .then(|| self.deleter(&a.object))
+                    .flatten();
+
+                match repeats {
+                    None => {
+                        return Ok(guard_evidence(
+                            reader,
+                            guard,
+                            GuardCoverage::ObservedVersion {
+                                read: observed.read.clone(),
+                                read_step: observed.step,
+                                version_field: version.clone(),
+                            },
+                            BTreeSet::from([version.clone()]),
+                        ));
+                    }
+
+                    Some(deleted_by) => {
+                        shortfall.get_or_insert(DependencyGap::ObservedVersionMayRepeat {
+                            transaction: reader.reference.clone(),
+                            object: a.object.clone(),
+                            step: a.step,
+                            deleted_by: deleted_by.clone(),
+                        });
+                    }
+                }
+            }
+
+            // The observed-state route: comparisons of the very read.
+            let compared: BTreeSet<FieldPath> = guard
+                .comparisons
+                .iter()
+                .filter(|comparison| {
+                    comparison
+                        .observed
+                        .as_ref()
+                        .is_some_and(|observed| observed.step == a.step)
+                })
+                .map(|comparison| comparison.field.clone())
+                .collect();
+
+            let Some(TransactionStep::Read(observing)) = reader.transaction.steps.get(a.step)
+            else {
+                continue;
+            };
+
+            if compared.is_empty() {
+                continue;
+            }
+
+            match uncovered(&a.fields, &b.fields, &compared) {
+                None => {
+                    return Ok(guard_evidence(
+                        reader,
+                        guard,
+                        GuardCoverage::ObservedState {
+                            read: observing.bind.clone(),
+                            read_step: a.step,
+                        },
+                        compared,
+                    ));
+                }
+
+                Some(fields) => {
+                    shortfall.get_or_insert(
+                        DependencyGap::ObservedStateGuardDoesNotCoverConflict {
+                            transaction: reader.reference.clone(),
+                            object: a.object.clone(),
+                            step: a.step,
+                            guard_step: guard.step,
+                            fields,
+                        },
+                    );
+                }
+            }
+        }
+
+        Err(
+            shortfall.unwrap_or_else(|| DependencyGap::ObservedStateGuardMissing {
+                transaction: reader.reference.clone(),
+                object: a.object.clone(),
+                step: a.step,
+            }),
+        )
     }
 
     /// The lock of the template that protects the access (§47, §48):
     /// on the same object, covering the selected domain, acquired at
     /// an earlier step, and exclusive when the access is a mutation.
+    #[allow(clippy::result_large_err)]
     fn covering_lock(
         &self,
         template: &TransactionTemplate<'_>,
@@ -1206,8 +1649,8 @@ impl<'a> ConflictIndex<'a> {
     }
 
     /// Every write to a managed field that is not the protocol's own:
-    /// an ordinary write naming the field, or a cursor advance of it
-    /// under a different rule (§55, §56).
+    /// an update, compare-and-set, or upsert update naming the field,
+    /// or a cursor advance of it under a different rule (§55, §56).
     pub fn uncontrolled_managed_writers(
         &self,
         object: &Id,
@@ -1222,12 +1665,24 @@ impl<'a> ConflictIndex<'a> {
                     continue;
                 }
 
+                let touches = |fields: &AccessFields| match fields {
+                    AccessFields::Only(fields) => fields.iter().any(|written| {
+                        written.0.starts_with(&field.0) || field.0.starts_with(&written.0)
+                    }),
+                    AccessFields::All | AccessFields::Unknown => true,
+                };
+
                 let uncontrolled = match access.mode {
-                    AccessMode::Write => match &access.fields {
-                        AccessFields::Only(fields) => fields.iter().any(|written| {
-                            written.0.starts_with(&field.0) || field.0.starts_with(&written.0)
-                        }),
-                        AccessFields::All | AccessFields::Unknown => true,
+                    AccessMode::Update | AccessMode::CompareWrite => touches(&access.fields),
+
+                    // Only the update branch assigns an existing
+                    // instance's fields; the insert branch initializes
+                    // one, as an insert does.
+                    AccessMode::UpsertReadWrite => match &template.transaction.steps[access.step] {
+                        TransactionStep::Upsert(upsert) => {
+                            touches(&AccessFields::Only(upsert.update_fields.clone()))
+                        }
+                        _ => true,
                     },
 
                     AccessMode::CursorReadWrite => {
@@ -1251,43 +1706,114 @@ impl<'a> ConflictIndex<'a> {
     }
 }
 
-/// Whether a `ValidateVersion` step's expected version is a preceding
-/// read of the same instance's version field: the read selects the
-/// same instance, precedes the validation, covers the version field,
-/// and the expected reference names exactly that field of that read.
-pub fn observes_version(
+/// The earlier read a guarded mutation's comparison observes, when the
+/// comparison is an observed-state one (§9): `expected` is exactly
+/// `transaction_read:<bind>.<the compared field>`, and `<bind>` is a
+/// read that precedes the comparison, selects the same instance, and
+/// covers the field.
+pub fn observation(
     transaction: &Transaction,
-    validate_step: usize,
+    step: usize,
     target: &ObjectSelector,
-    version: &FieldPath,
-    expected: &ValueRef,
-) -> bool {
-    let ValueSource::TransactionRead(bind) = &expected.source else {
-        return false;
-    };
-
-    if &expected.path != version {
-        return false;
-    }
+    condition: &CompareCondition,
+) -> Option<ObservedValue> {
+    let bind = condition.observed_read()?;
 
     transaction
         .steps
         .iter()
-        .take(validate_step)
-        .any(|step| match step {
-            TransactionStep::Read(read) => {
-                &read.bind == bind
+        .enumerate()
+        .take(step)
+        .find_map(|(position, inner)| match inner {
+            TransactionStep::Read(read)
+                if &read.bind == bind
                     && read.target == *target
                     && match &read.fields {
                         FieldSelection::All => true,
-                        FieldSelection::Only(fields) => {
-                            fields.iter().any(|field| version.0.starts_with(&field.0))
-                        }
-                    }
+                        FieldSelection::Only(fields) => fields
+                            .iter()
+                            .any(|field| condition.field.0.starts_with(&field.0)),
+                    } =>
+            {
+                Some(ObservedValue {
+                    read: bind.clone(),
+                    step: position,
+                })
             }
 
-            _ => false,
+            _ => None,
         })
+}
+
+/// The evidence a guarded mutation of `template` supplies.
+fn guard_evidence(
+    template: &TransactionTemplate<'_>,
+    guard: &ConditionalMutation,
+    coverage: GuardCoverage,
+    compared: BTreeSet<FieldPath>,
+) -> CommitOrderEvidence {
+    CommitOrderEvidence::AtomicConditionalMutation {
+        guarded_by: template.reference.clone(),
+        step: guard.step,
+        object: guard.target.object.clone(),
+        mechanism: guard.mechanism,
+        guard: coverage,
+        compared_fields: if compared.is_empty() {
+            guard
+                .comparisons
+                .iter()
+                .map(|comparison| comparison.field.clone())
+                .collect()
+        } else {
+            compared
+        },
+    }
+}
+
+/// The conflicting regions of a read footprint and a write footprint
+/// that no compared field covers, or `None` when every one is covered.
+/// A compared field covers itself and everything nested in it; where
+/// either footprint is undeclared, or both are whole instances, the
+/// conflict cannot be enumerated and nothing is covered.
+fn uncovered(
+    read: &AccessFields,
+    written: &AccessFields,
+    compared: &BTreeSet<FieldPath>,
+) -> Option<AccessFields> {
+    let covered = |region: &FieldPath| compared.iter().any(|field| region.0.starts_with(&field.0));
+
+    let regions: BTreeSet<FieldPath> = match (read, written) {
+        (AccessFields::Unknown, _) | (_, AccessFields::Unknown) => {
+            return Some(AccessFields::Unknown);
+        }
+
+        (AccessFields::All, AccessFields::All) => return Some(AccessFields::All),
+
+        (AccessFields::All, AccessFields::Only(fields))
+        | (AccessFields::Only(fields), AccessFields::All) => fields.clone(),
+
+        (AccessFields::Only(read), AccessFields::Only(written)) => read
+            .iter()
+            .flat_map(|r| {
+                written.iter().filter_map(move |w| {
+                    if r.0.starts_with(&w.0) {
+                        Some(r.clone())
+                    } else if w.0.starts_with(&r.0) {
+                        Some(w.clone())
+                    } else {
+                        None
+                    }
+                })
+            })
+            .collect(),
+    };
+
+    let missing: BTreeSet<FieldPath> = regions
+        .into_iter()
+        .filter(|region| !covered(region))
+        .collect();
+
+    (!missing.is_empty()).then_some(AccessFields::Only(missing))
 }
 
 /// The `Eq` constraints of a predicate, flattened.
@@ -1469,7 +1995,7 @@ pub enum DependencyKind {
     /// The target reads what the source wrote.
     WriteRead,
 
-    /// The source read a version the target then overwrote — the
+    /// The source read state the target then overwrote — the
     /// anti-dependency behind write skew.
     ReadWriteAntiDependency,
 
@@ -1529,15 +2055,31 @@ pub enum CommitOrderEvidence {
         writer_lock: LockRef,
     },
 
-    /// The named transaction validates the instance's version at
-    /// commit against the version it observed, and the other side's
-    /// mutation advances that version, so a stale observation rejects
-    /// rather than commits (§49).
-    VersionValidation {
-        validated_by: TransactionRef,
+    /// An atomic conditional mutation of the named transaction — a
+    /// compare-and-set, transition, cursor advance, fence, or upsert —
+    /// constrains the order: its condition and mutation are one storage
+    /// operation whose write protection is held to commit, and the
+    /// `guard` says why it covers this dependency (§21–§26).
+    AtomicConditionalMutation {
+        guarded_by: TransactionRef,
+
+        /// The guarded mutation's step.
+        step: usize,
+
         object: Id,
-        field: FieldPath,
+        mechanism: ConditionalMutationKind,
+        guard: GuardCoverage,
+
+        #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+        compared_fields: BTreeSet<FieldPath>,
     },
+
+    /// The reader only reads, and observes committed state at one
+    /// instant, which serves as its serialization point: every write it
+    /// observed committed before it, every write it missed commits after
+    /// it, so no cycle of otherwise commit-ordered dependencies can pass
+    /// through it.
+    ReadOnlyObservation { isolation: TransactionIsolation },
 
     /// Both accesses advance one cursor domain under one rule, so the
     /// accepted positions order the commits (§50).
@@ -1549,6 +2091,40 @@ pub enum CommitOrderEvidence {
 
     /// No declared fact constrains the commit order.
     None,
+}
+
+/// Why an atomic conditional mutation covers a dependency.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum GuardCoverage {
+    /// The access is part of the guarded mutation's own atomic
+    /// statement: its condition or its mutation.
+    Atomic,
+
+    /// The access follows the guarded mutation of the same instance,
+    /// under the write protection it holds to commit.
+    HeldProtection,
+
+    /// The guarded mutation compares, against their observed values,
+    /// every field of the instance the earlier read observed that the
+    /// conflict touches.
+    ObservedState { read: Id, read_step: usize },
+
+    /// The guarded mutation compares the object's version token against
+    /// the one the earlier read observed — at or before the access it
+    /// covers; every committed mutation of the live instance publishes
+    /// a newer token, and a deletion leaves none to match.
+    ObservedVersion {
+        read: Id,
+        read_step: usize,
+        version_field: FieldPath,
+    },
+
+    /// The reader holds a lock on the instance from before its
+    /// observation to commit, and the writer's guarded mutation must
+    /// acquire the instance's write protection, which that lock
+    /// withholds until the reader terminates.
+    LockedReader { reader_lock: LockRef },
 }
 
 /// A missing premise of commit-order evidence.
@@ -1574,17 +2150,44 @@ pub enum DependencyGap {
         access_step: usize,
     },
 
-    /// The reader does not validate the observed instance's version
-    /// at commit.
-    VersionValidationMissing {
+    /// The reader observes one identified instance, and no later atomic
+    /// mutation of it compares the observed state or version: nothing
+    /// keeps a stale observation from participating in a commit.
+    ObservedStateGuardMissing {
         transaction: TransactionRef,
         object: Id,
+        step: usize,
     },
 
-    /// The writer does not advance the version the reader validates.
-    VersionBumpMissing {
+    /// A later guarded mutation compares part of what the read
+    /// observed, but not every field the conflict touches.
+    ObservedStateGuardDoesNotCoverConflict {
         transaction: TransactionRef,
         object: Id,
+        step: usize,
+        guard_step: usize,
+        fields: AccessFields,
+    },
+
+    /// The reader observes a set or range rather than one identified
+    /// instance, so no conditional mutation of one instance can stand
+    /// for it — a concurrent insert of a new matching instance escapes
+    /// every such guard (§25).
+    ObservedStateNotIdentified {
+        transaction: TransactionRef,
+        object: Id,
+        step: usize,
+    },
+
+    /// The reader's guard compares the observed version, but the
+    /// conflict is an insertion and the object is deleted elsewhere: an
+    /// instance inserted after a deletion establishes its token afresh,
+    /// and may repeat the one observed.
+    ObservedVersionMayRepeat {
+        transaction: TransactionRef,
+        object: Id,
+        step: usize,
+        deleted_by: TransactionRef,
     },
 
     /// The transaction declares no isolation, so nothing says it reads

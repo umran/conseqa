@@ -2,7 +2,7 @@
 //!
 //! A System One decider is asked about a prompt, never about Conseqa:
 //! what a transaction does reaches it as a sentence a prompt could be
-//! matched against, not as DSL. Locks, version guards and established
+//! matched against, not as DSL. Locks, comparisons and established
 //! artifacts are how a transaction protects or reports its work, not
 //! work a prompt would describe, so they are left out.
 
@@ -21,16 +21,28 @@ pub(super) fn summarize(transaction: &Transaction) -> Option<String> {
         let phrase = match step {
             TransactionStep::Read(read) => Some(format!("reads {}", selected(&read.target))),
 
-            TransactionStep::Write(write) => {
+            TransactionStep::Update(update) => {
                 mutates = true;
 
-                Some(format!("updates {}", selected(&write.target)))
+                Some(format!("updates {}", selected(&update.target)))
+            }
+
+            TransactionStep::CompareAndSet(cas) => {
+                mutates = true;
+
+                Some(format!("updates {}", selected(&cas.target)))
             }
 
             TransactionStep::Insert(insert) => {
                 mutates = true;
 
                 Some(format!("inserts a new `{}`", insert.object))
+            }
+
+            TransactionStep::Upsert(upsert) => {
+                mutates = true;
+
+                Some(format!("inserts or updates {}", selected(&upsert.target)))
             }
 
             TransactionStep::Delete(delete) => {
@@ -80,8 +92,6 @@ pub(super) fn summarize(transaction: &Transaction) -> Option<String> {
             }
 
             TransactionStep::Lock(_)
-            | TransactionStep::ValidateVersion(_)
-            | TransactionStep::BumpVersion(_)
             | TransactionStep::EstablishEffectIntent(_)
             | TransactionStep::EstablishTransactionOutput(_) => None,
         };

@@ -356,10 +356,12 @@ transaction against its own concurrent execution. The route is badged:
 database orders the closure itself, *serialization graph* when the
 arrows carry the argument. Beneath the drawing, each arrow expands to
 its dependencies — step to step, access modes, object and fields,
-overlap — each with its evidence pill (strict lock, version
-validation, ordered cursor, atomic write order, committed read) or its
-gap pills (no lock on the reader, no version validation, overlap not
-proven disjoint, …) and the checker's sentence, ids linked. An
+overlap — each with its evidence pill (strict lock, conditional
+mutation, observed version guard, observed field guard, locked read,
+read-only observation, ordered cursor, atomic write order, committed
+read) or its gap pills (no lock on the reader, no observed-state guard,
+guard misses the conflicting fields, observes a set, overlap not proven
+disjoint, …) and the checker's sentence, ids linked. An
 ordering verdict adds the **mechanism strip** above that argument: the
 position, the guard's rule (successor, monotonic after, or a fence),
 and the managed field it advances, with the step that carries it — or
@@ -391,7 +393,7 @@ transitions in the machine view inherit theirs.
 ## The obligation report
 
 The report format is `conseqa::analyzer::report` (`ProverReport`,
-`format: 7`): one obligation per declared requirement — transaction
+`format: 9`): one obligation per declared requirement — transaction
 serializability and transaction ordering (anchored to the transaction
 that declares them, with the operation whose program carries it),
 idempotency, result replay (the result half of an idempotency
@@ -407,7 +409,12 @@ revisions; format 7 retired the operation-level serialization and
 ordering properties for `transaction_serializability` and
 `transaction_ordering`, proven from the transactions alone — isolation,
 strict locks, the version protocol, cursors and fences — and never
-from the runtime topology, so those proofs are always `l0_only`.
+from the runtime topology, so those proofs are always `l0_only`;
+format 8 judged request results per variant and carried the `abandon`
+terminal; format 9 (dsl 6) replaced version validation with atomic
+conditional-mutation evidence — a compare-and-set, transition, or
+cursor advance comparing the observed version or fields — and the
+read-only observation.
 Unknown is epistemic: the checker could not establish the property,
 typically because a required fact is `unspecified` or no V1 verifier
 attempts that family. It is never evidence of a violation.

@@ -19,6 +19,7 @@ import { hashes } from "../lib/route";
 import { typeText } from "../lib/text";
 import { useApp, useObligationsAt } from "../state/AppState";
 import type {
+  CompareCondition,
   Condition,
   Derivation,
   Id,
@@ -500,6 +501,24 @@ export function PredicateView({ predicate }: { predicate: SelectorPredicate }) {
         </span>
       );
   }
+}
+
+/** The comparisons a guarded mutation conjoins with its own condition,
+ *  read as its guard: `if version = ↑read.order.version ∧ …`. */
+export function CompareView({ compare }: { compare: CompareCondition[] }) {
+  if (compare.length === 0) return null;
+  return (
+    <span className="inline-flex flex-wrap items-center gap-1">
+      <span>if</span>
+      {compare.map((condition, i) => (
+        <Fragment key={i}>
+          {i > 0 && <Mono className="text-kumo-inactive">∧</Mono>}
+          <Mono className="text-kumo-subtle">{pathText(condition.field)} =</Mono>
+          <SelectorValueView value={condition.expected} />
+        </Fragment>
+      ))}
+    </span>
+  );
 }
 
 /** A branch condition, its values rendered as references. */

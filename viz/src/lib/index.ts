@@ -149,8 +149,8 @@ export function findTransactionSite(op: Operation, id: Id): TransactionSite | nu
 }
 
 /** Whether a transaction step is a logical commit guard that may reject
- *  the containing transaction: a transition (subject not in a `from`
- *  state), a version validation, a cursor advance, or a fence. */
+ *  the containing transaction: a compare-and-set, a transition (subject
+ *  not in a `from` state), a cursor advance, or a fence. */
 /** Whether every path through the block ends at a terminal, by the
  *  validator's rule: the last step is a `return` or `complete`, or a
  *  decision whose every arm terminates (a branch needs an `otherwise`),
@@ -177,8 +177,8 @@ export function blockTerminates(block: OperationBlock): boolean {
 
 export function stepRejects(step: TransactionStep): boolean {
   switch (step.kind) {
+    case "compare_and_set":
     case "transition":
-    case "validate_version":
     case "advance_cursor":
     case "fence":
       return true;

@@ -1,4 +1,4 @@
-dsl: 5
+dsl: 6
 revision: 24
 services:
   service.shop:
@@ -467,27 +467,6 @@ operations:
               - - quantity
               - - status
               - - version
-          - kind: validate_version
-            target:
-              object: object.order
-              predicate:
-                kind: eq
-                field:
-                - order_id
-                value:
-                  kind: value
-                  value:
-                    source:
-                      kind: input
-                      id: input.cancel_order.request
-                    path:
-                    - order_id
-            expected:
-              source:
-                kind: transaction_read
-                id: read.order
-              path:
-              - version
           - kind: transition
             machine: machine.order_lifecycle
             transition: transition.order.cancel
@@ -505,23 +484,16 @@ operations:
                       id: input.cancel_order.request
                     path:
                     - order_id
+            compare:
+            - field: version
+              expected:
+                source:
+                  kind: transaction_read
+                  id: read.order
+                path:
+                - version
             effect_intents: {}
             effects: {}
-          - kind: bump_version
-            target:
-              object: object.order
-              predicate:
-                kind: eq
-                field:
-                - order_id
-                value:
-                  kind: value
-                  value:
-                    source:
-                      kind: input
-                      id: input.cancel_order.request
-                    path:
-                    - order_id
           - kind: lock
             target:
               object: object.product
@@ -561,7 +533,7 @@ operations:
               fields:
               - - stock
               - - version
-          - kind: write
+          - kind: update
             target:
               object: object.product
               predicate:
@@ -591,21 +563,6 @@ operations:
                   id: read.order
                 path:
                 - quantity
-          - kind: bump_version
-            target:
-              object: object.product
-              predicate:
-                kind: eq
-                field:
-                - product_id
-                value:
-                  kind: value
-                  value:
-                    source:
-                      kind: transaction_read
-                      id: read.order
-                    path:
-                    - product_id
           - kind: establish_transaction_output
             bind: output.cancelled
             schema: schema.CancelOrderResponse
@@ -657,28 +614,6 @@ operations:
                   kind: only
                   fields:
                   - - status
-                  - - version
-              - kind: validate_version
-                target:
-                  object: object.order
-                  predicate:
-                    kind: eq
-                    field:
-                    - order_id
-                    value:
-                      kind: value
-                      value:
-                        source:
-                          kind: input
-                          id: input.cancel_order.request
-                        path:
-                        - order_id
-                expected:
-                  source:
-                    kind: transaction_read
-                    id: read.order_state
-                  path:
-                  - version
               - kind: establish_transaction_output
                 bind: output.order_state
                 schema: schema.Order
@@ -695,21 +630,6 @@ operations:
                       id: read.order_state
                     path:
                     - status
-            rejected:
-              steps:
-              - kind: return
-                request: input.cancel_order.request
-                outcome:
-                  kind: err
-                  error: not_cancellable
-                  values:
-                    kind: deterministic
-                    from:
-                    - source:
-                        kind: input
-                        id: input.cancel_order.request
-                      path:
-                      - order_id
           - kind: branch
             condition:
               kind: eq
@@ -906,27 +826,6 @@ operations:
               - - order_id
               - - status
               - - version
-          - kind: validate_version
-            target:
-              object: object.order
-              predicate:
-                kind: eq
-                field:
-                - order_id
-                value:
-                  kind: value
-                  value:
-                    source:
-                      kind: input
-                      id: input.pay_order.request
-                    path:
-                    - order_id
-            expected:
-              source:
-                kind: transaction_read
-                id: read.pay_order.order
-              path:
-              - version
           - kind: transition
             machine: machine.order_lifecycle
             transition: transition.order.pay
@@ -944,23 +843,16 @@ operations:
                       id: input.pay_order.request
                     path:
                     - order_id
+            compare:
+            - field: version
+              expected:
+                source:
+                  kind: transaction_read
+                  id: read.pay_order.order
+                path:
+                - version
             effect_intents: {}
             effects: {}
-          - kind: bump_version
-            target:
-              object: object.order
-              predicate:
-                kind: eq
-                field:
-                - order_id
-                value:
-                  kind: value
-                  value:
-                    source:
-                      kind: input
-                      id: input.pay_order.request
-                    path:
-                    - order_id
           - kind: insert
             object: object.payment
             values:
@@ -1031,28 +923,6 @@ operations:
                   fields:
                   - - order_id
                   - - status
-                  - - version
-              - kind: validate_version
-                target:
-                  object: object.order
-                  predicate:
-                    kind: eq
-                    field:
-                    - order_id
-                    value:
-                      kind: value
-                      value:
-                        source:
-                          kind: input
-                          id: input.pay_order.request
-                        path:
-                        - order_id
-                expected:
-                  source:
-                    kind: transaction_read
-                    id: read.pay_order.lookup
-                  path:
-                  - version
               - kind: establish_transaction_output
                 bind: output.pay_order.lookup
                 schema: schema.Order
@@ -1069,21 +939,6 @@ operations:
                       id: read.pay_order.lookup
                     path:
                     - status
-            rejected:
-              steps:
-              - kind: return
-                request: input.pay_order.request
-                outcome:
-                  kind: err
-                  error: not_payable
-                  values:
-                    kind: deterministic
-                    from:
-                    - source:
-                        kind: input
-                        id: input.pay_order.request
-                      path:
-                      - order_id
           - kind: branch
             condition:
               kind: not
@@ -1272,7 +1127,7 @@ operations:
                     - product_id
             fields:
               kind: all
-          - kind: validate_version
+          - kind: compare_and_set
             target:
               object: object.product
               predicate:
@@ -1287,27 +1142,14 @@ operations:
                       id: input.place_order.request
                     path:
                     - product_id
-            expected:
-              source:
-                kind: transaction_read
-                id: read.place_order.product
-              path:
-              - version
-          - kind: write
-            target:
-              object: object.product
-              predicate:
-                kind: eq
-                field:
-                - product_id
-                value:
-                  kind: value
-                  value:
-                    source:
-                      kind: input
-                      id: input.place_order.request
-                    path:
-                    - product_id
+            compare:
+            - field: version
+              expected:
+                source:
+                  kind: transaction_read
+                  id: read.place_order.product
+                path:
+                - version
             fields:
             - - stock
             values:
@@ -1323,21 +1165,6 @@ operations:
                   id: input.place_order.request
                 path:
                 - quantity
-          - kind: bump_version
-            target:
-              object: object.product
-              predicate:
-                kind: eq
-                field:
-                - product_id
-                value:
-                  kind: value
-                  value:
-                    source:
-                      kind: input
-                      id: input.place_order.request
-                    path:
-                    - product_id
           - kind: insert
             object: object.order
             values:
@@ -1501,7 +1328,7 @@ operations:
               kind: only
               fields:
               - - stock
-          - kind: write
+          - kind: update
             target:
               object: object.product
               predicate:
@@ -1531,21 +1358,6 @@ operations:
                   id: input.restock.request
                 path:
                 - quantity
-          - kind: bump_version
-            target:
-              object: object.product
-              predicate:
-                kind: eq
-                field:
-                - product_id
-                value:
-                  kind: value
-                  value:
-                    source:
-                      kind: input
-                      id: input.restock.request
-                    path:
-                    - product_id
           - kind: insert
             object: object.restock_receipt
             values:
@@ -1671,28 +1483,6 @@ operations:
               fields:
               - - order_id
               - - status
-              - - version
-          - kind: validate_version
-            target:
-              object: object.order
-              predicate:
-                kind: eq
-                field:
-                - order_id
-                value:
-                  kind: value
-                  value:
-                    source:
-                      kind: input
-                      id: input.ship_order.request
-                    path:
-                    - order_id
-            expected:
-              source:
-                kind: transaction_read
-                id: read.ship_order.inspect
-              path:
-              - version
           - kind: establish_transaction_output
             bind: output.ship_order.lookup
             schema: schema.Order
@@ -1709,9 +1499,6 @@ operations:
                   id: read.ship_order.inspect
                 path:
                 - status
-        rejected:
-          steps:
-          - kind: complete
       - kind: branch
         condition:
           kind: eq
@@ -1774,27 +1561,6 @@ operations:
                   - - order_id
                   - - status
                   - - version
-              - kind: validate_version
-                target:
-                  object: object.order
-                  predicate:
-                    kind: eq
-                    field:
-                    - order_id
-                    value:
-                      kind: value
-                      value:
-                        source:
-                          kind: input
-                          id: input.ship_order.request
-                        path:
-                        - order_id
-                expected:
-                  source:
-                    kind: transaction_read
-                    id: read.ship_order.order
-                  path:
-                  - version
               - kind: transition
                 machine: machine.order_lifecycle
                 transition: transition.order.ship
@@ -1812,23 +1578,16 @@ operations:
                           id: input.ship_order.request
                         path:
                         - order_id
+                compare:
+                - field: version
+                  expected:
+                    source:
+                      kind: transaction_read
+                      id: read.ship_order.order
+                    path:
+                    - version
                 effect_intents: {}
                 effects: {}
-              - kind: bump_version
-                target:
-                  object: object.order
-                  predicate:
-                    kind: eq
-                    field:
-                    - order_id
-                    value:
-                      kind: value
-                      value:
-                        source:
-                          kind: input
-                          id: input.ship_order.request
-                        path:
-                        - order_id
               - kind: establish_transaction_output
                 bind: output.ship_order.shipped
                 schema: schema.ShipOrderResponse

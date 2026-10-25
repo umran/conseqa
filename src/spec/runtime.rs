@@ -481,7 +481,7 @@ pub struct OutboxDispatch {
 /// old attempt having terminated — and no L1 declaration is: the
 /// state-level guard against a stale attempt is a transaction
 /// [`Fence`](super::Fence), [`AdvanceCursor`](super::AdvanceCursor),
-/// or [`ValidateVersion`](super::ValidateVersion) step.
+/// or [`CompareAndSet`](super::CompareAndSet) step.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OutboxRouting {

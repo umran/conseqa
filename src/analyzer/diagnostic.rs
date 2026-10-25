@@ -170,11 +170,14 @@ pub enum ValidationCode {
     // Object versions.
     InvalidObjectVersionField,
     DirectWriteToVersionField,
-    MissingVersionBump,
-    DuplicateVersionBump,
-    VersionValidationWithoutObservedVersion,
-    VersionValidationWithoutIdentifiedInstance,
-    VersionProtocolOnUnversionedObject,
+
+    // Atomic conditional mutations.
+    CompareAndSetWithoutIdentifiedInstance,
+    CompareAndSetWithoutComparison,
+    DuplicateCompareField,
+    UpsertWithoutIdentifiedInstance,
+    UpsertWithoutUpdateFields,
+    UpsertMutatesIdentity,
 
     // Managed monotonic fields.
     ManagedFieldRoleConflict,

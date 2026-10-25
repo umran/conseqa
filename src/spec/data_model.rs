@@ -75,29 +75,35 @@ pub struct DataObject {
     pub identity: Vec<FieldPath>,
 
     /// The object's application concurrency token, when it declares
-    /// one. Absent means the object carries no version protocol —
-    /// epistemic absence of the OCC route, not a claim that
-    /// concurrent mutation is safe.
+    /// one. Absent means the object carries no version token — no
+    /// observed-version guard is available, though an observed-field
+    /// comparison still is; never a claim that concurrent mutation is
+    /// safe.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version: Option<ObjectVersion>,
 }
 
-/// A versioned object's one monotonically increasing application
-/// concurrency token.
+/// A versioned object's application concurrency token.
 ///
 /// The field must be a non-optional `int` on the object's canonical
-/// schema, and must not be part of the object's identity. It is
-/// managed by the version protocol and never assigned directly:
-/// `Insert` creates the initial version, every `Write` or `Transition`
-/// of a live versioned instance must be accompanied by a `BumpVersion`
-/// of that instance (the unconditional increment that publishes the
-/// change), `Delete` removes the versioned instance, and an ordinary
-/// `Write` may not name the field. `ValidateVersion` is the other
-/// half: the transaction commits only if the version still equals the
-/// one an earlier read of this transaction observed, so a stale read
-/// can never silently participate in a successful commit. A proof over
-/// a read-then-write needs the reader's validation and the writer's
-/// bump; neither step implies the other.
+/// schema, outside the object's identity. It is managed by the
+/// persistence protocol, never assigned by an application mutation,
+/// and publication is an invariant of the object rather than a
+/// transaction step: insertion establishes an initial token, every
+/// committed transaction that mutates a live instance leaves it
+/// strictly greater than before that mutation (the precise increment
+/// is not observable — once per transaction, per statement, by an ORM
+/// or a trigger all qualify), and deletion removes the instance.
+///
+/// A token is what lets one comparison guard every field an earlier
+/// read observed: a [`CompareAndSet`](super::CompareAndSet) — or a
+/// transition or cursor advance carrying the comparison (a fence holds
+/// no write protection on an equal token, so it guards nothing) —
+/// that requires the version an earlier read of the same instance
+/// observed cannot succeed once any other committed transaction has
+/// mutated or deleted that instance, so the stale observation cannot
+/// participate in a successful commit. No writer-side annotation is
+/// involved.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ObjectVersion {

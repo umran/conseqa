@@ -374,7 +374,7 @@ fn rejects_publication_schema_not_carried_by_topic() {
 
     let transaction = transaction_mut(&mut model, "operation.cancel_order", "tx.cancel_order");
 
-    let TransactionStep::EstablishEffectIntent(establish) = &mut transaction.steps[4] else {
+    let TransactionStep::EstablishEffectIntent(establish) = &mut transaction.steps[2] else {
         panic!("expected the intent establishment");
     };
 
@@ -451,8 +451,8 @@ fn rejects_transaction_access_without_data_model() {
 
     let errors = validation::validate(&model);
 
-    // One error per accessing step: the read, the version validation,
-    // the transition, and the version bump each name the object.
+    // One error per accessing step: the read and the guarded
+    // transition each name the object.
     assert_eq!(
         errors,
         vec![
@@ -460,7 +460,7 @@ fn rejects_transaction_access_without_data_model() {
                 transaction: id("tx.cancel_order"),
                 object: id("object.order"),
             };
-            4
+            2
         ]
     );
 }
@@ -482,7 +482,7 @@ fn rejects_transaction_access_outside_declared_data_model() {
                 data_model: id("data.inventory"),
                 object: id("object.order"),
             };
-            4
+            2
         ]
     );
 }
@@ -518,7 +518,7 @@ fn rejects_state_transition_with_wrong_subject_object() {
 
     let transaction = transaction_mut(&mut model, "operation.apply_payment", "tx.apply_payment");
 
-    let TransactionStep::Transition(transition) = &mut transaction.steps[3] else {
+    let TransactionStep::Transition(transition) = &mut transaction.steps[2] else {
         panic!("expected transition step");
     };
 
@@ -612,7 +612,7 @@ fn transition_effect_intents_coverage_is_independent_of_the_guarantee() {
 
     transaction.idempotency = IdempotencyGuarantee::Unspecified;
 
-    let TransactionStep::Transition(transition) = &mut transaction.steps[3] else {
+    let TransactionStep::Transition(transition) = &mut transaction.steps[2] else {
         panic!("expected the mark_paid transition step");
     };
 
@@ -733,7 +733,7 @@ fn rejects_transaction_read_from_another_transaction() {
 
     let transaction = transaction_mut(&mut model, "operation.transfer_stock", "tx.transfer_stock");
 
-    let TransactionStep::Write(write) = &mut transaction.steps[3] else {
+    let TransactionStep::Update(write) = &mut transaction.steps[3] else {
         panic!("expected the source-warehouse write");
     };
 
@@ -790,7 +790,7 @@ fn rejects_reference_to_field_the_read_did_not_select() {
         "tx.reserve_inventory",
     );
 
-    let TransactionStep::Write(write) = &mut transaction.steps[1] else {
+    let TransactionStep::Update(write) = &mut transaction.steps[1] else {
         panic!("expected the stock write");
     };
 
@@ -980,7 +980,7 @@ fn rejects_transaction_read_in_recoverability_key() {
 fn set_reserve_write_source(model: &mut Model, source: ValueSource, path: &[&str]) {
     let transaction = transaction_mut(model, "operation.reserve_inventory", "tx.reserve_inventory");
 
-    let TransactionStep::Write(write) = &mut transaction.steps[1] else {
+    let TransactionStep::Update(write) = &mut transaction.steps[1] else {
         panic!("expected the stock write");
     };
 
@@ -1250,7 +1250,7 @@ fn rejects_invalid_field_path_in_execute_effect_values() {
 fn apply_payment_transition(model: &mut Model) -> &mut StateTransition {
     let transaction = transaction_mut(model, "operation.apply_payment", "tx.apply_payment");
 
-    let TransactionStep::Transition(transition) = &mut transaction.steps[3] else {
+    let TransactionStep::Transition(transition) = &mut transaction.steps[2] else {
         panic!("expected the mark_paid transition step");
     };
 
@@ -1293,7 +1293,7 @@ fn accepts_empty_effect_intents_for_transition_without_side_effects() {
         .transaction(&id("tx.cancel_order"))
         .unwrap();
 
-    let TransactionStep::Transition(transition) = &transaction.steps[2] else {
+    let TransactionStep::Transition(transition) = &transaction.steps[1] else {
         panic!("expected the cancel transition step");
     };
 
@@ -1362,7 +1362,7 @@ fn rejects_transition_intent_binding_owned_by_another_transition() {
     // side effect has no instance here for a binding to establish.
     let transaction = transaction_mut(&mut model, "operation.cancel_order", "tx.cancel_order");
 
-    let TransactionStep::Transition(transition) = &mut transaction.steps[2] else {
+    let TransactionStep::Transition(transition) = &mut transaction.steps[1] else {
         panic!("expected the cancel transition step");
     };
 

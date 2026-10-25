@@ -74,13 +74,20 @@ const EVENT_SEQ_KEY: &str = "task_event_seq";
 /// Bumped to 7 with dsl 5: a program may now hold the `abandon`
 /// terminal, which a format-6 build cannot read. The change is
 /// additive — every format-6 value reads as a format-7 one — so a
-/// format-6 database is upgraded in place ([`UPGRADES_FROM`]), and
-/// only an older build is refused it.
-const FORMAT: u64 = 7;
+/// format-6 database is upgraded in place, and only an older build is
+/// refused it.
+///
+/// Bumped to 8 with dsl 6: transaction programs lose `write`,
+/// `validate_version`, and `bump_version` and gain `update`,
+/// `compare_and_set`, and `upsert`, and the stored verdicts speak the
+/// conditional-mutation evidence. A format-7 workspace holds programs
+/// whose meaning changed, which is not an upgrade but a re-authoring,
+/// so no earlier format is read.
+const FORMAT: u64 = 8;
 
 /// The earlier formats whose every stored value this build reads
 /// unchanged, so opening one only restamps it.
-const UPGRADES_FROM: [u64; 1] = [6];
+const UPGRADES_FROM: [u64; 0] = [];
 
 #[derive(Debug, thiserror::Error)]
 pub enum PersistenceError {

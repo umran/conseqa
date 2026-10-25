@@ -85,9 +85,10 @@ export interface DependencyView {
   /** `same instance`, `may overlap`, or `disjoint`. */
   overlap: string;
   constrained: boolean;
-  /** `strict lock`, `version validation`, `ordered cursor`, `atomic
-   *  write order`, or `committed read`; null when nothing constrains
-   *  the edge. */
+  /** `strict lock`, `conditional mutation`, `observed version guard`,
+   *  `observed field guard`, `locked read`, `read-only observation`,
+   *  `ordered cursor`, `atomic write order`, or `committed read`; null
+   *  when nothing constrains the edge. */
   evidence: string | null;
   /** Short labels for what is missing on an unconstrained edge. */
   gaps: string[];

@@ -21,7 +21,7 @@ import { hashes } from "../lib/route";
 import { predicateText, refString } from "../lib/text";
 import { useApp, useCitations, useObligationsAt, type DetailTarget } from "../state/AppState";
 import { CLIENT_NODE_ID, EXTERNAL_PREFIX, type Edge } from "../types/graph";
-import type { Id, IdempotencyKeyPropagation, OperationBlock, RequirementKind, ResultType } from "../types/model";
+import type { CompareCondition, Id, IdempotencyKeyPropagation, OperationBlock, RequirementKind, ResultType } from "../types/model";
 import { useFrameMode } from "./frameMode";
 import { ProofSummary } from "./TransactionProof";
 import { ObligationCard } from "./ObligationCard";
@@ -785,9 +785,9 @@ function ObjectDetail({ dmId, id }: { dmId: Id; id: Id }) {
         <FactNote fact={objectVersion(obj.version.field)} />
       ) : (
         <p className="text-xs leading-relaxed text-kumo-subtle">
-          No version field: the object carries no application concurrency token, so no
-          validate_version guard can protect a read-then-write on it. Absence of the OCC route,
-          not a claim that concurrent mutation is safe.
+          No version field: the object carries no application concurrency token, so a
+          read-then-write is guarded only by comparing the observed fields themselves, by a
+          lock, or by serializable isolation — never a claim that concurrent mutation is safe.
         </p>
       )}
       <Section title="L1 · storage">
@@ -1418,22 +1418,17 @@ function TransactionDetail({ opId, id }: { opId: Id; id: Id }) {
             <span className="text-sm">{s.kind.replace(/_/g, " ")}</span>
             {s.kind === "read" && <Mono className="text-kumo-subtle">{shortId(s.bind)}</Mono>}
             {s.kind === "transition" && <Mono className="text-kumo-subtle">{shortId(s.transition)}</Mono>}
-            {(s.kind === "write" || s.kind === "delete" || s.kind === "lock")
+            {(s.kind === "update" || s.kind === "upsert" || s.kind === "delete" || s.kind === "lock")
               && <Mono className="text-kumo-subtle">{shortId(s.target.object)}</Mono>}
             {/* A guard's operands are the whole story of the step: which
                 instance it selects, and what it compares against — the
                 version an earlier read of this transaction observed, the
                 incoming position, the token. Naming only the object left
                 readers guessing where a version comes from. */}
-            {s.kind === "validate_version" && (
+            {s.kind === "compare_and_set" && (
               <span className="text-xs text-kumo-subtle">
-                <Mono>{shortId(s.target.object)}</Mono> where {predicateText(s.target.predicate)} still has
-                version <Mono>{refString(s.expected)}</Mono> at commit
-              </span>
-            )}
-            {s.kind === "bump_version" && (
-              <span className="text-xs text-kumo-subtle">
-                <Mono>{shortId(s.target.object)}</Mono> where {predicateText(s.target.predicate)} · version + 1
+                <Mono>{shortId(s.target.object)}</Mono> where {predicateText(s.target.predicate)} if{" "}
+                {compareText(s.compare)} · sets {s.fields.map(pathText).join(", ")}
               </span>
             )}
             {s.kind === "advance_cursor" && (
@@ -1495,7 +1490,7 @@ function RequirementDetail({ opId, prop, reqIndex, transaction }: { opId: Id; pr
     }
     return (
       <Frame kind="transaction requirement" title={`${family} #${reqIndex}`} subtitle={sub}
-        description="An obligation over this transaction's committed history, together with every transaction it may conflict with. Proven from the transactions alone — isolation, locks, the version protocol, cursors, fences — and never from runtime topology, so its verdict survives any change of realization.">
+        description="An obligation over this transaction's committed history, together with every transaction it may conflict with. Proven from the transactions alone — isolation, locks, guarded mutations such as compare-and-set, cursors — and never from runtime topology, so its verdict survives any change of realization.">
         {rows.length > 0 && <KeyValue rows={rows} />}
         {fact && <FactNote fact={fact} />}
         {/* The argument in summary, before the verdict that records it;
@@ -1538,6 +1533,54 @@ function RequirementDetail({ opId, prop, reqIndex, transaction }: { opId: Id; pr
   );
 }
 
+/** One guard comparison per row: the field, what it must equal, and —
+ *  when that is the same field of an earlier read — that it is the
+ *  observed value. */
+function CompareRows({ compare }: { compare: CompareCondition[] }) {
+  return (
+    <List items={compare.map((c, i) => (
+      <span key={i} className="inline-flex flex-wrap items-center gap-1.5">
+        <Mono>{pathText(c.field)}</Mono>
+        <span className="text-kumo-inactive">=</span>
+        {c.expected.kind === "value"
+          ? <RefText value={c.expected.value} />
+          : <Mono>{JSON.stringify(c.expected.value.value)}</Mono>}
+        {observedRead(c) && <span className="text-xs text-kumo-subtle">· the value read observed</span>}
+      </span>
+    ))} />
+  );
+}
+
+/** The comparisons a transition, cursor advance, or fence conjoins with
+ *  its own condition. A fence's are checked, but a fence holds no write
+ *  protection on an equal token, so they guard no read. */
+function GuardSection({ compare, fence }: { compare?: CompareCondition[]; fence?: boolean }) {
+  if (!compare || compare.length === 0) return null;
+  return (
+    <Section title="guard" count={compare.length}>
+      <p className="text-xs leading-relaxed text-kumo-subtle">
+        {fence
+          ? "Conjoined with the fencing condition in the same atomic statement. On an equal token the fence writes nothing and holds no write protection, so these comparisons protect no earlier read."
+          : "Conjoined with the step's own condition in the same atomic statement: if any is false the transaction rejects. Compared against an earlier read of this instance, the version covers every field that read observed."}
+      </p>
+      <CompareRows compare={compare} />
+    </Section>
+  );
+}
+
+/** Whether a comparison names the same field of a transaction read. */
+function observedRead(c: CompareCondition): boolean {
+  return c.expected.kind === "value"
+    && c.expected.value.source.kind === "transaction_read"
+    && pathText(c.expected.value.path) === pathText(c.field);
+}
+
+function compareText(compare: CompareCondition[]): string {
+  return compare
+    .map((c) => `${pathText(c.field)} = ${c.expected.kind === "value" ? refString(c.expected.value) : JSON.stringify(c.expected.value.value)}`)
+    .join(" ∧ ");
+}
+
 function TxStepDetail({ opId, txId, stepIndex }: { opId: Id; txId: Id; stepIndex: number }) {
   const { model, index } = useApp();
   const step = findTransaction(model.operations[opId], txId)?.steps[stepIndex];
@@ -1560,19 +1603,52 @@ function TxStepDetail({ opId, txId, stepIndex }: { opId: Id; txId: Id; stepIndex
           </Section>
         </Frame>
       );
-    case "write":
+    case "update": {
+      const version = findDataObject(model, step.target.object)?.object.version;
       return (
-        <Frame kind="transaction step" title={`write · ${shortId(step.target.object)}`} subtitle={sub}>
+        <Frame kind="transaction step" title={`update · ${shortId(step.target.object)}`} subtitle={sub}
+          description="An unconditional mutation of the selected instances. It is not a stale-read guard: it never rejects because something an earlier read observed has changed. Where the transaction relies on its read staying true, the mutation is a compare-and-set, or the read is protected by a lock or serializable isolation.">
           <KeyValue rows={[["object", <IdLink key="o" id={step.target.object} />], ["predicate", <PredicateView key="p" predicate={step.target.predicate} />]]} />
-          <Section title="fields written"><List items={step.fields.map((f, i) => <Mono key={i}>{pathText(f)}</Mono>)} /></Section>
+          <Section title="fields updated"><List items={step.fields.map((f, i) => <Mono key={i}>{pathText(f)}</Mono>)} /></Section>
           <Section title="value provenance"><DerivationView value={step.values} /></Section>
+          {version && <FactNote fact={objectVersion(version.field)} />}
         </Frame>
       );
+    }
+    case "compare_and_set": {
+      const version = findDataObject(model, step.target.object)?.object.version;
+      return (
+        <Frame kind="transaction step" title={`compare-and-set · ${shortId(step.target.object)}`} subtitle={sub}
+          description="One atomic conditional update of the identified instance — like UPDATE … WHERE id = ? AND version = ?: the comparisons and the mutation are a single storage operation, and once it succeeds the transaction holds the instance's write protection to commit. A comparison that is false, or a missing instance, rejects the transaction: nothing commits, and control enters the rejected block. A comparison against the same field of an earlier read of this instance is an observed-state guard — on the version, it covers every field that read observed, since every committed mutation of the live instance publishes a newer version.">
+          <KeyValue rows={[
+            ["object", <IdLink key="o" id={step.target.object} />],
+            ["predicate", <PredicateView key="p" predicate={step.target.predicate} />],
+            ["mutates", <Mono key="m">{step.fields.map(pathText).join(", ")}</Mono>],
+          ]} />
+          <Section title="compared" count={step.compare.length}><CompareRows compare={step.compare} /></Section>
+          <Section title="value provenance"><DerivationView value={step.values} /></Section>
+          {version && <FactNote fact={objectVersion(version.field)} />}
+        </Frame>
+      );
+    }
     case "insert":
       return (
         <Frame kind="transaction step" title={`insert · ${shortId(step.object)}`} subtitle={sub}>
           <KeyValue rows={[["object", <IdLink key="o" id={step.object} />]]} />
           <Section title="value provenance"><DerivationView value={step.values} /></Section>
+        </Frame>
+      );
+    case "upsert":
+      return (
+        <Frame kind="transaction step" title={`upsert · ${shortId(step.target.object)}`} subtitle={sub}
+          description="One atomic insert-or-update, arbitrated on the object's identity: absent, the instance is inserted; present, the update fields are set. It never rejects, and it protects no read before it — its only concurrency evidence is its own identity arbitration and mutation.">
+          <KeyValue rows={[
+            ["object", <IdLink key="o" id={step.target.object} />],
+            ["predicate", <PredicateView key="p" predicate={step.target.predicate} />],
+            ["updates", <Mono key="u">{step.update_fields.map(pathText).join(", ")}</Mono>],
+          ]} />
+          <Section title="inserted from"><DerivationView value={step.insert_values} /></Section>
+          <Section title="updated from"><DerivationView value={step.update_values} /></Section>
         </Frame>
       );
     case "delete":
@@ -1593,6 +1669,7 @@ function TxStepDetail({ opId, txId, stepIndex }: { opId: Id; txId: Id; stepIndex
         <Frame kind="transaction step" title={`transition · ${shortId(step.transition)}`} subtitle={sub}
           description="A commit guard over the subject's state: the transition applies only when the subject is in one of its from states. Otherwise the transaction rejects — nothing commits, no intent is established, no admission is made — and control enters the step's rejected block.">
           <KeyValue rows={[["machine", <IdLink key="m" id={step.machine} />], ["transition", <IdLink key="t" id={step.transition} />], ["subject", <IdLink key="s" id={step.subject.object} />], ["predicate", <PredicateView key="p" predicate={step.subject.predicate} />]]} />
+          <GuardSection compare={step.compare} />
           {Object.keys(step.effect_intents).length > 0 && (
             <Section title="bound intents">
               {Object.entries(step.effect_intents).map(([eid, intent]) => (
@@ -1628,33 +1705,6 @@ function TxStepDetail({ opId, txId, stepIndex }: { opId: Id; txId: Id; stepIndex
         </Frame>
       );
     }
-    case "validate_version": {
-      const version = findDataObject(model, step.target.object)?.object.version;
-      return (
-        <Frame kind="transaction step" title={`validate version · ${shortId(step.target.object)}`} subtitle={sub}
-          description="The observation guard of the version protocol. At commit the transaction proceeds only if the selected instance's version still equals the version an earlier read of this transaction observed; any change rejects it — nothing commits, and control enters the rejected block. The guard compares and never increments, holds no lock across the read-to-commit window, and is evaluated at commit wherever it sits in the step list. It is never required by validation: it is declared where the transaction relies on what it read, and a serializability proof over a read-then-write needs it on the reader's side together with the writer's bump_version — without the bump there is nothing for the guard to detect.">
-          <KeyValue rows={[
-            ["object", <IdLink key="o" id={step.target.object} />],
-            ["predicate", <PredicateView key="p" predicate={step.target.predicate} />],
-            ["expected", <RefText key="e" value={step.expected} />],
-          ]} />
-          {version && <FactNote fact={objectVersion(version.field)} />}
-        </Frame>
-      );
-    }
-    case "bump_version": {
-      const version = findDataObject(model, step.target.object)?.object.version;
-      return (
-        <Frame kind="transaction step" title={`bump version · ${shortId(step.target.object)}`} subtitle={sub}
-          description="The publishing half of the version protocol: at commit the selected instance's version becomes one higher than it is at that moment, unconditionally. The step compares nothing and never rejects; its purpose is other transactions, whose validate_version guards detect the moved token. Required beside every write or transition of a live versioned instance, at most once per instance; insert and delete need none. A bump on an instance the transaction never read is a legitimate blind write. With a validate_version on the same instance the two compose into a compare-and-swap from the observed version to that version plus one.">
-          <KeyValue rows={[
-            ["object", <IdLink key="o" id={step.target.object} />],
-            ["predicate", <PredicateView key="p" predicate={step.target.predicate} />],
-          ]} />
-          {version && <FactNote fact={objectVersion(version.field)} />}
-        </Frame>
-      );
-    }
     case "advance_cursor":
       return (
         <Frame kind="transaction step" title={`advance cursor · ${shortId(step.target.object)}.${pathText(step.field)}`} subtitle={sub}
@@ -1666,6 +1716,7 @@ function TxStepDetail({ opId, txId, stepIndex }: { opId: Id; txId: Id; stepIndex
             ["incoming position", <RefText key="i" value={step.incoming} />],
             ["rule", <Tag key="r">{step.rule}</Tag>],
           ]} />
+          <GuardSection compare={step.compare} />
           <FactNote fact={cursorRule(step.rule)} />
         </Frame>
       );
@@ -1679,6 +1730,7 @@ function TxStepDetail({ opId, txId, stepIndex }: { opId: Id; txId: Id; stepIndex
             ["fence field", <Mono key="f">{pathText(step.field)}</Mono>],
             ["incoming token", <RefText key="t" value={step.token} />],
           ]} />
+          <GuardSection compare={step.compare} fence />
           <FactNote fact={fence()} />
         </Frame>
       );

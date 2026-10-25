@@ -2736,10 +2736,42 @@ mod system_one {
         );
     }
 
-    /// `shop` as the benchmark's Jev run exported it, with the product
-    /// locks of the operations that reserve and add stock taken out.
+    /// `shop` with place_order's reservation written as a plain update:
+    /// a read-then-update of the product that only a lock protects, so
+    /// its transaction has nothing to reject. (As authored, the
+    /// reservation is a compare-and-set, whose own write protection
+    /// would already serialize restock's locked read against it.)
+    fn with_plain_reservation(mut model: conseqa::spec::Model) -> conseqa::spec::Model {
+        let OperationStep::Transaction(execution) = &mut model
+            .operations
+            .get_mut(&id("operation.place_order"))
+            .expect("the operation")
+            .program
+            .steps[0]
+        else {
+            panic!("place_order reserves first");
+        };
+
+        for step in &mut execution.transaction.steps {
+            if let conseqa::spec::TransactionStep::CompareAndSet(cas) = step {
+                *step = conseqa::spec::TransactionStep::Update(conseqa::spec::Update {
+                    target: cas.target.clone(),
+                    fields: cas.fields.clone(),
+                    values: cas.values.clone(),
+                });
+            }
+        }
+
+        execution.rejected = None;
+
+        model
+    }
+
+    /// `shop` as the benchmark's Jev run exported it, with the
+    /// reservation a plain update and the product locks of the
+    /// operations that reserve and add stock taken out.
     fn stock_without_its_locks() -> conseqa::spec::Model {
-        let mut broken = authored("shop.yaml");
+        let mut broken = with_plain_reservation(authored("shop.yaml"));
 
         for (operation, transaction) in [
             ("operation.place_order", "tx.place_order.reserve"),
@@ -2776,7 +2808,7 @@ mod system_one {
     /// authored.
     #[tokio::test]
     async fn a_closure_is_repaired_where_no_single_program_can_be() {
-        let authored = authored("shop.yaml");
+        let authored = with_plain_reservation(authored("shop.yaml"));
         let broken = stock_without_its_locks();
 
         for alone in ["operation.place_order", "operation.restock"] {
@@ -2838,7 +2870,7 @@ mod system_one {
     /// no session is needed at all.
     #[tokio::test]
     async fn the_workflow_repairs_a_conflict_closure_as_one_task() {
-        let authored = authored("shop.yaml");
+        let authored = with_plain_reservation(authored("shop.yaml"));
         let broken = stock_without_its_locks();
 
         let engine =
@@ -3048,12 +3080,14 @@ mod system_one {
         );
     }
 
-    /// A position recorded with an ordinary write orders nothing. The
-    /// builder turns the write into a cursor advance under both rules and
-    /// the analyzer proves both; which one the system needs is a fact of
-    /// the domain. Told that no entry may be skipped, it takes
-    /// `successor` — the author's program; told nothing, the permissive
-    /// `monotonic_after` stands.
+    /// A position recorded with an ordinary conditional write orders
+    /// nothing: the compare-and-set below guards the read by its observed
+    /// version, but assigns the position whatever it was. The builder
+    /// turns the write into a cursor advance — carrying the comparison —
+    /// under both rules and the analyzer proves both; which one the
+    /// system needs is a fact of the domain. Told that no entry may be
+    /// skipped, it takes `successor` — the author's program; told
+    /// nothing, the permissive `monotonic_after` stands.
     #[tokio::test]
     async fn a_position_written_plainly_becomes_a_cursor_under_the_stated_rule() {
         let as_plain_write = |transaction: &mut conseqa::spec::Transaction| {
@@ -3061,13 +3095,16 @@ mod system_one {
 
             for step in &mut transaction.steps {
                 if let conseqa::spec::TransactionStep::AdvanceCursor(advance) = step {
-                    *step = conseqa::spec::TransactionStep::Write(conseqa::spec::Write {
-                        target: advance.target.clone(),
-                        fields: [advance.field.clone()].into(),
-                        values: conseqa::spec::Derivation::Deterministic {
-                            from: vec![position.clone()],
+                    *step = conseqa::spec::TransactionStep::CompareAndSet(
+                        conseqa::spec::CompareAndSet {
+                            target: advance.target.clone(),
+                            compare: advance.compare.clone(),
+                            fields: [advance.field.clone()].into(),
+                            values: conseqa::spec::Derivation::Deterministic {
+                                from: vec![position.clone()],
+                            },
                         },
-                    });
+                    );
                 }
             }
         };
@@ -3168,8 +3205,9 @@ mod system_one {
 
     /// Keyed update: told the operation changes one field of the one
     /// record its input identifies, the builder writes the program — a
-    /// read, a write of that field, the version advanced, the result
-    /// returned — and the analyzer admits it. No session wrote it.
+    /// read, an update of that field (which publishes the version by
+    /// itself), the result returned — and the analyzer admits it. No
+    /// session wrote it.
     #[tokio::test]
     async fn a_keyed_update_is_written_from_its_template() {
         let opinions = Opinions::default()
@@ -3193,16 +3231,16 @@ mod system_one {
             .iter()
             .map(|step| match step {
                 conseqa::spec::TransactionStep::Read(_) => "read",
-                conseqa::spec::TransactionStep::Write(write) => {
-                    assert_eq!(write.fields, [path("stock")].into());
-                    "write"
+                conseqa::spec::TransactionStep::Update(update) => {
+                    assert_eq!(update.fields, [path("stock")].into());
+                    "update"
                 }
-                conseqa::spec::TransactionStep::BumpVersion(_) => "bump_version",
                 _ => "other",
             })
             .collect();
 
-        assert_eq!(kinds, ["read", "write", "bump_version"]);
+        // The version is published by the update itself.
+        assert_eq!(kinds, ["read", "update"]);
 
         assert!(matches!(
             program.steps.last(),
@@ -4525,9 +4563,10 @@ mod system_one {
         }
     }
 
-    /// `flash_checkout` as authored, and with `apply_payment`'s version
-    /// guard taken out. Its conflict closure spans three operations, so
-    /// neither isolation nor a lock in this program alone can prove it.
+    /// `flash_checkout` as authored, and with `apply_payment`'s
+    /// observed-version guard taken off its cursor advance. Its conflict
+    /// closure spans three operations, so neither isolation nor a lock in
+    /// this program alone can prove it.
     fn a_payment_without_its_version_guard() -> (conseqa::spec::Model, conseqa::spec::Model) {
         let authored = authored("flash_checkout.yaml");
 
@@ -4541,7 +4580,12 @@ mod system_one {
             .transaction_mut(&id("tx.apply_payment"))
             .expect("the transaction")
             .steps
-            .retain(|step| !matches!(step, conseqa::spec::TransactionStep::ValidateVersion(_)));
+            .iter_mut()
+            .for_each(|step| {
+                if let conseqa::spec::TransactionStep::AdvanceCursor(advance) = step {
+                    advance.compare.clear();
+                }
+            });
 
         assert!(conseqa::analyzer::validate(&broken).is_empty());
         assert!(serializability_proven(&authored, "tx.apply_payment"));
@@ -4551,10 +4595,10 @@ mod system_one {
     }
 
     /// Several routes are tried and the analyzer settles which one
-    /// works. Here only the version protocol can: the object is
-    /// versioned, the transaction already says what a rejection does, and
-    /// the one missing step is the guard — which lands where the author
-    /// had put it.
+    /// works. Here only the observed-state guard can: the object is
+    /// versioned, the transaction already mutates the instance it read and
+    /// says what a rejection does, and the one missing piece is the
+    /// comparison — which lands where the author had put it.
     #[tokio::test]
     async fn the_analyzer_picks_the_route_that_proves_across_operations() {
         let (authored, broken) = a_payment_without_its_version_guard();
@@ -4611,8 +4655,9 @@ mod system_one {
 
     /// A guard rejects, and what an operation does when its transaction
     /// is rejected is its author's to say. Without a `rejected` arm the
-    /// version route is not offered; what was tried, and what the
-    /// analyzer made of it, goes to the session.
+    /// observed-state guard — the update turned compare-and-set — is not
+    /// offered; what was tried, and what the analyzer made of it, goes to
+    /// the session.
     #[tokio::test]
     async fn a_repair_that_needs_a_judgment_is_handed_to_the_session() {
         let (_, mut broken) = a_payment_without_its_version_guard();
@@ -4639,6 +4684,27 @@ mod system_one {
                             | conseqa::spec::TransactionStep::Transition(_)
                     )
                 });
+
+                // What remains still changes the order it read — a plain
+                // update, so the transaction is no read-only observation
+                // and needs a real protection of its read.
+                let conseqa::spec::TransactionStep::Read(read) = &execution.transaction.steps[0]
+                else {
+                    panic!("apply_payment reads the order first");
+                };
+
+                let update = conseqa::spec::TransactionStep::Update(conseqa::spec::Update {
+                    target: read.target.clone(),
+                    fields: [path("amount")].into(),
+                    values: conseqa::spec::Derivation::Deterministic {
+                        from: vec![ValueRef {
+                            source: ValueSource::TransactionRead(read.bind.clone()),
+                            path: path("order_id"),
+                        }],
+                    },
+                });
+
+                execution.transaction.steps.insert(1, update);
             }
         }
 
@@ -4669,8 +4735,8 @@ mod system_one {
             handed[0].split("## Hand-off").last().unwrap_or_default()
         );
         assert!(
-            !handed[0].contains("validate at commit"),
-            "the version route was not offered"
+            !handed[0].contains("condition the later mutation"),
+            "the observed-state guard was not offered"
         );
     }
 

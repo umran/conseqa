@@ -91,9 +91,10 @@ pub enum OperationStep {
 ///
 /// A transaction attempt has three outcome classes. **Committed**: the
 /// mutations and artifacts commit atomically and control continues
-/// after the step. **Rejected**: a modeled commit guard — a transition
-/// whose `from` guard does not hold, a version validation mismatch, an
-/// inadmissible cursor position, a stale fencing token — conclusively
+/// after the step. **Rejected**: a modeled commit guard — a
+/// compare-and-set or guarded comparison that does not hold, a
+/// transition whose `from` guard does not hold, an inadmissible cursor
+/// position, a stale fencing token — conclusively
 /// fails; nothing commits, no artifact or outbox admission is
 /// established, and control enters `rejected`. If that block
 /// terminates, the operation terminates; if it falls through, control

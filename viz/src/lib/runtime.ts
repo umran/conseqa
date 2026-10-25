@@ -157,11 +157,11 @@ export function objectAccesses(model: Model): Map<Id, Map<Id, (SelectorPredicate
       for (const step of tx.steps) {
         switch (step.kind) {
           case "read":
-          case "write":
+          case "update":
+          case "compare_and_set":
+          case "upsert":
           case "delete":
           case "lock":
-          case "validate_version":
-          case "bump_version":
           case "advance_cursor":
           case "fence":
             add(step.target.object, opId, step.target.predicate);

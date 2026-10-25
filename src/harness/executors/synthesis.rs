@@ -44,12 +44,12 @@ use crate::confluence::{
     SearchSpec, SpecPatch, SymbolKey, SymbolKind, WriteGrant,
 };
 use crate::spec::{
-    Branch, BumpVersion, Condition, DataObject, Derivation, EstablishTransactionOutput,
-    ExecuteTransaction, FieldPath, FieldSelection, Id, IdempotencyGuarantee, IdempotencyKey, Input,
-    Insert, Literal, MessageSelector, ObjectSelector, OperationBlock, OperationStep, Read,
-    RequestIdentity, ResultOutcome, Return, Schema, SelectorPredicate, SelectorValue, StateMachine,
+    Branch, Condition, DataObject, Derivation, EstablishTransactionOutput, ExecuteTransaction,
+    FieldPath, FieldSelection, Id, IdempotencyGuarantee, IdempotencyKey, Input, Insert, Literal,
+    MessageSelector, ObjectSelector, OperationBlock, OperationStep, Read, RequestIdentity,
+    ResultOutcome, Return, Schema, SelectorPredicate, SelectorValue, StateMachine,
     StateMachineSubject, StateTransition, Transaction, TransactionIsolation, TransactionStep,
-    ValueRef, ValueSource, Write,
+    Update, ValueRef, ValueSource,
 };
 use crate::system_one::DecisionRequest;
 use crate::system_one::questions::synthesis as wording;
@@ -125,7 +125,7 @@ impl Record {
     }
 
     /// The fields an update could change: neither identity nor the
-    /// version, which only the version protocol advances.
+    /// version, which every mutation publishes intrinsically.
     fn changeable(&self) -> Vec<String> {
         let identity = self.identity_names();
         let version = self.version_field();
@@ -1354,7 +1354,7 @@ fn keyed_update(
             target: record.selector.clone(),
             fields: FieldSelection::Only(observed),
         }),
-        TransactionStep::Write(Write {
+        TransactionStep::Update(Update {
             target: record.selector.clone(),
             fields: changed
                 .iter()
@@ -1363,12 +1363,6 @@ fn keyed_update(
             values: Derivation::Deterministic { from },
         }),
     ];
-
-    if record.data.version.is_some() {
-        steps.push(TransactionStep::BumpVersion(BumpVersion {
-            target: record.selector.clone(),
-        }));
-    }
 
     let output = output_for(enumerated, record, Some(&read));
 
@@ -1433,21 +1427,14 @@ fn transition(
 }
 
 fn transition_steps(record: &Record, lifecycle: &Lifecycle) -> Vec<TransactionStep> {
-    let mut steps = vec![TransactionStep::Transition(StateTransition {
+    vec![TransactionStep::Transition(StateTransition {
         machine: lifecycle.machine.clone(),
         transition: lifecycle.transition.clone(),
         subject: record.selector.clone(),
+        compare: Vec::new(),
         effect_intents: BTreeMap::new(),
         effects: BTreeMap::new(),
-    })];
-
-    if record.data.version.is_some() {
-        steps.push(TransactionStep::BumpVersion(BumpVersion {
-            target: record.selector.clone(),
-        }));
-    }
-
-    steps
+    })]
 }
 
 fn refused(enumerated: &Enumerated, error: &Id) -> OperationStep {

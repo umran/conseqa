@@ -72,10 +72,11 @@ export interface Outbox {
   message_identity: MessageIdentity;
 }
 
-/** A versioned object's one monotonically increasing application
- *  concurrency token: a non-optional `int` on the canonical schema,
- *  outside the identity, managed only by the version protocol —
- *  `validate_version` and `bump_version` — never assigned directly. */
+/** A versioned object's application concurrency token: a non-optional
+ *  `int` on the canonical schema, outside the identity, never assigned
+ *  directly. Insertion establishes it, and every committed mutation of
+ *  the live instance publishes a newer one by itself; a guarded
+ *  mutation compares it against the version an earlier read observed. */
 export interface ObjectVersion {
   field: FieldPath;
 }
@@ -84,8 +85,9 @@ export interface DataObject {
   schema: Id;
   identity: FieldPath[];
   /** The object's application concurrency token, when it declares one.
-   *  Absent is the absence of the OCC route — no claim that concurrent
-   *  mutation is safe. */
+   *  Absent means no observed-version guard is available (an observed-
+   *  field comparison still is) — no claim that concurrent mutation is
+   *  safe. */
   version?: ObjectVersion;
 }
 
@@ -330,10 +332,39 @@ export interface TransitionEffectApplication {
  *  `monotonic_after` any `P > S`. */
 export type CursorAdvanceRule = "successor" | "monotonic_after";
 
+/** One equality condition of a guarded mutation: the instance's
+ *  current `field` equals `expected`. It is an observed-state comparison
+ *  when `expected` is the same field of an earlier read of the same
+ *  instance. */
+export interface CompareCondition {
+  field: FieldPath;
+  expected: SelectorValue;
+}
+
 export type TransactionStep =
   | { kind: "read"; bind: Id; target: ObjectSelector; fields: FieldSelection }
-  | { kind: "write"; target: ObjectSelector; fields: FieldPath[]; values: Derivation }
+  /** An unconditional mutation; never a stale-read guard. */
+  | { kind: "update"; target: ObjectSelector; fields: FieldPath[]; values: Derivation }
+  /** An atomic conditional update of one identified instance: the
+   *  comparisons and the mutation are one storage operation; a false
+   *  comparison or a missing instance rejects. */
+  | {
+      kind: "compare_and_set";
+      target: ObjectSelector;
+      compare: CompareCondition[];
+      fields: FieldPath[];
+      values: Derivation;
+    }
   | { kind: "insert"; object: Id; values: Derivation }
+  /** An atomic insert-or-update arbitrated on the object's identity;
+   *  never rejects and protects no earlier read. */
+  | {
+      kind: "upsert";
+      target: ObjectSelector;
+      insert_values: Derivation;
+      update_fields: FieldPath[];
+      update_values: Derivation;
+    }
   | { kind: "delete"; target: ObjectSelector }
   | { kind: "lock"; target: ObjectSelector; mode: "shared" | "exclusive"; order: LockOrder }
   | {
@@ -343,6 +374,9 @@ export type TransactionStep =
       machine: Id;
       transition: Id;
       subject: ObjectSelector;
+      /** Comparisons conjoined with the `from` guard in the same atomic
+       *  update. */
+      compare?: CompareCondition[];
       effect_intents: Record<Id, TransitionEffectIntent>;
       /** Derivations of the transition's declared outbox admissions,
        *  keyed by the transition's effect id. */
@@ -351,14 +385,6 @@ export type TransactionStep =
   | { kind: "establish_effect_intent"; bind: Id; effect_id: Id; effect: Effect; values: Derivation }
   | { kind: "establish_transaction_output"; bind: Id; schema: Id; values: Derivation }
   | { kind: "write_outbox"; effect_id: Id; effect: OutboxWriteEffect; values: Derivation }
-  /** The optimistic-concurrency commit guard: the transaction commits
-   *  only if the instance's version at commit arbitration still equals
-   *  the version an earlier read observed; a mismatch rejects. */
-  | { kind: "validate_version"; target: ObjectSelector; expected: ValueRef }
-  /** `version := version + 1` on the instance, atomically with the
-   *  commit; required beside every write or transition of a live
-   *  versioned instance. */
-  | { kind: "bump_version"; target: ObjectSelector }
   /** The ordered-cursor commit guard: commits only when `incoming` is
    *  admissible after the stored position under `rule`, then sets the
    *  cursor to it; an inadmissible position rejects. */
@@ -368,10 +394,19 @@ export type TransactionStep =
       field: FieldPath;
       incoming: ValueRef;
       rule: CursorAdvanceRule;
+      /** Comparisons conjoined with the cursor rule. */
+      compare?: CompareCondition[];
     }
   /** The fencing commit guard: a token older than the persisted fence
    *  rejects, an equal one leaves it, a newer one advances it. */
-  | { kind: "fence"; target: ObjectSelector; field: FieldPath; token: ValueRef };
+  | {
+      kind: "fence";
+      target: ObjectSelector;
+      field: FieldPath;
+      token: ValueRef;
+      /** Comparisons conjoined with the fencing condition. */
+      compare?: CompareCondition[];
+    };
 
 /** `SerializableBy(key)`: within each key value, committed executions
  *  of the transaction and every transaction it may conflict with are
@@ -436,7 +471,7 @@ export type OperationStep =
   /** One transaction execution site. A transaction attempt commits,
    *  rejects, or is interrupted: on rejection nothing commits and
    *  control enters `rejected`, which is present exactly when the body
-   *  contains a rejecting step — a transition, `validate_version`,
+   *  contains a rejecting step — a `compare_and_set`, a transition,
    *  `advance_cursor`, or `fence`. */
   | { kind: "transaction"; transaction: Transaction; rejected?: OperationBlock }
   | { kind: "execute_effect"; effect_id: Id; effect: Effect; values: Derivation; bind: Id | null }

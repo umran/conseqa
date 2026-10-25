@@ -35,7 +35,7 @@ use super::{
 /// families are declared per transaction — `SerializableBy(K)` and
 /// `OrderedBy(K, P)` in `Transaction.requirements` — and proven from a
 /// model-wide conflict analysis over transaction primitives: declared
-/// isolation, S/X locks, object versions (`ValidateVersion` /
+/// isolation, S/X locks, object versions (then `ValidateVersion` /
 /// `BumpVersion`), ordered cursors (`AdvanceCursor`), and fences
 /// (`Fence`). Transactions become explicitly rejectable
 /// (`ExecuteTransaction.rejected`), state transitions become explicit
@@ -48,17 +48,31 @@ use super::{
 /// ends without completing, its message unacknowledged or still
 /// pending, so a consumer can pass a retryable error up. It is the
 /// first additive revision — every dsl 4 specification means the same
-/// under dsl 5 — so dsl 4 documents are still read ([`DSL_READS`]).
+/// under dsl 5 — so dsl 4 documents were still read.
+///
+/// Version 6 is the atomic-mutation revision, and incompatible:
+/// `validate_version` and `bump_version` are gone, `write` is renamed
+/// `update`, and the vocabulary gains `compare_and_set` (an atomic
+/// conditional update of one identified instance) and `upsert` (an
+/// atomic identity-arbitrated insert-or-update), while `transition`,
+/// `advance_cursor`, and `fence` may carry comparisons of their own.
+/// Version publication is intrinsic to every mutation of a live
+/// versioned instance. The serializability checker credits a stale
+/// read only where a real storage mechanism — a lock, serializable
+/// isolation, or an atomic guarded mutation comparing the observed
+/// state or version — prevents it from participating in a commit, so
+/// dsl 4 and 5 documents are no longer read ([`DSL_READS`]).
 ///
 /// Independent of the stored-workspace `FORMAT` (a storage-encoding
 /// counter): a DSL bump forces a `FORMAT` bump, never conversely, and
 /// the numbers are not aligned.
-pub const DSL_VERSION: DslVersion = DslVersion(5);
+pub const DSL_VERSION: DslVersion = DslVersion(6);
 
 /// The declared versions this build reads: the current one, and every
 /// earlier one it extends without changing what the earlier one said.
-/// A document declaring one is read as the current version.
-pub const DSL_READS: [DslVersion; 2] = [DslVersion(4), DslVersion(5)];
+/// A document declaring one is read as the current version. Dsl 6
+/// changed the meaning of transaction programs, so it extends nothing.
+pub const DSL_READS: [DslVersion; 1] = [DslVersion(6)];
 
 /// A declared DSL contract version.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
