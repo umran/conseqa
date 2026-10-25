@@ -93,6 +93,12 @@ fn gap_sentence(gap: &ReplayGap) -> String {
                 .to_string()
         }
 
+        ReplayGap::ContainsFenceComparison => {
+            "the transaction fences with a comparison that is re-evaluated against live state \
+             and may reject on re-execution after an intervening mutation"
+                .to_string()
+        }
+
         ReplayGap::ContainsUpsert => {
             "the transaction upserts an instance, which re-execution would update where its \
              first attempt inserted"

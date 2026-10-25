@@ -2432,7 +2432,7 @@ const PROGRAM_EXAMPLE_JSON: &str = r#"{"steps":[
 /// teach an agent the language from the server itself — instead of the
 /// agent reverse-engineering the crate's source, which it cannot see
 /// from its own project anyway.
-const DSL_SEMANTICS: &str = include_str!("../../CONSEQA_DSL_SEMANTICS.md");
+const DSL_SEMANTICS: &str = include_str!("../../docs/live/CONSEQA_DSL_SEMANTICS.md");
 
 /// The `##` sections of the semantics document: header line and full
 /// body, subsections included. Fence-aware, so a `##` inside a code

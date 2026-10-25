@@ -1453,6 +1453,18 @@ fn an_upsert_identifies_one_instance_and_leaves_its_identity_alone() {
 
     assert_eq!(
         edit(upsert_stock(
+            stock_selector("input.reserve_inventory.created"),
+            &[]
+        )),
+        vec![ValidationError::UpsertWithoutUpdateFields {
+            transaction: id("tx.reserve_inventory"),
+            step: 1,
+            object: id("object.stock"),
+        }]
+    );
+
+    assert_eq!(
+        edit(upsert_stock(
             ObjectSelector {
                 object: id("object.stock"),
                 predicate: SelectorPredicate::All,

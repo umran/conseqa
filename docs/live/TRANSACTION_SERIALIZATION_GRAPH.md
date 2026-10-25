@@ -3,12 +3,13 @@
 Originally a read-only investigation of the DSL 4 checker (`master`, top
 commit `8637bd0`). Revised for DSL 6 — the Atomic Mutation and
 Serialization Primitives revision
-(`Conseqa_Atomic_Mutation_and_Serialization_Primitives_Revision_Specification_DSL_v6.md`),
+(`Conseqa_Atomic_Mutation_and_Serialization_Primitives_Revision_Specification_DSL_v6.md`,
+retained at the repository root as a historical design record),
 which replaced the `validate_version` / `bump_version` protocol with atomic
 conditional mutations — against the `atomic-mutation-dsl-6` working tree.
 Line numbers are a snapshot of that tree; the code moves, so search by the
 symbol named beside each one. The normative statement of every rule below
-is `CONSEQA_DSL_SEMANTICS.md` §17 and §20.
+is `docs/live/CONSEQA_DSL_SEMANTICS.md` §17 and §20.
 
 ## 0. The one-sentence version
 

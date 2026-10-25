@@ -176,6 +176,7 @@ pub enum ValidationCode {
     CompareAndSetWithoutComparison,
     DuplicateCompareField,
     UpsertWithoutIdentifiedInstance,
+    UpsertWithoutUpdateFields,
     UpsertMutatesIdentity,
 
     // Managed monotonic fields.

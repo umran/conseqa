@@ -261,6 +261,11 @@ pub enum ReplayGap {
     /// commit changed — it may reject instead of reproducing it.
     ContainsCompareAndSet,
 
+    /// Route A: the transaction contains a fence comparison, which is
+    /// re-evaluated against live state and may reject on re-execution
+    /// after an intervening mutation.
+    ContainsFenceComparison,
+
     /// Route A: the transaction contains an upsert, which re-execution
     /// would take down the update branch where the first attempt
     /// inserted.
@@ -2145,10 +2150,17 @@ impl<'a> ReplayAnalysis<'a> {
                     push(&mut gaps, ReplayGap::ContainsCursorAdvance)
                 }
 
-                // A fence re-presents the same token, which an equal
-                // fence accepts; on a versioned instance, though, the
-                // fence publishes a newer version each time it commits.
+                // A bare fence re-presents the same token, which an
+                // equal fence accepts. A fence comparison is
+                // re-evaluated against live state and may reject after
+                // an intervening mutation. On a versioned instance,
+                // the fence also publishes a newer version each time
+                // it commits.
                 TransactionStep::Fence(fence) => {
+                    if !fence.compare.is_empty() {
+                        push(&mut gaps, ReplayGap::ContainsFenceComparison);
+                    }
+
                     if self.versioned(&fence.target.object) {
                         push(&mut gaps, ReplayGap::PublishesVersion);
                     }

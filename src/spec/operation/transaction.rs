@@ -494,6 +494,8 @@ pub struct Upsert {
     /// Provenance of the inserted contents.
     pub insert_values: Derivation,
 
+    /// The non-empty set of fields assigned when the instance already
+    /// exists.
     pub update_fields: BTreeSet<FieldPath>,
 
     /// Provenance of the values the update branch writes.

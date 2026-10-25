@@ -87,8 +87,8 @@ pub struct ProverReport {
 /// follow the new vocabulary (`update`, `compare_read`,
 /// `compare_write`, `upsert_read_write`, `version_publish`), and the
 /// natural-replay gap `contains_version_bump` becomes
-/// `publishes_version` beside `contains_compare_and_set` and
-/// `contains_upsert`.
+/// `publishes_version` beside `contains_compare_and_set`,
+/// `contains_fence_comparison`, and `contains_upsert`.
 pub const FORMAT: u32 = 9;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

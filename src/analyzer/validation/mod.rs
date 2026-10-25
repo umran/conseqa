@@ -588,6 +588,7 @@ fn is_program_local_error(error: &ValidationError) -> bool {
         | CompareAndSetWithoutComparison { .. }
         | DuplicateCompareField { .. }
         | UpsertWithoutIdentifiedInstance { .. }
+        | UpsertWithoutUpdateFields { .. }
         | UpsertMutatesIdentity { .. }
         | InvalidReferenceOwner { .. } => true,
 
@@ -1337,6 +1338,14 @@ fn validate_guarded_mutations(model: &Model, index: &ReferenceIndex<'_>) -> Vec<
                     TransactionStep::Upsert(upsert) => {
                         if !identified(&upsert.target) {
                             errors.push(ValidationError::UpsertWithoutIdentifiedInstance {
+                                transaction: transaction.id.clone(),
+                                step,
+                                object: upsert.target.object.clone(),
+                            });
+                        }
+
+                        if upsert.update_fields.is_empty() {
+                            errors.push(ValidationError::UpsertWithoutUpdateFields {
                                 transaction: transaction.id.clone(),
                                 step,
                                 object: upsert.target.object.clone(),

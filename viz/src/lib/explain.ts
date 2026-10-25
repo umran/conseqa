@@ -1,7 +1,7 @@
 // Declared facts, said the way a reader would say them: a short label for
 // a badge, and one sentence on what the fact implies for retries,
 // duplicates, and proofs. The DSL's enum names are precise but opaque;
-// these are what they mean (CONSEQA_DSL_SEMANTICS.md §8, §9, §13, §17).
+// these are what they mean (docs/live/CONSEQA_DSL_SEMANTICS.md §8, §9, §13, §17).
 
 import type {
   CursorAdvanceRule,

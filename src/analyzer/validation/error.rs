@@ -391,6 +391,14 @@ pub enum ValidationError {
         object: Id,
     },
 
+    /// An `upsert`'s existing-instance branch assigns no fields, so it
+    /// does not express the update half of insert-or-update.
+    UpsertWithoutUpdateFields {
+        transaction: Id,
+        step: usize,
+        object: Id,
+    },
+
     /// An `upsert`'s update branch names a field of the object's
     /// identity, which the arbitration is over and which never changes.
     UpsertMutatesIdentity {
@@ -1908,6 +1916,27 @@ impl From<ValidationError> for Diagnostic {
                     message: "An upsert is arbitrated on the object's declared identity: its \
                               target must pin every identity field by equality, so that one \
                               logical instance is inserted or updated."
+                        .to_string(),
+                }],
+            },
+
+            ValidationError::UpsertWithoutUpdateFields {
+                transaction,
+                step,
+                object,
+            } => Diagnostic {
+                code: DiagnosticCode::Validation(ValidationCode::UpsertWithoutUpdateFields),
+                severity: Severity::Error,
+                subject: Some(transaction.clone()),
+                message: format!(
+                    "Step {} of transaction `{transaction}` upserts `{object}` with an update \
+                     branch that assigns no fields.",
+                    step + 1
+                ),
+                evidence: vec![Evidence {
+                    subject: Some(object),
+                    message: "`update_fields` must contain at least one field so the \
+                              existing-instance branch expresses a real update."
                         .to_string(),
                 }],
             },
