@@ -3,9 +3,13 @@
 //!
 //! `serve` exposes the shared MCP endpoint for interactive Claude
 //! Code / Codex sessions, IDE integration, and external orchestrators,
-//! plus a minimal localhost admin surface for creating tasks. `status`
-//! and `export` operate directly on the database while no daemon holds
-//! it.
+//! plus a minimal localhost admin surface for creating tasks. `init`
+//! creates a project; `status` and `export` read one without opening it
+//! for writing, so they work beside a running server.
+//!
+//! A project is the `.conseqa/` directory of the repository it
+//! describes (see `conseqa::confluence::store`); every command names it
+//! by `--project`, the repository or any directory inside it.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -23,7 +27,7 @@ use serde::Deserialize;
 
 use conseqa::confluence::mcp::{self, DesignLauncher};
 use conseqa::confluence::{
-    AnalysisState, ConfluenceEngine, CreateTask, Persistence, PromptEvidence, RunId, RunMetadata,
+    AnalysisState, ConfluenceEngine, CreateTask, ProjectStore, PromptEvidence, RunId, RunMetadata,
     TaskBudget, TaskId, TaskKind, WorkspaceState, WriteScope,
 };
 use conseqa::harness::backend::InvocationBudget;
@@ -48,19 +52,21 @@ struct Cli {
 enum Command {
     /// Serve the MCP endpoint and the localhost admin surface.
     Serve {
-        /// Authoring database path.
-        #[arg(long, default_value = ".conseqa/confluence.redb")]
-        database: PathBuf,
+        /// The project: its directory or any directory inside it. Created
+        /// there when none exists.
+        #[arg(long, default_value = ".")]
+        project: PathBuf,
 
         /// Bind address for MCP (`/mcp`) and admin (`/admin/...`).
         #[arg(long, default_value = "127.0.0.1:43127")]
         bind: SocketAddr,
 
-        /// Adopt an existing Conseqa model when the database is empty.
+        /// Adopt an existing Conseqa model when creating the project.
         #[arg(long)]
         model: Option<PathBuf>,
 
-        /// The natural-language application prompt for a fresh run.
+        /// The natural-language application prompt when creating the
+        /// project.
         #[arg(long)]
         prompt: Option<String>,
 
@@ -82,29 +88,26 @@ enum Command {
         #[arg(long, default_value_t = 4)]
         max_agents: usize,
 
-        /// Where a triggered workflow writes its finalized artifacts.
-        #[arg(long, default_value = ".conseqa/design")]
-        design_out: PathBuf,
+        /// Where a triggered workflow writes its finalized artifacts;
+        /// the project's uncommitted `.conseqa/local/design` when omitted.
+        #[arg(long)]
+        design_out: Option<PathBuf>,
 
         #[command(flatten)]
         system_one: SystemOne,
     },
 
     /// Run one shared server hosting many projects, for global use from
-    /// the Claude Code UI. No per-project database is given up front;
-    /// projects are created and selected through the MCP project tools.
+    /// the Claude Code UI. Projects are opened and created by path
+    /// through the MCP project tools.
     Global {
-        /// Directory holding one database per project.
-        #[arg(long, default_value_t = default_data_dir())]
-        data_dir: String,
-
         /// Bind address for MCP (`/mcp`) and admin (`/admin/...`).
         #[arg(long, default_value = "127.0.0.1:43127")]
         bind: SocketAddr,
 
         /// Stable API key clients authenticate with. Defaults to
-        /// `CONSEQA_API_KEY`, else a key persisted next to the data
-        /// directory (generated on first run).
+        /// `CONSEQA_API_KEY`, else a key persisted at
+        /// `~/.conseqa/api-key` (generated on first run).
         #[arg(long)]
         api_key: Option<String>,
 
@@ -126,13 +129,10 @@ enum Command {
 
     /// Serve one shared multi-project instance over stdio, for the
     /// Claude Desktop / Code UI. The app spawns this command and speaks
-    /// MCP over stdin/stdout — no URL, no TLS, no certificate. Projects
-    /// are created and selected through the MCP project tools.
+    /// MCP over stdin/stdout — no URL, no TLS, no certificate. The
+    /// project the app starts it in is the default one; others are
+    /// opened and created by path through the MCP project tools.
     Stdio {
-        /// Directory holding one database per project.
-        #[arg(long, default_value_t = default_data_dir())]
-        data_dir: String,
-
         /// Backend for the `request_design` concurrent workflow.
         #[arg(long, value_enum, default_value_t = Backend::Claude)]
         backend: Backend,
@@ -149,16 +149,38 @@ enum Command {
         system_one: SystemOne,
     },
 
-    /// Print the persisted head, tasks, and commit count.
+    /// Create a project: a `.conseqa/` directory to commit with the code.
+    Init {
+        /// The directory to create it in, normally the repository root.
+        #[arg(long, default_value = ".")]
+        project: PathBuf,
+
+        /// The project's name; the directory's name when omitted.
+        #[arg(long)]
+        name: Option<String>,
+
+        /// The natural-language application prompt.
+        #[arg(long)]
+        prompt: Option<String>,
+
+        /// Adopt an existing Conseqa model.
+        #[arg(long)]
+        model: Option<PathBuf>,
+    },
+
+    /// Print the head revision, the commit and task counts, and the
+    /// tasks.
     Status {
-        #[arg(long, default_value = ".conseqa/confluence.redb")]
-        database: PathBuf,
+        /// The project: its directory or any directory inside it.
+        #[arg(long, default_value = ".")]
+        project: PathBuf,
     },
 
     /// Assemble the head workspace and write the canonical model YAML.
     Export {
-        #[arg(long, default_value = ".conseqa/confluence.redb")]
-        database: PathBuf,
+        /// The project: its directory or any directory inside it.
+        #[arg(long, default_value = ".")]
+        project: PathBuf,
 
         /// Where to write the model.
         #[arg(long, default_value = "conseqa.yaml")]
@@ -186,7 +208,7 @@ async fn main() -> ExitCode {
 
     let outcome = match cli.command {
         Command::Serve {
-            database,
+            project,
             bind,
             model,
             prompt,
@@ -198,7 +220,7 @@ async fn main() -> ExitCode {
             system_one,
         } => {
             serve(ServeOptions {
-                database,
+                project,
                 bind,
                 model,
                 prompt,
@@ -212,7 +234,6 @@ async fn main() -> ExitCode {
             .await
         }
         Command::Global {
-            data_dir,
             bind,
             api_key,
             backend,
@@ -221,7 +242,6 @@ async fn main() -> ExitCode {
             system_one,
         } => {
             serve_global(GlobalOptions {
-                data_dir: PathBuf::from(data_dir),
                 bind,
                 api_key,
                 backend,
@@ -232,14 +252,12 @@ async fn main() -> ExitCode {
             .await
         }
         Command::Stdio {
-            data_dir,
             backend,
             backend_program,
             max_agents,
             system_one,
         } => {
             serve_stdio_cmd(StdioOptions {
-                data_dir: PathBuf::from(data_dir),
                 backend,
                 backend_program,
                 max_agents,
@@ -247,12 +265,18 @@ async fn main() -> ExitCode {
             })
             .await
         }
-        Command::Status { database } => status(database),
+        Command::Init {
+            project,
+            name,
+            prompt,
+            model,
+        } => init(project, name, prompt, model),
+        Command::Status { project } => status(project),
         Command::Export {
-            database,
+            project,
             out,
             report,
-        } => export(database, out, report),
+        } => export(project, out, report),
     };
 
     match outcome {
@@ -333,11 +357,25 @@ fn default_claude_program() -> Option<String> {
     .find(|candidate| std::path::Path::new(candidate).is_file())
 }
 
+/// A new project's workspace: `model` adopted when given, else empty.
+/// It is named `name`, or after the directory it is created in.
 fn initial_workspace(
+    dir: &std::path::Path,
+    name: Option<String>,
     model: Option<PathBuf>,
     prompt: Option<String>,
 ) -> Result<WorkspaceState, String> {
-    let mut run_meta = RunMetadata::new(RunId(uuid::Uuid::new_v4().to_string()));
+    let name = name.unwrap_or_else(|| {
+        dir.canonicalize()
+            .ok()
+            .and_then(|dir| {
+                dir.file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+            })
+            .unwrap_or_else(|| "project".to_string())
+    });
+
+    let mut run_meta = RunMetadata::new(RunId(name));
 
     run_meta.prompt = prompt;
 
@@ -393,7 +431,7 @@ fn design_executor(_: &SystemOne) -> Result<DesignExecutor, String> {
 }
 
 struct ServeOptions {
-    database: PathBuf,
+    project: PathBuf,
     bind: SocketAddr,
     model: Option<PathBuf>,
     prompt: Option<String>,
@@ -401,17 +439,17 @@ struct ServeOptions {
     backend: Backend,
     backend_program: Option<String>,
     max_agents: usize,
-    design_out: PathBuf,
+    design_out: Option<PathBuf>,
     system_one: SystemOne,
 }
 
 async fn serve(options: ServeOptions) -> Result<(), String> {
     let executor = design_executor(&options.system_one)?;
 
-    let initial = initial_workspace(options.model, options.prompt)?;
+    let initial = initial_workspace(&options.project, None, options.model, options.prompt)?;
 
-    let engine = ConfluenceEngine::open(&options.database, initial)
-        .map_err(|error| format!("cannot open {}: {error}", options.database.display()))?;
+    let engine = ConfluenceEngine::open(&options.project, initial)
+        .map_err(|error| format!("cannot open {}: {error}", options.project.display()))?;
 
     // The workers connect back to this daemon's own MCP endpoint. The
     // bound URL is known only after binding, so the launcher reads it
@@ -424,7 +462,7 @@ async fn serve(options: ServeOptions) -> Result<(), String> {
         backend,
         executor,
         mcp_url: Arc::clone(&mcp_url),
-        out_dir: options.design_out,
+        design_out: options.design_out,
         max_agents: options.max_agents.max(1),
         state: Arc::new(DesignState::default()),
     });
@@ -451,7 +489,8 @@ async fn serve(options: ServeOptions) -> Result<(), String> {
     *mcp_url.write() = url.clone();
 
     println!(
-        "conseqa-confluence serving\n  mcp:   {url}\n  admin: http://{}/admin/status\n  head:  revision {}",
+        "conseqa-confluence serving\n  project: {}\n  mcp:     {url}\n  admin:   http://{}/admin/status\n  head:    revision {}",
+        engine.project_dir().unwrap_or_default().display(),
         server.local_addr,
         engine.head_revision().0,
     );
@@ -476,7 +515,6 @@ async fn serve(options: ServeOptions) -> Result<(), String> {
 }
 
 struct GlobalOptions {
-    data_dir: PathBuf,
     bind: SocketAddr,
     api_key: Option<String>,
     backend: Backend,
@@ -485,30 +523,12 @@ struct GlobalOptions {
     system_one: SystemOne,
 }
 
-/// Where design-run artifacts go: a sibling of the projects directory,
-/// so a run's output never appears as a project. Each run then gets its
-/// own subdirectory by project name.
-fn design_runs_root(data_dir: &std::path::Path) -> PathBuf {
-    data_dir
-        .parent()
-        .unwrap_or(data_dir)
-        .join("design-runs")
-}
-
-/// The default per-user data directory, `~/.conseqa/projects`.
-fn default_data_dir() -> String {
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-
-    format!("{home}/.conseqa/projects")
-}
-
 /// Loads the stable API key: an explicit value, else `CONSEQA_API_KEY`,
-/// else a key persisted at `<data_dir>/../api-key` (generated on first
-/// run). Persisting it is what makes the UI config set-once.
-fn load_or_create_api_key(
-    explicit: Option<String>,
-    data_dir: &std::path::Path,
-) -> Result<String, String> {
+/// else a key persisted at `~/.conseqa/api-key` (generated on first
+/// run). Persisting it is what makes the UI config set-once. The key
+/// configures this machine's server, not any project, so it stays out
+/// of every project.
+fn load_or_create_api_key(explicit: Option<String>) -> Result<String, String> {
     if let Some(key) = explicit {
         return Ok(key);
     }
@@ -519,10 +539,8 @@ fn load_or_create_api_key(
         return Ok(key);
     }
 
-    let path = data_dir
-        .parent()
-        .unwrap_or(data_dir)
-        .join("api-key");
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    let path = PathBuf::from(home).join(".conseqa/api-key");
 
     if let Ok(existing) = std::fs::read_to_string(&path) {
         let existing = existing.trim().to_string();
@@ -548,12 +566,9 @@ fn load_or_create_api_key(
 async fn serve_global(options: GlobalOptions) -> Result<(), String> {
     let executor = design_executor(&options.system_one)?;
 
-    std::fs::create_dir_all(&options.data_dir)
-        .map_err(|error| format!("cannot create {}: {error}", options.data_dir.display()))?;
+    let api_key = load_or_create_api_key(options.api_key)?;
 
-    let api_key = load_or_create_api_key(options.api_key, &options.data_dir)?;
-
-    let manager = Arc::new(conseqa::confluence::WorkspaceManager::new(&options.data_dir));
+    let manager = Arc::new(conseqa::confluence::WorkspaceManager::new());
 
     let mcp_url = Arc::new(RwLock::new(String::new()));
 
@@ -563,7 +578,7 @@ async fn serve_global(options: GlobalOptions) -> Result<(), String> {
         backend,
         executor,
         mcp_url: Arc::clone(&mcp_url),
-        out_dir: design_runs_root(&options.data_dir),
+        design_out: None,
         max_agents: options.max_agents.max(1),
         state: Arc::new(DesignState::default()),
     });
@@ -583,8 +598,8 @@ async fn serve_global(options: GlobalOptions) -> Result<(), String> {
                         .map(|project| {
                             serde_json::json!({
                                 "name": project.name,
-                                "open": project.open,
-                                "revision": project.revision.map(|revision| revision.0),
+                                "path": project.path,
+                                "revision": project.revision.0,
                             })
                         })
                         .collect();
@@ -604,7 +619,7 @@ async fn serve_global(options: GlobalOptions) -> Result<(), String> {
     let url = format!("http://{}/mcp", server.local_addr);
     *mcp_url.write() = url.clone();
 
-    print_global_config(&url, &api_key, &options.data_dir);
+    print_global_config(&url, &api_key);
 
     tokio::signal::ctrl_c()
         .await
@@ -618,7 +633,7 @@ async fn serve_global(options: GlobalOptions) -> Result<(), String> {
 }
 
 /// Prints the set-once global MCP config for the Claude Code UI.
-fn print_global_config(mcp_url: &str, api_key: &str, data_dir: &std::path::Path) {
+fn print_global_config(mcp_url: &str, api_key: &str) {
     let config = serde_json::json!({
         "mcpServers": {
             "conseqa": {
@@ -632,20 +647,19 @@ fn print_global_config(mcp_url: &str, api_key: &str, data_dir: &std::path::Path)
     let pretty = serde_json::to_string_pretty(&config).unwrap_or_default();
 
     println!(
-        "conseqa-confluence global server\n  mcp:      {mcp_url}\n  projects: {}\n\n\
+        "conseqa-confluence global server\n  mcp: {mcp_url}\n\n\
          Register this ONCE in Claude Code (user scope, so it is global):\n\n\
          Option A — the GUI: Settings → Connectors → Add → HTTP, URL `{mcp_url}`,\n\
          header `Authorization: Bearer {api_key}`.\n\n\
          Option B — the config file `~/.claude.json` (top-level `mcpServers`):\n\n{pretty}\n\n\
-         Then, in any project, ask Claude to `list_projects`, `open_project`, or \n\
-         `create_project` — each project is its own isolated model. Keep this server\n\
-         running; the API key is stable across restarts.\n",
-        data_dir.display(),
+         Then, in any repository, ask Claude to `open_project` or `create_project` with\n\
+         the repository's path — each project lives in its repository's `.conseqa/`\n\
+         directory, committed with the code. Keep this server running; the API key is\n\
+         stable across restarts.\n",
     );
 }
 
 struct StdioOptions {
-    data_dir: PathBuf,
     backend: Backend,
     backend_program: Option<String>,
     max_agents: usize,
@@ -655,10 +669,11 @@ struct StdioOptions {
 async fn serve_stdio_cmd(options: StdioOptions) -> Result<(), String> {
     let executor = design_executor(&options.system_one)?;
 
-    std::fs::create_dir_all(&options.data_dir)
-        .map_err(|error| format!("cannot create {}: {error}", options.data_dir.display()))?;
+    let manager = Arc::new(conseqa::confluence::WorkspaceManager::new());
 
-    let manager = Arc::new(conseqa::confluence::WorkspaceManager::new(&options.data_dir));
+    // The app starts the server in the user's working directory; the
+    // project there is the one meant when a client names none.
+    let home = std::env::current_dir().ok();
 
     // Worker agents from request_design are `claude -p` subprocesses,
     // which accept an http MCP URL. They connect back to a private
@@ -671,7 +686,7 @@ async fn serve_stdio_cmd(options: StdioOptions) -> Result<(), String> {
         backend,
         executor,
         mcp_url: Arc::clone(&mcp_url),
-        out_dir: design_runs_root(&options.data_dir),
+        design_out: None,
         max_agents: options.max_agents.max(1),
         state: Arc::new(DesignState::default()),
     });
@@ -688,14 +703,14 @@ async fn serve_stdio_cmd(options: StdioOptions) -> Result<(), String> {
     *mcp_url.write() = format!("http://{}/mcp", worker_server.local_addr);
 
     tracing::info!(
-        data_dir = %options.data_dir.display(),
+        home = %home.as_deref().unwrap_or(std::path::Path::new("?")).display(),
         worker_endpoint = %worker_server.local_addr,
         "conseqa stdio server ready"
     );
 
     // Blocks until the UI client disconnects. Keep the worker endpoint
     // alive for the duration.
-    let result = mcp::serve_stdio(manager, Some(launcher))
+    let result = mcp::serve_stdio(manager, Some(launcher), home)
         .await
         .map_err(|error| format!("stdio server error: {error}"));
 
@@ -753,12 +768,32 @@ struct DaemonDesignLauncher {
     #[cfg_attr(not(feature = "system-one"), allow(dead_code))]
     executor: DesignExecutor,
     mcp_url: Arc<RwLock<String>>,
-    out_dir: PathBuf,
+
+    /// Where runs write their finalized artifacts, overriding each
+    /// project's own `.conseqa/local/design`.
+    design_out: Option<PathBuf>,
     max_agents: usize,
     state: Arc<DesignState>,
 }
 
 impl DaemonDesignLauncher {
+    /// Where a run on `engine`'s project writes its finalized model,
+    /// report, and manifest: derived artifacts, so the project's
+    /// uncommitted local directory.
+    fn design_dir(&self, engine: &ConfluenceEngine) -> PathBuf {
+        self.design_out
+            .clone()
+            .or_else(|| engine.local_dir().map(|local| local.join("design")))
+            .unwrap_or_else(|| std::env::temp_dir().join("conseqa-design"))
+    }
+
+    /// The worker agents' scratch directories, which hold only their
+    /// MCP configuration. Outside every repository, so no worker picks
+    /// up a project's own agent settings.
+    fn work_dir() -> PathBuf {
+        std::env::temp_dir().join("conseqa-work")
+    }
+
     /// The backend of one design run: the agent backend, behind the
     /// System One builders when they are configured. A builder acts on
     /// one engine, and each run has its own project's.
@@ -810,14 +845,12 @@ impl DesignLauncher for DaemonDesignLauncher {
             return Err("the MCP endpoint is not ready yet".to_string());
         }
 
-        let work_dir = self.out_dir.join("work");
-
         let supervisor = Supervisor::new(
             engine.clone(),
             self.backend_for(&engine),
             mcp_url,
             None,
-            work_dir,
+            Self::work_dir(),
         );
 
         let scheduler = Scheduler::new(
@@ -833,16 +866,10 @@ impl DesignLauncher for DaemonDesignLauncher {
             },
         );
 
-        // Each run writes its artifacts under its own project name, so
-        // runs never collide and the directory never looks like a
-        // project itself.
-        let run_name = engine.head_snapshot().workspace.run_meta.run.0.clone();
-        let run_out = self.out_dir.join(&run_name);
-
         let workflow = Workflow::new(
             scheduler,
             WorkflowConfig {
-                out_dir: run_out,
+                out_dir: self.design_dir(&engine),
                 analysis_timeout: Duration::from_secs(180),
                 max_iterations: 8,
                 objective,
@@ -908,7 +935,7 @@ impl DesignLauncher for DaemonDesignLauncher {
             self.builders_over(&engine, Arc::new(hand_off.clone())),
             "http://127.0.0.1:0/mcp",
             None,
-            self.out_dir.join("work"),
+            Self::work_dir(),
         );
 
         // One task at a time: the builders take milliseconds to
@@ -927,12 +954,10 @@ impl DesignLauncher for DaemonDesignLauncher {
             },
         );
 
-        let run_name = engine.head_snapshot().workspace.run_meta.run.0.clone();
-
         let workflow = Workflow::new(
             scheduler,
             WorkflowConfig {
-                out_dir: self.out_dir.join(&run_name),
+                out_dir: self.design_dir(&engine),
                 analysis_timeout: Duration::from_secs(180),
                 max_iterations: 8,
                 objective,
@@ -1205,27 +1230,46 @@ async fn admin_analysis(
     Json(value)
 }
 
-fn open_persistence(database: &std::path::Path) -> Result<Persistence, String> {
-    Persistence::open_file(database)
-        .map_err(|error| format!("cannot open {}: {error}", database.display()))
+fn init(
+    project: PathBuf,
+    name: Option<String>,
+    prompt: Option<String>,
+    model: Option<PathBuf>,
+) -> Result<(), String> {
+    let initial = initial_workspace(&project, name, model, prompt)?;
+
+    let store = ProjectStore::create(&project, &initial)
+        .map_err(|error| format!("cannot create a project in {}: {error}", project.display()))?;
+
+    println!(
+        "created {}\ncommit it with the code; its local/ directory is ignored",
+        store
+            .project_dir()
+            .unwrap_or(&project)
+            .join(conseqa::confluence::PROJECT_DIR)
+            .display(),
+    );
+
+    Ok(())
 }
 
-fn status(database: PathBuf) -> Result<(), String> {
-    let persistence = open_persistence(&database)?;
+/// Reads the project at or above `dir`, without opening it for writing.
+fn read_project(dir: &std::path::Path) -> Result<conseqa::confluence::ProjectRead, String> {
+    let project = ProjectStore::discover(dir)
+        .ok_or_else(|| format!("no conseqa project at {} or above it", dir.display()))?;
 
-    let head = persistence
-        .head()
-        .map_err(|error| error.to_string())?
-        .ok_or("the database holds no head yet")?;
+    ProjectStore::read(&project).map_err(|error| error.to_string())
+}
 
-    let tasks = persistence.load_tasks().map_err(|error| error.to_string())?;
-    let commits = persistence.load_commits().map_err(|error| error.to_string())?;
+fn status(project: PathBuf) -> Result<(), String> {
+    let read = read_project(&project)?;
 
-    println!("head revision: {}", head.0);
-    println!("commits:       {}", commits.len());
-    println!("tasks:         {}", tasks.len());
+    println!("project:       {}", read.workspace.run_meta.run);
+    println!("head revision: {}", read.workspace.revision.0);
+    println!("commits:       {}", read.log.len());
+    println!("tasks:         {}", read.tasks.len());
 
-    for record in tasks {
+    for record in read.tasks {
         println!(
             "  {} {} [{}] {}",
             record.spec.id, record.spec.kind, record.state, record.spec.objective,
@@ -1235,20 +1279,9 @@ fn status(database: PathBuf) -> Result<(), String> {
     Ok(())
 }
 
-fn export(database: PathBuf, out: PathBuf, report: Option<PathBuf>) -> Result<(), String> {
-    let persistence = open_persistence(&database)?;
-
-    let head = persistence
-        .head()
-        .map_err(|error| error.to_string())?
-        .ok_or("the database holds no head yet")?;
-
-    let workspace = persistence
-        .load_workspace(head)
-        .map_err(|error| error.to_string())?
-        .ok_or("the head workspace is missing")?;
-
-    let model = workspace
+fn export(project: PathBuf, out: PathBuf, report: Option<PathBuf>) -> Result<(), String> {
+    let model = read_project(&project)?
+        .workspace
         .assemble_model()
         .map_err(|error| error.to_string())?;
 

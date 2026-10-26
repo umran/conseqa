@@ -309,13 +309,18 @@ async fn a_multi_project_server_isolates_projects_behind_one_api_key() {
     use std::sync::Arc;
 
     // One global server, a stable API key. Projects are isolated: the
-    // active project switches, and each keeps its own model. This does
-    // not depend on any MCP session id — real clients (Claude Code) run
-    // the transport statelessly — so the client never sends one.
-    let dir = std::env::temp_dir().join(format!("conseqa-multi-{}", uuid::Uuid::new_v4()));
-    std::fs::create_dir_all(&dir).expect("data dir");
+    // active project switches, and each keeps its own model in its own
+    // repository. This does not depend on any MCP session id — real
+    // clients (Claude Code) run the transport statelessly — so the
+    // client never sends one.
+    let root = std::env::temp_dir().join(format!("conseqa-multi-{}", uuid::Uuid::new_v4()));
+    let checkout = root.join("checkout");
+    let billing = root.join("billing");
 
-    let manager = Arc::new(conseqa::confluence::WorkspaceManager::new(&dir));
+    std::fs::create_dir_all(&checkout).expect("checkout repository");
+    std::fs::create_dir_all(&billing).expect("billing repository");
+
+    let manager = Arc::new(conseqa::confluence::WorkspaceManager::new());
     let api_key = "test-api-key-xyz".to_string();
 
     let server = mcp::serve_router(
@@ -341,15 +346,22 @@ async fn a_multi_project_server_isolates_projects_behind_one_api_key() {
         "{early}"
     );
 
+    // A directory holding no project is not one.
+    let (missing, is_error) = client
+        .call("open_project", serde_json::json!({"path": checkout}))
+        .await;
+    assert!(is_error, "{missing}");
+
     // Create "checkout", grounded by its prompt, and commit a service.
     let (created, is_error) = client
         .call(
             "create_project",
-            serde_json::json!({"project": "checkout", "prompt": "A checkout system."}),
+            serde_json::json!({"path": checkout, "prompt": "A checkout system."}),
         )
         .await;
     assert!(!is_error, "{created}");
     assert_eq!(created["created"], true);
+    assert_eq!(created["project"], "checkout", "named after its directory");
 
     let (context, _) = client.call("task_context", serde_json::json!({})).await;
     assert_eq!(
@@ -368,10 +380,17 @@ async fn a_multi_project_server_isolates_projects_behind_one_api_key() {
     assert!(!is_error, "{committed}");
     assert_eq!(committed["committed"], true);
 
+    assert!(
+        checkout
+            .join(".conseqa/spec/services/service.checkout.yaml")
+            .is_file(),
+        "the commit is in checkout's own files"
+    );
+
     // Switch to a fresh "billing" project: it is empty — checkout's
     // service is not visible.
-    let (_opened, is_error) = client
-        .call("open_project", serde_json::json!({"project": "billing"}))
+    let (_created, is_error) = client
+        .call("create_project", serde_json::json!({"path": billing}))
         .await;
     assert!(!is_error);
 
@@ -384,11 +403,16 @@ async fn a_multi_project_server_isolates_projects_behind_one_api_key() {
         "billing is isolated from checkout: {search}"
     );
 
-    // Switch back to checkout: its committed service is still there,
-    // proving projects persist independently.
-    client
-        .call("open_project", serde_json::json!({"project": "checkout"}))
+    // Switch back to checkout, by a directory inside it: its committed
+    // service is still there, proving projects persist independently.
+    let inside = checkout.join("src");
+    std::fs::create_dir_all(&inside).expect("a directory inside checkout");
+
+    let (opened, is_error) = client
+        .call("open_project", serde_json::json!({"path": inside}))
         .await;
+    assert!(!is_error, "{opened}");
+    assert_eq!(opened["project"], "checkout");
 
     let (search, _) = client
         .call("search_symbols", serde_json::json!({"kind": "service"}))
@@ -404,17 +428,6 @@ async fn a_multi_project_server_isolates_projects_behind_one_api_key() {
         "checkout kept its service: {search}"
     );
 
-    // list_projects sees both.
-    let (list, _) = client.call("list_projects", serde_json::json!({})).await;
-    let names: Vec<&str> = list["projects"]
-        .as_array()
-        .expect("projects")
-        .iter()
-        .filter_map(|p| p["name"].as_str())
-        .collect();
-    assert!(names.contains(&"checkout"), "{list}");
-    assert!(names.contains(&"billing"), "{list}");
-
     // A wrong API key is refused.
     let mut intruder = McpClient::connect(&url, "wrong-key").await;
     let refused = intruder
@@ -422,7 +435,7 @@ async fn a_multi_project_server_isolates_projects_behind_one_api_key() {
             "jsonrpc": "2.0",
             "id": 500,
             "method": "tools/call",
-            "params": {"name": "list_projects", "arguments": {}},
+            "params": {"name": "open_project", "arguments": {"path": checkout}},
         }))
         .await;
     assert!(
@@ -431,7 +444,7 @@ async fn a_multi_project_server_isolates_projects_behind_one_api_key() {
     );
 
     server.shutdown().await;
-    std::fs::remove_dir_all(&dir).ok();
+    std::fs::remove_dir_all(&root).ok();
 }
 
 #[tokio::test]
