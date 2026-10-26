@@ -1,11 +1,12 @@
 //! The command-line surface of the System One layer (§26 of the System
-//! One orchestration revision), used by the design MCP daemon whose
-//! `request_design` tool runs the workflow.
+//! One orchestration revision): `conseqa design`, whose coding agents
+//! run behind the builders it is told to put in front of them, and the
+//! design MCP daemon, whose `build_design` runs every builder.
 //!
 //! Nothing here is ever enabled implicitly. A run uses a decider only
 //! when one is named, sends state off the machine only to a URL that
-//! was given, and attempts in process only the task kinds it was told
-//! to.
+//! was given, and puts in front of coding agents only the builders it
+//! was told to.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -14,7 +15,9 @@ use clap::{Args, ValueEnum};
 
 use crate::design::{DesignEngine, TaskKind};
 use crate::harness::AgentBackend;
-use crate::system_one::{BackendSettings, ConfiguredDecider, DeciderKind, DeciderSettings};
+use crate::system_one::{
+    BackendSettings, ConfiguredDecider, DeciderKind, DeciderSettings, NoDecider,
+};
 
 use super::{BUILDABLE, SystemOneBackend};
 
@@ -216,10 +219,45 @@ pub fn configure(args: &DeciderArgs, kinds: &[TaskKind]) -> Result<Option<Execut
         &configured.egress,
     );
 
+    eprintln!(
+        "system one attempts, before the agent backend: {}",
+        kinds
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+
     Ok(Some(Executor {
         configured,
         kinds: kinds.to_vec(),
     }))
+}
+
+/// Every builder, for a run with no agent behind it: what they leave
+/// is handed back to the caller, so there is nothing to keep them away
+/// from. The decider is optional — without one, each builder settles
+/// what code alone can and abstains from what needs a judgment.
+/// Validates the settings and says what will leave the machine, like
+/// [`configure`].
+pub fn every_builder(args: &DeciderArgs) -> Result<Executor, String> {
+    let configured = match args.settings().build().map_err(|error| error.to_string())? {
+        Some(configured) => configured,
+        None => ConfiguredDecider {
+            decider: Arc::new(NoDecider),
+            egress: Vec::new(),
+        },
+    };
+
+    announce_egress(
+        "the run's prompt, and a summary of each operation a builder decides,",
+        &configured.egress,
+    );
+
+    Ok(Executor {
+        configured,
+        kinds: BUILDABLE.to_vec(),
+    })
 }
 
 impl Executor {
@@ -231,23 +269,11 @@ impl Executor {
         engine: &DesignEngine,
         fallback: Arc<dyn AgentBackend>,
     ) -> Arc<dyn AgentBackend> {
-        let backend = SystemOneBackend::new(
+        Arc::new(SystemOneBackend::new(
             engine.clone(),
             Arc::clone(&self.configured.decider),
             self.kinds.iter().copied(),
             fallback,
-        );
-
-        eprintln!(
-            "system one attempts, before the agent backend: {}",
-            backend
-                .kinds()
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
-
-        Arc::new(backend)
+        ))
     }
 }

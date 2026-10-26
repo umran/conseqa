@@ -1,27 +1,35 @@
 //! The MCP tool surface (§42–§53 of the harness spec).
 //!
-//! One shared Streamable HTTP server; every request authenticates with
-//! a per-task bearer capability that resolves to the task's pinned
-//! snapshot, read tracker, and write scope. The tool set is
-//! deliberately small: tracked reads, canonical queries, one mutation
-//! tool (`submit_patch`), dependency requests, and status.
+//! One server, two roles, each served its own brief and only its own
+//! tools. The coordinator — the stdio client, the holder of the API
+//! key, or an interactive session's token — designs the system: it
+//! selects projects, authors through `submit_patch`, builds in process
+//! with `build_design`, reads the checker's verdict, and exports. A
+//! worker — a scoped task's agent, holding that task's bearer
+//! capability — reads its pinned snapshot, commits through the same
+//! gate, and files dependency requests. Both read through tracked
+//! reads and canonical queries.
 //!
 //! DSL payloads — symbol keys, graph queries, patches — travel in
-//! their canonical serialized JSON forms; `dsl_reference` documents
-//! the shapes compactly for agents.
+//! their canonical serialized JSON forms; `dsl_guide` documents the
+//! shapes under its `JSON shapes` topics.
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use rmcp::{
     ErrorData as McpError, RoleServer, ServerHandler,
-    handler::server::wrapper::Parameters,
-    model::{CallToolResult, ContentBlock, ServerCapabilities, ServerInfo},
+    handler::server::{router::tool::ToolRouter, tool::ToolCallContext, wrapper::Parameters},
+    model::{
+        CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock,
+        InitializeRequestParams, InitializeResult, ListToolsResult, PaginatedRequestParams,
+        ServerCapabilities, ServerInfo, Tool,
+    },
     schemars,
     service::RequestContext,
-    tool, tool_handler, tool_router,
+    tool, tool_router,
 };
 use serde::Deserialize;
 use uuid::Uuid;
@@ -39,10 +47,8 @@ use super::task::{TaskId, TaskState};
 use super::workspace::EvidenceRef;
 use super::workspace_manager::WorkspaceManager;
 
-/// The invariants every architecture agent operates under (§89),
-/// served as the MCP server's instructions.
-/// The contract served to harness worker agents (`Single` backing):
-/// one scoped task, one patch, restart on invalidation.
+/// The invariants every worker operates under (§89), served as its
+/// brief: one scoped task, one patch, restart on invalidation.
 const WORKER_INSTRUCTIONS: &str = "\
 Conseqa shared architecture state. Invariants:
 1. Shared Conseqa state is available only through these tools.
@@ -55,14 +61,13 @@ Conseqa shared architecture state. Invariants:
 8. Prefer unknown/unresolved over inventing an unsupported guarantee.
 9. Finish by committing one patch, filing a dependency request, or \
 reporting unresolved.
-Call dsl_guide for DSL semantics by topic, and dsl_reference for the \
-JSON shapes of symbols, queries, and patches.";
+Call dsl_guide for the DSL's semantics by topic, and for the JSON \
+shapes of symbols, queries, and patches under its `JSON shapes` topics.";
 
-/// The brief served to interactive clients (`Local` stdio and `Multi`
-/// http backings): the authoring loop, stated up front, so an agent
-/// asked to design a system with Conseqa knows exactly how to work
-/// instead of reverse-engineering the crate.
-const INTERACTIVE_INSTRUCTIONS: &str = "\
+/// The brief served to the coordinator: the authoring loop, stated up
+/// front, so an agent asked to design a system with Conseqa knows
+/// exactly how to work instead of reverse-engineering the crate.
+const COORDINATOR_INSTRUCTIONS: &str = "\
 Conseqa architecture authoring. You design a system as a Conseqa model \
 — services, schemas, data models, topics, state machines, and \
 operations with explicit causal programs — and a deterministic checker \
@@ -80,37 +85,41 @@ repository's absolute path (or any directory inside it). A server \
 started inside a project opens it on its own. create_project starts a \
 new one in a directory, normally the repository root.
 2. Learn the DSL from this server, not from source code: dsl_guide \
-explains the semantics by topic — pass every section you need as \
-topics in ONE call rather than one call per section; dsl_reference \
-gives the exact JSON shapes plus a worked program example.
+explains the semantics by topic, and its `JSON shapes` topics give the \
+exact shapes — symbol keys, graph queries, patch mutations, sketch \
+steps, program steps, and a worked program example. Pass every topic \
+you need as `topics` in ONE call rather than one call per topic.
 3. Author the shared skeleton yourself with submit_patch: services, \
 schemas, data models (outboxes included), topics, state machines, and \
 one interface per planned operation (its id, service, inputs, and \
 request, subscription, or outbox contracts). Give every interface a \
 `sketch` — the operation's business actions as typed steps (find, \
 update, create, delete, transition, advance, fence, enqueue, publish, \
-call, request, when, reject, parallel, answer, race, start; see \
-dsl_reference) — whenever its work fits that vocabulary: a sketched \
+call, request, when, reject, parallel, answer, race, start; see the \
+sketch shapes) — whenever its work fits that vocabulary: a sketched \
 program is compiled in code, in milliseconds. Many small typed patches \
 are normal. The commit gate rejects a structurally broken patch with \
 precise diagnostics; fix it and resubmit in the same session.
 4. Once that skeleton is complete for the whole system, call \
 build_design, passing the user's request as `prompt` — the project \
-records no prompt, so each run is told what to build. It runs the whole design in this server, one step after \
-another, with no worker agents: it compiles every sketch, declares the \
-default runtime topology, discovers requirements, verifies, and \
-repairs what its remedy catalogue can prove. It returns within the \
-call, and your session is refreshed to the new head.
-5. Whatever code could not settle comes back as `hand_offs`, each with \
-its objective and what the builder established — a sketch that does \
-not compile, a program the sketch vocabulary cannot express, an unsure \
+records no prompt, so each build is told what to build. It runs the \
+whole design in this server, one step after another: it compiles every \
+sketch, declares the default runtime topology, discovers requirements, \
+verifies, and repairs what its remedy catalogue can prove. It returns \
+within the call with the checker's verdict, and your session is moved \
+to the new head.
+5. When code could not settle something, the build stops at that phase \
+with status `handed_back` and lists it under `hand_offs`, each with its \
+objective and what the builder established — a sketch that does not \
+compile, a program the sketch vocabulary cannot express, an unsure \
 requirement, a repair outside the catalogue. Those are yours: resolve \
 them with submit_patch, then call build_design again. Repeat until it \
-returns no hand-offs and a success status.
-6. spec_status is your feedback loop throughout: assembly gaps while \
-drafting, validation errors, or the verification verdict with exactly \
-which obligations are proven and which are not. Fix what it names \
-narrowly, yourself, and build again.
+returns status `success`.
+6. spec_status is your feedback loop while drafting: assembly gaps, \
+validation errors, or the verification verdict with exactly which \
+obligations are proven and which are not; requirement_report gives an \
+operation's open obligations in full. Fix what they name narrowly, \
+yourself, and build again.
 
 An unproven transaction serializability or ordering obligation \
 carries `remedy: application`, always: the fix is in the L0 model. \
@@ -138,18 +147,19 @@ visualization, written to a directory you choose — show these to the \
 user.
 
 Write an operation program yourself only when its work does not fit \
-the sketch vocabulary, or when build_design hands it back. Invariants: requirements are \
-obligations, not guarantees; never weaken or remove a requirement to \
-make verification pass; prefer unknown/unspecified over inventing a \
-guarantee the design does not support. Correctness verdicts come only \
-from the checker.";
+the sketch vocabulary, or when build_design hands it back. To have \
+coding agents build the design instead, the user runs `conseqa design` \
+in the repository. Invariants: requirements are obligations, not \
+guarantees; never weaken or remove a requirement to make verification \
+pass; prefer unknown/unspecified over inventing a guarantee the design \
+does not support. Correctness verdicts come only from the checker.";
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ReadSymbolParams {
     /// The symbol key in its canonical serialized form, e.g.
     /// {"kind":"schema","value":"schema.Order"} or
     /// {"kind":"transaction","value":{"operation":"operation.checkout",
-    /// "transaction":"tx.charge"}}. See dsl_reference.
+    /// "transaction":"tx.charge"}}. See dsl_guide's `JSON shapes`.
     pub symbol: serde_json::Value,
 }
 
@@ -196,7 +206,7 @@ pub struct GraphQueryParams {
     /// The canonical query, e.g. {"kind":"callers","operation":
     /// "operation.checkout"} or {"kind":"writers","data_model":
     /// "data.checkout","object":"object.order","field":"status"}.
-    /// See dsl_reference.
+    /// See dsl_guide's `JSON shapes`.
     pub query: serde_json::Value,
 }
 
@@ -211,6 +221,12 @@ pub struct RequirementReportParams {
     /// Any other value is an error, never an empty report.
     #[serde(default)]
     pub family: Option<String>,
+
+    /// Also list the proven obligations, each with its whole proof.
+    /// Off by default: they are counted, and a repair reads only what
+    /// is open.
+    #[serde(default)]
+    pub include_proven: bool,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -223,8 +239,8 @@ pub struct SubmitPatchParams {
     #[serde(default)]
     pub dsl: Option<u64>,
 
-    /// The typed patch: {"mutations":[...]}. See dsl_reference for
-    /// mutation shapes.
+    /// The typed patch: {"mutations":[...]}. See dsl_guide's `JSON
+    /// shapes` for mutation shapes.
     pub patch: serde_json::Value,
 
     /// The revision your reasoning is based on. Defaults to your
@@ -240,30 +256,14 @@ pub struct SubmitPatchParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct RequestDesignParams {
-    /// What to design, in the user's words: pass the user's request on
-    /// the run that starts from it. Every task of this run sees it; the
-    /// project does not record it — the correctness obligations
-    /// requirement discovery extracts from it are what last.
+pub struct BuildDesignParams {
+    /// What to design, in the user's words. Pass it on every build: the
+    /// project records no prompt — the correctness obligations
+    /// discovery extracts from it are what last — and discovery judges
+    /// each explicit obligation against it.
     #[serde(default)]
     pub prompt: Option<String>,
-
-    /// Optional extra guidance for the worker agents, layered on top of
-    /// the prompt.
-    #[serde(default)]
-    pub objective: Option<String>,
 }
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct AwaitDesignParams {
-    /// How long to wait, in seconds; at most 55. Defaults to 50.
-    #[serde(default)]
-    pub wait_secs: Option<u64>,
-}
-
-/// The longest `await_design` holds a call open: under the minute an
-/// MCP client commonly allows a tool call.
-const AWAIT_DESIGN_MAX_SECS: u64 = 55;
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct OpenProjectParams {
@@ -303,53 +303,57 @@ pub struct DependencyRequestParams {
     pub evidence: Vec<String>,
 }
 
-/// Launches the concurrent multi-agent design workflow against one
-/// project's engine. Implemented by the orchestrating binary (which
-/// depends on the `harness` module) and injected here, so the MCP
-/// server can trigger a fanout without `design` depending on
-/// `harness`.
-pub trait DesignLauncher: Send + Sync {
-    /// Starts the workflow in the background against `engine` and
-    /// returns a description of the launched run, or a reason it could
-    /// not start (for example, one is already running).
-    fn launch(&self, engine: DesignEngine, input: DesignInput)
-    -> Result<serde_json::Value, String>;
-
-    /// Whether a run is in flight and the last one's report, for
-    /// `spec_status` to surface. `None` when the orchestrator tracks no
-    /// such state.
-    fn status(&self) -> Option<serde_json::Value> {
-        None
-    }
-
-    /// Runs the workflow to completion in one thread, with no agent
-    /// sessions: what the in-process builders cannot settle is handed
-    /// back in the returned report instead. `Err` when the orchestrator
-    /// cannot (a run is already active, or it has no builders).
+/// Builds one project's design in process, one task at a time and
+/// with no agent sessions. Implemented by the harness (which depends on
+/// `design`) and injected here, so the MCP server can build without
+/// `design` depending on `harness`.
+pub trait DesignBuilder: Send + Sync {
+    /// Starts a build of `engine`'s project for `prompt`, returning
+    /// what it did once it is done, or why it could not start (another
+    /// build is running).
     fn build(
         &self,
         engine: DesignEngine,
-        input: DesignInput,
-    ) -> Result<futures::future::BoxFuture<'static, serde_json::Value>, String> {
-        let _ = (engine, input);
-
-        Err("this server cannot build a design in process".to_string())
-    }
+        prompt: Option<String>,
+    ) -> Result<futures::future::BoxFuture<'static, DesignBuild>, String>;
 }
 
-/// What one design run is asked: the requester's prompt and any extra
-/// objective. Inputs to that run only — the project records neither.
-#[derive(Debug, Clone, Default)]
-pub struct DesignInput {
-    pub prompt: Option<String>,
-    pub objective: Option<String>,
+/// What one build did.
+#[derive(Debug, Clone)]
+pub struct DesignBuild {
+    pub started_at_revision: Revision,
+    pub elapsed: Duration,
+    pub outcome: BuildOutcome,
 }
 
-impl From<RequestDesignParams> for DesignInput {
-    fn from(params: RequestDesignParams) -> Self {
-        Self {
-            prompt: params.prompt,
-            objective: params.objective,
+/// How a build ended.
+#[derive(Debug, Clone)]
+pub enum BuildOutcome {
+    /// Every phase ran, every adopted obligation is proven, and every
+    /// explicit prompt obligation is mapped.
+    Success,
+
+    /// Every phase ran, and what is named is left.
+    Incomplete {
+        reason: String,
+        unresolved: Vec<String>,
+    },
+
+    /// The build stopped at a phase boundary to hand what code could
+    /// not settle back to its caller; later phases have not run.
+    HandedBack { hand_offs: Vec<serde_json::Value> },
+
+    /// The workflow itself failed.
+    Failed { error: String },
+}
+
+impl BuildOutcome {
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Success => "success",
+            Self::Incomplete { .. } => "incomplete",
+            Self::HandedBack { .. } => "handed_back",
+            Self::Failed { .. } => "failed",
         }
     }
 }
@@ -404,9 +408,8 @@ enum Backing {
     /// embedded and single-project daemon paths.
     Single(DesignEngine),
 
-    /// Many projects over HTTP behind a stable API key; the UI selects
-    /// the active project through the project tools, and worker
-    /// capability tokens resolve against the open engines.
+    /// Many projects over HTTP behind a stable API key; the client
+    /// selects the active project through the project tools.
     Multi { host: ProjectHost, api_key: String },
 
     /// Many projects over stdio: the single local client is inherently
@@ -435,42 +438,82 @@ enum ResolveError {
     Project(String),
 }
 
+/// Who is calling, which decides the brief and the tools served.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Role {
+    /// The author driving the design: the stdio client, the holder of
+    /// the API key, or an interactive session's token.
+    Coordinator,
+
+    /// A scoped task's agent, holding that task's capability.
+    Worker,
+}
+
+/// Each role's tools, built once: a router generates every tool's
+/// schema, and rebuilding one per list or call is waste.
+struct Routers {
+    worker: ToolRouter<ConseqaMcp>,
+
+    /// The coordinator of a multi-project server, which selects its
+    /// projects.
+    coordinator: ToolRouter<ConseqaMcp>,
+
+    /// The coordinator of a single-project server: an interactive
+    /// session, with no project to select.
+    session: ToolRouter<ConseqaMcp>,
+
+    /// Every tool, for looking one up by name.
+    all: ToolRouter<ConseqaMcp>,
+}
+
+static ROUTERS: LazyLock<Routers> = LazyLock::new(|| Routers {
+    worker: ConseqaMcp::shared_tools() + ConseqaMcp::worker_tools(),
+    coordinator: ConseqaMcp::shared_tools()
+        + ConseqaMcp::coordinator_tools()
+        + ConseqaMcp::project_tools(),
+    session: ConseqaMcp::shared_tools() + ConseqaMcp::coordinator_tools(),
+    all: ConseqaMcp::shared_tools()
+        + ConseqaMcp::worker_tools()
+        + ConseqaMcp::coordinator_tools()
+        + ConseqaMcp::project_tools(),
+});
+
 #[derive(Clone)]
 pub struct ConseqaMcp {
     backing: Backing,
-    launcher: Option<Arc<dyn DesignLauncher>>,
+    builder: Option<Arc<dyn DesignBuilder>>,
 }
 
 impl ConseqaMcp {
     pub fn new(engine: DesignEngine) -> Self {
         Self {
             backing: Backing::Single(engine),
-            launcher: None,
+            builder: None,
         }
     }
 
-    /// A single-project server that can also launch the concurrent
-    /// design workflow.
-    pub fn with_launcher(engine: DesignEngine, launcher: Arc<dyn DesignLauncher>) -> Self {
+    /// A single-project server whose sessions can also build the
+    /// design.
+    pub fn with_builder(engine: DesignEngine, builder: Arc<dyn DesignBuilder>) -> Self {
         Self {
             backing: Backing::Single(engine),
-            launcher: Some(launcher),
+            builder: Some(builder),
         }
     }
 
-    /// A multi-project HTTP server: a stable API key authenticates UI
+    /// A multi-project HTTP server: a stable API key authenticates
     /// clients, which select projects through the project tools.
     pub fn multi(
         manager: Arc<WorkspaceManager>,
         api_key: impl Into<String>,
-        launcher: Option<Arc<dyn DesignLauncher>>,
+        builder: Option<Arc<dyn DesignBuilder>>,
     ) -> Self {
         Self {
             backing: Backing::Multi {
                 host: ProjectHost::new(manager, None),
                 api_key: api_key.into(),
             },
-            launcher,
+            builder,
         }
     }
 
@@ -480,13 +523,66 @@ impl ConseqaMcp {
     /// opens on the first call that needs one.
     pub fn local(
         manager: Arc<WorkspaceManager>,
-        launcher: Option<Arc<dyn DesignLauncher>>,
+        builder: Option<Arc<dyn DesignBuilder>>,
         home: Option<PathBuf>,
     ) -> Self {
         Self {
             backing: Backing::Local(ProjectHost::new(manager, home)),
-            launcher,
+            builder,
         }
+    }
+
+    /// The role of a request's caller. A single-project server serves
+    /// its workers and its interactive sessions alike, so there the
+    /// bearer decides; every other server's caller is its coordinator.
+    fn role(&self, context: &RequestContext<RoleServer>) -> Role {
+        match &self.backing {
+            Backing::Single(engine) => match Self::bearer(context)
+                .ok()
+                .and_then(|bearer| engine.resolve_token(&bearer))
+            {
+                Some(task) if engine.is_session(task) => Role::Coordinator,
+                _ => Role::Worker,
+            },
+
+            Backing::Multi { .. } | Backing::Local(_) => Role::Coordinator,
+        }
+    }
+
+    /// The tools `role` is served on this server.
+    fn tools(&self, role: Role) -> &'static ToolRouter<Self> {
+        match (role, &self.backing) {
+            (Role::Worker, _) => &ROUTERS.worker,
+            (Role::Coordinator, Backing::Single(_)) => &ROUTERS.session,
+            (Role::Coordinator, _) => &ROUTERS.coordinator,
+        }
+    }
+
+    /// The server's description for `role`. Both briefs lead with the
+    /// DSL contract version, so an agent learns which contract it
+    /// authors against before it drafts anything; `Implementation`
+    /// stays the build version — the axes are distinct.
+    fn info(&self, role: Role) -> ServerInfo {
+        let mut info = ServerInfo::new(ServerCapabilities::builder().enable_tools().build());
+
+        // This build, honestly: the default is rmcp's own build env,
+        // which reports the library.
+        let mut implementation = rmcp::model::Implementation::default();
+        implementation.name = env!("CARGO_PKG_NAME").to_string();
+        implementation.version = env!("CARGO_PKG_VERSION").to_string();
+        info.server_info = implementation;
+
+        info.instructions = Some(format!(
+            "This server speaks Conseqa DSL contract version {}; author against it, \
+             and learn it through dsl_guide.\n\n{}",
+            crate::spec::DSL_VERSION,
+            match role {
+                Role::Worker => WORKER_INSTRUCTIONS,
+                Role::Coordinator => COORDINATOR_INSTRUCTIONS,
+            }
+        ));
+
+        info
     }
 
     /// The bearer credential of a request.
@@ -535,27 +631,13 @@ impl ConseqaMcp {
             }
 
             Backing::Multi { host, api_key } => {
-                let bearer = Self::bearer(context)?;
-
-                if &bearer == api_key {
-                    host.active_resolved()
-                } else {
-                    // Worker agent: its capability token resolves in
-                    // whichever open project engine minted it.
-                    for engine in host.manager.open_engines() {
-                        if engine.resolve_token(&bearer).is_some() {
-                            sync(&engine)?;
-
-                            if let Some(task) = engine.resolve_token(&bearer) {
-                                return Ok(Resolved { engine, task });
-                            }
-                        }
-                    }
-
-                    Err(ResolveError::Unauthorized(
-                        "the credential is not recognized".to_string(),
-                    ))
+                if &Self::bearer(context)? != api_key {
+                    return Err(ResolveError::Unauthorized(
+                        "the API key is not recognized".to_string(),
+                    ));
                 }
+
+                host.active_resolved()
             }
 
             // stdio: the local client is trusted; no bearer to check.
@@ -591,32 +673,6 @@ impl ConseqaMcp {
 }
 
 impl ProjectHost {
-    /// Gives the active project a fresh session at the current head, so
-    /// the caller's next reads and patches are against what a build just
-    /// committed rather than the snapshot its session opened on.
-    fn renew(&self, engine: &DesignEngine) -> Result<(), String> {
-        let mut active = self.active.write();
-
-        let Some(session) = active.as_mut() else {
-            return Ok(());
-        };
-
-        if !session.engine.same_engine(engine) {
-            return Ok(());
-        }
-
-        let handle = engine
-            .create_session(
-                super::task::WriteScope::of([super::task::WriteGrant::All]),
-                "interactive session, renewed after a build".to_string(),
-            )
-            .map_err(|error| error.to_string())?;
-
-        session.token = handle.token.0;
-
-        Ok(())
-    }
-
     /// Resolves the active project to `(engine, task)`, first opening
     /// the server's own project when none is active, and adopting any
     /// change made to the files outside the server.
@@ -741,15 +797,17 @@ fn project_error_result(message: String) -> Result<CallToolResult, McpError> {
     }))
 }
 
+/// A tool's answer, as compact JSON: every byte of it is read into the
+/// caller's context, and indentation is most of a deep program's size.
 fn json_result(value: serde_json::Value) -> Result<CallToolResult, McpError> {
-    let text = serde_json::to_string_pretty(&value)
+    let text = serde_json::to_string(&value)
         .map_err(|error| McpError::internal_error(error.to_string(), None))?;
 
     Ok(CallToolResult::success(vec![ContentBlock::text(text)]))
 }
 
 fn json_error(value: serde_json::Value) -> Result<CallToolResult, McpError> {
-    let text = serde_json::to_string_pretty(&value)
+    let text = serde_json::to_string(&value)
         .map_err(|error| McpError::internal_error(error.to_string(), None))?;
 
     Ok(CallToolResult::error(vec![ContentBlock::text(text)]))
@@ -777,7 +835,7 @@ fn engine_error(error: EngineError) -> Result<CallToolResult, McpError> {
 /// failure rather than a JSON-RPC protocol error. A protocol error is
 /// what an MCP client surfaces as a "transport" failure — opaque to the
 /// model — so a malformed argument must come back as a readable tool
-/// result the agent can correct, pointing at `dsl_reference`.
+/// result the agent can correct, pointing at the guide's shapes.
 ///
 /// A structured argument is accepted whether it arrives as a JSON
 /// object or as a JSON-encoded string: some models serialize nested
@@ -796,8 +854,8 @@ fn parse<T: serde::de::DeserializeOwned>(
         json_error(serde_json::json!({
             "error": format!("{what} did not parse: {error}"),
             "guidance": format!(
-                "Pass `{what}` as a JSON object, not a JSON string. Call dsl_reference \
-                 for the exact shapes, then try again."
+                "Pass `{what}` as a JSON object, not a JSON string. Call dsl_guide with \
+                 the topic `JSON shapes` for the exact shapes, then try again."
             ),
         }))
     })
@@ -874,44 +932,10 @@ pub struct ExportSpecParams {
     pub title: Option<String>,
 }
 
-#[tool_router]
+/// The tools of both roles: tracked reads, canonical queries, the one
+/// mutation tool, and the guide.
+#[tool_router(router = shared_tools)]
 impl ConseqaMcp {
-    #[tool(
-        description = "Your task: objective, kind, pinned snapshot revision, write scope, \
-                       prompt evidence, and completion condition. Call this first."
-    )]
-    async fn task_context(
-        &self,
-        context: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, McpError> {
-        let resolved = resolved!(self, context);
-        let (engine, task) = (resolved.engine, resolved.task);
-
-        match engine.task_context(task) {
-            Ok(view) => json_result(serde_json::to_value(view).expect("context serializes")),
-            Err(error) => engine_error(error),
-        }
-    }
-
-    #[tool(
-        description = "Your task's current state: running, invalidated, committed, or \
-                       cancelled. A harness worker whose task is invalidated must stop — \
-                       the harness restarts it. An interactive session rolls forward on \
-                       each commit and stays running."
-    )]
-    async fn task_status(
-        &self,
-        context: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, McpError> {
-        let resolved = resolved!(self, context);
-        let (engine, task) = (resolved.engine, resolved.task);
-
-        match engine.task_status(task) {
-            Ok(state) => json_result(serde_json::json!({ "state": state.to_string() })),
-            Err(error) => engine_error(error),
-        }
-    }
-
     #[tool(
         description = "Read one shared architecture symbol from your pinned snapshot. The \
                        read is tracked: committing depends on it still holding."
@@ -1011,8 +1035,11 @@ impl ConseqaMcp {
     }
 
     #[tool(
-        description = "Analyzer verdicts for declared requirements: proven or unproven, \
-                       with structured proofs and obstacles. The central input for repair."
+        description = "The checker's open obligations: each unproven declared requirement \
+                       with its structured obstacles and the evidence naming the missing \
+                       fact, for one operation or family or the whole model. The central \
+                       input for repair. Proven obligations are counted, not listed, unless \
+                       include_proven asks for their proofs."
     )]
     async fn requirement_report(
         &self,
@@ -1027,6 +1054,7 @@ impl ConseqaMcp {
             task,
             params.operation.as_deref().map(id_from),
             params.family.as_deref(),
+            params.include_proven,
         ) {
             Ok(report) => json_result(report),
             Err(error) => engine_error(error),
@@ -1035,10 +1063,8 @@ impl ConseqaMcp {
 
     #[tool(
         description = "Submit your typed patch through the serializable commit gate. The \
-                       gate revalidates everything you observed; a stale-context rejection \
-                       means stop — do not retry in this session, the harness restarts the \
-                       task. Scope, unobserved-dependency, and draft-validation rejections \
-                       are fixable here."
+                       gate revalidates everything you observed and rejects with precise \
+                       diagnostics; the rejection's guidance says whether to fix it here."
     )]
     async fn submit_patch(
         &self,
@@ -1065,8 +1091,7 @@ impl ConseqaMcp {
                 "guidance": format!(
                     "This patch declares dsl {declared}, but this server speaks dsl {}; \
                      the contract changed and patches are not migrated automatically. \
-                     Re-learn the DSL with dsl_guide and dsl_reference, then re-author \
-                     the patch.",
+                     Re-learn the DSL with dsl_guide, then re-author the patch.",
                     crate::spec::DSL_VERSION
                 ),
             }));
@@ -1078,9 +1103,10 @@ impl ConseqaMcp {
             return json_error(serde_json::json!({
                 "committed": false,
                 "error": "empty patch",
-                "guidance": "A patch must contain at least one mutation. Call dsl_reference \
-                             for mutation shapes and submit a non-empty patch, or finish \
-                             the task another way if there is nothing to change.",
+                "guidance": "A patch must contain at least one mutation. Call dsl_guide \
+                             with the topic `JSON shapes` for mutation shapes and submit a \
+                             non-empty patch, or finish another way if there is nothing to \
+                             change.",
             }));
         }
 
@@ -1129,12 +1155,20 @@ impl ConseqaMcp {
             })),
 
             Ok(Err(rejection)) => {
-                let guidance = if rejection.is_stale_context() {
-                    "Your context is stale. Do not try to fix this in this session; \
-                     the harness will restart the task against a fresh snapshot."
-                } else {
-                    "This is fixable in this session: adjust the patch (or read the \
-                     missing symbols) and submit again with a fresh nonce."
+                let guidance = match (rejection.is_stale_context(), self.role(&context)) {
+                    (true, Role::Worker) => {
+                        "Your context is stale. Do not try to fix this in this session; \
+                         the harness will restart the task against a fresh snapshot."
+                    }
+                    (true, Role::Coordinator) => {
+                        "Your session's snapshot is behind the head. Reopen the project \
+                         (open_project with no path) to move it there, re-read what the \
+                         rejection names, and submit again with a fresh nonce."
+                    }
+                    (false, _) => {
+                        "This is fixable in this session: adjust the patch (or read the \
+                         missing symbols) and submit again with a fresh nonce."
+                    }
                 };
 
                 json_error(serde_json::json!({
@@ -1145,6 +1179,78 @@ impl ConseqaMcp {
                     "guidance": guidance,
                 }))
             }
+        }
+    }
+
+    #[tool(
+        description = "The Conseqa DSL, by topic: what services, schemas, data models, \
+                       topics, state machines, operations, programs, transactions, effects, \
+                       value references, and requirements mean and how they compose — and, \
+                       under the `JSON shapes` topics, the exact shapes these tools exchange: \
+                       symbol keys, graph queries, patch mutations, sketch steps, program \
+                       steps, a worked program example. Call with no topic for the table of \
+                       contents, then pass every section you need as topics in one call (a \
+                       section name or a few words of it). Use this instead of reading \
+                       Conseqa's source code."
+    )]
+    async fn dsl_guide(
+        &self,
+        params: Parameters<DslGuideParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let params = params.0;
+
+        let mut topics: Vec<&str> = params.topic.iter().map(String::as_str).collect();
+        topics.extend(params.topics.iter().map(String::as_str));
+
+        let text = match topics.as_slice() {
+            [] => guide_toc(),
+            [topic] => guide_lookup(topic),
+            topics => topics
+                .iter()
+                .map(|topic| guide_lookup(topic))
+                .collect::<Vec<_>>()
+                .join("\n\n---\n\n"),
+        };
+
+        Ok(CallToolResult::success(vec![ContentBlock::text(text)]))
+    }
+}
+
+/// A worker's own tools: its task, and asks outside its scope.
+#[tool_router(router = worker_tools)]
+impl ConseqaMcp {
+    #[tool(
+        description = "Your task: objective, kind, pinned snapshot revision, write scope, \
+                       prompt evidence, and completion condition. Call this first."
+    )]
+    async fn task_context(
+        &self,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        let resolved = resolved!(self, context);
+        let (engine, task) = (resolved.engine, resolved.task);
+
+        match engine.task_context(task) {
+            Ok(view) => json_result(serde_json::to_value(view).expect("context serializes")),
+            Err(error) => engine_error(error),
+        }
+    }
+
+    #[tool(
+        description = "Your task's current state: running, invalidated, committed, or \
+                       cancelled. A task that is invalidated must stop — the harness \
+                       restarts it."
+    )]
+    async fn task_status(
+        &self,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        let resolved = resolved!(self, context);
+        let (engine, task) = (resolved.engine, resolved.task);
+
+        match engine.task_status(task) {
+            Ok(state) => json_result(serde_json::json!({ "state": state.to_string() })),
+            Err(error) => engine_error(error),
         }
     }
 
@@ -1178,397 +1284,19 @@ impl ConseqaMcp {
             Err(error) => engine_error(error),
         }
     }
+}
 
-    #[tool(
-        description = "Wait for the running design workflow to finish, instead of polling \
-                       spec_status in a loop. Blocks up to wait_secs (default 50, at most 55) \
-                       and returns the design block: finished true with the run's report, or \
-                       finished false while workers are still committing — then call it \
-                       again. When it finishes, call open_project to refresh your session, \
-                       then spec_status for the verdict."
-    )]
-    async fn await_design(
-        &self,
-        params: Parameters<AwaitDesignParams>,
-    ) -> Result<CallToolResult, McpError> {
-        let Some(launcher) = &self.launcher else {
-            return json_error(serde_json::json!({
-                "error": "concurrent design is not available on this server",
-            }));
-        };
-
-        let wait = std::time::Duration::from_secs(
-            params.0.wait_secs.unwrap_or(50).min(AWAIT_DESIGN_MAX_SECS),
-        );
-        let deadline = tokio::time::Instant::now() + wait;
-
-        let running = |status: &Option<serde_json::Value>| {
-            status
-                .as_ref()
-                .and_then(|status| status.get("running"))
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or(false)
-        };
-
-        let mut status = launcher.status();
-
-        while running(&status) && tokio::time::Instant::now() < deadline {
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-            status = launcher.status();
-        }
-
-        let finished = !running(&status);
-
-        json_result(serde_json::json!({
-            "finished": finished,
-            "design": status,
-            "guidance": if finished {
-                "The run is over. Call open_project to refresh your session to the new \
-                 head, then spec_status for the verdict."
-            } else {
-                "Workers are still committing. Call await_design again; do not submit \
-                 patches meanwhile."
-            },
-        }))
-    }
-
-    #[tool(
-        description = "Build the design in one call, with no worker agents: compiles every \
-                       sketched operation still missing a program, declares the default \
-                       runtime topology, discovers requirements, verifies, and repairs what \
-                       the remedy catalogue can prove — all in this server, one step after \
-                       another. Whatever code cannot settle comes back under `hand_offs`, \
-                       each with what it was for and what the builder established: a \
-                       sketch that does not compile, an unsure requirement, a repair outside \
-                       the catalogue. Resolve those yourself with submit_patch (fix the \
-                       sketch, write the program, declare or decline the requirement, \
-                       repair the transaction), then call build_design again, until it \
-                       returns no hand-offs and status success. Author the whole skeleton \
-                       first, with a sketch on every interface. Blocks until the build is \
-                       done, usually seconds to a minute; your session is refreshed to the \
-                       new head afterwards."
-    )]
-    async fn build_design(
-        &self,
-        params: Parameters<RequestDesignParams>,
-        context: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, McpError> {
-        let resolved = resolved!(self, context);
-        let engine = resolved.engine;
-
-        let Some(launcher) = &self.launcher else {
-            return json_error(serde_json::json!({
-                "built": false,
-                "error": "this server has no design builder",
-            }));
-        };
-
-        let head = engine.head_snapshot();
-
-        if head.workspace.operations.is_empty() {
-            return json_error(serde_json::json!({
-                "built": false,
-                "error": "no operation interfaces are declared",
-                "guidance": "Author the skeleton first — services, schemas, data models, \
-                             topics, machines, and one sketched interface per operation — \
-                             then call build_design.",
-            }));
-        }
-
-        let gaps = super::commit::skeleton_diagnostics(&head.workspace);
-
-        if !gaps.is_empty() {
-            return json_error(serde_json::json!({
-                "built": false,
-                "error": "the skeleton has unresolved references",
-                "skeleton_gaps": gaps,
-                "guidance": "Resolve each gap with submit_patch, then call build_design \
-                             again.",
-            }));
-        }
-
-        match launcher.build(engine.clone(), params.0.into()) {
-            Ok(build) => {
-                let mut report = build.await;
-
-                // The build moved the head; without a fresh session the
-                // caller's next patch would be refused as stale.
-                let renewed = match self.project_host(&context) {
-                    Ok(host) => host.renew(&engine),
-                    Err(_) => Err("open_project to refresh your session".to_string()),
-                };
-
-                if let (Err(note), Some(object)) = (renewed, report.as_object_mut()) {
-                    object.insert("session".to_string(), serde_json::json!(note));
-                }
-
-                json_result(report)
-            }
-
-            Err(error) => json_error(serde_json::json!({
-                "built": false,
-                "error": error,
-            })),
-        }
-    }
-
-    #[tool(
-        description = "Fan out concurrent coding agents to write the operation programs. \
-                       Prefer build_design, which settles the same work in process in \
-                       seconds and hands the rest back to you; use this only when the user \
-                       asks for worker agents. Author the skeleton FIRST and completely — services, schemas, \
-                       data models, topics, machines, and an interface per planned \
-                       operation — then call this: it skips decomposition when interfaces \
-                       already exist and runs one agent per operation still missing a \
-                       program, concurrently, each committing through the same gate. It \
-                       also repairs operations the checker leaves unproven. Do not call it \
-                       early: workers write against the skeleton as it stands at launch, so \
-                       anything missing becomes every worker's mistake at once. A run whose \
-                       skeleton has unresolved references is refused; check \
-                       spec_status.skeleton.ready_to_fan_out first, and confirm the \
-                       operations it reports are the whole system you intend. Optionally \
-                       pass an objective to steer the workers. Returns immediately; call \
-                       await_design (not a polling loop) rather than patching while it runs, \
-                       then call open_project to refresh your session to the new head. One \
-                       workflow runs at a time."
-    )]
-    async fn request_design(
-        &self,
-        params: Parameters<RequestDesignParams>,
-        context: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, McpError> {
-        // Any valid session establishes that the caller is an
-        // authorized client of this engine.
-        let resolved = resolved!(self, context);
-        let engine = resolved.engine;
-
-        let Some(launcher) = &self.launcher else {
-            return json_error(serde_json::json!({
-                "launched": false,
-                "error": "concurrent design is not available on this server",
-                "guidance": "This server embeds the design MCP surface without a design \
-                             launcher, so it cannot start design runs. Every \
-                             `conseqa-design-mcp` command (serve, global, stdio) provides \
-                             one; connect to such a server to run the design workflow.",
-            }));
-        };
-
-        // The skeleton is the contract every worker writes against, so
-        // an incoherent one is refused here rather than dispatched to
-        // all of them at once.
-        let head = engine.head_snapshot();
-        let gaps = super::commit::skeleton_diagnostics(&head.workspace);
-
-        if !gaps.is_empty() {
-            return json_error(serde_json::json!({
-                "launched": false,
-                "error": "the skeleton is not ready to fan out",
-                "skeleton_gaps": gaps,
-                "guidance": "Every worker writes its operation program against these \
-                             declarations, so fanning out now would send all of them at an \
-                             incoherent skeleton. Resolve each gap with submit_patch — \
-                             spec_status reports the same list under `skeleton` — then call \
-                             request_design again.",
-            }));
-        }
-
-        let no_interfaces = head.workspace.operations.is_empty();
-
-        if no_interfaces && params.0.prompt.is_none() {
-            return json_error(serde_json::json!({
-                "launched": false,
-                "error": "nothing to design: no interfaces are declared and no prompt was given",
-                "guidance": "Pass the user's request as `prompt` for the run to decompose, or \
-                             author the skeleton first with submit_patch.",
-            }));
-        }
-
-        let pending: Vec<String> = head
-            .workspace
-            .operations
-            .iter()
-            .filter(|(_, draft)| draft.program.is_none())
-            .map(|(id, _)| id.to_string())
-            .collect();
-
-        match launcher.launch(engine, params.0.into()) {
-            Ok(mut value) => {
-                // Naming the operations makes a premature fanout
-                // visible at once: a list short of the intended system
-                // means the skeleton was handed over half-built.
-                if let Some(object) = value.as_object_mut() {
-                    let (operations, check) = if no_interfaces {
-                        (
-                            serde_json::Value::Null,
-                            "No interfaces are declared, so this run decomposes the given \
-                             prompt itself before synthesizing. To keep control of the contracts, \
-                             cancel and author the skeleton first.",
-                        )
-                    } else if pending.is_empty() {
-                        (
-                            serde_json::json!([]),
-                            "Every operation already has a program, so this run verifies and \
-                             repairs rather than synthesizing.",
-                        )
-                    } else {
-                        (
-                            serde_json::json!(pending),
-                            "These are the operations receiving a worker. If that is not the \
-                             whole system you intended, the skeleton went out too early.",
-                        )
-                    };
-
-                    object.insert("operations".to_string(), operations);
-                    object.insert("check".to_string(), serde_json::json!(check));
-                }
-
-                json_result(value)
-            }
-
-            Err(error) => json_error(serde_json::json!({
-                "launched": false,
-                "error": error,
-            })),
-        }
-    }
-
-    #[tool(
-        description = "Select a project as the active one; every subsequent architecture \
-                       tool call operates on it. A project is the `.conseqa/` directory of a \
-                       repository, committed with its code: pass the repository's absolute \
-                       path, or any directory inside it. Omit the path to reopen the active \
-                       project at its current head (after a design run, say) or, with none \
-                       active, the project this server was started in."
-    )]
-    async fn open_project(
-        &self,
-        params: Parameters<OpenProjectParams>,
-        context: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, McpError> {
-        let host = self.project_host(&context)?;
-
-        let opened = host
-            .project_at(params.0.path.as_deref())
-            .and_then(|engine| host.activate(engine));
-
-        match opened {
-            Ok(info) => json_result(serde_json::json!({
-                "project": info.name,
-                "path": info.path,
-                "opened": true,
-                "revision": info.revision.0,
-                "note": "This is now the active project. Explore it with task_context and \
-                         the read tools, learn the DSL with dsl_guide, change it with \
-                         submit_patch, check spec_status for the checker's verdict, and \
-                         export_spec to deliver YAML, report, and visualization. \
-                         Author the skeleton with a sketch on every interface, then \
-                         call build_design. Every accepted patch is written to the \
-                         project's `.conseqa/` files; remind the user to commit them.",
-            })),
-
-            Err(error) => json_error(serde_json::json!({
-                "opened": false,
-                "error": error,
-                "guidance": "Pass the absolute path of a repository holding a \
-                             `.conseqa/project.yaml`, or call create_project to start one.",
-            })),
-        }
-    }
-
-    #[tool(
-        description = "Create a new project in a directory — normally the repository \
-                       root — and make it active. Its state is a `.conseqa/` directory \
-                       there, to be committed with the code. Errors if the directory, or \
-                       one above it, already holds a project. What to design is not part \
-                       of the project: pass the user's request as `prompt` to build_design \
-                       or request_design."
-    )]
-    async fn create_project(
-        &self,
-        params: Parameters<CreateProjectParams>,
-        context: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, McpError> {
-        let host = self.project_host(&context)?;
-        let params = params.0;
-
-        let created = host
-            .manager
-            .create(Path::new(&params.path), params.name)
-            .map_err(|error| error.to_string())
-            .and_then(|engine| host.activate(engine));
-
-        match created {
-            Ok(info) => json_result(serde_json::json!({
-                "project": info.name,
-                "path": info.path,
-                "created": true,
-                "note": "New project created and now active; its files are in `.conseqa/` \
-                         under the path above, and the user should commit them. Learn the DSL with dsl_guide and \
-                         dsl_reference, then author the skeleton with submit_patch — \
-                         services, schemas, data models, topics, machines, and one sketched \
-                         interface per planned operation — and call build_design, which \
-                         compiles, verifies and repairs in one call and hands back only \
-                         what code cannot settle. Check spec_status as you go, and \
-                         export_spec to deliver.",
-            })),
-
-            Err(error) => json_error(serde_json::json!({
-                "created": false,
-                "error": error,
-                "guidance": "Use open_project for a directory that already holds a project.",
-            })),
-        }
-    }
-
-    #[tool(
-        description = "Compact reference for the JSON shapes these tools exchange: symbol \
-                       keys, graph queries, and patch mutations."
-    )]
-    async fn dsl_reference(&self) -> Result<CallToolResult, McpError> {
-        Ok(CallToolResult::success(vec![ContentBlock::text(format!(
-            "DSL contract version {}.\n\n{DSL_REFERENCE}{PROGRAM_EXAMPLE_PREAMBLE}\n\
-             {PROGRAM_EXAMPLE_JSON}\n",
-            crate::spec::DSL_VERSION,
-        ))]))
-    }
-
-    #[tool(
-        description = "The Conseqa DSL semantics, by topic: what services, schemas, data \
-                       models, topics, state machines, operations, programs, transactions, \
-                       effects, effect intents, value references, and requirements mean and \
-                       how they compose. Call with no topic for the table of contents, then \
-                       with a topic — a section name or a few words of it — for the full \
-                       section, or with topics to read several sections in one call. Use \
-                       this instead of reading Conseqa's source code."
-    )]
-    async fn dsl_guide(
-        &self,
-        params: Parameters<DslGuideParams>,
-    ) -> Result<CallToolResult, McpError> {
-        let params = params.0;
-
-        let mut topics: Vec<&str> = params.topic.iter().map(String::as_str).collect();
-        topics.extend(params.topics.iter().map(String::as_str));
-
-        let text = match topics.as_slice() {
-            [] => guide_toc(),
-            [topic] => guide_lookup(topic),
-            topics => topics
-                .iter()
-                .map(|topic| guide_lookup(topic))
-                .collect::<Vec<_>>()
-                .join("\n\n---\n\n"),
-        };
-
-        Ok(CallToolResult::success(vec![ContentBlock::text(text)]))
-    }
-
+/// The coordinator's tools: where the model stands, the in-process
+/// build, and delivery.
+#[tool_router(router = coordinator_tools)]
+impl ConseqaMcp {
     #[tool(
         description = "Where the active model stands right now: revision, an inventory of \
-                       its symbols, which operations still lack programs, and the checker's \
-                       verdict — assembly gaps while drafting, validation errors, or the \
-                       verification result with every open obligation. Call it after \
-                       committing to steer your next step."
+                       its symbols, which operations still lack programs, whether the \
+                       skeleton is ready to build, and the checker's verdict — assembly gaps \
+                       while drafting, validation errors, or the verification result with \
+                       every open obligation. Call it after committing to steer your next \
+                       step."
     )]
     async fn spec_status(
         &self,
@@ -1598,38 +1326,15 @@ impl ConseqaMcp {
             })
             .collect();
 
-        // A design run is reported before waiting on analysis: while
-        // workers are committing, the head moves under us and the
-        // caller's next step is to keep polling, not to read a verdict.
-        let design = self
-            .launcher
-            .as_ref()
-            .and_then(|launcher| launcher.status());
-
-        let running = design
-            .as_ref()
-            .and_then(|status| status.get("running"))
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false);
-
-        let analysis = if running {
-            serde_json::json!({
-                "state": "design_running",
-                "guidance": "Worker agents are committing to this model right now. Wait for \
-                             the design run to finish before judging the verdict or \
-                             submitting patches of your own.",
-            })
-        } else {
-            analysis_json(&settled_analysis(&engine, head.revision).await)
-        };
+        let analysis = analysis_json(&settled_analysis(&engine, head.revision).await);
 
         let skeleton_gaps = super::commit::skeleton_diagnostics(workspace);
 
-        let mut body = serde_json::json!({
+        json_result(serde_json::json!({
             "dsl": crate::spec::DSL_VERSION,
             "revision": head.revision.0,
             "skeleton": {
-                "ready_to_fan_out": skeleton_gaps.is_empty(),
+                "ready": skeleton_gaps.is_empty(),
                 "gaps": skeleton_gaps,
             },
             "inventory": {
@@ -1643,21 +1348,130 @@ impl ConseqaMcp {
             },
             "prompt_obligations": prompt_obligations,
             "analysis": analysis,
-        });
+        }))
+    }
 
-        if let Some(design) = design {
-            body["design"] = design;
+    #[tool(
+        description = "Build the design in this server, in one call: compiles every \
+                       sketched operation still missing a program, declares the default \
+                       runtime topology, discovers requirements, verifies, and repairs what \
+                       the remedy catalogue can prove, one step after another. Pass the \
+                       user's request as `prompt`. Status success: done. Incomplete: every \
+                       phase ran, and `unresolved` names what is left. Handed_back: the \
+                       build stopped at the first phase whose work code could not settle, \
+                       listed under `hand_offs` with what each builder established — resolve \
+                       those with submit_patch and build again. Every result carries the \
+                       checker's verdict as `analysis`, and your session is moved to the new \
+                       head. Author the whole skeleton first, with a sketch on every \
+                       interface."
+    )]
+    async fn build_design(
+        &self,
+        params: Parameters<BuildDesignParams>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        let resolved = resolved!(self, context);
+        let (engine, session) = (resolved.engine, resolved.task);
 
-            if !running {
-                body["note"] = serde_json::Value::String(
-                    "If a design run just finished, call open_project again to refresh your \
-                     session to the new head before reading or patching."
-                        .to_string(),
-                );
-            }
+        let Some(builder) = &self.builder else {
+            return json_error(serde_json::json!({
+                "error": "this server has no design builder",
+                "guidance": "This server embeds the design MCP surface without a builder; \
+                             every `conseqa-design-mcp` command (serve, global, stdio) has \
+                             one.",
+            }));
+        };
+
+        let head = engine.head_snapshot();
+
+        if head.workspace.operations.is_empty() {
+            return json_error(serde_json::json!({
+                "error": "no operation interfaces are declared",
+                "guidance": "Author the skeleton first — services, schemas, data models, \
+                             topics, machines, and one sketched interface per operation — \
+                             then call build_design.",
+            }));
         }
 
-        json_result(body)
+        let gaps = super::commit::skeleton_diagnostics(&head.workspace);
+
+        if !gaps.is_empty() {
+            return json_error(serde_json::json!({
+                "error": "the skeleton has unresolved references",
+                "skeleton_gaps": gaps,
+                "guidance": "Resolve each gap with submit_patch, then call build_design \
+                             again.",
+            }));
+        }
+
+        let build = match builder.build(engine.clone(), params.0.prompt) {
+            Ok(build) => build.await,
+            Err(error) => return json_error(serde_json::json!({ "error": error })),
+        };
+
+        // The build moved the head; without moving the session there
+        // the caller's next patch would be refused as stale.
+        let refreshed = engine.refresh_session(session);
+
+        let revision = engine.head_revision();
+
+        let mut body = serde_json::json!({
+            "status": build.outcome.label(),
+            "revision": revision.0,
+            "started_at_revision": build.started_at_revision.0,
+            "elapsed_ms": u64::try_from(build.elapsed.as_millis()).unwrap_or(u64::MAX),
+        });
+
+        let failed = matches!(build.outcome, BuildOutcome::Failed { .. });
+
+        let guidance = match build.outcome {
+            BuildOutcome::Success => {
+                "Every phase ran and every obligation the run adopted is proven. \
+                 export_spec delivers the design."
+            }
+
+            BuildOutcome::Incomplete { reason, unresolved } => {
+                body["reason"] = serde_json::json!(reason);
+                body["unresolved"] = serde_json::json!(unresolved);
+
+                "Every phase ran; `unresolved` and `analysis` name what is left. Fix what \
+                 they name with submit_patch and build again — or leave an obligation the \
+                 design cannot support unproven, which is a legitimate outcome."
+            }
+
+            BuildOutcome::HandedBack { hand_offs } => {
+                body["hand_offs"] = serde_json::json!(hand_offs);
+
+                "The build stopped at the first phase that handed work back, so later \
+                 phases have not run. Resolve each hand-off with submit_patch — fix a \
+                 sketch that does not compile, write a program the vocabulary cannot \
+                 express, declare or decline an unsure requirement, repair an unproven \
+                 transaction — then call build_design again."
+            }
+
+            BuildOutcome::Failed { error } => {
+                body["error"] = serde_json::json!(error);
+
+                "The build aborted. The model keeps every commit it made; call \
+                 build_design again to resume from the current head."
+            }
+        };
+
+        body["analysis"] = analysis_json(&settled_analysis(&engine, revision).await);
+        body["guidance"] = serde_json::json!(guidance);
+
+        if let Err(error) = refreshed {
+            body["session"] = serde_json::json!(format!(
+                "your session could not be moved to the head ({error}); call open_project \
+                 before patching"
+            ));
+        }
+
+        if failed {
+            json_error(body)
+        } else {
+            json_result(body)
+        }
     }
 
     #[tool(
@@ -1732,6 +1546,96 @@ impl ConseqaMcp {
                 "exported": false,
                 "error": error.message,
                 "artifacts": error.written,
+            })),
+        }
+    }
+}
+
+/// Project selection, on a server that hosts several.
+#[tool_router(router = project_tools)]
+impl ConseqaMcp {
+    #[tool(
+        description = "Select a project as the active one; every subsequent architecture \
+                       tool call operates on it. A project is the `.conseqa/` directory of a \
+                       repository, committed with its code: pass the repository's absolute \
+                       path, or any directory inside it. Omit the path to reopen the active \
+                       project at its current head or, with none active, the project this \
+                       server was started in."
+    )]
+    async fn open_project(
+        &self,
+        params: Parameters<OpenProjectParams>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        let host = self.project_host(&context)?;
+
+        let opened = host
+            .project_at(params.0.path.as_deref())
+            .and_then(|engine| host.activate(engine));
+
+        match opened {
+            Ok(info) => json_result(serde_json::json!({
+                "project": info.name,
+                "path": info.path,
+                "opened": true,
+                "revision": info.revision.0,
+                "note": "This is now the active project. See where it stands with \
+                         spec_status, learn the DSL with dsl_guide, author the skeleton \
+                         with submit_patch — a sketch on every interface — then call \
+                         build_design, and export_spec to deliver. Every accepted patch \
+                         is written to the project's `.conseqa/` files; remind the user \
+                         to commit them.",
+            })),
+
+            Err(error) => json_error(serde_json::json!({
+                "opened": false,
+                "error": error,
+                "guidance": "Pass the absolute path of a repository holding a \
+                             `.conseqa/project.yaml`, or call create_project to start one.",
+            })),
+        }
+    }
+
+    #[tool(
+        description = "Create a new project in a directory — normally the repository \
+                       root — and make it active. Its state is a `.conseqa/` directory \
+                       there, to be committed with the code. Errors if the directory, or \
+                       one above it, already holds a project. What to design is not part of \
+                       the project: pass the user's request as `prompt` to build_design."
+    )]
+    async fn create_project(
+        &self,
+        params: Parameters<CreateProjectParams>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        let host = self.project_host(&context)?;
+        let params = params.0;
+
+        let created = host
+            .manager
+            .create(Path::new(&params.path), params.name)
+            .map_err(|error| error.to_string())
+            .and_then(|engine| host.activate(engine));
+
+        match created {
+            Ok(info) => json_result(serde_json::json!({
+                "project": info.name,
+                "path": info.path,
+                "created": true,
+                "note": "New project created and now active; its files are in `.conseqa/` \
+                         under the path above, and the user should commit them. Learn the \
+                         DSL with dsl_guide, then author the skeleton with submit_patch — \
+                         services, schemas, data models, topics, machines, and one \
+                         sketched interface per planned operation — and call \
+                         build_design, which compiles, verifies and repairs in one call \
+                         and hands back only what code cannot settle. Export with \
+                         export_spec.",
+            })),
+
+            Err(error) => json_error(serde_json::json!({
+                "created": false,
+                "error": error,
+                "guidance": "Use open_project for a directory that already holds a project.",
             })),
         }
     }
@@ -1835,37 +1739,64 @@ fn rejection_body(rejection: &CommitRejection) -> serde_json::Value {
         .unwrap_or_else(|_| serde_json::json!({ "kind": "unserializable_rejection" }))
 }
 
-#[tool_handler]
 impl ServerHandler for ConseqaMcp {
+    /// The description of the server's usual caller: workers on a
+    /// single-project server, its coordinator on every other.
     fn get_info(&self) -> ServerInfo {
-        let mut info = ServerInfo::new(ServerCapabilities::builder().enable_tools().build());
+        self.info(match &self.backing {
+            Backing::Single(_) => Role::Worker,
+            Backing::Multi { .. } | Backing::Local(_) => Role::Coordinator,
+        })
+    }
 
-        // This build, honestly: the default is rmcp's own build env,
-        // which reports the library. The DSL contract version is a
-        // separate axis and deliberately not encoded here — it rides
-        // the instructions and the served guide instead.
-        let mut implementation = rmcp::model::Implementation::default();
-        implementation.name = env!("CARGO_PKG_NAME").to_string();
-        implementation.version = env!("CARGO_PKG_VERSION").to_string();
-        info.server_info = implementation;
+    /// The handshake, answered with the caller's own brief: rmcp's asks
+    /// `get_info`, which cannot see who is calling, so it runs here over
+    /// the caller's description instead.
+    async fn initialize(
+        &self,
+        request: InitializeRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<InitializeResult, McpError> {
+        let brief = Brief(self.info(self.role(&context)));
 
-        // The worker daemon serves the task contract; interactive
-        // backings (the stdio and multi-project servers) serve the
-        // authoring loop. Both briefs lead with the DSL contract
-        // version, so an agent learns which contract it authors
-        // against before it drafts anything; `Implementation` stays
-        // the build version — the axes are distinct.
-        info.instructions = Some(format!(
-            "This server speaks Conseqa DSL contract version {}; author against it, \
-             and learn it through dsl_guide and dsl_reference.\n\n{}",
-            crate::spec::DSL_VERSION,
-            match &self.backing {
-                Backing::Single(_) => WORKER_INSTRUCTIONS,
-                Backing::Multi { .. } | Backing::Local(_) => INTERACTIVE_INSTRUCTIONS,
-            }
-        ));
+        brief.initialize(request, context).await
+    }
 
-        info
+    async fn list_tools(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<ListToolsResult, McpError> {
+        Ok(ListToolsResult {
+            tools: self.tools(self.role(&context)).list_all(),
+            ..Default::default()
+        })
+    }
+
+    async fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResponse, McpError> {
+        let tools = self.tools(self.role(&context));
+
+        tools
+            .call(ToolCallContext::new(self, request, context))
+            .await
+    }
+
+    fn get_tool(&self, name: &str) -> Option<Tool> {
+        ROUTERS.all.get(name).cloned()
+    }
+}
+
+/// A server that is only a description, so rmcp's own handshake can
+/// run over a caller's brief.
+struct Brief(ServerInfo);
+
+impl ServerHandler for Brief {
+    fn get_info(&self) -> ServerInfo {
+        self.0.clone()
     }
 }
 
@@ -1880,12 +1811,12 @@ impl ServerHandler for ConseqaMcp {
 /// the one a client means without naming one.
 pub async fn serve_stdio(
     manager: Arc<WorkspaceManager>,
-    launcher: Option<Arc<dyn DesignLauncher>>,
+    builder: Option<Arc<dyn DesignBuilder>>,
     home: Option<PathBuf>,
 ) -> std::io::Result<()> {
     use rmcp::{ServiceExt, transport::stdio};
 
-    let mcp = ConseqaMcp::local(manager, launcher, home);
+    let mcp = ConseqaMcp::local(manager, builder, home);
 
     let service = mcp.serve(stdio()).await.map_err(std::io::Error::other)?;
 
@@ -1914,24 +1845,21 @@ pub fn router(engine: DesignEngine) -> axum::Router {
     build_router(ConseqaMcp::new(engine))
 }
 
-/// The `/mcp` router with a design launcher wired in, so `request_design`
-/// can start the concurrent workflow.
-pub fn router_with_launcher(
-    engine: DesignEngine,
-    launcher: Arc<dyn DesignLauncher>,
-) -> axum::Router {
-    build_router(ConseqaMcp::with_launcher(engine, launcher))
+/// The `/mcp` router with a design builder wired in, so an interactive
+/// session's `build_design` can build.
+pub fn router_with_builder(engine: DesignEngine, builder: Arc<dyn DesignBuilder>) -> axum::Router {
+    build_router(ConseqaMcp::with_builder(engine, builder))
 }
 
 /// The `/mcp` router for a multi-project server: a stable API key
-/// authenticates UI clients, which select projects through the project
-/// tools, and an optional design launcher powers `request_design`.
+/// authenticates clients, which select projects through the project
+/// tools, and an optional design builder powers `build_design`.
 pub fn router_multi(
     manager: Arc<WorkspaceManager>,
     api_key: impl Into<String>,
-    launcher: Option<Arc<dyn DesignLauncher>>,
+    builder: Option<Arc<dyn DesignBuilder>>,
 ) -> axum::Router {
-    build_router(ConseqaMcp::multi(manager, api_key, launcher))
+    build_router(ConseqaMcp::multi(manager, api_key, builder))
 }
 
 fn build_router(mcp: ConseqaMcp) -> axum::Router {
@@ -1984,9 +1912,11 @@ pub async fn serve_router(router: axum::Router, bind: SocketAddr) -> std::io::Re
     })
 }
 
-const DSL_REFERENCE: &str = r#"Conseqa design JSON shapes (canonical serialized forms).
+/// The JSON shapes the tools exchange, in their canonical serialized
+/// forms, as guide sections: each `##` header is a topic.
+const DSL_REFERENCE: &str = r#"## JSON shapes — symbol keys
 
-SYMBOL KEYS — {"kind": K, "value": V}:
+Every symbol key is {"kind": K, "value": V}:
   {"kind":"service","value":"service.checkout"}
   {"kind":"schema","value":"schema.Order"}
   {"kind":"data_model","value":"data.checkout"}
@@ -2012,7 +1942,9 @@ SYMBOL KEYS — {"kind": K, "value": V}:
   {"kind":"operation_summary","value":"operation.checkout"}
   {"kind":"prompt_obligation","value":"obl.no-double-charge"}
 
-GRAPH QUERIES — {"kind": K, ...}:
+## JSON shapes — graph queries
+
+Every query is {"kind": K, ...}:
   {"kind":"callers","operation":"operation.x"}
   {"kind":"callees","operation":"operation.x"}
   {"kind":"readers","data_model":"data.x","object":"object.y","field":"status"}   (field optional)
@@ -2025,7 +1957,10 @@ GRAPH QUERIES — {"kind": K, ...}:
   {"kind":"operation_neighborhood","operation":"operation.x","depth":2}
   {"kind":"provenance_roots","operation":"operation.x","binding":"output.y"}
 
-PATCH — {"mutations": [<mutation>, ...]}; each mutation {"kind": K, ...}:
+## JSON shapes — skeleton patches
+
+A patch is {"mutations": [<mutation>, ...]}; each mutation is
+{"kind": K, ...}. The shared skeleton's mutations:
   {"kind":"put_service","id":"service.x","value":{"kind":"backend"}}
   {"kind":"put_schema","id":"schema.X","value":<schema declaration>}
   {"kind":"put_data_model","id":"data.x","value":{"objects":{...},"outboxes":{...}}}
@@ -2057,6 +1992,16 @@ PATCH — {"mutations": [<mutation>, ...]}; each mutation {"kind": K, ...}:
      belong to the data model owning the subject object and admit the
      schema. The applying transaction step supplies each message's
      derivation under the same key.)
+  {"kind":"put_prompt_obligation","id":"obl.x","value":{"source_span":"...",
+   "normalized_intent":"...","targets":["operation.x"],"status":{"kind":"unmapped"}}}
+  {"kind":"delete_top_level","symbol":<symbol key>}   (coordinator-only)
+
+Schema, topic, state-machine, input, and program declarations use the
+Conseqa model YAML structure, as JSON.
+
+## JSON shapes — operation interfaces and sketches
+
+A patch mutation, and the input shape it uses for an outbox:
   {"kind":"put_operation_interface","operation":"operation.x",
    "value":{"service":"service.x","description":"...","inputs":{...},
             "sketch":{"steps":[
@@ -2146,6 +2091,22 @@ PATCH — {"mutations": [<mutation>, ...]}; each mutation {"kind": K, ...}:
      keyed commits, key propagation into messages and requests, and the
      inspect-then-decide shape a guarded transition needs; a record only
      read gets no guard. Requirements are added after, by discovery.)
+An outbox input:
+  {"kind":"outbox","outbox":"outbox.x"}
+    (exactly ONE outbox input in the model may reference a given
+     outbox: its operation is the outbox's exclusive logical consumer
+     of every admitted schema — there is no message selection and no
+     acknowledgement field. Consumption is intrinsic: a committed
+     message stays durably pending, re-driven until an attempt reaches
+     successful logical completion, and overlapping attempts for one
+     message are possible — so the consumer needs idempotency. Fan-out
+     to several consumers belongs to a topic, not an outbox. One
+     committed message = one logical invocation; no batch payload
+     exists at L0.)
+
+## JSON shapes — program and requirement patches
+
+Patch mutations:
   {"kind":"replace_operation_program","operation":"operation.x","program":{"steps":[...]}}
   {"kind":"replace_operation_requirements","operation":"operation.x","requirements":{...}}
     (operation requirements are idempotency and recoverability only;
@@ -2167,7 +2128,10 @@ PATCH — {"mutations": [<mutation>, ...]}; each mutation {"kind": K, ...}:
      exist — | idempotency | recoverability.
      origins: explicit_prompt {obligation}; strongly_implied {rationale, evidence};
      recommended {rationale, evidence})
-L1 RUNTIME TOPOLOGY (all shared-skeleton writes; L1 is optional):
+
+## JSON shapes — L1 runtime topology patches
+
+Patch mutations, all shared-skeleton writes; L1 is optional:
   {"kind":"put_topic_runtime","topic":"topic.x",
    "value":{"grouping":{"schema.Event":[["order_id"]]},"ordering":"within_group"}}
     (grouping: a per-schema key mapping, or omitted for no grouping;
@@ -2234,24 +2198,11 @@ L1 RUNTIME TOPOLOGY (all shared-skeleton writes; L1 is optional):
    "value":{"object":{"data_model":"data.x","object":"object.y"},
             "partition_key":["channel_id","bucket"]}}
 
-  {"kind":"put_prompt_obligation","id":"obl.x","value":{"source_span":"...",
-   "normalized_intent":"...","targets":["operation.x"],"status":{"kind":"unmapped"}}}
-  {"kind":"delete_top_level","symbol":<symbol key>}   (coordinator-only)
 
-Schema, topic, state-machine, input, and program declarations use the
-Conseqa model YAML structure, as JSON. An outbox input:
-  {"kind":"outbox","outbox":"outbox.x"}
-    (exactly ONE outbox input in the model may reference a given
-     outbox: its operation is the outbox's exclusive logical consumer
-     of every admitted schema — there is no message selection and no
-     acknowledgement field. Consumption is intrinsic: a committed
-     message stays durably pending, re-driven until an attempt reaches
-     successful logical completion, and overlapping attempts for one
-     message are possible — so the consumer needs idempotency. Fan-out
-     to several consumers belongs to a topic, not an outbox. One
-     committed message = one logical invocation; no batch payload
-     exists at L0.)
-A TRANSACTION STEP declares and executes one inline transaction:
+
+## JSON shapes — transaction steps
+
+A transaction step declares and executes one inline transaction:
   {"kind":"transaction",
    "transaction":{"id":"tx.x","data_model":"data.x","isolation":"read_committed",
                   "idempotency":{"kind":"deduplicated_by","key":{"components":[...]}},
@@ -2354,7 +2305,10 @@ A transactional outbox write, legal ONLY as a transaction step:
      admission is atomic with the commit; the step binds no result. The
      kind is rejected under execute_effect, execute_effect_async, and
      establish_effect_intent.)
-RESULT CONTRACTS name their error classes:
+
+## JSON shapes — results, effects, values, and branches
+
+Result contracts name their error classes:
   {"ok":"schema.Ok",
    "errors":{"conflict":{"schema":"schema.Conflict","disposition":"retryable"},
              "declined":{"schema":"schema.Declined","disposition":"terminal"}}}
@@ -2403,7 +2357,7 @@ Value references:
   {"source":"input:input.x.request","path":"order_id"}
 Derivations: {"kind":"unspecified"} or {"kind":"deterministic","from":[<value ref>...]}.
 
-BRANCH CONDITIONS — deliberately small, structurally exposed:
+Branch conditions — deliberately small, structurally exposed:
   {"kind":"eq","value":<value ref>,"equals":<value ref or literal>}
   {"kind":"present","value":<value ref>}   (holds iff the path resolves;
      absent iff any optional segment is absent. eq never holds over an
@@ -2412,7 +2366,9 @@ BRANCH CONDITIONS — deliberately small, structurally exposed:
   {"kind":"and","conditions":[...]}  {"kind":"not","condition":...}
   {"kind":"unspecified"}   (no fact; the decision never replays)
 
-ASYNC PROGRAM STEPS — launch effects without waiting, then synchronize:
+## JSON shapes — async program steps
+
+Launch effects without waiting, then synchronize:
   {"kind":"execute_effect_async","handle":"async.x","effect_id":"effect.x",
    "effect":<effect>, "values":<derivation>}
     (same contract/derivation semantics as execute_effect; binds NO result,
@@ -2432,7 +2388,7 @@ ASYNC PROGRAM STEPS — launch effects without waiting, then synchronize:
 
 /// The prose that introduces [`PROGRAM_EXAMPLE_JSON`] in the reference.
 const PROGRAM_EXAMPLE_PREAMBLE: &str = "
-WORKED EXAMPLE — a valid program (the body of a `replace_operation_program`
+A valid program (the body of a `replace_operation_program`
 patch). The transaction step nests its declaration under `transaction`; it
 carries no `rejected` block because nothing in the body can reject. An
 effect intent must be established before it is executed, by the same
@@ -2441,8 +2397,8 @@ binding id: executing an intent no transaction established is the
 is bound once and then consumed by the `return`.
 ";
 
-/// A complete, valid operation program, appended to `dsl_reference` so an
-/// agent has a concrete template for the establish/execute-intent and
+/// A complete, valid operation program, the reference's last section, so
+/// an agent has a concrete template for the establish/execute-intent and
 /// output-binding wiring it most often gets wrong. Kept as pure JSON and
 /// checked by a test (`the_worked_example_is_a_valid_program`), so the
 /// reference cannot drift into an invalid shape.
@@ -2474,12 +2430,28 @@ const PROGRAM_EXAMPLE_JSON: &str = r#"{"steps":[
 /// from its own project anyway.
 const DSL_SEMANTICS: &str = include_str!("../../docs/live/CONSEQA_DSL_SEMANTICS.md");
 
-/// The `##` sections of the semantics document: header line and full
-/// body, subsections included. Fence-aware, so a `##` inside a code
-/// block never starts a section.
-fn guide_sections() -> Vec<(&'static str, &'static str)> {
-    let doc = DSL_SEMANTICS;
+/// The reference, its worked example included.
+static REFERENCE: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        "{DSL_REFERENCE}\n## JSON shapes — worked program example\n{PROGRAM_EXAMPLE_PREAMBLE}\n\
+         ```json\n{PROGRAM_EXAMPLE_JSON}\n```\n"
+    )
+});
 
+/// Every section the guide serves: the semantics document's, then the
+/// reference's.
+fn guide_sections() -> Vec<(&'static str, &'static str)> {
+    let mut sections = sections_of(DSL_SEMANTICS);
+
+    sections.extend(sections_of(REFERENCE.as_str()));
+
+    sections
+}
+
+/// The `##` sections of a document: header line and full body,
+/// subsections included. Fence-aware, so a `##` inside a code block
+/// never starts a section.
+fn sections_of(doc: &'static str) -> Vec<(&'static str, &'static str)> {
     let mut starts: Vec<usize> = Vec::new();
     let mut in_fence = false;
     let mut offset = 0;
@@ -2509,13 +2481,14 @@ fn guide_sections() -> Vec<(&'static str, &'static str)> {
         .collect()
 }
 
-/// The guide's table of contents: every section and subsection header,
-/// with the usage hint.
+/// The guide's table of contents: every section and subsection header
+/// of the semantics, then the reference's sections, with the usage
+/// hint.
 fn guide_toc() -> String {
     let mut toc = format!(
-        "The Conseqa DSL semantics guide, DSL contract version {}. Call dsl_guide again \
-         with a topic — a section name or a few words of it — to read that section in \
-         full, or with topics (a list) to read every section you need in one call.\n\nSections:\n",
+        "The Conseqa DSL guide, DSL contract version {}. Call dsl_guide again with \
+         topics — section names or a few words of them — to read those sections in full, \
+         every one you need in one call.\n\nSections:\n",
         crate::spec::DSL_VERSION,
     );
 
@@ -2538,12 +2511,25 @@ fn guide_toc() -> String {
         }
     }
 
+    toc.push_str(
+        "\nThe exact JSON shapes these tools exchange (the topic `JSON shapes` reads them \
+         all):\n",
+    );
+
+    for (header, _) in sections_of(REFERENCE.as_str()) {
+        if let Some(header) = header.strip_prefix("## ") {
+            toc.push_str(&format!("- {header}\n"));
+        }
+    }
+
     toc
 }
 
 /// Sections whose header — or any subsection header within — contains
-/// the query, case-insensitively. An unmatched or over-broad query
-/// falls back to headers so the caller can narrow.
+/// the query, case-insensitively. An unmatched query falls back to the
+/// contents, and one matching several sections too long to serve
+/// together to their headers, so the caller can narrow; one section
+/// is always served whole, however long.
 fn guide_lookup(topic: &str) -> String {
     let query = topic.trim().to_lowercase();
 
@@ -2567,7 +2553,7 @@ fn guide_lookup(topic: &str) -> String {
 
     let total: usize = matched.iter().map(|(_, body)| body.len()).sum();
 
-    if total > 40_000 {
+    if matched.len() > 1 && total > 40_000 {
         let headers: Vec<&str> = matched.iter().map(|(header, _)| *header).collect();
 
         return format!(
@@ -2589,7 +2575,7 @@ mod tests {
 
     use crate::spec::{Id, Model, Operation, OperationBlock, Revision};
 
-    /// The worked example in `dsl_reference` must be a genuinely valid
+    /// The worked example in the guide's shapes must be a genuinely valid
     /// program: it parses as an operation program and passes the same
     /// program-local checks the commit gate applies, so the reference can
     /// never teach a shape the gate would reject.
@@ -2643,8 +2629,8 @@ mod tests {
     // transaction obligation's remedy is always an application edit,
     // and no agent is told to expect — or to route on — a `runtime` one.
     #[test]
-    fn the_interactive_instructions_promise_no_runtime_remedy() {
-        let instructions = super::INTERACTIVE_INSTRUCTIONS;
+    fn the_coordinator_instructions_promise_no_runtime_remedy() {
+        let instructions = super::COORDINATOR_INSTRUCTIONS;
 
         assert!(instructions.contains("carries `remedy: application`, always"));
         assert!(instructions.contains("No obligation currently carries `remedy: runtime`"));
@@ -2687,6 +2673,56 @@ mod tests {
                 && section.contains("MemberAssignment"),
             "a `###` header match should return its whole enclosing section:\n{section}"
         );
+    }
+
+    /// A section longer than the over-broad limit is still one section,
+    /// and is served whole rather than "narrowed" to itself forever.
+    #[test]
+    fn a_section_longer_than_the_limit_is_served_whole() {
+        let section = super::guide_lookup("16. The operation program");
+
+        assert!(section.len() > 40_000, "{} bytes", section.len());
+        assert!(
+            section.starts_with("## 16. The operation program"),
+            "{}",
+            &section[..200.min(section.len())]
+        );
+    }
+
+    /// The shapes are guide sections: listed in the contents, served by
+    /// name, and all at once under `JSON shapes`.
+    #[test]
+    fn the_json_shapes_are_guide_topics() {
+        let toc = super::guide_toc();
+
+        for topic in [
+            "JSON shapes — symbol keys",
+            "JSON shapes — skeleton patches",
+            "JSON shapes — operation interfaces and sketches",
+            "JSON shapes — worked program example",
+        ] {
+            assert!(toc.contains(topic), "toc lacks `{topic}`:\n{toc}");
+        }
+
+        let sketches = super::guide_lookup("interfaces and sketches");
+
+        assert!(sketches.contains("put_operation_interface"), "{sketches}");
+        assert!(!sketches.contains("put_topic_runtime"), "{sketches}");
+
+        let every = super::guide_lookup("JSON shapes");
+
+        for shape in [
+            "\"kind\":\"callers\"",
+            "put_service",
+            "replace_operation_program",
+            "put_router",
+            "compare_and_set",
+            "match_result",
+            "join_all",
+            super::PROGRAM_EXAMPLE_JSON,
+        ] {
+            assert!(every.contains(shape), "`JSON shapes` lacks {shape}");
+        }
     }
 
     #[test]

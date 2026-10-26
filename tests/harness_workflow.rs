@@ -542,18 +542,7 @@ fn workflow(
     script: ScriptFn,
     max_iterations: u32,
 ) -> (Workflow, DesignEngine) {
-    workflow_with_objective(out_dir, script, max_iterations, None)
-}
-
-/// The same harness, with a run objective layered on as `request_design`
-/// supplies one.
-fn workflow_with_objective(
-    out_dir: PathBuf,
-    script: ScriptFn,
-    max_iterations: u32,
-    objective: Option<String>,
-) -> (Workflow, DesignEngine) {
-    workflow_over(out_dir, max_iterations, objective, |engine| {
+    workflow_over(out_dir, max_iterations, |engine| {
         Arc::new(ScriptedBackend {
             engine: engine.clone(),
             script,
@@ -565,7 +554,6 @@ fn workflow_with_objective(
 fn workflow_over(
     out_dir: PathBuf,
     max_iterations: u32,
-    objective: Option<String>,
     backend: impl FnOnce(&DesignEngine) -> Arc<dyn AgentBackend>,
 ) -> (Workflow, DesignEngine) {
     let mut run_meta = RunMetadata::new(RunId("workflow-test".to_string()));
@@ -596,7 +584,6 @@ fn workflow_over(
             analysis_timeout: Duration::from_secs(20),
             max_iterations,
             prompt: Some("A ping service.".to_string()),
-            objective,
         },
     );
 
@@ -1274,11 +1261,10 @@ async fn a_requirement_free_model_finalizes_without_spinning() {
     std::fs::remove_dir_all(&out_dir).ok();
 }
 
-/// `request_design`'s objective is layered onto the project prompt as
-/// task evidence, so every fanned-out worker sees the caller's steer.
-/// It used to be accepted and discarded.
+/// The run's prompt is every task's evidence, so every fanned-out
+/// worker is told what is being built.
 #[tokio::test]
-async fn a_run_objective_reaches_every_worker_prompt() {
+async fn the_run_prompt_reaches_every_worker_prompt() {
     let out_dir = std::env::temp_dir().join(format!("conseqa-wf-{}", Uuid::new_v4()));
 
     let prompts: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -1297,12 +1283,7 @@ async fn a_run_objective_reaches_every_worker_prompt() {
         })
     });
 
-    let (workflow, _engine) = workflow_with_objective(
-        out_dir.clone(),
-        script,
-        1,
-        Some("prioritize the checkout path".to_string()),
-    );
+    let (workflow, _engine) = workflow(out_dir.clone(), script, 1);
 
     workflow.run().await.expect("the workflow runs");
 
@@ -1312,14 +1293,8 @@ async fn a_run_objective_reaches_every_worker_prompt() {
     assert!(
         prompts
             .iter()
-            .all(|prompt| prompt.contains("prioritize the checkout path")),
-        "every worker prompt carries the run objective: {prompts:#?}"
-    );
-    assert!(
-        prompts
-            .iter()
             .all(|prompt| prompt.contains("A ping service.")),
-        "the project prompt is still carried too: {prompts:#?}"
+        "every worker prompt carries the run prompt: {prompts:#?}"
     );
 
     std::fs::remove_dir_all(&out_dir).ok();
@@ -1859,7 +1834,7 @@ mod system_one {
 
         let decider: Arc<dyn Decider> = Arc::new(opinions.clone());
 
-        let (workflow, engine) = workflow_over(out_dir, 8, None, |engine| {
+        let (workflow, engine) = workflow_over(out_dir, 8, |engine| {
             Arc::new(SystemOneBackend::new(
                 engine.clone(),
                 decider,
@@ -2904,7 +2879,6 @@ mod system_one {
                 analysis_timeout: Duration::from_secs(20),
                 max_iterations: 8,
                 prompt: Some("A shop.".to_string()),
-                objective: None,
             },
         );
 
@@ -3446,7 +3420,6 @@ mod system_one {
                 analysis_timeout: Duration::from_secs(20),
                 max_iterations: 8,
                 prompt: Some("A small shop backend.".to_string()),
-                objective: None,
             },
         );
 
@@ -3751,7 +3724,6 @@ mod system_one {
                 analysis_timeout: Duration::from_secs(20),
                 max_iterations: 3,
                 prompt: Some("A small shop backend.".to_string()),
-                objective: None,
             },
         );
 
@@ -3827,7 +3799,6 @@ mod system_one {
                 analysis_timeout: Duration::from_secs(20),
                 max_iterations: 3,
                 prompt: Some("A small shop backend.".to_string()),
-                objective: None,
             },
         );
 
@@ -3904,7 +3875,6 @@ mod system_one {
                 analysis_timeout: Duration::from_secs(20),
                 max_iterations: 8,
                 prompt: Some("A small shop backend.".to_string()),
-                objective: None,
             },
         );
 
@@ -3995,7 +3965,6 @@ mod system_one {
                 analysis_timeout: Duration::from_secs(20),
                 max_iterations: 8,
                 prompt: Some("A small shop backend.".to_string()),
-                objective: None,
             },
         )
         .with_halt(hand_off.halt());
@@ -4118,7 +4087,6 @@ mod system_one {
                 analysis_timeout: Duration::from_secs(20),
                 max_iterations: 8,
                 prompt: Some("A small shop backend.".to_string()),
-                objective: None,
             },
         );
 
@@ -4475,7 +4443,6 @@ mod system_one {
                 analysis_timeout: Duration::from_secs(20),
                 max_iterations: 8,
                 prompt: Some(LEDGER_PROMPT.to_string()),
-                objective: None,
             },
         );
 

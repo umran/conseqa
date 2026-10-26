@@ -11,6 +11,7 @@
 
 pub mod backend;
 pub mod backends;
+pub mod build;
 #[cfg(feature = "system-one")]
 pub mod executors;
 pub mod handoff;
@@ -20,6 +21,7 @@ pub mod task_prompt;
 pub mod workflow;
 
 pub use backend::*;
+pub use build::InProcessBuilder;
 pub use handoff::{HandOff, HandOffBackend};
 pub use scheduler::*;
 pub use supervisor::*;

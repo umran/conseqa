@@ -453,7 +453,6 @@ async fn design(args: DesignArgs) -> Result<ExitCode, String> {
             analysis_timeout: Duration::from_secs(180),
             max_iterations: 8,
             prompt,
-            objective: None,
         },
     );
 
