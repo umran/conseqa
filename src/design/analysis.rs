@@ -1,5 +1,5 @@
 //! Background Conseqa analysis: assemble → validate → verify →
-//! summarize, off the commit path (§36–§39 of the confluence spec).
+//! summarize, off the commit path (§36–§39 of the design spec).
 //!
 //! Commits publish immediately and enqueue analysis; a dedicated
 //! worker thread runs the synchronous checker. Analysis is tagged with

@@ -24,7 +24,7 @@ loadPageData().then(
           icon={<WarningCircleIcon size={48} className="text-kumo-danger" />}
           title="No model data"
           description={error instanceof Error ? error.message : String(error)}
-          commandLine="npm run data"
+          commandLine="provide public/conseqa.json"
         />
       </div>,
     );

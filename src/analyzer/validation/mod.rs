@@ -478,7 +478,7 @@ pub fn validate(model: &Model) -> Vec<ValidationError> {
 }
 
 /// Operation-local structural diagnostics for one program, for the
-/// confluence draft-commit gate (§8.1, §29 step 11).
+/// design draft-commit gate (§8.1, §29 step 11).
 ///
 /// Runs the validator's own reference-resolution and definite-
 /// availability passes against `model` for `operation_id`, then keeps

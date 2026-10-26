@@ -182,7 +182,6 @@ fn fixture_report_matches_the_checker() {
     assert_eq!(
         stored, expected,
         "tests/fixtures/flash_checkout.report.json is stale; regenerate it \
-         with `cargo run --bin conseqa -- tests/fixtures/flash_checkout.yaml \
-         --report tests/fixtures/flash_checkout.report.json`"
+         from the analyzer report API"
     );
 }

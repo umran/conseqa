@@ -1,15 +1,13 @@
-//! conseqa-confluence: the standalone confluence daemon (§6.2, §88 of
-//! the confluence spec).
+//! conseqa-design-mcp: the standalone design daemon (§6.2, §88 of
+//! the design spec).
 //!
 //! `serve` exposes the shared MCP endpoint for interactive Claude
 //! Code / Codex sessions, IDE integration, and external orchestrators,
-//! plus a minimal localhost admin surface for creating tasks. `init`
-//! creates a project; `status` and `export` read one without opening it
-//! for writing, so they work beside a running server.
+//! plus a minimal localhost admin surface for creating tasks. Project
+//! lifecycle commands live in the project-local `conseqa` CLI.
 //!
 //! A project is the `.conseqa/` directory of the repository it
-//! describes (see `conseqa::confluence::store`); every command names it
-//! by `--project`, the repository or any directory inside it.
+//! describes (see `conseqa::design::store`).
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -25,9 +23,9 @@ use clap::{Parser, Subcommand, ValueEnum};
 use parking_lot::{Mutex, RwLock};
 use serde::Deserialize;
 
-use conseqa::confluence::mcp::{self, DesignLauncher};
-use conseqa::confluence::{
-    AnalysisState, ConfluenceEngine, CreateTask, ProjectStore, PromptEvidence, RunId, RunMetadata,
+use conseqa::design::mcp::{self, DesignLauncher};
+use conseqa::design::{
+    AnalysisState, DesignEngine, CreateTask, PromptEvidence, RunId, RunMetadata,
     TaskBudget, TaskId, TaskKind, WorkspaceState, WriteScope,
 };
 use conseqa::harness::backend::InvocationBudget;
@@ -40,8 +38,8 @@ use conseqa::spec::Revision;
 
 #[derive(Parser)]
 #[command(
-    name = "conseqa-confluence",
-    about = "Standalone Conseqa confluence daemon: shared architecture state over MCP"
+    name = "conseqa-design-mcp",
+    about = "Standalone Conseqa design daemon: shared architecture state over MCP"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -148,48 +146,6 @@ enum Command {
         #[command(flatten)]
         system_one: SystemOne,
     },
-
-    /// Create a project: a `.conseqa/` directory to commit with the code.
-    Init {
-        /// The directory to create it in, normally the repository root.
-        #[arg(long, default_value = ".")]
-        project: PathBuf,
-
-        /// The project's name; the directory's name when omitted.
-        #[arg(long)]
-        name: Option<String>,
-
-        /// The natural-language application prompt.
-        #[arg(long)]
-        prompt: Option<String>,
-
-        /// Adopt an existing Conseqa model.
-        #[arg(long)]
-        model: Option<PathBuf>,
-    },
-
-    /// Print the head revision, the commit and task counts, and the
-    /// tasks.
-    Status {
-        /// The project: its directory or any directory inside it.
-        #[arg(long, default_value = ".")]
-        project: PathBuf,
-    },
-
-    /// Assemble the head workspace and write the canonical model YAML.
-    Export {
-        /// The project: its directory or any directory inside it.
-        #[arg(long, default_value = ".")]
-        project: PathBuf,
-
-        /// Where to write the model.
-        #[arg(long, default_value = "conseqa.yaml")]
-        out: PathBuf,
-
-        /// Also validate, verify, and write the obligation report.
-        #[arg(long)]
-        report: Option<PathBuf>,
-    },
 }
 
 #[tokio::main]
@@ -265,18 +221,6 @@ async fn main() -> ExitCode {
             })
             .await
         }
-        Command::Init {
-            project,
-            name,
-            prompt,
-            model,
-        } => init(project, name, prompt, model),
-        Command::Status { project } => status(project),
-        Command::Export {
-            project,
-            out,
-            report,
-        } => export(project, out, report),
     };
 
     match outcome {
@@ -401,8 +345,8 @@ enum Backend {
 }
 
 /// The System One layer of a triggered design run (§26 of the System
-/// One orchestration revision): the same flags `conseqa-harness design`
-/// takes. Nothing is enabled unless they say so.
+/// One orchestration revision). Nothing is enabled unless explicitly
+/// configured.
 #[cfg(feature = "system-one")]
 type SystemOne = conseqa::harness::executors::cli::SystemOneArgs;
 
@@ -448,7 +392,7 @@ async fn serve(options: ServeOptions) -> Result<(), String> {
 
     let initial = initial_workspace(&options.project, None, options.model, options.prompt)?;
 
-    let engine = ConfluenceEngine::open(&options.project, initial)
+    let engine = DesignEngine::open(&options.project, initial)
         .map_err(|error| format!("cannot open {}: {error}", options.project.display()))?;
 
     // The workers connect back to this daemon's own MCP endpoint. The
@@ -489,7 +433,7 @@ async fn serve(options: ServeOptions) -> Result<(), String> {
     *mcp_url.write() = url.clone();
 
     println!(
-        "conseqa-confluence serving\n  project: {}\n  mcp:     {url}\n  admin:   http://{}/admin/status\n  head:    revision {}",
+        "conseqa-design-mcp serving\n  project: {}\n  mcp:     {url}\n  admin:   http://{}/admin/status\n  head:    revision {}",
         engine.project_dir().unwrap_or_default().display(),
         server.local_addr,
         engine.head_revision().0,
@@ -550,7 +494,7 @@ fn load_or_create_api_key(explicit: Option<String>) -> Result<String, String> {
         }
     }
 
-    let key = conseqa::confluence::TaskToken::generate().0;
+    let key = conseqa::design::TaskToken::generate().0;
 
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
@@ -568,7 +512,7 @@ async fn serve_global(options: GlobalOptions) -> Result<(), String> {
 
     let api_key = load_or_create_api_key(options.api_key)?;
 
-    let manager = Arc::new(conseqa::confluence::WorkspaceManager::new());
+    let manager = Arc::new(conseqa::design::WorkspaceManager::new());
 
     let mcp_url = Arc::new(RwLock::new(String::new()));
 
@@ -647,7 +591,7 @@ fn print_global_config(mcp_url: &str, api_key: &str) {
     let pretty = serde_json::to_string_pretty(&config).unwrap_or_default();
 
     println!(
-        "conseqa-confluence global server\n  mcp: {mcp_url}\n\n\
+        "conseqa-design-mcp global server\n  mcp: {mcp_url}\n\n\
          Register this ONCE in Claude Code (user scope, so it is global):\n\n\
          Option A — the GUI: Settings → Connectors → Add → HTTP, URL `{mcp_url}`,\n\
          header `Authorization: Bearer {api_key}`.\n\n\
@@ -669,7 +613,7 @@ struct StdioOptions {
 async fn serve_stdio_cmd(options: StdioOptions) -> Result<(), String> {
     let executor = design_executor(&options.system_one)?;
 
-    let manager = Arc::new(conseqa::confluence::WorkspaceManager::new());
+    let manager = Arc::new(conseqa::design::WorkspaceManager::new());
 
     // The app starts the server in the user's working directory; the
     // project there is the one meant when a client names none.
@@ -691,7 +635,7 @@ async fn serve_stdio_cmd(options: StdioOptions) -> Result<(), String> {
         state: Arc::new(DesignState::default()),
     });
 
-    let worker_key = conseqa::confluence::TaskToken::generate().0;
+    let worker_key = conseqa::design::TaskToken::generate().0;
 
     let worker_server = mcp::serve_router(
         mcp::router_multi(Arc::clone(&manager), worker_key, Some(Arc::clone(&launcher))),
@@ -780,11 +724,11 @@ impl DaemonDesignLauncher {
     /// Where a run on `engine`'s project writes its finalized model,
     /// report, and manifest: derived artifacts, so the project's
     /// uncommitted local directory.
-    fn design_dir(&self, engine: &ConfluenceEngine) -> PathBuf {
+    fn design_dir(&self, engine: &DesignEngine) -> PathBuf {
         self.design_out
             .clone()
             .or_else(|| engine.local_dir().map(|local| local.join("design")))
-            .unwrap_or_else(|| std::env::temp_dir().join("conseqa-design"))
+            .unwrap_or_else(|| std::env::temp_dir().join("conseqa-design-mcp"))
     }
 
     /// The worker agents' scratch directories, which hold only their
@@ -797,7 +741,7 @@ impl DaemonDesignLauncher {
     /// The backend of one design run: the agent backend, behind the
     /// System One builders when they are configured. A builder acts on
     /// one engine, and each run has its own project's.
-    fn backend_for(&self, engine: &ConfluenceEngine) -> Arc<dyn AgentBackend> {
+    fn backend_for(&self, engine: &DesignEngine) -> Arc<dyn AgentBackend> {
         self.builders_over(engine, Arc::clone(&self.backend))
     }
 
@@ -805,7 +749,7 @@ impl DaemonDesignLauncher {
     /// configured.
     fn builders_over(
         &self,
-        engine: &ConfluenceEngine,
+        engine: &DesignEngine,
         fallback: Arc<dyn AgentBackend>,
     ) -> Arc<dyn AgentBackend> {
         #[cfg(feature = "system-one")]
@@ -823,7 +767,7 @@ impl DaemonDesignLauncher {
 impl DesignLauncher for DaemonDesignLauncher {
     fn launch(
         &self,
-        engine: ConfluenceEngine,
+        engine: DesignEngine,
         objective: Option<String>,
     ) -> Result<serde_json::Value, String> {
         // One workflow at a time across the server: overlapping runs
@@ -915,7 +859,7 @@ impl DesignLauncher for DaemonDesignLauncher {
 
     fn build(
         &self,
-        engine: ConfluenceEngine,
+        engine: DesignEngine,
         objective: Option<String>,
     ) -> Result<futures::future::BoxFuture<'static, serde_json::Value>, String> {
         if self
@@ -1069,8 +1013,8 @@ impl DesignLauncher for DaemonDesignLauncher {
 /// create and edit anything, including operations it creates during the
 /// session. The human is the coordinator; read-before-reference, draft
 /// validation, and OCC still apply.
-fn interactive_scope() -> conseqa::confluence::WriteScope {
-    conseqa::confluence::WriteScope::of([conseqa::confluence::WriteGrant::All])
+fn interactive_scope() -> conseqa::design::WriteScope {
+    conseqa::design::WriteScope::of([conseqa::design::WriteGrant::All])
 }
 
 /// Prints a ready-to-paste `.mcp.json` block for the Claude Code UI,
@@ -1103,7 +1047,7 @@ fn print_session_config(mcp_url: &str, token: &str) {
 /// launcher.
 #[derive(Clone)]
 struct AdminState {
-    engine: ConfluenceEngine,
+    engine: DesignEngine,
     launcher: Arc<dyn DesignLauncher>,
 }
 
@@ -1228,95 +1172,4 @@ async fn admin_analysis(
     };
 
     Json(value)
-}
-
-fn init(
-    project: PathBuf,
-    name: Option<String>,
-    prompt: Option<String>,
-    model: Option<PathBuf>,
-) -> Result<(), String> {
-    let initial = initial_workspace(&project, name, model, prompt)?;
-
-    let store = ProjectStore::create(&project, &initial)
-        .map_err(|error| format!("cannot create a project in {}: {error}", project.display()))?;
-
-    println!(
-        "created {}\ncommit it with the code; its local/ directory is ignored",
-        store
-            .project_dir()
-            .unwrap_or(&project)
-            .join(conseqa::confluence::PROJECT_DIR)
-            .display(),
-    );
-
-    Ok(())
-}
-
-/// Reads the project at or above `dir`, without opening it for writing.
-fn read_project(dir: &std::path::Path) -> Result<conseqa::confluence::ProjectRead, String> {
-    let project = ProjectStore::discover(dir)
-        .ok_or_else(|| format!("no conseqa project at {} or above it", dir.display()))?;
-
-    ProjectStore::read(&project).map_err(|error| error.to_string())
-}
-
-fn status(project: PathBuf) -> Result<(), String> {
-    let read = read_project(&project)?;
-
-    println!("project:       {}", read.workspace.run_meta.run);
-    println!("head revision: {}", read.workspace.revision.0);
-    println!("commits:       {}", read.log.len());
-    println!("tasks:         {}", read.tasks.len());
-
-    for record in read.tasks {
-        println!(
-            "  {} {} [{}] {}",
-            record.spec.id, record.spec.kind, record.state, record.spec.objective,
-        );
-    }
-
-    Ok(())
-}
-
-fn export(project: PathBuf, out: PathBuf, report: Option<PathBuf>) -> Result<(), String> {
-    let model = read_project(&project)?
-        .workspace
-        .assemble_model()
-        .map_err(|error| error.to_string())?;
-
-    let yaml =
-        serde_yaml::to_string(&model).map_err(|error| format!("cannot serialize model: {error}"))?;
-
-    std::fs::write(&out, yaml)
-        .map_err(|error| format!("cannot write {}: {error}", out.display()))?;
-
-    println!("wrote {} (revision {})", out.display(), model.revision.0);
-
-    if let Some(report_path) = report {
-        let errors = conseqa::analyzer::validate(&model);
-
-        if !errors.is_empty() {
-            for error in errors {
-                let diagnostic = conseqa::analyzer::Diagnostic::from(error);
-
-                eprintln!("error: {}", diagnostic.message);
-            }
-
-            return Err("the model fails validation; no report written".to_string());
-        }
-
-        let verification = conseqa::analyzer::verification::verify(&model);
-        let obligations = conseqa::analyzer::report::obligations(&model, &verification);
-
-        let json = serde_json::to_string_pretty(&obligations)
-            .map_err(|error| format!("cannot serialize report: {error}"))?;
-
-        std::fs::write(&report_path, format!("{json}\n"))
-            .map_err(|error| format!("cannot write {}: {error}", report_path.display()))?;
-
-        println!("wrote {}", report_path.display());
-    }
-
-    Ok(())
 }

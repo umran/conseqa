@@ -12,11 +12,11 @@ When sources disagree, use this precedence:
 
 | Document | Role | Currency check |
 |---|---|---|
-| [`CONSEQA_DSL_SEMANTICS.md`](CONSEQA_DSL_SEMANTICS.md) | Normative DSL and V1 verifier semantics. | Declares DSL contract version 6 and names itself as the single authoritative semantics document. Embedded into the MCP `dsl_guide` by `src/confluence/mcp.rs`. |
+| [`CONSEQA_DSL_SEMANTICS.md`](CONSEQA_DSL_SEMANTICS.md) | Normative DSL and V1 verifier semantics. | Declares DSL contract version 6 and names itself as the single authoritative semantics document. Embedded into the MCP `dsl_guide` by `src/design/mcp.rs`. |
 | [`SERIALIZATION_AND_ORDERING_PRIMITIVES_MAP.md`](SERIALIZATION_AND_ORDERING_PRIMITIVES_MAP.md) | Implementation-oriented map of serialization and ordering vocabulary, validation, proof logic, diagnostics, and tests. | Written against the DSL 6 implementation on the current branch. |
 | [`TRANSACTION_SERIALIZATION_GRAPH.md`](TRANSACTION_SERIALIZATION_GRAPH.md) | Detailed explanation of the current static transaction-conflict and serialization-graph analysis. | Explicitly revised for DSL 6 atomic conditional mutations. |
-| [`PROJECT_STATE.md`](PROJECT_STATE.md) | How a project's state lives in its repository's `.conseqa/` directory: layout, file format, outside edits, locking, crash safety, and the CLI and MCP surfaces that open projects. | Written against the format 9 project store in `src/confluence/store.rs`. |
-| [`CONSEQA_VIZ.md`](CONSEQA_VIZ.md) | User-facing guide to the current self-contained visualization. | Matches the current report overlay, pages, panels, and CLI surface. |
+| [`PROJECT_STATE.md`](PROJECT_STATE.md) | How a project's state lives in its repository's `.conseqa/` directory: layout, file format, outside edits, locking, crash safety, and the CLI and MCP surfaces that open projects. | Written against the format 9 project store in `src/design/store.rs`. |
+| [`CONSEQA_VIZ.md`](CONSEQA_VIZ.md) | User-facing guide to the current self-contained visualization. | Matches the current report overlay, pages, panels, library renderer, and design MCP export surface. |
 | [`VIZ_FRONTEND.md`](VIZ_FRONTEND.md) | Developer guide for the current React/Vite visualization frontend and embedded bundle workflow. | Matches the current `viz/` source tree and build commands. |
 
 ## Historical design records outside the live corpus
@@ -25,7 +25,7 @@ The following documents remain at the repository root for design history. They a
 
 | Document | Classification |
 |---|---|
-| `CONSEQA_AGENT_CONFLUENCE_HARNESS_IMPLEMENTATION_SPEC.md` | Historical implementation plan tied to an earlier baseline; consult current harness and confluence code instead. |
+| `CONSEQA_AGENT_DESIGN_HARNESS_IMPLEMENTATION_SPEC.md` | Historical implementation plan tied to an earlier baseline; consult current harness and design code instead. |
 | `CONSEQA_INLINE_EXECUTION_AND_TYPED_BINDINGS_REVISION.md` | Implemented revision whose semantic result is consolidated into the live DSL contract. |
 | `Concise_Conseqa_Outbox_Semantics_Revision.md` | Historical concise outbox proposal; superseded by the live contract and current code. |
 | `Conseqa_Asynchronous_Effect_Execution_Revision_Specification.md` | Implemented feature specification; current semantics are consolidated into the live contract. |

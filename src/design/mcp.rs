@@ -1,4 +1,4 @@
-//! The MCP tool surface (§42–§53 of the confluence spec).
+//! The MCP tool surface (§42–§53 of the design spec).
 //!
 //! One shared Streamable HTTP server; every request authenticates with
 //! a per-task bearer capability that resolves to the task's pinned
@@ -30,7 +30,7 @@ use crate::spec::{Id, Revision};
 
 use super::analysis::AnalysisState;
 use super::commit::{CommitRejection, CommitRequest};
-use super::engine::{ConfluenceEngine, EngineError, OperationReadMode};
+use super::engine::{DesignEngine, EngineError, OperationReadMode};
 use super::graph_query::GraphQuery;
 use super::patch::{PatchId, SpecPatch};
 use super::read_set::SearchSpec;
@@ -302,7 +302,7 @@ pub struct DependencyRequestParams {
 /// Launches the concurrent multi-agent design workflow against one
 /// project's engine. Implemented by the orchestrating binary (which
 /// depends on the `harness` module) and injected here, so the MCP
-/// server can trigger a fanout without `confluence` depending on
+/// server can trigger a fanout without `design` depending on
 /// `harness`.
 pub trait DesignLauncher: Send + Sync {
     /// Starts the workflow in the background against `engine` and
@@ -310,7 +310,7 @@ pub trait DesignLauncher: Send + Sync {
     /// not start (for example, one is already running).
     fn launch(
         &self,
-        engine: ConfluenceEngine,
+        engine: DesignEngine,
         objective: Option<String>,
     ) -> Result<serde_json::Value, String>;
 
@@ -327,7 +327,7 @@ pub trait DesignLauncher: Send + Sync {
     /// cannot (a run is already active, or it has no builders).
     fn build(
         &self,
-        engine: ConfluenceEngine,
+        engine: DesignEngine,
         objective: Option<String>,
     ) -> Result<futures::future::BoxFuture<'static, serde_json::Value>, String> {
         let _ = (engine, objective);
@@ -347,7 +347,7 @@ pub trait DesignLauncher: Send + Sync {
 /// two simultaneous UI connections is intentionally not offered here.
 #[derive(Clone)]
 struct ProjectSession {
-    engine: ConfluenceEngine,
+    engine: DesignEngine,
     /// The interactive session token in that engine (never sent to the
     /// client; the client authenticates with the stable API key). Rolls
     /// to a successor internally on each commit while the string stays
@@ -384,7 +384,7 @@ impl ProjectHost {
 enum Backing {
     /// One fixed engine; the bearer is a per-task capability (§43). The
     /// embedded and single-project daemon paths.
-    Single(ConfluenceEngine),
+    Single(DesignEngine),
 
     /// Many projects over HTTP behind a stable API key; the UI selects
     /// the active project through the project tools, and worker
@@ -400,7 +400,7 @@ enum Backing {
 
 /// What one authenticated architecture request resolves to.
 struct Resolved {
-    engine: ConfluenceEngine,
+    engine: DesignEngine,
     task: TaskId,
 }
 
@@ -424,7 +424,7 @@ pub struct ConseqaMcp {
 }
 
 impl ConseqaMcp {
-    pub fn new(engine: ConfluenceEngine) -> Self {
+    pub fn new(engine: DesignEngine) -> Self {
         Self {
             backing: Backing::Single(engine),
             launcher: None,
@@ -433,7 +433,7 @@ impl ConseqaMcp {
 
     /// A single-project server that can also launch the concurrent
     /// design workflow.
-    pub fn with_launcher(engine: ConfluenceEngine, launcher: Arc<dyn DesignLauncher>) -> Self {
+    pub fn with_launcher(engine: DesignEngine, launcher: Arc<dyn DesignLauncher>) -> Self {
         Self {
             backing: Backing::Single(engine),
             launcher: Some(launcher),
@@ -576,7 +576,7 @@ impl ProjectHost {
     /// Gives the active project a fresh session at the current head, so
     /// the caller's next reads and patches are against what a build just
     /// committed rather than the snapshot its session opened on.
-    fn renew(&self, engine: &ConfluenceEngine) -> Result<(), String> {
+    fn renew(&self, engine: &DesignEngine) -> Result<(), String> {
         let mut active = self.active.write();
 
         let Some(session) = active.as_mut() else {
@@ -640,7 +640,7 @@ impl ProjectHost {
     /// at its current head.
     fn activate(
         &self,
-        engine: ConfluenceEngine,
+        engine: DesignEngine,
     ) -> Result<super::workspace_manager::ProjectInfo, String> {
         engine.sync_with_disk().map_err(|error| error.to_string())?;
 
@@ -663,7 +663,7 @@ impl ProjectHost {
 
     /// The project `open_project` means: the one at `path`, else the
     /// active one, else the server's own.
-    fn project_at(&self, path: Option<&str>) -> Result<ConfluenceEngine, String> {
+    fn project_at(&self, path: Option<&str>) -> Result<DesignEngine, String> {
         let opened = match (path, self.active.read().clone(), &self.home) {
             (Some(path), _, _) => self.manager.open(Path::new(path)),
             (None, Some(session), _) => return Ok(session.engine),
@@ -681,7 +681,7 @@ impl ProjectHost {
 
 /// Adopts what changed a project's files outside the server, before a
 /// request reads or writes it.
-fn sync(engine: &ConfluenceEngine) -> Result<(), ResolveError> {
+fn sync(engine: &DesignEngine) -> Result<(), ResolveError> {
     engine
         .sync_with_disk()
         .map(|_| ())
@@ -1328,8 +1328,8 @@ impl ConseqaMcp {
             return json_error(serde_json::json!({
                 "launched": false,
                 "error": "concurrent design is not available on this server",
-                "guidance": "This confluence server has no orchestration backend. Run the \
-                             design workflow with the conseqa-harness CLI instead.",
+                "guidance": "This design server has no orchestration backend. Restart \
+                             the design MCP server with a configured backend.",
             }));
         };
 
@@ -1744,8 +1744,7 @@ impl ConseqaMcp {
             "artifacts": artifacts,
             "analysis": analysis_json(&analysis),
             "note": "spec.html is self-contained — open it in a browser or hand it to \
-                     the user. conseqa.yaml is the canonical model, consumable by the \
-                     `conseqa` checker and `conseqa-viz`.",
+                     the user. conseqa.yaml is the canonical model for library consumers.",
         }))
     }
 }
@@ -1753,7 +1752,7 @@ impl ConseqaMcp {
 /// Waits a bounded moment for the head revision's analysis, so a status
 /// call right after a commit reports the verdict rather than
 /// "analyzing".
-async fn settled_analysis(engine: &ConfluenceEngine, revision: Revision) -> AnalysisState {
+async fn settled_analysis(engine: &DesignEngine, revision: Revision) -> AnalysisState {
     let state = engine.analysis_state(revision);
 
     if state.is_terminal() {
@@ -1942,14 +1941,14 @@ impl McpServer {
 
 /// The axum router exposing `/mcp`, for embedding alongside other
 /// routes (the standalone daemon adds its admin surface).
-pub fn router(engine: ConfluenceEngine) -> axum::Router {
+pub fn router(engine: DesignEngine) -> axum::Router {
     build_router(ConseqaMcp::new(engine))
 }
 
 /// The `/mcp` router with a design launcher wired in, so `request_design`
 /// can start the concurrent workflow.
 pub fn router_with_launcher(
-    engine: ConfluenceEngine,
+    engine: DesignEngine,
     launcher: Arc<dyn DesignLauncher>,
 ) -> axum::Router {
     build_router(ConseqaMcp::with_launcher(engine, launcher))
@@ -1987,7 +1986,7 @@ fn build_router(mcp: ConseqaMcp) -> axum::Router {
 
 /// Serves the MCP endpoint on `bind` (use port 0 for an ephemeral
 /// port; the handle reports the bound address).
-pub async fn serve(engine: ConfluenceEngine, bind: SocketAddr) -> std::io::Result<McpServer> {
+pub async fn serve(engine: DesignEngine, bind: SocketAddr) -> std::io::Result<McpServer> {
     serve_router(router(engine), bind).await
 }
 
@@ -2016,7 +2015,7 @@ pub async fn serve_router(router: axum::Router, bind: SocketAddr) -> std::io::Re
     })
 }
 
-const DSL_REFERENCE: &str = r#"Conseqa confluence JSON shapes (canonical serialized forms).
+const DSL_REFERENCE: &str = r#"Conseqa design JSON shapes (canonical serialized forms).
 
 SYMBOL KEYS — {"kind": K, "value": V}:
   {"kind":"service","value":"service.checkout"}

@@ -10,7 +10,7 @@
 //! pieces it acts on. It writes nothing.
 //!
 //! The filled program is judged by the analyzer before it is submitted
-//! ([`evaluate_candidate`](crate::confluence::ConfluenceEngine::evaluate_candidate)):
+//! ([`evaluate_candidate`](crate::design::DesignEngine::evaluate_candidate)):
 //! a program that does not validate is never submitted, and the task
 //! goes to a session with the diagnostics. A program says what an
 //! operation does, which only the description can settle, so every
@@ -38,8 +38,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde_json::json;
 use uuid::Uuid;
 
-use crate::confluence::sketch;
-use crate::confluence::{
+use crate::design::sketch;
+use crate::design::{
     AssemblyGap, BundleSpec, CommitRequest, DraftOperation, EngineError, Mutation, PatchId,
     SearchSpec, SpecPatch, SymbolKey, SymbolKind, WriteGrant,
 };
@@ -206,7 +206,7 @@ async fn synthesize(
     )?;
 
     if let Ok(interface) =
-        serde_json::from_value::<crate::confluence::OperationInterfaceDraft>(interface.content)
+        serde_json::from_value::<crate::design::OperationInterfaceDraft>(interface.content)
         && interface.sketch.is_some()
     {
         let prompt: String = task

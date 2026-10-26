@@ -3,7 +3,7 @@ import type { Graph } from "./graph";
 import type { Model } from "./model";
 import type { ProverReport } from "./report";
 
-// The page data `conseqa-viz` injects as `window.CONSEQA`, or serves
+// The page data the Rust renderer injects as `window.CONSEQA`, or serves
 // as `conseqa.json` during development.
 export interface PageData {
   title: string;
@@ -29,8 +29,8 @@ export async function loadPageData(): Promise<PageData> {
   if (!response.ok) {
     throw new Error(
       `no page data: ${response.status} ${response.statusText}. ` +
-        "Run `npm run data` to generate public/conseqa.json, or open a " +
-        "file produced by conseqa-viz.",
+        "Provide public/conseqa.json, or open the spec.html produced by " +
+        "the design MCP server's export_spec tool.",
     );
   }
 

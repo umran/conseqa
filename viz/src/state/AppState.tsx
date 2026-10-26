@@ -133,7 +133,7 @@ export interface AppStateProviderProps {
   /**
    * Colour mode, when a host owns it.
    *
-   * The self-contained page `conseqa-viz` writes has no host, so the
+   * The self-contained page the Rust renderer writes has no host, so the
    * app manages the mode itself: it restores the stored choice, sets
    * `data-mode` on the document, and offers a toggle. Embedded in an
    * application that has a colour mode of its own, that would be a

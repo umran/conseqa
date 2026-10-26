@@ -1,4 +1,4 @@
-//! The confluence authoring workspace: the shared architecture state
+//! The design authoring workspace: the shared architecture state
 //! agents synthesize concurrently.
 //!
 //! This is deliberately not `spec::Model`. During synthesis the model
@@ -49,7 +49,7 @@ pub enum AssemblyGap {
 
 /// The authoritative shared architecture state at one revision.
 ///
-/// Owned by the confluence engine; agents interact with it only
+/// Owned by the design engine; agents interact with it only
 /// through tracked reads and the serializable commit gate. The
 /// canonical `conseqa.yaml` is materialized from it only at
 /// finalization or explicit export.
@@ -151,7 +151,7 @@ impl WorkspaceState {
 
     /// A workspace holding an existing complete model: every operation
     /// becomes a fully populated draft, ready for assembly. This is how
-    /// a confluence run adopts an existing `conseqa.yaml`.
+    /// a design run adopts an existing `conseqa.yaml`.
     pub fn from_model(model: &Model, run_meta: RunMetadata) -> Self {
         Self {
             revision: model.revision,
@@ -181,7 +181,7 @@ impl WorkspaceState {
 /// still being synthesized. The program and requirements arrive
 /// through later scoped commits.
 ///
-/// This type is confluence-authoring metadata, not a DSL primitive.
+/// This type is design-authoring metadata, not a DSL primitive.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DraftOperation {
@@ -473,7 +473,7 @@ pub enum ProposalStatus {
 #[serde(transparent)]
 pub struct EvidenceRef(pub String);
 
-/// Identity of one confluence run.
+/// Identity of one design run.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct RunId(pub String);

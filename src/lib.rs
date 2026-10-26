@@ -1,7 +1,7 @@
 pub mod analyzer;
-#[cfg(feature = "confluence")]
-pub mod confluence;
-#[cfg(feature = "confluence")]
+#[cfg(feature = "design")]
+pub mod design;
+#[cfg(feature = "design")]
 pub mod harness;
 pub mod parser;
 pub mod spec;

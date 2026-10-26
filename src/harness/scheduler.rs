@@ -1,5 +1,5 @@
 //! The scheduler: turning logical task specifications into completed
-//! confluence commits, restarting a session when its task is
+//! design commits, restarting a session when its task is
 //! invalidated and running a fanout's tasks concurrently.
 //!
 //! `run_many` fans out a batch of tasks in conflict-free waves — the
@@ -24,8 +24,8 @@ use std::collections::{BTreeSet, HashSet, VecDeque};
 use parking_lot::Mutex;
 use rustc_hash::FxHashMap;
 
-use crate::confluence::{
-    AnalysisState, BundleSpec, ConfluenceEngine, CreateTask, EngineError, InvalidationNote,
+use crate::design::{
+    AnalysisState, BundleSpec, DesignEngine, CreateTask, EngineError, InvalidationNote,
     PromptEvidence, SymbolKey, TaskBudget, TaskId, TaskKind, TaskState, WriteGrant, WriteScope,
 };
 use crate::spec::Id;
@@ -206,7 +206,7 @@ pub enum SchedulerError {
 }
 
 pub struct Scheduler {
-    engine: ConfluenceEngine,
+    engine: DesignEngine,
     supervisor: Supervisor,
     policy: SchedulerPolicy,
 
@@ -221,7 +221,7 @@ pub struct Scheduler {
 }
 
 impl Scheduler {
-    pub fn new(engine: ConfluenceEngine, supervisor: Supervisor, policy: SchedulerPolicy) -> Self {
+    pub fn new(engine: DesignEngine, supervisor: Supervisor, policy: SchedulerPolicy) -> Self {
         Self {
             engine,
             supervisor,
@@ -236,7 +236,7 @@ impl Scheduler {
         self.ledger.lock().clone()
     }
 
-    pub fn engine(&self) -> &ConfluenceEngine {
+    pub fn engine(&self) -> &DesignEngine {
         &self.engine
     }
 
@@ -384,7 +384,7 @@ impl Scheduler {
             .collect())
     }
 
-    /// Runs one logical task to a terminal confluence state, creating a
+    /// Runs one logical task to a terminal design state, creating a
     /// fresh task and session each time an attempt is invalidated or
     /// its process fails, up to the policy's attempt bound.
     pub async fn run(&self, logical: &LogicalTask) -> Result<TaskRun, SchedulerError> {

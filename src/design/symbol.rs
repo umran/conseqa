@@ -5,7 +5,7 @@
 //! interface, program, requirements, and derived summary version
 //! separately, so a task that read only a callee's interface is not
 //! invalidated when the callee's requirements change (§9.1 of the
-//! confluence spec).
+//! design spec).
 //!
 //! The L1 runtime declarations are symbols of their own, and every one
 //! of them is shared. Runtime topology is architecture: which

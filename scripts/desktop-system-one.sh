@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Turns System One (hosted Jev) on for the `conseqa-confluence stdio`
+# Turns System One (hosted Jev) on for the `conseqa-design-mcp stdio`
 # server Claude Desktop runs, without touching Desktop's own config —
 # Desktop rewrites that file from memory while it runs, so edits made
 # there do not stick. Instead this writes two files only you own:
@@ -10,7 +10,7 @@
 #   scripts/desktop-system-one.sh          # enable System One
 #   scripts/desktop-system-one.sh --off    # agent backend only
 #
-# Desktop's entry only needs: command = <repo>/target/release/conseqa-confluence,
+# Desktop's entry only needs: command = <repo>/target/release/conseqa-design-mcp,
 # args = ["stdio"]. Restart Claude Desktop afterwards.
 set -euo pipefail
 
@@ -36,7 +36,7 @@ if [[ ! -s "$key_file" || "${1:-}" == "--new-key" ]]; then
 fi
 
 cat > "$args_file" <<EOF
-# Read by \`conseqa-confluence stdio\`; written by scripts/desktop-system-one.sh
+# Read by \`conseqa-design-mcp stdio\`; written by scripts/desktop-system-one.sh
 --decider
 system-one
 --decider-url

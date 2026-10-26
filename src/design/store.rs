@@ -52,7 +52,7 @@ pub const PROJECT_DIR: &str = ".conseqa";
 ///
 /// Formats 1 to 8 were a central redb database per project, holding
 /// every revision of the workspace as one serialized blob; their bump
-/// history is in git, in `src/confluence/persistence.rs`. Format 9 moved
+/// history is in git, in `src/design/persistence.rs`. Format 9 moved
 /// the state into the project, as one YAML file per entity. A `dsl`
 /// bump forces a format bump — the files hold spec types — never
 /// conversely.

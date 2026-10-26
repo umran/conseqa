@@ -28,7 +28,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use uuid::Uuid;
 
-use crate::confluence::{
+use crate::design::{
     CommitRequest, EngineError, Mutation, OperationInterfaceDraft, PatchId, SearchSpec, SpecPatch,
     SymbolKey, SymbolKind,
 };

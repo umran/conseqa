@@ -19,7 +19,7 @@ export interface AppProps {
 
   /** Colour mode, when a host owns it. Given one, the app follows it and
    *  offers no toggle of its own; left out, it manages its own, as the
-   *  self-contained page `conseqa-viz` writes does. */
+   *  self-contained page the Rust renderer writes does. */
   theme?: Theme;
 }
 

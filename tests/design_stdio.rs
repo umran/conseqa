@@ -1,4 +1,4 @@
-//! stdio-transport acceptance: the `conseqa-confluence stdio` command
+//! stdio-transport acceptance: the `conseqa-design-mcp stdio` command
 //! serves multi-project MCP over stdin/stdout, the transport Claude
 //! Desktop / Code accepts for a local server without TLS. Spawns the
 //! real binary and speaks newline-delimited JSON-RPC to it, so the
@@ -21,7 +21,7 @@ impl StdioClient {
     /// Starts the server in `cwd`, as the app starts it in the user's
     /// working directory.
     fn spawn(cwd: &std::path::Path) -> Self {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_conseqa-confluence"))
+        let mut child = Command::new(env!("CARGO_BIN_EXE_conseqa-design-mcp"))
             .arg("stdio")
             .current_dir(cwd)
             // Hermetic: never this machine's own `~/.conseqa/stdio.args`.

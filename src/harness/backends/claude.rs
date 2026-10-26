@@ -1,7 +1,7 @@
-//! The Claude Code backend (§57 of the confluence spec).
+//! The Claude Code backend (§57 of the design spec).
 //!
 //! Launches `claude -p <prompt> --output-format stream-json` with a
-//! generated strict MCP config pointing at the confluence server, the
+//! generated strict MCP config pointing at the design server, the
 //! task token injected through the environment. Architecture agents
 //! get read-only repository access and the Conseqa tools only; on
 //! invalidation the harness cancels the child and never reuses the
@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
 
-use crate::confluence::AgentBackendMetadata;
+use crate::design::AgentBackendMetadata;
 use crate::harness::backend::{
     AgentBackend, AgentBackendError, AgentEvent, AgentEventSink, AgentExit, AgentHandle,
     AgentInvocation, AgentUsage, mcp_config_json,
@@ -124,7 +124,7 @@ impl ClaudeCliBackend {
             "--verbose".to_string(),
             "--mcp-config".to_string(),
             mcp_config.display().to_string(),
-            // Only the confluence server; no user/project MCP servers
+            // Only the design server; no user/project MCP servers
             // enter the architecture task (§57).
             "--strict-mcp-config".to_string(),
         ];

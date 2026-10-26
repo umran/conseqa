@@ -2,7 +2,7 @@
 
 A Conseqa project lives in the repository it describes, in a `.conseqa/` directory committed with the code. The architecture model is versioned, reviewed, branched, and merged like any other source, so the repository is the source of truth for both the code and the architecture it claims to implement. Nothing about a project is kept anywhere else on the machine.
 
-Implementation: [`src/confluence/store.rs`](../../src/confluence/store.rs).
+Implementation: [`src/design/store.rs`](../../src/design/store.rs).
 
 ## Layout
 
@@ -30,7 +30,7 @@ Implementation: [`src/confluence/store.rs`](../../src/confluence/store.rs).
   local/                          this machine's engine state (not committed)
 ```
 
-Everything except `local/` is committed. The committed state is the authoring workspace (`WorkspaceState`), not the assembled `Model`: an operation may be planned with no program yet, and the prompt, its obligations, and the provenance of each requirement are part of the design record. `conseqa-confluence export` assembles the canonical single-file `conseqa.yaml` from it when every operation has a program.
+Everything except `local/` is committed. The committed state is the authoring workspace (`WorkspaceState`), not the assembled `Model`: an operation may be planned with no program yet, and the prompt, its obligations, and the provenance of each requirement are part of the design record. The design MCP server's `export_spec` tool assembles the canonical single-file `conseqa.yaml` when every operation has a program.
 
 Empty collections have no directory and no file. `intent/` files exist only when they hold something.
 
@@ -49,7 +49,7 @@ Empty collections have no directory and no file. `intent/` files exist only when
 
 **A broken file blocks writes.** When the files no longer load — invalid YAML, an unknown field, an unexpected entry — every tool call reports the file and the error, and every commit is refused until the file loads again. The engine never writes over an edit in progress.
 
-**One writer per project.** An open project holds an exclusive lock on `local/lock`, which records the holder's pid. A second process opening it for writing is refused by name; reading it (`status`, `export`) takes no lock.
+**One writer per project.** An open project holds an exclusive lock on `local/lock`, which records the holder's pid. A second process opening it for writing is refused by name; reading it with `conseqa status` takes no lock.
 
 **Crash safety.** A commit first writes its file changes to `local/pending.json`, then writes each file atomically (a temporary sibling renamed into place), then updates the head pointer and removes the journal. If writing fails, the engine restores the files it had changed and keeps its old head. If the process dies midway, the next open completes the commit from the journal, so the files never hold half of one.
 
@@ -71,7 +71,7 @@ All of it can be deleted while no engine has the project open; nothing in it is 
 
 ## Versioning
 
-`project.yaml` records the store `format` (currently 9) and the `dsl` contract version the project is authored in. A project of another format or DSL version is refused by name before anything else is read. A `dsl` bump forces a format bump, never conversely. Formats 1 to 8 were the central per-project databases under `~/.conseqa/projects`; they are not read. To bring an older design forward, re-author it, or adopt an exported `conseqa.yaml` with `conseqa-confluence init --model`.
+`project.yaml` records the store `format` (currently 9) and the `dsl` contract version the project is authored in. A project of another format or DSL version is refused by name before anything else is read. A `dsl` bump forces a format bump, never conversely. Formats 1 to 8 were the central per-project databases under `~/.conseqa/projects`; they are not read. To bring an older design forward, initialize a current project and re-author it through the design MCP surface.
 
 ## Opening a project
 
@@ -79,9 +79,12 @@ All of it can be deleted while no engine has the project open; nothing in it is 
 |---|---|
 | MCP `open_project` | `path`: the repository, or any directory inside it. Without a path, the active project is reopened at its head; with none active, the project the server was started in. |
 | MCP `create_project` | `path`: the directory to create `.conseqa/` in, normally the repository root. Refused if it, or a directory above it, already holds a project. `name` defaults to the directory's name. |
-| `conseqa-confluence stdio` | The project at or above the directory the app starts the server in opens on the first call that needs a project, with no `open_project`. |
-| `conseqa-confluence init / serve / status / export` | `--project`, default `.`. `serve` creates the project when none exists; `status` and `export` read without locking. |
-| `conseqa-harness design` | `--project`, default `.`. An existing project resumes from its files; `--prompt` or `--model` creates one. |
+| `conseqa-design-mcp stdio` | The project at or above the directory the app starts the server in opens on the first call that needs a project, with no `open_project`. |
+| `conseqa init` | Creates the minimal `.conseqa/` scaffold in the current directory. This is the only Conseqa CLI command valid outside a project, and it refuses to create a nested project. |
+| `conseqa status` | Discovers `.conseqa/project.yaml` in the current directory or its nearest ancestor, reads it without taking the writer lock, and prints its root, revision, commit count, and tasks. |
+| `conseqa-design-mcp serve` | `--project`, default `.`. Opens that project for the design MCP and admin surfaces; its existing server options may initialize a workspace when one is absent. |
+
+The `conseqa` CLI deliberately has no project path flag: after initialization, its context is the `.conseqa/` directory discovered from the working directory. Model validation, verification, export, visualization, and design orchestration are library or design-MCP capabilities rather than additional CLI commands.
 
 A server hosts any number of projects at once, keyed by directory. Worker agents of a design run keep their scratch configuration in the system temporary directory, outside every repository, so that no worker picks up a repository's own agent settings.
 
@@ -91,6 +94,6 @@ Settings of the machine's server, not of any project, stay in `~/.conseqa/`: the
 
 ## Tests
 
-- [`src/confluence/store.rs`](../../src/confluence/store.rs) unit tests: id encoding, case collisions, every fixture and a varied sketch with intent round-tripping through the files, the writer lock, nested projects, outside edits versus reformatting, crash completion, format refusal, and strict directories.
-- [`tests/confluence_occ.rs`](../../tests/confluence_occ.rs): restart recovery; an outside edit invalidating exactly the tasks that observed it; an interactive session moving to the adopted head; a broken file refusing commits until fixed.
-- [`tests/confluence_mcp.rs`](../../tests/confluence_mcp.rs) and [`tests/confluence_stdio.rs`](../../tests/confluence_stdio.rs): projects created and opened by path over HTTP and stdio, commits landing in each project's own files, and a stdio server started inside a repository opening its project unasked.
+- [`src/design/store.rs`](../../src/design/store.rs) unit tests: id encoding, case collisions, every fixture and a varied sketch with intent round-tripping through the files, the writer lock, nested projects, outside edits versus reformatting, crash completion, format refusal, and strict directories.
+- [`tests/design_occ.rs`](../../tests/design_occ.rs): restart recovery; an outside edit invalidating exactly the tasks that observed it; an interactive session moving to the adopted head; a broken file refusing commits until fixed.
+- [`tests/design_mcp.rs`](../../tests/design_mcp.rs) and [`tests/design_stdio.rs`](../../tests/design_stdio.rs): projects created and opened by path over HTTP and stdio, commits landing in each project's own files, and a stdio server started inside a repository opening its project unasked.

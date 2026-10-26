@@ -3,7 +3,7 @@
 //! Events let a supervisor cancel obsolete work early and schedule
 //! follow-ups; they are never the correctness mechanism. A lost event
 //! cannot cause a stale commit — the commit gate revalidates
-//! everything (§2.7 of the confluence spec).
+//! everything (§2.7 of the design spec).
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;

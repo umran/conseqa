@@ -315,7 +315,7 @@ They remain useful for:
 - architecture description;
 - simulation;
 - latency/contention analysis;
-- Confluence realization;
+- Design realization;
 - identifying expected input precedence.
 
 They are not sufficient correctness evidence.

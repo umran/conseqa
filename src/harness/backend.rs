@@ -1,6 +1,6 @@
-//! The agent backend abstraction (§55 of the confluence spec).
+//! The agent backend abstraction (§55 of the design spec).
 //!
-//! A backend maps one logical confluence task to one coding-agent
+//! A backend maps one logical design task to one coding-agent
 //! session, exposing the Conseqa tool surface through MCP and nothing
 //! else. The workflow never knows which backend is active; provider
 //! specifics — command lines, event framing, cancellation — live
@@ -12,9 +12,9 @@ use std::path::PathBuf;
 use async_trait::async_trait;
 use tokio::sync::mpsc;
 
-use crate::confluence::{AgentBackendMetadata, TaskId, TaskKind};
+use crate::design::{AgentBackendMetadata, TaskId, TaskKind};
 
-/// Everything a backend needs to launch one session. The confluence
+/// Everything a backend needs to launch one session. The design
 /// engine's MCP endpoint and the task's capability token are injected
 /// here; the agent reaches shared state only through them.
 #[derive(Debug, Clone)]
@@ -26,7 +26,7 @@ pub struct AgentInvocation {
     /// tracked context bundle rendered for the model.
     pub prompt: String,
 
-    /// The confluence MCP endpoint, e.g. `http://127.0.0.1:43127/mcp`.
+    /// The design MCP endpoint, e.g. `http://127.0.0.1:43127/mcp`.
     pub mcp_url: String,
 
     /// The task's bearer capability. Injected into the agent's MCP
@@ -52,7 +52,7 @@ pub struct InvocationBudget {
 
 /// A backend's structured observations during a session, forwarded to
 /// the supervisor for diagnostics and correlation. These never carry
-/// authority over task outcome — the confluence engine owns that.
+/// authority over task outcome — the design engine owns that.
 #[derive(Debug, Clone)]
 pub enum AgentEvent {
     /// The session started; the string is the provider's session id
@@ -79,7 +79,7 @@ pub type AgentEventSink = mpsc::UnboundedSender<AgentEvent>;
 /// How one agent session ended, as the backend observed it. This is
 /// the *process* outcome, not the architectural one: whether the task
 /// committed, filed a dependency request, or is unresolved is the
-/// confluence engine's authoritative record (§91), which the
+/// design engine's authoritative record (§91), which the
 /// supervisor reads separately.
 #[derive(Debug, Clone)]
 pub struct AgentExit {
@@ -176,7 +176,7 @@ pub trait AgentBackend: Send + Sync {
 }
 
 /// The MCP config a backend writes so its agent reaches only the
-/// confluence server, with the task token injected through the
+/// design server, with the task token injected through the
 /// environment rather than the file (§57.1).
 pub fn mcp_config_json(mcp_url: &str, token_env_var: &str) -> serde_json::Value {
     serde_json::json!({

@@ -1,47 +1,41 @@
-//! conseqa: validates an Conseqa model and verifies its declared
-//! requirements.
+//! The project-local Conseqa command-line interface.
 //!
-//! Validation errors are fatal: verification is meaningful only over a
-//! structurally coherent model. Verification verdicts are epistemic —
-//! unproven obligations are reported as notes with the checker's
-//! evidence, never as errors — and the full obligation report, with
-//! proofs rendered as the facts they rely on, can be written as JSON
-//! for tooling such as conseqa-viz.
+//! Conseqa project state belongs in `.conseqa/` beside the code it
+//! describes. `init` is the only command that works outside a project;
+//! every other command discovers the nearest project at or above the
+//! current directory.
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use conseqa::analyzer::{self, Diagnostic, Severity, report};
+use clap::{Parser, Subcommand};
 
-struct Args {
-    model: PathBuf,
-    report: Option<PathBuf>,
+use conseqa::design::{ProjectStore, RunId, RunMetadata, WorkspaceState};
+
+#[derive(Parser)]
+#[command(name = "conseqa", about = "Initialize and inspect a Conseqa project")]
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
 }
 
-const USAGE: &str = "\
-conseqa — validate and verify an Conseqa model
+#[derive(Subcommand)]
+enum Command {
+    /// Create minimal Conseqa state in the current directory.
+    Init,
 
-USAGE:
-    conseqa <MODEL.yaml> [OPTIONS]
-
-OPTIONS:
-    --report <PATH>    Write the obligation report (JSON), consumable
-                       by conseqa-viz --report.
-    -h, --help         Show this help.
-";
+    /// Show the Conseqa project's current local state.
+    Status,
+}
 
 fn main() -> ExitCode {
-    let args = match parse_args() {
-        Ok(Some(args)) => args,
-        Ok(None) => return ExitCode::SUCCESS,
-        Err(message) => {
-            eprintln!("error: {message}\n\n{USAGE}");
-            return ExitCode::FAILURE;
-        }
+    let outcome = match Cli::parse().command {
+        Command::Init => init(),
+        Command::Status => status(),
     };
 
-    match run(&args) {
-        Ok(code) => code,
+    match outcome {
+        Ok(()) => ExitCode::SUCCESS,
         Err(message) => {
             eprintln!("error: {message}");
             ExitCode::FAILURE
@@ -49,125 +43,51 @@ fn main() -> ExitCode {
     }
 }
 
-fn run(args: &Args) -> Result<ExitCode, String> {
-    let source = std::fs::read_to_string(&args.model)
-        .map_err(|error| format!("cannot read {}: {error}", args.model.display()))?;
-
-    let model = conseqa::parser::yaml::parse(&source)
-        .map_err(|error| format!("cannot parse {}: {error}", args.model.display()))?;
-
-    let errors = analyzer::validate(&model);
-
-    if !errors.is_empty() {
-        for error in errors {
-            print_diagnostic(&Diagnostic::from(error));
-        }
-
-        eprintln!("model is invalid; verification not attempted");
-
-        return Ok(ExitCode::FAILURE);
-    }
-
-    let verification = analyzer::verification::verify(&model);
-
-    for diagnostic in verification.diagnostics() {
-        print_diagnostic(&diagnostic);
-    }
-
-    let obligations = report::obligations(&model, &verification);
-
-    let mut proven = 0usize;
-    let mut disproven = 0usize;
-    let mut unknown = 0usize;
-
-    for obligation in &obligations.obligations {
-        match obligation.status {
-            report::Status::Proven => proven += 1,
-            report::Status::Disproven => disproven += 1,
-            report::Status::Unknown => unknown += 1,
-        }
-    }
-
-    println!(
-        "obligations: {proven} proven, {unknown} unknown, {disproven} disproven \
-         ({} total)",
-        obligations.obligations.len()
-    );
-
-    if let Some(path) = &args.report {
-        let json = serde_json::to_string_pretty(&obligations)
-            .map_err(|error| format!("cannot serialize report: {error}"))?;
-
-        write_output(path, &format!("{json}\n"))?;
-
-        eprintln!("wrote {}", path.display());
-    }
-
-    Ok(ExitCode::SUCCESS)
+fn current_dir() -> Result<PathBuf, String> {
+    std::env::current_dir().map_err(|error| format!("cannot read the current directory: {error}"))
 }
 
-fn write_output(path: &Path, contents: &str) -> Result<(), String> {
-    std::fs::write(path, contents)
-        .map_err(|error| format!("cannot write {}: {error}", path.display()))
+fn project_name(dir: &Path) -> String {
+    dir.file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .unwrap_or("project")
+        .to_owned()
 }
 
-fn print_diagnostic(diagnostic: &Diagnostic) {
-    let severity = match diagnostic.severity {
-        Severity::Error => "error",
-        Severity::Warning => "warning",
-        Severity::Unknown => "note",
-    };
+fn init() -> Result<(), String> {
+    let dir = current_dir()?;
+    let workspace = WorkspaceState::empty(RunMetadata::new(RunId(project_name(&dir))));
+    let store = ProjectStore::create(&dir, &workspace)
+        .map_err(|error| format!("cannot initialize Conseqa: {error}"))?;
+    let project = store.project_dir().unwrap_or(&dir);
 
-    let subject = diagnostic
-        .subject
-        .as_ref()
-        .map(|id| format!(" [{id}]"))
-        .unwrap_or_default();
+    println!("initialized {}", project.join(".conseqa").display());
+    println!("commit .conseqa with the project; .conseqa/local is ignored");
 
-    eprintln!("{severity}{subject}: {}", diagnostic.message);
-
-    for evidence in &diagnostic.evidence {
-        let subject = evidence
-            .subject
-            .as_ref()
-            .map(|id| format!("[{id}] "))
-            .unwrap_or_default();
-
-        eprintln!("    {subject}{}", evidence.message);
-    }
+    Ok(())
 }
 
-fn parse_args() -> Result<Option<Args>, String> {
-    let mut model = None;
-    let mut report = None;
+fn status() -> Result<(), String> {
+    let dir = current_dir()?;
+    let project = ProjectStore::discover(&dir).ok_or_else(|| {
+        "not inside a Conseqa project; run `conseqa init` from the project root".to_string()
+    })?;
+    let read = ProjectStore::read(&project)
+        .map_err(|error| format!("cannot read {}: {error}", project.display()))?;
 
-    let mut argv = std::env::args().skip(1);
+    println!("project:       {}", read.workspace.run_meta.run);
+    println!("root:          {}", project.display());
+    println!("head revision: {}", read.workspace.revision.0);
+    println!("commits:       {}", read.log.len());
+    println!("tasks:         {}", read.tasks.len());
 
-    while let Some(arg) = argv.next() {
-        match arg.as_str() {
-            "-h" | "--help" => {
-                println!("{USAGE}");
-                return Ok(None);
-            }
-            "--report" => {
-                report = Some(PathBuf::from(
-                    argv.next().ok_or("--report requires a value")?,
-                ));
-            }
-            other if other.starts_with('-') => {
-                return Err(format!("unknown option {other}"));
-            }
-            _ => {
-                if model.replace(PathBuf::from(&arg)).is_some() {
-                    return Err("more than one model path given".to_string());
-                }
-            }
-        }
+    for record in read.tasks {
+        println!(
+            "  {} {} [{}] {}",
+            record.spec.id, record.spec.kind, record.state, record.spec.objective,
+        );
     }
 
-    let Some(model) = model else {
-        return Err("no model path given".to_string());
-    };
-
-    Ok(Some(Args { model, report }))
+    Ok(())
 }

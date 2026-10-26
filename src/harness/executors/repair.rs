@@ -5,7 +5,7 @@
 //! obstacle its gaps. Code synthesizes the candidate repairs
 //! ([`remedies`](super::remedies)), the analyzer judges every one of
 //! them against the task's pinned snapshot
-//! ([`evaluate_candidate`](crate::confluence::ConfluenceEngine::evaluate_candidate)),
+//! ([`evaluate_candidate`](crate::design::DesignEngine::evaluate_candidate)),
 //! and only a candidate that is *admissible* — it validates, it proves
 //! every obligation it targets, and it un-proves nothing anywhere in
 //! the model — is ever submitted.
@@ -33,7 +33,7 @@ use crate::analyzer::verification::transaction_serializability::{
 use crate::analyzer::verification::{
     TransactionOrderingCheck, TransactionOrderingObstacle, TransactionOrderingVerdict,
 };
-use crate::confluence::{
+use crate::design::{
     BundleSpec, CandidateVerdict, CommitRequest, DraftOperation, EngineError, Mutation, PatchId,
     RequirementRef, SpecPatch, SymbolKey, WriteGrant, standing,
 };
@@ -545,7 +545,7 @@ fn inadmissibility(
 async fn prefer<'a>(
     context: &BuildContext<'_>,
     policy: &RepairPolicy,
-    prompt_evidence: &[crate::confluence::PromptEvidence],
+    prompt_evidence: &[crate::design::PromptEvidence],
     draft: &DraftOperation,
     programs: &Programs,
     operation: &Id,

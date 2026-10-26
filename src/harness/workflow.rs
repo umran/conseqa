@@ -1,9 +1,9 @@
-//! The design workflow (§61–§76, §107 phase 7 of the confluence
+//! The design workflow (§61–§76, §107 phase 7 of the design
 //! spec): natural-language prompt to validated Conseqa model through
 //! staged multi-agent synthesis and requirement-scoped repair to a
 //! semantic fixpoint.
 //!
-//! The workflow enumerates work from the current confluence head and
+//! The workflow enumerates work from the current design head and
 //! runs it through the scheduler; it never decides correctness itself.
 //! Success is a validated, all-obligations-proven, all-obligations-
 //! mapped head with no unresolved dependency requests and no active
@@ -15,8 +15,8 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use crate::confluence::{
-    AnalysisSnapshot, AnalysisState, BundleSpec, ConfluenceEngine, DependencyRequest,
+use crate::design::{
+    AnalysisSnapshot, AnalysisState, BundleSpec, DesignEngine, DependencyRequest,
     DependencyResolution, EvidenceRef, PromptEvidence, PromptObligationStatus, RequirementFamily,
     SymbolKey, SymbolVersion, TaskKind, WriteGrant, WriteScope,
 };
@@ -102,7 +102,7 @@ pub enum WorkflowError {
     Scheduler(#[from] SchedulerError),
 
     #[error(transparent)]
-    Engine(#[from] crate::confluence::EngineError),
+    Engine(#[from] crate::design::EngineError),
 
     #[error("analysis for revision {} did not finish within the timeout", .0.0)]
     AnalysisTimeout(Revision),
@@ -154,7 +154,7 @@ impl Workflow {
             .is_some_and(|halt| halt.load(std::sync::atomic::Ordering::SeqCst))
     }
 
-    fn engine(&self) -> &ConfluenceEngine {
+    fn engine(&self) -> &DesignEngine {
         self.scheduler.engine()
     }
 
@@ -470,7 +470,7 @@ impl Workflow {
     async fn repair_validation(
         &self,
         operations: &[Id],
-        errors: &[crate::confluence::AnalysisDiagnostic],
+        errors: &[crate::design::AnalysisDiagnostic],
     ) -> Result<u32, WorkflowError> {
         let tasks: Vec<LogicalTask> = operations
             .iter()
@@ -594,10 +594,10 @@ impl Workflow {
     /// can reach.
     fn split_diagnostics(
         &self,
-        errors: &[crate::confluence::AnalysisDiagnostic],
+        errors: &[crate::design::AnalysisDiagnostic],
     ) -> (
-        Vec<crate::confluence::AnalysisDiagnostic>,
-        Vec<crate::confluence::AnalysisDiagnostic>,
+        Vec<crate::design::AnalysisDiagnostic>,
+        Vec<crate::design::AnalysisDiagnostic>,
     ) {
         let head = self.engine().head_snapshot();
         let runtime = &head.workspace.runtime;
@@ -620,7 +620,7 @@ impl Workflow {
     /// author. Returns how many tasks ran.
     async fn repair_topology_validation(
         &self,
-        errors: &[crate::confluence::AnalysisDiagnostic],
+        errors: &[crate::design::AnalysisDiagnostic],
     ) -> Result<u32, WorkflowError> {
         let obstacle = errors
             .iter()
@@ -639,7 +639,7 @@ impl Workflow {
             bundle: BundleSpec {
                 operation: None,
                 requirements: Vec::new(),
-                include: crate::confluence::topology_symbols(
+                include: crate::design::topology_symbols(
                     &self.engine().head_snapshot().workspace,
                 ),
                 peers: Vec::new(),
@@ -761,7 +761,7 @@ impl Workflow {
             bundle: BundleSpec {
                 operation: None,
                 requirements: Vec::new(),
-                include: crate::confluence::topology_symbols(
+                include: crate::design::topology_symbols(
                     &self.engine().head_snapshot().workspace,
                 ),
                 peers: Vec::new(),
@@ -803,7 +803,7 @@ impl Workflow {
             .collect()
     }
 
-    fn operations_named_by(&self, errors: &[crate::confluence::AnalysisDiagnostic]) -> Vec<Id> {
+    fn operations_named_by(&self, errors: &[crate::design::AnalysisDiagnostic]) -> Vec<Id> {
         let head = self.engine().head_snapshot();
         let mut named = Vec::new();
 
@@ -944,7 +944,7 @@ impl Workflow {
     fn write_artifacts(
         &self,
         model: &Model,
-        analysis: &crate::confluence::AnalysisSnapshot,
+        analysis: &crate::design::AnalysisSnapshot,
         status: &RunStatus,
     ) -> Result<Vec<String>, String> {
         std::fs::create_dir_all(&self.config.out_dir)
@@ -971,7 +971,7 @@ impl Workflow {
         artifacts.push(report_path.display().to_string());
 
         let manifest = self.build_manifest(model.revision, status);
-        let manifest_path = self.config.out_dir.join("confluence-manifest.json");
+        let manifest_path = self.config.out_dir.join("design-manifest.json");
         let manifest_json = serde_json::to_string_pretty(&manifest)
             .map_err(|error| format!("serialize manifest: {error}"))?;
 
@@ -1522,7 +1522,7 @@ fn dependency_repair_task(
 /// must repair it.
 fn operation_owned_ids(
     operation: &Id,
-    draft: &crate::confluence::DraftOperation,
+    draft: &crate::design::DraftOperation,
 ) -> std::collections::BTreeSet<String> {
     use crate::spec::{OperationStep, TransactionStep};
 
@@ -1616,14 +1616,14 @@ fn operation_owned_ids(
 /// The operations an unmapped prompt obligation concerns. An
 /// obligation naming no operation concerns all of them.
 fn unmapped_obligation_targets(
-    workspace: &crate::confluence::WorkspaceState,
+    workspace: &crate::design::WorkspaceState,
 ) -> std::collections::BTreeSet<Id> {
     let mut targets = std::collections::BTreeSet::new();
 
     for obligation in workspace.prompt_obligations.values() {
         if !matches!(
             obligation.status,
-            crate::confluence::PromptObligationStatus::Unmapped
+            crate::design::PromptObligationStatus::Unmapped
         ) {
             continue;
         }
@@ -1638,7 +1638,7 @@ fn unmapped_obligation_targets(
     targets
 }
 
-fn requirements_empty(draft: &crate::confluence::DraftOperation) -> bool {
+fn requirements_empty(draft: &crate::design::DraftOperation) -> bool {
     let transactional = draft.program.as_ref().is_some_and(|program| {
         program
             .transactions()
@@ -1664,7 +1664,7 @@ fn repair_family(property: &crate::analyzer::report::Property) -> Option<Require
     })
 }
 
-fn describe_gaps(gaps: &[crate::confluence::AssemblyGap]) -> String {
+fn describe_gaps(gaps: &[crate::design::AssemblyGap]) -> String {
     gaps.iter()
         .map(|gap| gap.to_string())
         .collect::<Vec<_>>()
@@ -1679,8 +1679,8 @@ mod tests {
     };
     use crate::analyzer::report::{Obligation, Property, ProverReport, Status, Subject};
     use crate::analyzer::verification::VerificationReport;
-    use crate::confluence::symbol::RequirementFamily;
-    use crate::confluence::{
+    use crate::design::symbol::RequirementFamily;
+    use crate::design::{
         AnalysisSnapshot, DependencyRequest, DependencyRequestId, DraftOperation,
         OperationInterfaceDraft, SymbolKey, TaskId, WriteGrant, WriteScope,
     };

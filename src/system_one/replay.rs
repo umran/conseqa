@@ -29,7 +29,7 @@ use async_trait::async_trait;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
-use crate::confluence::SemanticHash;
+use crate::design::SemanticHash;
 
 use super::{
     Answer, Decider, DeciderError, DeciderIdentity, Decision, DecisionRequest, Json, Question,

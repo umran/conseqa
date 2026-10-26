@@ -5,8 +5,8 @@
 
 use std::path::PathBuf;
 
-use conseqa::confluence::sketch::{self, OperationSketch, Settled, Symbols};
-use conseqa::confluence::{DraftOperation, RunId, RunMetadata, WorkspaceState};
+use conseqa::design::sketch::{self, OperationSketch, Settled, Symbols};
+use conseqa::design::{DraftOperation, RunId, RunMetadata, WorkspaceState};
 use conseqa::spec::Id;
 
 mod common;
@@ -191,8 +191,8 @@ fn the_gate_compiles_a_sketch_when_it_is_written() {
 
         value.sketch = Some(serde_json::from_value(sketch).expect("parses"));
 
-        conseqa::confluence::SpecPatch {
-            mutations: vec![conseqa::confluence::Mutation::PutOperationInterface {
+        conseqa::design::SpecPatch {
+            mutations: vec![conseqa::design::Mutation::PutOperationInterface {
                 operation: id("operation.ship_order"),
                 value,
             }],
@@ -201,7 +201,7 @@ fn the_gate_compiles_a_sketch_when_it_is_written() {
 
     let mut broken = workspace.clone();
 
-    let diagnostics = conseqa::confluence::commit::apply_patch(
+    let diagnostics = conseqa::design::commit::apply_patch(
         &mut broken,
         &interface(serde_json::json!({ "steps": [
             { "kind": "find", "as": "order", "record": "object.order",
@@ -225,7 +225,7 @@ fn the_gate_compiles_a_sketch_when_it_is_written() {
         .expect("sketched")
         .1;
 
-    let diagnostics = conseqa::confluence::commit::apply_patch(&mut sound, &interface(sketch));
+    let diagnostics = conseqa::design::commit::apply_patch(&mut sound, &interface(sketch));
 
     assert!(diagnostics.is_empty(), "{diagnostics:?}");
     assert!(
@@ -445,7 +445,7 @@ impl conseqa::harness::backend::AgentBackend for NoSession {
             session: None,
             final_message: None,
             usage: Default::default(),
-            backend: conseqa::confluence::AgentBackendMetadata {
+            backend: conseqa::design::AgentBackendMetadata {
                 name: "no-session".to_string(),
                 version: None,
                 session: None,
@@ -467,12 +467,12 @@ async fn through_the_pipeline(
     let mut run_meta = RunMetadata::new(RunId("sketch-pipeline".into()));
 
     run_meta.prompt = Some("A system.".to_string());
-    run_meta.policy = conseqa::confluence::RunPolicy {
+    run_meta.policy = conseqa::design::RunPolicy {
         strict_requirements: false,
         adopt_recommended: false,
     };
 
-    let engine = conseqa::confluence::ConfluenceEngine::in_memory(WorkspaceState::from_model(
+    let engine = conseqa::design::DesignEngine::in_memory(WorkspaceState::from_model(
         compiled, run_meta,
     ))
     .expect("engine starts");

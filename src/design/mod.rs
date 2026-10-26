@@ -1,4 +1,4 @@
-//! The agent-confluence layer: concurrent multi-agent authoring of one
+//! The agent-design layer: concurrent multi-agent authoring of one
 //! shared architecture model.
 //!
 //! Agents reason against immutable semantic snapshots
