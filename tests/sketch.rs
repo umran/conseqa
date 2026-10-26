@@ -508,7 +508,6 @@ async fn through_the_pipeline(
             analysis_timeout: std::time::Duration::from_secs(20),
             max_iterations: 8,
             prompt: Some("A system.".to_string()),
-            objective: None,
         },
     );
 

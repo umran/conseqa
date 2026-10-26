@@ -773,6 +773,10 @@ pub enum DeciderError {
     #[error("preview only: the request was written down and not sent")]
     PreviewOnly,
 
+    /// No decider is configured, so there is no one to ask.
+    #[error("no decider is configured, so nothing was asked")]
+    NotConfigured,
+
     #[error(transparent)]
     Replay(#[from] ReplayError),
 }
@@ -817,4 +821,27 @@ pub trait Decider: Send + Sync {
     fn identity(&self) -> DeciderIdentity;
 
     async fn decide(&self, request: &DecisionRequest) -> Result<Decision, DeciderError>;
+}
+
+/// The decider of a run that has none: every ask fails with
+/// [`DeciderError::NotConfigured`]. A builder then settles what code
+/// alone can — a sketch compiles deterministically, a default topology
+/// and a catalogue repair need no judgment — and abstains from the
+/// rest, exactly as it does when a configured decider is unavailable.
+pub struct NoDecider;
+
+#[async_trait]
+impl Decider for NoDecider {
+    fn identity(&self) -> DeciderIdentity {
+        DeciderIdentity {
+            backend: "none".to_string(),
+            model: "none".to_string(),
+            endpoint: None,
+            calibrated: None,
+        }
+    }
+
+    async fn decide(&self, _request: &DecisionRequest) -> Result<Decision, DeciderError> {
+        Err(DeciderError::NotConfigured)
+    }
 }

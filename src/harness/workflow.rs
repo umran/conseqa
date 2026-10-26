@@ -44,11 +44,6 @@ pub struct WorkflowConfig {
     /// extracts from it are. A run without one works from the skeleton
     /// and those obligations.
     pub prompt: Option<String>,
-
-    /// Extra guidance for this run's workers, layered on top of the
-    /// prompt as additional prompt evidence — how an interactive caller
-    /// of `request_design` steers a fanout.
-    pub objective: Option<String>,
 }
 
 impl Default for WorkflowConfig {
@@ -58,7 +53,6 @@ impl Default for WorkflowConfig {
             analysis_timeout: Duration::from_secs(120),
             max_iterations: 8,
             prompt: None,
-            objective: None,
         }
     }
 }
@@ -135,8 +129,8 @@ pub struct Workflow {
     discovered: parking_lot::Mutex<std::collections::BTreeSet<Id>>,
 
     /// When set, the run stops at its next phase boundary: a task was
-    /// handed back to the caller, and every later phase would only
-    /// reproduce it.
+    /// handed back to the caller, and every later phase would build on
+    /// what it left unsettled.
     halt: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
@@ -189,7 +183,11 @@ impl Workflow {
         loop {
             iterations += 1;
 
-            if iterations > self.config.max_iterations || self.halted() {
+            if self.halted() {
+                return Ok(self.stopped(iterations - 1));
+            }
+
+            if iterations > self.config.max_iterations {
                 return self.finalize(iterations - 1, None).await;
             }
 
@@ -286,6 +284,10 @@ impl Workflow {
 
                     self.requirement_discovery().await?;
 
+                    if self.halted() {
+                        return Ok(self.stopped(iterations));
+                    }
+
                     if self.engine().head_revision() != before {
                         continue;
                     }
@@ -302,6 +304,10 @@ impl Workflow {
 
                         self.synthesize_topology().await?;
 
+                        if self.halted() {
+                            return Ok(self.stopped(iterations));
+                        }
+
                         // A commit moves the head; a filed dependency
                         // request is progress too, and the next
                         // iteration dispatches it.
@@ -315,6 +321,10 @@ impl Workflow {
                     // Phase 7: verify, then repair the unproven per
                     // operation.
                     let repaired = self.repair_unproven(revision).await?;
+
+                    if self.halted() {
+                        return Ok(self.stopped(iterations));
+                    }
 
                     if repaired == 0 {
                         // Nothing left to repair this iteration: either
@@ -353,12 +363,10 @@ impl Workflow {
     }
 
     /// The run's natural-language prompt as task evidence, so every
-    /// worker is told what to build — plus the caller's run objective,
-    /// when one was given. Without this a decompose worker has nothing
-    /// to decompose.
+    /// worker is told what to build. Without this a decompose worker
+    /// has nothing to decompose.
     fn prompt_evidence(&self) -> Vec<PromptEvidence> {
-        let mut evidence: Vec<PromptEvidence> = self
-            .config
+        self.config
             .prompt
             .clone()
             .map(|prompt| {
@@ -367,16 +375,7 @@ impl Workflow {
                     excerpt: prompt,
                 }]
             })
-            .unwrap_or_default();
-
-        if let Some(objective) = &self.config.objective {
-            evidence.push(PromptEvidence {
-                source: EvidenceRef("run.objective".to_string()),
-                excerpt: objective.clone(),
-            });
-        }
-
-        evidence
+            .unwrap_or_default()
     }
 
     async fn decompose(&self) -> Result<(), WorkflowError> {
@@ -843,6 +842,25 @@ impl Workflow {
         };
 
         Ok(unproven_targets(&analysis))
+    }
+
+    /// The report of a run halted at a phase boundary. Later phases
+    /// have not run, so whether the design is complete is not judged,
+    /// and nothing is finalized.
+    fn stopped(&self, iterations: u32) -> RunReport {
+        let revision = self.engine().head_revision();
+
+        RunReport {
+            status: RunStatus::Incomplete {
+                revision: revision.0,
+                reason: "the run stopped at a phase boundary to hand work back to its caller"
+                    .to_string(),
+                unresolved: self.unresolved_labels(revision),
+            },
+            final_revision: revision.0,
+            iterations,
+            artifacts: Vec::new(),
+        }
     }
 
     async fn incomplete(

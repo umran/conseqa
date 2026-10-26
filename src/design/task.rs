@@ -327,12 +327,17 @@ pub enum TaskCompletionGate {
     #[default]
     SinglePatch,
 
-    /// An interactive authoring session (§6.2): one human driving one
-    /// session with no concurrent agents. On each successful commit the
-    /// engine rolls the session's capability token to a fresh successor
-    /// task pinned to the new head, so the session can commit repeatedly
-    /// while every individual task keeps its frozen-snapshot invariant.
+    /// A worker that commits repeatedly: on each successful commit the
+    /// engine rolls its capability token to a fresh successor task
+    /// pinned to the new head, so it can build incrementally while every
+    /// individual task keeps its frozen-snapshot invariant.
     Interactive,
+
+    /// An interactive authoring session (§6.2): the coordinator driving
+    /// the design — a person, or the agent working for one — committing
+    /// repeatedly exactly as [`Self::Interactive`] does. Kept distinct so
+    /// the server can tell its coordinator from its workers.
+    Session,
 }
 
 /// Identity of one dependency request.

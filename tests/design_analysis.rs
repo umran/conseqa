@@ -316,7 +316,7 @@ async fn requirement_reports_serve_verdicts_and_guard_repairs() {
     );
 
     let report = engine
-        .requirement_report(repair.id, Some(id("operation.charge_payment")), None)
+        .requirement_report(repair.id, Some(id("operation.charge_payment")), None, false)
         .expect("the report is ready");
 
     assert_eq!(report["analysis"], "ready");
@@ -343,6 +343,7 @@ async fn requirement_reports_serve_verdicts_and_guard_repairs() {
             repair.id,
             Some(id("operation.charge_payment")),
             Some("idempotency"),
+            false,
         )
         .expect("the filtered report is ready");
 

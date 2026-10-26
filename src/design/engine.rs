@@ -25,7 +25,7 @@ use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
 
-use crate::analyzer::report::{Property, Subject};
+use crate::analyzer::report::{Property, Status, Subject};
 use crate::spec::{Id, Input, Revision};
 
 use super::analysis::{AnalysisHub, AnalysisPin, AnalysisState};
@@ -241,7 +241,10 @@ pub struct InvalidationNote {
 
 impl TaskEntry {
     fn interactive(&self) -> bool {
-        self.spec.completion_gate == TaskCompletionGate::Interactive
+        matches!(
+            self.spec.completion_gate,
+            TaskCompletionGate::Interactive | TaskCompletionGate::Session
+        )
     }
 }
 
@@ -462,12 +465,48 @@ impl DesignEngine {
             write_scope,
             prompt_evidence: Vec::new(),
             budget: TaskBudget::default(),
-            completion_gate: TaskCompletionGate::Interactive,
+            completion_gate: TaskCompletionGate::Session,
         };
 
         let token = self.inner.tokens.issue(spec.id);
 
         install_task(&self.inner, spec, token.0)
+    }
+
+    /// Moves the interactive session `task` belongs to to the head, when
+    /// another writer moved the head under it — a build its coordinator
+    /// ran, say. Its token rolls to a successor pinned there, which, like
+    /// any fresh session, re-reads before it references. A session
+    /// already at the head, or a task that is not one, is left alone.
+    pub fn refresh_session(&self, task: TaskId) -> Result<(), EngineError> {
+        let _writer = self.inner.writer.lock();
+
+        let entry = self.entry(task)?;
+
+        if !entry.interactive()
+            || entry.spec.snapshot_revision == self.inner.head.load().revision
+            || *entry.state.lock() != TaskState::Running
+        {
+            return Ok(());
+        }
+
+        *entry.state.lock() = TaskState::Invalidated;
+
+        let _ = self
+            .inner
+            .store
+            .update_task_state(task, TaskState::Invalidated, now_unix_ms());
+
+        spawn_interactive_successor(&self.inner, &entry.spec, entry.token.clone());
+
+        Ok(())
+    }
+
+    /// Whether `task` belongs to an interactive authoring session — the
+    /// coordinator — rather than to a worker.
+    pub fn is_session(&self, task: TaskId) -> bool {
+        self.entry(task)
+            .is_ok_and(|entry| entry.spec.completion_gate == TaskCompletionGate::Session)
     }
 
     /// The task's own context (§45). Available in every state.
@@ -712,11 +751,17 @@ impl DesignEngine {
     /// obstacles. Scoping the report to one operation records the
     /// operation's sub-symbols (and summary) as observations, so a
     /// repair built on the report is guarded by the commit gate.
+    /// The analyzer's verdicts on the declared requirements of the
+    /// task's snapshot, for one operation or family or the whole model.
+    /// Unproven obligations are listed with their proof attempts; a
+    /// proven one only when `include_proven` asks for its proof, since
+    /// that is what a repair reads and what most of a report's size is.
     pub fn requirement_report(
         &self,
         task: TaskId,
         operation: Option<Id>,
         family: Option<&str>,
+        include_proven: bool,
     ) -> Result<serde_json::Value, EngineError> {
         let entry = self.active_entry(task)?;
         let revision = entry.snapshot.revision;
@@ -809,12 +854,23 @@ impl DesignEngine {
                     })
                     .collect();
 
+                let proven = obligations
+                    .iter()
+                    .filter(|obligation| obligation.status == Status::Proven)
+                    .count();
+
+                let listed: Vec<_> = obligations
+                    .into_iter()
+                    .filter(|obligation| include_proven || obligation.status != Status::Proven)
+                    .collect();
+
                 serde_json::json!({
                     "dsl": crate::spec::DSL_VERSION,
                     "revision": revision.0,
                     "analysis": "ready",
                     "all_proven": analysis.verification.all_proven(),
-                    "obligations": obligations,
+                    "proven": proven,
+                    "obligations": listed,
                     "notes": analysis.obligations.notes,
                 })
             }
@@ -1442,7 +1498,7 @@ fn spawn_interactive_successor(inner: &Arc<EngineInner>, predecessor: &TaskSpec,
         write_scope: predecessor.write_scope.clone(),
         prompt_evidence: predecessor.prompt_evidence.clone(),
         budget: predecessor.budget,
-        completion_gate: TaskCompletionGate::Interactive,
+        completion_gate: predecessor.completion_gate,
     };
 
     match install_task(inner, spec, token.clone()) {

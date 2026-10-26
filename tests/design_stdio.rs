@@ -153,7 +153,7 @@ fn stdio_server_hosts_projects_without_a_session_id_or_bearer() {
     let mut client = StdioClient::spawn(&dir);
 
     // No project active yet: architecture tools guide rather than fail.
-    let (early, is_error) = client.call("task_context", serde_json::json!({}));
+    let (early, is_error) = client.call("spec_status", serde_json::json!({}));
     assert!(is_error);
     assert!(
         early["error"].as_str().unwrap_or_default().contains("no project is open"),
@@ -198,8 +198,8 @@ fn stdio_server_hosts_projects_without_a_session_id_or_bearer() {
     // on the first call, with no open_project.
     let mut client = StdioClient::spawn(&dir.join("src"));
 
-    let (context, is_error) = client.call("task_context", serde_json::json!({}));
-    assert!(!is_error, "{context}");
+    let (status, is_error) = client.call("spec_status", serde_json::json!({}));
+    assert!(!is_error, "{status}");
 
     let (search, _) = client.call("search_symbols", serde_json::json!({"kind": "service"}));
     assert!(search.to_string().contains("service.todo"), "{search}");

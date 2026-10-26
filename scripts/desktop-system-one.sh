@@ -8,7 +8,7 @@
 #   ~/.conseqa/stdio.args     flags `stdio` appends to its command line
 #
 #   scripts/desktop-system-one.sh          # enable System One
-#   scripts/desktop-system-one.sh --off    # agent backend only
+#   scripts/desktop-system-one.sh --off    # builders ask no decider
 #
 # Desktop's entry only needs: command = <repo>/target/release/conseqa-design-mcp,
 # args = ["stdio"]. Restart Claude Desktop afterwards.
@@ -47,8 +47,6 @@ $model
 $key_file
 --decider-log
 $dir/decisions.jsonl
---system-one-kinds
-operation_synthesis,topology_synthesis,requirement_discovery,requirement_repair
 EOF
 
 echo "System One on ($model). Key: $key_file. Flags: $args_file"

@@ -9,6 +9,9 @@ use conseqa::design::{
 };
 use conseqa::spec::Id;
 
+#[cfg(feature = "system-one")]
+mod common;
+
 fn fixture_workspace() -> WorkspaceState {
     let source =
         std::fs::read_to_string("tests/fixtures/flash_checkout.yaml").expect("fixture exists");
@@ -28,6 +31,14 @@ fn task(engine: &DesignEngine, operation: &str) -> TaskHandle {
             budget: TaskBudget::default(),
         })
         .expect("task is created")
+}
+
+/// An interactive session with the full authoring grant: the
+/// coordinator's credential on a single-project server.
+fn session(engine: &DesignEngine) -> TaskHandle {
+    engine
+        .create_session(WriteScope::of([conseqa::design::WriteGrant::All]), "ui")
+        .expect("session is created")
 }
 
 /// A minimal Streamable HTTP MCP client speaking raw JSON-RPC, so the
@@ -336,7 +347,7 @@ async fn a_multi_project_server_isolates_projects_behind_one_api_key() {
 
     // Before any project is active, architecture tools guide rather than
     // fail at the protocol level.
-    let (early, is_error) = client.call("task_context", serde_json::json!({})).await;
+    let (early, is_error) = client.call("spec_status", serde_json::json!({})).await;
     assert!(is_error);
     assert!(
         early["error"]
@@ -360,13 +371,7 @@ async fn a_multi_project_server_isolates_projects_behind_one_api_key() {
     assert_eq!(created["created"], true);
     assert_eq!(created["project"], "checkout", "named after its directory");
 
-    // What to design is a run's input, never project state.
-    let (context, _) = client.call("task_context", serde_json::json!({})).await;
-    assert_eq!(
-        context["prompt_evidence"],
-        serde_json::json!([]),
-        "{context}"
-    );
+    // What to design is a build's input, never project state.
     assert!(
         !std::fs::read_to_string(checkout.join(".conseqa/project.yaml"))
             .expect("project.yaml")
@@ -451,41 +456,51 @@ async fn a_multi_project_server_isolates_projects_behind_one_api_key() {
     std::fs::remove_dir_all(&root).ok();
 }
 
-#[tokio::test]
-async fn request_design_invokes_the_injected_launcher() {
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+/// A stand-in builder: records each build's prompt and answers with a
+/// fixed outcome, proving the tool reaches the injected builder without
+/// `design` depending on the harness.
+struct MockBuilder {
+    prompts: std::sync::Arc<std::sync::Mutex<Vec<Option<String>>>>,
+    outcome: mcp::BuildOutcome,
+}
 
-    // A stand-in launcher records how many times the tool triggered it,
-    // proving the MCP tool reaches the injected orchestrator without
-    // design depending on the harness.
-    struct MockLauncher {
-        calls: Arc<AtomicUsize>,
+impl MockBuilder {
+    fn answering(outcome: mcp::BuildOutcome) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            prompts: Default::default(),
+            outcome,
+        })
     }
 
-    impl mcp::DesignLauncher for MockLauncher {
-        fn launch(
-            &self,
-            _engine: DesignEngine,
-            _input: mcp::DesignInput,
-        ) -> Result<serde_json::Value, String> {
-            self.calls.fetch_add(1, Ordering::SeqCst);
-
-            Ok(serde_json::json!({ "launched": true, "backend": "mock" }))
-        }
+    fn prompts(&self) -> Vec<Option<String>> {
+        self.prompts.lock().expect("lock").clone()
     }
+}
 
-    let engine = DesignEngine::in_memory(WorkspaceState::empty(RunMetadata::new(RunId(
-        "design".to_string(),
-    ))))
-    .expect("engine starts");
+impl mcp::DesignBuilder for MockBuilder {
+    fn build(
+        &self,
+        engine: DesignEngine,
+        prompt: Option<String>,
+    ) -> Result<futures::future::BoxFuture<'static, mcp::DesignBuild>, String> {
+        self.prompts.lock().expect("lock").push(prompt);
 
-    let calls = Arc::new(AtomicUsize::new(0));
-    let launcher = Arc::new(MockLauncher {
-        calls: Arc::clone(&calls),
-    });
+        let build = mcp::DesignBuild {
+            started_at_revision: engine.head_revision(),
+            elapsed: std::time::Duration::from_millis(3),
+            outcome: self.outcome.clone(),
+        };
 
-    let router = mcp::router_with_launcher(engine.clone(), launcher);
+        Ok(Box::pin(async move { build }))
+    }
+}
+
+/// Serves `engine` with `builder` and connects an interactive session.
+async fn session_with_builder(
+    engine: &DesignEngine,
+    builder: std::sync::Arc<MockBuilder>,
+) -> (mcp::McpServer, McpClient) {
+    let router = mcp::router_with_builder(engine.clone(), builder);
 
     let server = mcp::serve_router(router, "127.0.0.1:0".parse().expect("addr"))
         .await
@@ -497,44 +512,89 @@ async fn request_design_invokes_the_injected_launcher() {
         .create_session(WriteScope::shared_skeleton(), "ui")
         .expect("session");
 
-    let mut client = McpClient::connect(&url, &handle.token.0).await;
+    let client = McpClient::connect(&url, &handle.token.0).await;
 
-    // An empty project with no prompt gives a run nothing to design.
-    let (refused, is_error) = client.call("request_design", serde_json::json!({})).await;
+    (server, client)
+}
+
+/// The tool reaches the injected builder with the caller's prompt, and
+/// answers with the outcome, what was handed back, and the checker's
+/// verdict — so no status call is needed after a build.
+#[tokio::test]
+async fn build_design_reaches_the_injected_builder_and_reports_its_outcome() {
+    let engine = DesignEngine::in_memory(fixture_workspace()).expect("engine starts");
+
+    let builder = MockBuilder::answering(mcp::BuildOutcome::HandedBack {
+        hand_offs: vec![serde_json::json!({
+            "kind": "requirement_discovery",
+            "objective": "Discover the correctness requirements of operation.create_order.",
+        })],
+    });
+
+    let (server, mut client) = session_with_builder(&engine, std::sync::Arc::clone(&builder)).await;
+
+    let (built, is_error) = client
+        .call(
+            "build_design",
+            serde_json::json!({"prompt": "A flash-sale checkout."}),
+        )
+        .await;
+
+    assert!(!is_error, "{built}");
+    assert_eq!(
+        builder.prompts(),
+        vec![Some("A flash-sale checkout.".to_string())]
+    );
+    assert_eq!(built["status"], "handed_back", "{built}");
+    assert_eq!(
+        built["hand_offs"][0]["kind"], "requirement_discovery",
+        "{built}"
+    );
+    assert_eq!(built["elapsed_ms"], 3, "{built}");
+    assert_eq!(built["analysis"]["state"], "validated", "{built}");
+    assert!(
+        built["guidance"]
+            .as_str()
+            .is_some_and(|guidance| guidance.contains("later phases have not run")),
+        "{built}"
+    );
+
+    server.shutdown().await;
+}
+
+/// An empty project gives a build nothing to build, and a server
+/// without a builder says so in the result rather than at the protocol
+/// level.
+#[tokio::test]
+async fn build_design_refuses_an_empty_project_and_a_server_without_a_builder() {
+    let empty = DesignEngine::in_memory(WorkspaceState::empty(RunMetadata::new(RunId(
+        "design".to_string(),
+    ))))
+    .expect("engine starts");
+
+    let builder = MockBuilder::answering(mcp::BuildOutcome::Success);
+
+    let (server, mut client) = session_with_builder(&empty, std::sync::Arc::clone(&builder)).await;
+
+    let (refused, is_error) = client
+        .call(
+            "build_design",
+            serde_json::json!({"prompt": "A ping service."}),
+        )
+        .await;
 
     assert!(is_error, "{refused}");
     assert!(
         refused["error"]
             .as_str()
-            .unwrap_or_default()
-            .contains("nothing to design"),
+            .is_some_and(|error| error.contains("no operation interfaces")),
         "{refused}"
     );
-    assert_eq!(calls.load(Ordering::SeqCst), 0);
-
-    let (result, is_error) = client
-        .call(
-            "request_design",
-            serde_json::json!({"prompt": "A ping service."}),
-        )
-        .await;
-
-    assert!(!is_error, "{result}");
-    assert_eq!(result["launched"], true);
-    assert_eq!(result["backend"], "mock");
-    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert!(builder.prompts().is_empty());
 
     server.shutdown().await;
-}
 
-#[tokio::test]
-async fn request_design_reports_when_no_launcher_is_configured() {
-    // A plain design server (no orchestration backend) reports the
-    // feature is unavailable rather than erroring at the protocol level.
-    let engine = DesignEngine::in_memory(WorkspaceState::empty(RunMetadata::new(RunId(
-        "no-design".to_string(),
-    ))))
-    .expect("engine starts");
+    let engine = DesignEngine::in_memory(fixture_workspace()).expect("engine starts");
 
     let server = mcp::serve(engine.clone(), "127.0.0.1:0".parse().expect("addr"))
         .await
@@ -548,17 +608,115 @@ async fn request_design_reports_when_no_launcher_is_configured() {
 
     let mut client = McpClient::connect(&url, &handle.token.0).await;
 
-    let (result, is_error) = client.call("request_design", serde_json::json!({})).await;
+    let (result, is_error) = client.call("build_design", serde_json::json!({})).await;
 
-    assert!(is_error);
-    assert_eq!(result["launched"], false);
+    assert!(is_error, "{result}");
     assert!(
         result["error"]
             .as_str()
-            .unwrap_or_default()
-            .contains("not available"),
+            .is_some_and(|error| error.contains("no design builder")),
         "{result}"
     );
+
+    server.shutdown().await;
+}
+
+/// The surface follows the credential. On one server, an interactive
+/// session is the coordinator — the authoring brief, the build and
+/// status tools, no task tools — and a task's token is a worker, with
+/// the task contract and only its own tools.
+#[tokio::test]
+async fn a_session_and_a_task_are_each_served_their_own_role() {
+    let engine = DesignEngine::in_memory(fixture_workspace()).expect("engine starts");
+
+    let server = mcp::serve(engine.clone(), "127.0.0.1:0".parse().expect("addr"))
+        .await
+        .expect("mcp server binds");
+
+    let url = format!("http://{}/mcp", server.local_addr);
+
+    let session = engine
+        .create_session(WriteScope::shared_skeleton(), "ui")
+        .expect("session");
+
+    let worker = task(&engine, "operation.create_order");
+
+    for (token, coordinator) in [(&session.token.0, true), (&worker.token.0, false)] {
+        let mut client = McpClient::connect(&url, token).await;
+
+        let instructions = client.init["instructions"]
+            .as_str()
+            .expect("the server declares instructions")
+            .to_string();
+
+        assert_eq!(
+            instructions.contains("The authoring loop"),
+            coordinator,
+            "{instructions}"
+        );
+
+        let listed = client
+            .rpc(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 900,
+                "method": "tools/list",
+                "params": {},
+            }))
+            .await;
+
+        let names: Vec<String> = listed["result"]["tools"]
+            .as_array()
+            .expect("tools are listed")
+            .iter()
+            .map(|tool| tool["name"].as_str().expect("named").to_string())
+            .collect();
+
+        for shared in [
+            "read_symbol",
+            "submit_patch",
+            "requirement_report",
+            "dsl_guide",
+        ] {
+            assert!(names.iter().any(|name| name == shared), "{names:?}");
+        }
+
+        for (tool, served) in [
+            ("build_design", coordinator),
+            ("spec_status", coordinator),
+            ("export_spec", coordinator),
+            ("task_context", !coordinator),
+            ("dependency_request", !coordinator),
+            // A single-project server selects no project.
+            ("open_project", false),
+            ("request_design", false),
+            ("await_design", false),
+            ("dsl_reference", false),
+        ] {
+            assert_eq!(
+                names.iter().any(|name| name == tool),
+                served,
+                "`{tool}` for coordinator={coordinator}: {names:?}"
+            );
+        }
+
+        // A tool outside the caller's role cannot be called either.
+        let foreign = if coordinator {
+            "task_context"
+        } else {
+            "spec_status"
+        };
+
+        let refused = client
+            .rpc(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 901,
+                "method": "tools/call",
+                "params": {"name": foreign, "arguments": {}},
+            }))
+            .await;
+
+        assert!(refused.get("result").is_none(), "{refused}");
+    }
 
     server.shutdown().await;
 }
@@ -602,13 +760,20 @@ async fn an_interactive_session_commits_repeatedly_under_one_bearer_token() {
         assert_eq!(committed["committed"], true, "{committed}");
         assert_eq!(committed["revision"], index + 1);
 
-        // task_context still works under the same token, now pointing at
-        // the rolled successor pinned to the new head.
-        let (context, is_error) = client.call("task_context", serde_json::json!({})).await;
+        // The same token now resolves to the rolled successor, pinned
+        // to the new head.
+        let (status, is_error) = client.call("spec_status", serde_json::json!({})).await;
 
-        assert!(!is_error);
-        assert_eq!(context["state"], "running");
-        assert_eq!(context["snapshot_revision"], index + 1);
+        assert!(!is_error, "{status}");
+        assert_eq!(status["revision"], index + 1);
+        assert_eq!(
+            engine
+                .task_context(engine.resolve_token(&handle.token.0).expect("resolves"))
+                .expect("context")
+                .snapshot_revision
+                .0,
+            index + 1
+        );
     }
 
     assert_eq!(engine.head_revision().0, 3);
@@ -671,8 +836,8 @@ async fn a_malformed_patch_returns_actionable_feedback_not_a_protocol_error() {
             .expect("text content");
 
         assert!(
-            text.contains("dsl_reference"),
-            "the feedback points at dsl_reference: {text}"
+            text.contains("JSON shapes"),
+            "the feedback points at the guide's shapes: {text}"
         );
     }
 
@@ -901,7 +1066,7 @@ async fn status_export_and_guide_serve_the_authoring_loop() {
         .expect("the mcp server binds");
 
     let url = format!("http://{}/mcp", server.local_addr);
-    let handle = task(&engine, "operation.create_order");
+    let handle = session(&engine);
     let mut client = McpClient::connect(&url, &handle.token.0).await;
 
     // The status call reports the fixture's real standing: a complete,
@@ -1003,35 +1168,15 @@ async fn status_export_and_guide_serve_the_authoring_loop() {
     server.shutdown().await;
 }
 
-/// Fanning out over an incomplete skeleton makes one mistake
-/// simultaneously in every worker, so the server refuses rather than
-/// trusting the agent to remember. The refusal is deterministic — the
-/// same judgment the commit gate applies — and spec_status reports the
-/// same gaps so the agent can check before it calls.
+/// Building over an incomplete skeleton would make one mistake in every
+/// operation at once, so the server refuses rather than trusting the
+/// agent to remember. The refusal is deterministic — the same judgment
+/// the commit gate applies — and spec_status reports the same gaps so
+/// the agent can check before it calls.
 #[tokio::test]
-async fn request_design_refuses_a_skeleton_that_is_not_ready() {
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    struct CountingLauncher {
-        calls: Arc<AtomicUsize>,
-    }
-
-    impl mcp::DesignLauncher for CountingLauncher {
-        fn launch(
-            &self,
-            _engine: DesignEngine,
-            _input: mcp::DesignInput,
-        ) -> Result<serde_json::Value, String> {
-            self.calls.fetch_add(1, Ordering::SeqCst);
-
-            Ok(serde_json::json!({"launched": true}))
-        }
-    }
-
+async fn build_design_refuses_a_skeleton_that_is_not_ready() {
     // A schema an operation's request input names is gone: the
-    // interface no longer resolves, though every operation still has a
-    // program the workers would otherwise be asked to repair.
+    // interface no longer resolves.
     let mut workspace = fixture_workspace();
 
     workspace
@@ -1040,34 +1185,14 @@ async fn request_design_refuses_a_skeleton_that_is_not_ready() {
 
     let engine = DesignEngine::in_memory(workspace).expect("engine starts");
 
-    let calls = Arc::new(AtomicUsize::new(0));
-    let launcher = Arc::new(CountingLauncher {
-        calls: Arc::clone(&calls),
-    });
+    let builder = MockBuilder::answering(mcp::BuildOutcome::Success);
 
-    let router = mcp::router_with_launcher(engine.clone(), launcher);
+    let (server, mut client) = session_with_builder(&engine, std::sync::Arc::clone(&builder)).await;
 
-    let server = mcp::serve_router(router, "127.0.0.1:0".parse().expect("addr"))
-        .await
-        .expect("mcp server binds");
+    let (refused, is_error) = client.call("build_design", serde_json::json!({})).await;
 
-    let url = format!("http://{}/mcp", server.local_addr);
-
-    let handle = engine
-        .create_session(WriteScope::shared_skeleton(), "ui")
-        .expect("session");
-
-    let mut client = McpClient::connect(&url, &handle.token.0).await;
-
-    let (refused, is_error) = client.call("request_design", serde_json::json!({})).await;
-
-    assert!(is_error, "a premature fanout is refused: {refused}");
-    assert_eq!(refused["launched"], false, "{refused}");
-    assert_eq!(
-        calls.load(Ordering::SeqCst),
-        0,
-        "no worker is dispatched: {refused}"
-    );
+    assert!(is_error, "a premature build is refused: {refused}");
+    assert!(builder.prompts().is_empty(), "nothing is built: {refused}");
 
     let gaps = refused["skeleton_gaps"]
         .as_array()
@@ -1083,185 +1208,58 @@ async fn request_design_refuses_a_skeleton_that_is_not_ready() {
     // The agent can see the same verdict before it ever calls.
     let (status, _) = client.call("spec_status", serde_json::json!({})).await;
 
-    assert_eq!(status["skeleton"]["ready_to_fan_out"], false, "{status}");
+    assert_eq!(status["skeleton"]["ready"], false, "{status}");
 
     server.shutdown().await;
 }
 
-/// The complement: a coherent skeleton launches, and the result names
-/// the operations receiving a worker so a short list — the signature of
-/// handing the skeleton over half-built — is visible immediately.
+/// With no decider configured, every builder still runs and settles
+/// what code alone can: every sketch compiles, the default topology is
+/// declared, and nothing that needs no judgment is handed back.
+#[cfg(feature = "system-one")]
 #[tokio::test]
-async fn a_ready_skeleton_launches_and_names_its_operations() {
-    use std::sync::Arc;
+async fn a_build_with_no_decider_settles_what_code_alone_can() {
+    use clap::Parser;
 
-    struct OkLauncher;
-
-    impl mcp::DesignLauncher for OkLauncher {
-        fn launch(
-            &self,
-            _engine: DesignEngine,
-            _input: mcp::DesignInput,
-        ) -> Result<serde_json::Value, String> {
-            Ok(serde_json::json!({"launched": true}))
-        }
+    #[derive(Parser)]
+    struct Flags {
+        #[command(flatten)]
+        decider: conseqa::harness::executors::cli::DeciderArgs,
     }
 
-    // The intact fixture, with one operation's program dropped: the
-    // skeleton resolves, and exactly that operation needs a worker.
-    let mut workspace = fixture_workspace();
+    let source = std::fs::read_to_string("tests/fixtures/shop.yaml").expect("fixture exists");
+    let mut model = conseqa::parser::yaml::parse(&source).expect("fixture parses");
 
-    workspace
-        .operations
-        .get_mut(&Id("operation.create_order".to_string()))
-        .expect("the fixture declares create_order")
-        .program = None;
+    model.runtime = None;
+
+    let mut run_meta = RunMetadata::new(RunId("build-test".to_string()));
+
+    // Implied requirements need a judgment, so adopt only explicit ones.
+    run_meta.policy.strict_requirements = false;
+
+    let mut workspace = WorkspaceState::from_model(&model, run_meta);
+
+    for (operation, sketch) in common::sketches::shop_sketches() {
+        let draft = workspace
+            .operations
+            .get_mut(&Id(operation.to_string()))
+            .expect("the operation");
+
+        draft.program = None;
+        draft.sketch = Some(serde_json::from_value(sketch).expect("the sketch parses"));
+    }
 
     let engine = DesignEngine::in_memory(workspace).expect("engine starts");
 
-    let router = mcp::router_with_launcher(engine.clone(), Arc::new(OkLauncher));
+    let builders =
+        conseqa::harness::executors::cli::every_builder(&Flags::parse_from(["test"]).decider)
+            .expect("no decider is valid settings");
 
-    let server = mcp::serve_router(router, "127.0.0.1:0".parse().expect("addr"))
-        .await
-        .expect("mcp server binds");
-
-    let url = format!("http://{}/mcp", server.local_addr);
-
-    let handle = engine
-        .create_session(WriteScope::shared_skeleton(), "ui")
-        .expect("session");
-
-    let mut client = McpClient::connect(&url, &handle.token.0).await;
-
-    let (status, _) = client.call("spec_status", serde_json::json!({})).await;
-
-    assert_eq!(status["skeleton"]["ready_to_fan_out"], true, "{status}");
-
-    let (launched, is_error) = client.call("request_design", serde_json::json!({})).await;
-
-    assert!(!is_error, "{launched}");
-    assert_eq!(
-        launched["operations"],
-        serde_json::json!(["operation.create_order"]),
-        "the run names the operation it parallelizes: {launched}"
+    let router = mcp::router_with_builder(
+        engine.clone(),
+        std::sync::Arc::new(conseqa::harness::InProcessBuilder::new(builders)),
     );
 
-    server.shutdown().await;
-}
-
-/// A client with no way to sleep waits on the run by holding one call
-/// open: await_design returns as soon as the run finishes, with its
-/// report, and says so when it does not finish within the wait.
-#[tokio::test]
-async fn await_design_blocks_until_the_run_finishes() {
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    struct FinishingLauncher {
-        polls: AtomicUsize,
-        finish_after: usize,
-    }
-
-    impl mcp::DesignLauncher for FinishingLauncher {
-        fn launch(
-            &self,
-            _engine: DesignEngine,
-            _input: mcp::DesignInput,
-        ) -> Result<serde_json::Value, String> {
-            Ok(serde_json::json!({"launched": true}))
-        }
-
-        fn status(&self) -> Option<serde_json::Value> {
-            let polls = self.polls.fetch_add(1, Ordering::SeqCst);
-            let running = polls < self.finish_after;
-
-            let last_run = if running {
-                serde_json::Value::Null
-            } else {
-                serde_json::json!({"status": "done"})
-            };
-
-            Some(serde_json::json!({"running": running, "last_run": last_run}))
-        }
-    }
-
-    for (finish_after, wait_secs, finished) in [(3, 5, true), (usize::MAX, 1, false)] {
-        let engine = DesignEngine::in_memory(fixture_workspace()).expect("engine starts");
-
-        let launcher = Arc::new(FinishingLauncher {
-            polls: AtomicUsize::new(0),
-            finish_after,
-        });
-
-        let router = mcp::router_with_launcher(engine.clone(), launcher);
-
-        let server = mcp::serve_router(router, "127.0.0.1:0".parse().expect("addr"))
-            .await
-            .expect("mcp server binds");
-
-        let url = format!("http://{}/mcp", server.local_addr);
-
-        let handle = engine
-            .create_session(WriteScope::shared_skeleton(), "ui")
-            .expect("session");
-
-        let mut client = McpClient::connect(&url, &handle.token.0).await;
-
-        let (waited, is_error) = client
-            .call("await_design", serde_json::json!({"wait_secs": wait_secs}))
-            .await;
-
-        assert!(!is_error, "{waited}");
-        assert_eq!(waited["finished"], finished, "{waited}");
-
-        if finished {
-            assert_eq!(waited["design"]["last_run"]["status"], "done", "{waited}");
-        }
-
-        server.shutdown().await;
-    }
-}
-
-/// The fanout hand-off an interactive agent depends on: its prompt and
-/// objective reach the orchestrator, and while workers are committing,
-/// spec_status reports the run rather than a verdict read off a head
-/// that is still moving — so the agent polls instead of synthesizing
-/// operations serially or patching into a live run.
-#[tokio::test]
-async fn spec_status_reports_a_running_design_and_passes_the_prompt_and_objective() {
-    use std::sync::Arc;
-    use std::sync::Mutex;
-
-    struct MockLauncher {
-        inputs: Arc<Mutex<Vec<mcp::DesignInput>>>,
-    }
-
-    impl mcp::DesignLauncher for MockLauncher {
-        fn launch(
-            &self,
-            _engine: DesignEngine,
-            input: mcp::DesignInput,
-        ) -> Result<serde_json::Value, String> {
-            self.inputs.lock().expect("lock").push(input);
-
-            Ok(serde_json::json!({"launched": true}))
-        }
-
-        fn status(&self) -> Option<serde_json::Value> {
-            // A run in flight, as the daemon launcher reports one.
-            Some(serde_json::json!({"running": true, "started_at_revision": 0}))
-        }
-    }
-
-    let engine = DesignEngine::in_memory(fixture_workspace()).expect("engine starts");
-
-    let inputs = Arc::new(Mutex::new(Vec::new()));
-    let launcher = Arc::new(MockLauncher {
-        inputs: Arc::clone(&inputs),
-    });
-
-    let router = mcp::router_with_launcher(engine.clone(), launcher);
-
     let server = mcp::serve_router(router, "127.0.0.1:0".parse().expect("addr"))
         .await
         .expect("mcp server binds");
@@ -1269,46 +1267,47 @@ async fn spec_status_reports_a_running_design_and_passes_the_prompt_and_objectiv
     let url = format!("http://{}/mcp", server.local_addr);
 
     let handle = engine
-        .create_session(WriteScope::shared_skeleton(), "ui")
+        .create_session(WriteScope::of([conseqa::design::WriteGrant::All]), "ui")
         .expect("session");
 
     let mut client = McpClient::connect(&url, &handle.token.0).await;
 
-    let (launched, is_error) = client
+    let (built, is_error) = client
         .call(
-            "request_design",
-            serde_json::json!({
-                "prompt": "A flash-sale checkout.",
-                "objective": "prioritize the checkout path",
-            }),
+            "build_design",
+            serde_json::json!({"prompt": "A small shop backend."}),
         )
         .await;
 
-    assert!(!is_error, "{launched}");
-    {
-        let inputs = inputs.lock().expect("lock");
+    assert!(!is_error, "{built}");
+    assert!(built.get("hand_offs").is_none(), "{built}");
 
-        assert_eq!(inputs.len(), 1, "{inputs:?}");
-        assert_eq!(
-            inputs[0].prompt.as_deref(),
-            Some("A flash-sale checkout."),
-            "the caller's prompt reaches the orchestrator"
-        );
-        assert_eq!(
-            inputs[0].objective.as_deref(),
-            Some("prioritize the checkout path"),
-            "the caller's objective reaches the orchestrator"
-        );
-    }
+    let head = engine.head_snapshot();
 
-    let (status, is_error) = client.call("spec_status", serde_json::json!({})).await;
-
-    assert!(!is_error, "{status}");
-    assert_eq!(status["design"]["running"], true, "{status}");
-    assert_eq!(
-        status["analysis"]["state"], "design_running",
-        "a moving head reports the run, not a verdict: {status}"
+    assert!(
+        head.workspace
+            .operations
+            .values()
+            .all(|draft| draft.program.is_some()),
+        "every sketch compiled: {built}"
     );
+    assert!(
+        !head.workspace.runtime.is_empty(),
+        "the default topology is declared"
+    );
+    assert_eq!(built["revision"], head.revision.0, "{built}");
+
+    // The session was moved to the build's head: a patch commits.
+    let (committed, is_error) = client
+        .call(
+            "submit_patch",
+            serde_json::json!({"patch": {"mutations": [
+                {"kind": "put_service", "id": "service.after_build", "value": {"kind": "backend"}}
+            ]}}),
+        )
+        .await;
+
+    assert!(!is_error, "{committed}");
 
     server.shutdown().await;
 }
@@ -1326,7 +1325,7 @@ async fn the_server_and_its_artifacts_declare_the_dsl_contract_version() {
         .expect("the mcp server binds");
 
     let url = format!("http://{}/mcp", server.local_addr);
-    let handle = task(&engine, "operation.create_order");
+    let handle = session(&engine);
     let mut client = McpClient::connect(&url, &handle.token.0).await;
 
     // The handshake: instructions lead with the contract version; the
@@ -1347,7 +1346,8 @@ async fn the_server_and_its_artifacts_declare_the_dsl_contract_version() {
         client.init
     );
 
-    // Machine-readable before any project state: guide and reference.
+    // Machine-readable before any project state: the guide, its
+    // semantics and its shapes.
     let (toc, is_error) = client.call("dsl_guide", serde_json::json!({})).await;
 
     assert!(!is_error);
@@ -1357,14 +1357,17 @@ async fn the_server_and_its_artifacts_declare_the_dsl_contract_version() {
         "{toc}"
     );
 
-    let (reference, is_error) = client.call("dsl_reference", serde_json::json!({})).await;
+    let (shapes, is_error) = client
+        .call("dsl_guide", serde_json::json!({"topics": ["JSON shapes"]}))
+        .await;
 
     assert!(!is_error);
     assert!(
-        reference
+        shapes
             .as_str()
-            .is_some_and(|text| text.starts_with("DSL contract version 6.")),
-        "{reference}"
+            .is_some_and(|text| text.starts_with("## JSON shapes — symbol keys")
+                && text.contains("put_operation_interface")),
+        "{shapes}"
     );
 
     // Machine-readable with a project open: status and report.
