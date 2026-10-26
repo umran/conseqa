@@ -1,4 +1,4 @@
-//! Task prompt construction (§89 of the design spec).
+//! Task prompt construction (§89 of the harness spec).
 //!
 //! Every architecture-agent prompt carries a short invariant section,
 //! the task objective, the tracked initial context bundle, and a

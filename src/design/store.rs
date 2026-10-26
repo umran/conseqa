@@ -6,7 +6,7 @@
 //!
 //! ```text
 //! .conseqa/
-//!   project.yaml                    format, dsl, name, prompt, run policy
+//!   project.yaml                    format, dsl, name, run policy
 //!   spec/<kind>/<id>.yaml           one file per service, schema, data
 //!                                   model, topic, state machine, operation
 //!   spec/runtime/<kind>/<id>.yaml   one file per runtime declaration
@@ -52,11 +52,13 @@ pub const PROJECT_DIR: &str = ".conseqa";
 ///
 /// Formats 1 to 8 were a central redb database per project, holding
 /// every revision of the workspace as one serialized blob; their bump
-/// history is in git, in `src/design/persistence.rs`. Format 9 moved
-/// the state into the project, as one YAML file per entity. A `dsl`
-/// bump forces a format bump — the files hold spec types — never
-/// conversely.
-pub const FORMAT: u64 = 9;
+/// history is in git, in the persistence module this store replaced.
+/// Format 9 moved the state into the project, as one YAML file per
+/// entity. Format 10 dropped the prompt from `project.yaml`: what a
+/// design run is asked to build is that run's input, not project state.
+/// A `dsl` bump forces a format bump — the files hold spec types —
+/// never conversely.
+pub const FORMAT: u64 = 10;
 
 const PROJECT_FILE: &str = "project.yaml";
 const OBLIGATIONS: &str = "intent/obligations.yaml";
@@ -151,6 +153,13 @@ pub enum StoreError {
         .0.display()
     )]
     NotAProject(PathBuf),
+
+    #[error(
+        "{} is the home directory, whose `.conseqa` holds this machine's conseqa \
+         configuration; create the project in a repository instead",
+        .0.display()
+    )]
+    MachineHome(PathBuf),
 
     #[error("{} already holds a conseqa project", .0.display())]
     AlreadyAProject(PathBuf),
@@ -297,9 +306,6 @@ struct ProjectFile {
     dsl: DslVersion,
     name: String,
 
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    prompt: Option<String>,
-
     #[serde(default)]
     policy: RunPolicy,
 }
@@ -337,17 +343,24 @@ impl ProjectStore {
     /// The project directory holding `start`, or `start` itself: the
     /// nearest directory at or above it with a `.conseqa/project.yaml`.
     pub fn discover(start: &Path) -> Option<PathBuf> {
-        let start = start.canonicalize().ok()?;
-
-        start
-            .ancestors()
-            .find(|dir| dir.join(PROJECT_DIR).join(PROJECT_FILE).is_file())
-            .map(Path::to_path_buf)
+        discover_below(start, machine_home().as_deref())
     }
 
     /// Creates a project in `project_dir`, holding `workspace`.
     pub fn create(project_dir: &Path, workspace: &WorkspaceState) -> Result<Self, StoreError> {
+        Self::create_below(project_dir, workspace, machine_home().as_deref())
+    }
+
+    fn create_below(
+        project_dir: &Path,
+        workspace: &WorkspaceState,
+        home: Option<&Path>,
+    ) -> Result<Self, StoreError> {
         let project_dir = project_dir.canonicalize().map_err(io_error(project_dir))?;
+
+        if Some(project_dir.as_path()) == home {
+            return Err(StoreError::MachineHome(project_dir));
+        }
 
         let root = project_dir.join(PROJECT_DIR);
 
@@ -355,7 +368,10 @@ impl ProjectStore {
             return Err(StoreError::AlreadyAProject(project_dir));
         }
 
-        if let Some(enclosing) = project_dir.parent().and_then(Self::discover) {
+        if let Some(enclosing) = project_dir
+            .parent()
+            .and_then(|parent| discover_below(parent, home))
+        {
             return Err(StoreError::InsideProject {
                 path: project_dir,
                 project: enclosing,
@@ -722,6 +738,63 @@ impl DirectoryStore {
     }
 }
 
+/// The workspace a new project in `dir` starts from: named after the
+/// directory, and holding the model at `model` when one is adopted,
+/// else empty.
+pub fn new_project_workspace(
+    dir: &Path,
+    model: Option<&Path>,
+) -> Result<WorkspaceState, StoreError> {
+    let run_meta = RunMetadata::new(RunId(default_project_name(dir)));
+
+    let Some(path) = model else {
+        return Ok(WorkspaceState::empty(run_meta));
+    };
+
+    let source = fs::read_to_string(path).map_err(io_error(path))?;
+
+    let model = crate::parser::yaml::parse(&source).map_err(|error| StoreError::Parse {
+        path: path.to_path_buf(),
+        message: error.to_string(),
+    })?;
+
+    Ok(WorkspaceState::from_model(&model, run_meta))
+}
+
+/// The name a project gets when none is given: its directory's.
+pub fn default_project_name(dir: &Path) -> String {
+    dir.canonicalize()
+        .ok()
+        .and_then(|dir| {
+            dir.file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+        })
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "project".to_string())
+}
+
+/// The home directory, whose `.conseqa` is this machine's conseqa
+/// configuration — the server's API key, `stdio.args`, decider keys —
+/// and so never a project.
+fn machine_home() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .and_then(|home| PathBuf::from(home).canonicalize().ok())
+}
+
+/// The nearest project at or above `start`, looking no higher than
+/// below `home`: a project there would claim every directory of the
+/// user's as its own.
+fn discover_below(start: &Path, home: Option<&Path>) -> Option<PathBuf> {
+    let start = start.canonicalize().ok()?;
+
+    start
+        .ancestors()
+        .take_while(|dir| Some(*dir) != home)
+        .find(|dir| dir.join(PROJECT_DIR).join(PROJECT_FILE).is_file())
+        .map(Path::to_path_buf)
+}
+
 /// The revision a reopened project continues from: the last one this
 /// machine recorded when the files still hold it, the next one when
 /// they changed while no engine had them open, and 0 for a project this
@@ -841,7 +914,6 @@ fn render(workspace: &WorkspaceState) -> Result<FileSet, StoreError> {
         format: FORMAT,
         dsl: DSL_VERSION,
         name: workspace.run_meta.run.0.clone(),
-        prompt: workspace.run_meta.prompt.clone(),
         policy: workspace.run_meta.policy,
     };
 
@@ -934,7 +1006,6 @@ fn load_workspace(root: &Path) -> Result<WorkspaceState, StoreError> {
         requirement_proposals: load_optional(root, PROPOSALS)?.unwrap_or_default(),
         run_meta: RunMetadata {
             run: RunId(project.name),
-            prompt: project.prompt,
             policy: project.policy,
         },
     })
@@ -1384,10 +1455,7 @@ mod tests {
 
         let model = crate::parser::yaml::parse(&source).expect("fixture parses");
 
-        let mut run_meta = RunMetadata::new(RunId("shop".to_string()));
-        run_meta.prompt = Some("A shop.\nIt sells things.".to_string());
-
-        WorkspaceState::from_model(&model, run_meta)
+        WorkspaceState::from_model(&model, RunMetadata::new(RunId("shop".to_string())))
     }
 
     #[test]
@@ -1616,6 +1684,45 @@ mod tests {
         fs::remove_dir_all(&dir).ok();
     }
 
+    /// The home directory's `.conseqa` is the machine's configuration:
+    /// no project is created there, and none found there, so it can
+    /// never claim the user's repositories as its own.
+    #[test]
+    fn the_home_directory_is_never_a_project() {
+        let home = temp_project();
+        let repository = home.join("code/shop");
+
+        fs::create_dir_all(repository.join("src")).expect("repository");
+
+        assert!(matches!(
+            ProjectStore::create_below(&home, &workspace(), Some(&home)),
+            Err(StoreError::MachineHome(_))
+        ));
+
+        // A project.yaml left there by an older build is not found from
+        // below, and does not stop a project in a repository.
+        fs::create_dir_all(home.join(PROJECT_DIR)).expect("machine config dir");
+        fs::write(home.join(PROJECT_DIR).join(PROJECT_FILE), "format: 9\n").expect("stray");
+
+        assert_eq!(discover_below(&repository.join("src"), Some(&home)), None);
+        assert_eq!(
+            discover_below(&repository.join("src"), None),
+            Some(home.clone())
+        );
+
+        drop(
+            ProjectStore::create_below(&repository, &workspace(), Some(&home))
+                .expect("a repository under home holds its own project"),
+        );
+
+        assert_eq!(
+            discover_below(&repository.join("src"), Some(&home)),
+            Some(repository.clone())
+        );
+
+        fs::remove_dir_all(&home).ok();
+    }
+
     #[test]
     fn a_project_inside_another_is_refused() {
         let dir = temp_project();
@@ -1683,7 +1790,7 @@ mod tests {
 
         let mut next = workspace.clone();
         next.revision = Revision(7);
-        next.run_meta.prompt = Some("A different shop.".to_string());
+        next.run_meta.policy.adopt_recommended = true;
         let removed = next.services.keys().next().cloned().expect("a service");
         next.services.remove(&removed);
 
@@ -1736,7 +1843,11 @@ mod tests {
         let project_file = dir.join(".conseqa/project.yaml");
         let text = fs::read_to_string(&project_file).expect("project file");
 
-        fs::write(&project_file, text.replace("format: 9", "format: 8")).expect("edit");
+        fs::write(
+            &project_file,
+            text.replace(&format!("format: {FORMAT}"), "format: 8"),
+        )
+        .expect("edit");
 
         assert!(matches!(
             ProjectStore::open(&dir),

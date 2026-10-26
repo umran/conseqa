@@ -174,6 +174,17 @@ fn fixture_report_matches_the_checker() {
 
     let path = fixture_path("flash_checkout.report.json");
 
+    // `CONSEQA_BLESS=1` rewrites the fixture from the checker instead of
+    // comparing against it.
+    if std::env::var_os("CONSEQA_BLESS").is_some() {
+        let json = serde_json::to_string_pretty(&expected).expect("the report serializes");
+
+        fs::write(&path, format!("{json}\n"))
+            .unwrap_or_else(|error| panic!("failed to write `{}`: {error}", path.display()));
+
+        return;
+    }
+
     let raw = fs::read_to_string(&path)
         .unwrap_or_else(|error| panic!("failed to read `{}`: {error}", path.display()));
 
@@ -182,6 +193,7 @@ fn fixture_report_matches_the_checker() {
     assert_eq!(
         stored, expected,
         "tests/fixtures/flash_checkout.report.json is stale; regenerate it \
-         from the analyzer report API"
+         with `CONSEQA_BLESS=1 cargo test --test report \
+         fixture_report_matches_the_checker`"
     );
 }

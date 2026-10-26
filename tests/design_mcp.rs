@@ -352,21 +352,25 @@ async fn a_multi_project_server_isolates_projects_behind_one_api_key() {
         .await;
     assert!(is_error, "{missing}");
 
-    // Create "checkout", grounded by its prompt, and commit a service.
+    // Create "checkout" and commit a service.
     let (created, is_error) = client
-        .call(
-            "create_project",
-            serde_json::json!({"path": checkout, "prompt": "A checkout system."}),
-        )
+        .call("create_project", serde_json::json!({"path": checkout}))
         .await;
     assert!(!is_error, "{created}");
     assert_eq!(created["created"], true);
     assert_eq!(created["project"], "checkout", "named after its directory");
 
+    // What to design is a run's input, never project state.
     let (context, _) = client.call("task_context", serde_json::json!({})).await;
     assert_eq!(
-        context["prompt_evidence"][0]["excerpt"],
-        "A checkout system."
+        context["prompt_evidence"],
+        serde_json::json!([]),
+        "{context}"
+    );
+    assert!(
+        !std::fs::read_to_string(checkout.join(".conseqa/project.yaml"))
+            .expect("project.yaml")
+            .contains("prompt"),
     );
 
     let (committed, is_error) = client
@@ -463,7 +467,7 @@ async fn request_design_invokes_the_injected_launcher() {
         fn launch(
             &self,
             _engine: DesignEngine,
-            _objective: Option<String>,
+            _input: mcp::DesignInput,
         ) -> Result<serde_json::Value, String> {
             self.calls.fetch_add(1, Ordering::SeqCst);
 
@@ -495,7 +499,25 @@ async fn request_design_invokes_the_injected_launcher() {
 
     let mut client = McpClient::connect(&url, &handle.token.0).await;
 
-    let (result, is_error) = client.call("request_design", serde_json::json!({})).await;
+    // An empty project with no prompt gives a run nothing to design.
+    let (refused, is_error) = client.call("request_design", serde_json::json!({})).await;
+
+    assert!(is_error, "{refused}");
+    assert!(
+        refused["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("nothing to design"),
+        "{refused}"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+    let (result, is_error) = client
+        .call(
+            "request_design",
+            serde_json::json!({"prompt": "A ping service."}),
+        )
+        .await;
 
     assert!(!is_error, "{result}");
     assert_eq!(result["launched"], true);
@@ -999,7 +1021,7 @@ async fn request_design_refuses_a_skeleton_that_is_not_ready() {
         fn launch(
             &self,
             _engine: DesignEngine,
-            _objective: Option<String>,
+            _input: mcp::DesignInput,
         ) -> Result<serde_json::Value, String> {
             self.calls.fetch_add(1, Ordering::SeqCst);
 
@@ -1079,7 +1101,7 @@ async fn a_ready_skeleton_launches_and_names_its_operations() {
         fn launch(
             &self,
             _engine: DesignEngine,
-            _objective: Option<String>,
+            _input: mcp::DesignInput,
         ) -> Result<serde_json::Value, String> {
             Ok(serde_json::json!({"launched": true}))
         }
@@ -1144,7 +1166,7 @@ async fn await_design_blocks_until_the_run_finishes() {
         fn launch(
             &self,
             _engine: DesignEngine,
-            _objective: Option<String>,
+            _input: mcp::DesignInput,
         ) -> Result<serde_json::Value, String> {
             Ok(serde_json::json!({"launched": true}))
         }
@@ -1200,27 +1222,27 @@ async fn await_design_blocks_until_the_run_finishes() {
     }
 }
 
-/// The fanout hand-off an interactive agent depends on: its objective
-/// reaches the orchestrator, and while workers are committing,
+/// The fanout hand-off an interactive agent depends on: its prompt and
+/// objective reach the orchestrator, and while workers are committing,
 /// spec_status reports the run rather than a verdict read off a head
 /// that is still moving — so the agent polls instead of synthesizing
 /// operations serially or patching into a live run.
 #[tokio::test]
-async fn spec_status_reports_a_running_design_and_passes_the_objective() {
+async fn spec_status_reports_a_running_design_and_passes_the_prompt_and_objective() {
     use std::sync::Arc;
     use std::sync::Mutex;
 
     struct MockLauncher {
-        objectives: Arc<Mutex<Vec<Option<String>>>>,
+        inputs: Arc<Mutex<Vec<mcp::DesignInput>>>,
     }
 
     impl mcp::DesignLauncher for MockLauncher {
         fn launch(
             &self,
             _engine: DesignEngine,
-            objective: Option<String>,
+            input: mcp::DesignInput,
         ) -> Result<serde_json::Value, String> {
-            self.objectives.lock().expect("lock").push(objective);
+            self.inputs.lock().expect("lock").push(input);
 
             Ok(serde_json::json!({"launched": true}))
         }
@@ -1233,9 +1255,9 @@ async fn spec_status_reports_a_running_design_and_passes_the_objective() {
 
     let engine = DesignEngine::in_memory(fixture_workspace()).expect("engine starts");
 
-    let objectives = Arc::new(Mutex::new(Vec::new()));
+    let inputs = Arc::new(Mutex::new(Vec::new()));
     let launcher = Arc::new(MockLauncher {
-        objectives: Arc::clone(&objectives),
+        inputs: Arc::clone(&inputs),
     });
 
     let router = mcp::router_with_launcher(engine.clone(), launcher);
@@ -1255,16 +1277,29 @@ async fn spec_status_reports_a_running_design_and_passes_the_objective() {
     let (launched, is_error) = client
         .call(
             "request_design",
-            serde_json::json!({"objective": "prioritize the checkout path"}),
+            serde_json::json!({
+                "prompt": "A flash-sale checkout.",
+                "objective": "prioritize the checkout path",
+            }),
         )
         .await;
 
     assert!(!is_error, "{launched}");
-    assert_eq!(
-        objectives.lock().expect("lock").as_slice(),
-        [Some("prioritize the checkout path".to_string())],
-        "the caller's objective reaches the orchestrator"
-    );
+    {
+        let inputs = inputs.lock().expect("lock");
+
+        assert_eq!(inputs.len(), 1, "{inputs:?}");
+        assert_eq!(
+            inputs[0].prompt.as_deref(),
+            Some("A flash-sale checkout."),
+            "the caller's prompt reaches the orchestrator"
+        );
+        assert_eq!(
+            inputs[0].objective.as_deref(),
+            Some("prioritize the checkout path"),
+            "the caller's objective reaches the orchestrator"
+        );
+    }
 
     let (status, is_error) = client.call("spec_status", serde_json::json!({})).await;
 

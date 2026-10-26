@@ -37,9 +37,17 @@ pub struct WorkflowConfig {
     /// Maximum fixpoint iterations before declaring the run incomplete.
     pub max_iterations: u32,
 
+    /// What to design, in the requester's words: every worker's prompt
+    /// evidence for this run — what decomposition plans from, and what
+    /// discovery tells stated requirements from inferred ones by. Not
+    /// recorded in the project; the prompt obligations discovery
+    /// extracts from it are. A run without one works from the skeleton
+    /// and those obligations.
+    pub prompt: Option<String>,
+
     /// Extra guidance for this run's workers, layered on top of the
-    /// project prompt as additional prompt evidence — how an
-    /// interactive caller of `request_design` steers a fanout.
+    /// prompt as additional prompt evidence — how an interactive caller
+    /// of `request_design` steers a fanout.
     pub objective: Option<String>,
 }
 
@@ -49,6 +57,7 @@ impl Default for WorkflowConfig {
             out_dir: PathBuf::from("."),
             analysis_timeout: Duration::from_secs(120),
             max_iterations: 8,
+            prompt: None,
             objective: None,
         }
     }
@@ -349,10 +358,7 @@ impl Workflow {
     /// to decompose.
     fn prompt_evidence(&self) -> Vec<PromptEvidence> {
         let mut evidence: Vec<PromptEvidence> = self
-            .engine()
-            .head_snapshot()
-            .workspace
-            .run_meta
+            .config
             .prompt
             .clone()
             .map(|prompt| {

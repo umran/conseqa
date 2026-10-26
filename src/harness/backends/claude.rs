@@ -1,4 +1,4 @@
-//! The Claude Code backend (§57 of the design spec).
+//! The Claude Code backend (§57 of the harness spec).
 //!
 //! Launches `claude -p <prompt> --output-format stream-json` with a
 //! generated strict MCP config pointing at the design server, the

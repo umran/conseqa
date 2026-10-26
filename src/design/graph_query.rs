@@ -1,6 +1,6 @@
 //! Canonical typed graph queries.
 //!
-//! No general query language in V1 (§22 of the design spec): a
+//! No general query language in V1 (§22 of the harness spec): a
 //! closed enum keeps parameters canonical, which makes caching,
 //! fingerprinting, and phantom revalidation straightforward. Every
 //! result is canonically ordered and fingerprinted; the commit gate

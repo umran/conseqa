@@ -16,6 +16,10 @@
 //! an auxiliary authoring representation rather than a weakened DSL.
 //! A structurally coherent `Model` is assembled from the workspace
 //! only for validation and verification.
+//!
+//! Section references here and in `harness` — "§N of the harness
+//! spec" — cite `CONSEQA_AGENT_DESIGN_HARNESS_IMPLEMENTATION_SPEC.md`,
+//! the historical implementation plan.
 
 pub mod analysis;
 pub mod auth;
@@ -23,6 +27,7 @@ pub mod candidate;
 pub mod commit;
 pub mod engine;
 pub mod events;
+pub mod export;
 pub mod fingerprint;
 pub mod graph;
 pub mod graph_build;

@@ -1,4 +1,4 @@
-//! The MCP tool surface (§42–§53 of the design spec).
+//! The MCP tool surface (§42–§53 of the harness spec).
 //!
 //! One shared Streamable HTTP server; every request authenticates with
 //! a per-task bearer capability that resolves to the task's pinned
@@ -95,7 +95,8 @@ program is compiled in code, in milliseconds. Many small typed patches \
 are normal. The commit gate rejects a structurally broken patch with \
 precise diagnostics; fix it and resubmit in the same session.
 4. Once that skeleton is complete for the whole system, call \
-build_design. It runs the whole design in this server, one step after \
+build_design, passing the user's request as `prompt` — the project \
+records no prompt, so each run is told what to build. It runs the whole design in this server, one step after \
 another, with no worker agents: it compiles every sketch, declares the \
 default runtime topology, discovers requirements, verifies, and \
 repairs what its remedy catalogue can prove. It returns within the \
@@ -240,8 +241,15 @@ pub struct SubmitPatchParams {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct RequestDesignParams {
+    /// What to design, in the user's words: pass the user's request on
+    /// the run that starts from it. Every task of this run sees it; the
+    /// project does not record it — the correctness obligations
+    /// requirement discovery extracts from it are what last.
+    #[serde(default)]
+    pub prompt: Option<String>,
+
     /// Optional extra guidance for the worker agents, layered on top of
-    /// the run's prompt.
+    /// the prompt.
     #[serde(default)]
     pub objective: Option<String>,
 }
@@ -277,10 +285,6 @@ pub struct CreateProjectParams {
     /// A short name for the project; the directory's name when omitted.
     #[serde(default)]
     pub name: Option<String>,
-
-    /// Natural-language description of the system to build.
-    #[serde(default)]
-    pub prompt: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -308,11 +312,8 @@ pub trait DesignLauncher: Send + Sync {
     /// Starts the workflow in the background against `engine` and
     /// returns a description of the launched run, or a reason it could
     /// not start (for example, one is already running).
-    fn launch(
-        &self,
-        engine: DesignEngine,
-        objective: Option<String>,
-    ) -> Result<serde_json::Value, String>;
+    fn launch(&self, engine: DesignEngine, input: DesignInput)
+    -> Result<serde_json::Value, String>;
 
     /// Whether a run is in flight and the last one's report, for
     /// `spec_status` to surface. `None` when the orchestrator tracks no
@@ -328,11 +329,28 @@ pub trait DesignLauncher: Send + Sync {
     fn build(
         &self,
         engine: DesignEngine,
-        objective: Option<String>,
+        input: DesignInput,
     ) -> Result<futures::future::BoxFuture<'static, serde_json::Value>, String> {
-        let _ = (engine, objective);
+        let _ = (engine, input);
 
         Err("this server cannot build a design in process".to_string())
+    }
+}
+
+/// What one design run is asked: the requester's prompt and any extra
+/// objective. Inputs to that run only — the project records neither.
+#[derive(Debug, Clone, Default)]
+pub struct DesignInput {
+    pub prompt: Option<String>,
+    pub objective: Option<String>,
+}
+
+impl From<RequestDesignParams> for DesignInput {
+    fn from(params: RequestDesignParams) -> Self {
+        Self {
+            prompt: params.prompt,
+            objective: params.objective,
+        }
     }
 }
 
@@ -1269,7 +1287,7 @@ impl ConseqaMcp {
             }));
         }
 
-        match launcher.build(engine.clone(), params.0.objective) {
+        match launcher.build(engine.clone(), params.0.into()) {
             Ok(build) => {
                 let mut report = build.await;
 
@@ -1328,8 +1346,10 @@ impl ConseqaMcp {
             return json_error(serde_json::json!({
                 "launched": false,
                 "error": "concurrent design is not available on this server",
-                "guidance": "This design server has no orchestration backend. Restart \
-                             the design MCP server with a configured backend.",
+                "guidance": "This server embeds the design MCP surface without a design \
+                             launcher, so it cannot start design runs. Every \
+                             `conseqa-design-mcp` command (serve, global, stdio) provides \
+                             one; connect to such a server to run the design workflow.",
             }));
         };
 
@@ -1354,6 +1374,15 @@ impl ConseqaMcp {
 
         let no_interfaces = head.workspace.operations.is_empty();
 
+        if no_interfaces && params.0.prompt.is_none() {
+            return json_error(serde_json::json!({
+                "launched": false,
+                "error": "nothing to design: no interfaces are declared and no prompt was given",
+                "guidance": "Pass the user's request as `prompt` for the run to decompose, or \
+                             author the skeleton first with submit_patch.",
+            }));
+        }
+
         let pending: Vec<String> = head
             .workspace
             .operations
@@ -1362,7 +1391,7 @@ impl ConseqaMcp {
             .map(|(id, _)| id.to_string())
             .collect();
 
-        match launcher.launch(engine, params.0.objective) {
+        match launcher.launch(engine, params.0.into()) {
             Ok(mut value) => {
                 // Naming the operations makes a premature fanout
                 // visible at once: a list short of the intended system
@@ -1371,8 +1400,8 @@ impl ConseqaMcp {
                     let (operations, check) = if no_interfaces {
                         (
                             serde_json::Value::Null,
-                            "No interfaces are declared, so this run decomposes the prompt \
-                             itself before synthesizing. To keep control of the contracts, \
+                            "No interfaces are declared, so this run decomposes the given \
+                             prompt itself before synthesizing. To keep control of the contracts, \
                              cancel and author the skeleton first.",
                         )
                     } else if pending.is_empty() {
@@ -1448,10 +1477,11 @@ impl ConseqaMcp {
 
     #[tool(
         description = "Create a new project in a directory — normally the repository \
-                       root — and make it active, seeded with an optional natural-language \
-                       prompt describing the system to build. Its state is a `.conseqa/` \
-                       directory there, to be committed with the code. Errors if the \
-                       directory, or one above it, already holds a project."
+                       root — and make it active. Its state is a `.conseqa/` directory \
+                       there, to be committed with the code. Errors if the directory, or \
+                       one above it, already holds a project. What to design is not part \
+                       of the project: pass the user's request as `prompt` to build_design \
+                       or request_design."
     )]
     async fn create_project(
         &self,
@@ -1463,7 +1493,7 @@ impl ConseqaMcp {
 
         let created = host
             .manager
-            .create(Path::new(&params.path), params.name, params.prompt)
+            .create(Path::new(&params.path), params.name)
             .map_err(|error| error.to_string())
             .and_then(|engine| host.activate(engine));
 
@@ -1473,8 +1503,7 @@ impl ConseqaMcp {
                 "path": info.path,
                 "created": true,
                 "note": "New project created and now active; its files are in `.conseqa/` \
-                         under the path above, and the user should commit them. Its prompt \
-                         is in task_context. Learn the DSL with dsl_guide and \
+                         under the path above, and the user should commit them. Learn the DSL with dsl_guide and \
                          dsl_reference, then author the skeleton with submit_patch — \
                          services, schemas, data models, topics, machines, and one sketched \
                          interface per planned operation — and call build_design, which \
@@ -1668,32 +1697,6 @@ impl ConseqaMcp {
             }
         };
 
-        let dir = PathBuf::from(&params.dir);
-
-        if let Err(error) = std::fs::create_dir_all(&dir) {
-            return json_error(serde_json::json!({
-                "exported": false,
-                "error": format!("cannot create {}: {error}", dir.display()),
-            }));
-        }
-
-        let dir = dir.canonicalize().unwrap_or(dir);
-        let mut artifacts = Vec::new();
-
-        let yaml = match serde_yaml::to_string(&model) {
-            Ok(yaml) => yaml,
-            Err(error) => {
-                return json_error(serde_json::json!({
-                    "exported": false,
-                    "error": format!("cannot serialize the model: {error}"),
-                }));
-            }
-        };
-
-        if let Some(result) = write_artifact(&dir.join("conseqa.yaml"), &yaml, &mut artifacts) {
-            return result;
-        }
-
         let analysis = settled_analysis(&engine, head.revision).await;
 
         let report = match &analysis {
@@ -1701,51 +1704,36 @@ impl ConseqaMcp {
             _ => None,
         };
 
-        if let Some(report) = report {
-            let json = serde_json::to_string_pretty(report).unwrap_or_else(|_| "{}".to_string());
-
-            if let Some(result) = write_artifact(
-                &dir.join("verification-report.json"),
-                &format!("{json}\n"),
-                &mut artifacts,
-            ) {
-                return result;
-            }
-        }
-
-        if params.render.unwrap_or(true) {
-            let title = params
+        let title = params.render.unwrap_or(true).then(|| {
+            params
                 .title
                 .clone()
-                .unwrap_or_else(|| head.workspace.run_meta.run.0.clone());
+                .unwrap_or_else(|| head.workspace.run_meta.run.0.clone())
+        });
 
-            match crate::viz::render(&model, report, &title) {
-                Ok(html) => {
-                    if let Some(result) =
-                        write_artifact(&dir.join("spec.html"), &html, &mut artifacts)
-                    {
-                        return result;
-                    }
-                }
+        match super::export::write_artifacts(
+            Path::new(&params.dir),
+            &model,
+            report,
+            title.as_deref(),
+        ) {
+            Ok(artifacts) => json_result(serde_json::json!({
+                "exported": true,
+                "revision": head.revision.0,
+                "artifacts": artifacts,
+                "analysis": analysis_json(&analysis),
+                "note": "spec.html is self-contained — open it in a browser or hand it to \
+                         the user. conseqa.yaml is the canonical model; `conseqa check` \
+                         verifies the project from the command line. The report is written only once the analysis has \
+                         settled.",
+            })),
 
-                Err(error) => {
-                    return json_error(serde_json::json!({
-                        "exported": false,
-                        "error": format!("cannot render the visualization: {error}"),
-                        "artifacts": artifacts,
-                    }));
-                }
-            }
+            Err(error) => json_error(serde_json::json!({
+                "exported": false,
+                "error": error.message,
+                "artifacts": error.written,
+            })),
         }
-
-        json_result(serde_json::json!({
-            "exported": true,
-            "revision": head.revision.0,
-            "artifacts": artifacts,
-            "analysis": analysis_json(&analysis),
-            "note": "spec.html is self-contained — open it in a browser or hand it to \
-                     the user. conseqa.yaml is the canonical model for library consumers.",
-        }))
     }
 }
 
@@ -1842,25 +1830,6 @@ fn obligation_status_label(status: &super::workspace::PromptObligationStatus) ->
 
 /// Writes one export artifact, recording its path; on failure returns
 /// the error result to hand straight back to the caller.
-fn write_artifact(
-    path: &std::path::Path,
-    contents: &str,
-    artifacts: &mut Vec<String>,
-) -> Option<Result<CallToolResult, McpError>> {
-    match std::fs::write(path, contents) {
-        Ok(()) => {
-            artifacts.push(path.display().to_string());
-            None
-        }
-
-        Err(error) => Some(json_error(serde_json::json!({
-            "exported": false,
-            "error": format!("cannot write {}: {error}", path.display()),
-            "artifacts": artifacts,
-        }))),
-    }
-}
-
 fn rejection_body(rejection: &CommitRejection) -> serde_json::Value {
     serde_json::to_value(rejection)
         .unwrap_or_else(|_| serde_json::json!({ "kind": "unserializable_rejection" }))

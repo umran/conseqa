@@ -2,7 +2,7 @@
 //!
 //! A task is permanently tied to one snapshot revision, one agent
 //! session, one read tracker, and one write scope (§17 of the
-//! design spec). An invalidated task never runs again — its
+//! harness spec). An invalidated task never runs again — its
 //! replacement is a new task in a fresh agent session, because stale
 //! semantic facts may remain latent inside the old conversation
 //! (§2.6).

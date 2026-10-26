@@ -1,7 +1,7 @@
 //! Typed semantic mutations: the only commit protocol.
 //!
 //! Never a text diff, JSON Patch over array indexes, or YAML string
-//! replacement (§25 of the design spec). V1 granularity is the
+//! replacement (§25 of the harness spec). V1 granularity is the
 //! operation slice — `ReplaceOperationProgram` is one semantic
 //! transaction — because one primary writer per operation already
 //! avoids most contention (§26).

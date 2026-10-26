@@ -484,16 +484,15 @@ impl fmt::Display for RunId {
     }
 }
 
-/// Facts about the run the workspace belongs to: the prompt being
-/// designed against and the policies commits are judged under.
+/// Facts about the project the workspace belongs to: its name and the
+/// policies commits are judged under. What a design run is asked to
+/// build is that run's input, not a fact about the project
+/// ([`crate::harness::WorkflowConfig::prompt`]); what lasts of it is
+/// the prompt obligations discovery extracts.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RunMetadata {
     pub run: RunId,
-
-    /// The exact natural-language application prompt, persisted
-    /// verbatim.
-    pub prompt: Option<String>,
 
     pub policy: RunPolicy,
 }
@@ -502,7 +501,6 @@ impl RunMetadata {
     pub fn new(run: RunId) -> Self {
         Self {
             run,
-            prompt: None,
             policy: RunPolicy::default(),
         }
     }

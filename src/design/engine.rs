@@ -451,31 +451,16 @@ impl DesignEngine {
         write_scope: WriteScope,
         objective: impl Into<String>,
     ) -> Result<TaskHandle, EngineError> {
-        // Surface the run's natural-language prompt to the session, so
-        // task_context grounds the agent even before the human types.
-        let prompt_evidence = self
-            .inner
-            .head
-            .load()
-            .workspace
-            .run_meta
-            .prompt
-            .clone()
-            .map(|prompt| {
-                vec![PromptEvidence {
-                    source: EvidenceRef("run.prompt".to_string()),
-                    excerpt: prompt,
-                }]
-            })
-            .unwrap_or_default();
-
+        // An interactive session's requester is the human driving it,
+        // whose request is in their own conversation; the project
+        // records none.
         let spec = TaskSpec {
             id: TaskId::fresh(),
             kind: TaskKind::Decompose,
             objective: objective.into(),
             snapshot_revision: self.inner.head.load().revision,
             write_scope,
-            prompt_evidence,
+            prompt_evidence: Vec::new(),
             budget: TaskBudget::default(),
             completion_gate: TaskCompletionGate::Interactive,
         };

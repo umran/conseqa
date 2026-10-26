@@ -466,7 +466,6 @@ async fn through_the_pipeline(
 
     let mut run_meta = RunMetadata::new(RunId("sketch-pipeline".into()));
 
-    run_meta.prompt = Some("A system.".to_string());
     run_meta.policy = conseqa::design::RunPolicy {
         strict_requirements: false,
         adopt_recommended: false,
@@ -508,6 +507,7 @@ async fn through_the_pipeline(
             out_dir: out_dir.clone(),
             analysis_timeout: std::time::Duration::from_secs(20),
             max_iterations: 8,
+            prompt: Some("A system.".to_string()),
             objective: None,
         },
     );

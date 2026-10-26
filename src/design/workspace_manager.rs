@@ -14,7 +14,7 @@ use rustc_hash::FxHashMap;
 use crate::spec::Revision;
 
 use super::engine::{DesignEngine, EngineError};
-use super::store::{ProjectStore, StoreError};
+use super::store::{ProjectStore, StoreError, default_project_name};
 use super::workspace::{RunId, RunMetadata, WorkspaceState};
 
 #[derive(Debug, thiserror::Error)]
@@ -65,31 +65,15 @@ impl WorkspaceManager {
     }
 
     /// Creates a project in `path`, named `name` (the directory's name
-    /// when omitted) and seeded with `prompt`.
-    pub fn create(
-        &self,
-        path: &Path,
-        name: Option<String>,
-        prompt: Option<String>,
-    ) -> Result<DesignEngine, ProjectError> {
-        let name = match name {
-            Some(name) => name,
-            None => path
-                .canonicalize()
-                .ok()
-                .and_then(|dir| {
-                    dir.file_name()
-                        .map(|name| name.to_string_lossy().into_owned())
-                })
-                .unwrap_or_else(|| "project".to_string()),
-        };
+    /// when omitted).
+    pub fn create(&self, path: &Path, name: Option<String>) -> Result<DesignEngine, ProjectError> {
+        let name = name.unwrap_or_else(|| default_project_name(path));
 
         if name.trim().is_empty() || name.contains('\n') {
             return Err(ProjectError::InvalidName(name));
         }
 
-        let mut run_meta = RunMetadata::new(RunId(name));
-        run_meta.prompt = prompt;
+        let run_meta = RunMetadata::new(RunId(name));
 
         let mut guard = self.projects.write();
 

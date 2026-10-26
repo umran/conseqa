@@ -162,16 +162,10 @@ fn stdio_server_hosts_projects_without_a_session_id_or_bearer() {
 
     // Project tools work with no Mcp-Session-Id and no bearer — the
     // exact conditions that broke the http multi-project server. Create
-    // a project, grounded by its prompt, and commit into it.
-    let (created, is_error) = client.call(
-        "create_project",
-        serde_json::json!({"path": dir, "prompt": "A todo service."}),
-    );
+    // a project and commit into it.
+    let (created, is_error) = client.call("create_project", serde_json::json!({"path": dir}));
     assert!(!is_error, "{created}");
     assert_eq!(created["created"], true);
-
-    let (context, _) = client.call("task_context", serde_json::json!({}));
-    assert_eq!(context["prompt_evidence"][0]["excerpt"], "A todo service.");
 
     let (committed, is_error) = client.call(
         "submit_patch",
@@ -206,7 +200,6 @@ fn stdio_server_hosts_projects_without_a_session_id_or_bearer() {
 
     let (context, is_error) = client.call("task_context", serde_json::json!({}));
     assert!(!is_error, "{context}");
-    assert_eq!(context["prompt_evidence"][0]["excerpt"], "A todo service.");
 
     let (search, _) = client.call("search_symbols", serde_json::json!({"kind": "service"}));
     assert!(search.to_string().contains("service.todo"), "{search}");

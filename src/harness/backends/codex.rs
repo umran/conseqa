@@ -1,4 +1,4 @@
-//! The Codex backend (§58 of the design spec).
+//! The Codex backend (§58 of the harness spec).
 //!
 //! Launches `codex exec --json --ephemeral --sandbox read-only` with
 //! one-shot `-c` config overrides pointing its `conseqa` MCP server at

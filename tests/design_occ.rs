@@ -1,4 +1,4 @@
-//! OCC commit-engine tests (§100–§102 of the design spec):
+//! OCC commit-engine tests (§100–§102 of the harness spec):
 //! non-conflicting commits, read-write / write-write conflicts,
 //! phantoms, removed dependencies, unobserved references, duplicate
 //! submission, task invalidation, and draft workspace behavior.
@@ -316,23 +316,6 @@ fn interactive_session_commits_repeatedly_under_one_token() {
     }
 
     assert_eq!(commits, 3);
-}
-
-#[test]
-fn an_interactive_session_surfaces_the_run_prompt() {
-    let mut run_meta = RunMetadata::new(RunId("prompted".to_string()));
-    run_meta.prompt = Some("Build a URL shortener.".to_string());
-
-    let engine = DesignEngine::in_memory(WorkspaceState::empty(run_meta)).expect("engine");
-
-    let session = engine
-        .create_session(WriteScope::of([WriteGrant::All]), "build")
-        .expect("session");
-
-    let context = engine.task_context(session.id).expect("context");
-
-    assert_eq!(context.prompt_evidence.len(), 1);
-    assert_eq!(context.prompt_evidence[0].excerpt, "Build a URL shortener.");
 }
 
 #[test]

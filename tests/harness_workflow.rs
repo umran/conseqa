@@ -569,7 +569,6 @@ fn workflow_over(
     backend: impl FnOnce(&DesignEngine) -> Arc<dyn AgentBackend>,
 ) -> (Workflow, DesignEngine) {
     let mut run_meta = RunMetadata::new(RunId("workflow-test".to_string()));
-    run_meta.prompt = Some("A ping service.".to_string());
     run_meta.policy = RunPolicy {
         strict_requirements: true,
         adopt_recommended: false,
@@ -596,6 +595,7 @@ fn workflow_over(
             out_dir,
             analysis_timeout: Duration::from_secs(20),
             max_iterations,
+            prompt: Some("A ping service.".to_string()),
             objective,
         },
     );
@@ -2181,6 +2181,11 @@ mod system_one {
 
     /// A model a person authored and the checker proves, with everything
     /// its author declared taken out — so discovery has it all to find.
+    /// What the ledger runs are asked to build.
+    const LEDGER_PROMPT: &str = "Entries must be applied to each tenant's ledger exactly once \
+                                 and in sequence order, even when events are redelivered or \
+                                 the service restarts.";
+
     fn undeclared(fixture: &str, operation: &Id) -> (WorkspaceState, conseqa::spec::Operation) {
         let source = std::fs::read_to_string(
             PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -2213,12 +2218,6 @@ mod system_one {
         }
 
         let mut run_meta = RunMetadata::new(RunId("discovery-test".to_string()));
-
-        run_meta.prompt = Some(
-            "Entries must be applied to each tenant's ledger exactly once and in sequence \
-             order, even when events are redelivered or the service restarts."
-                .to_string(),
-        );
 
         run_meta.policy = RunPolicy {
             strict_requirements: true,
@@ -2262,13 +2261,14 @@ mod system_one {
             })
             .collect();
 
-        run_tasks(workspace, tasks, opinions).await
+        run_tasks(workspace, LEDGER_PROMPT, tasks, opinions).await
     }
 
     /// Runs operation-scoped tasks with every builder in front of an
     /// agent backend that does nothing but record what reaches it.
     async fn run_tasks(
         workspace: WorkspaceState,
+        prompt: &str,
         tasks: Vec<(TaskKind, conseqa::design::WriteScope, Id)>,
         opinions: &Opinions,
     ) -> (DesignEngine, Seen, Vec<conseqa::harness::TaskRun>) {
@@ -2306,13 +2306,7 @@ mod system_one {
             },
         );
 
-        let prompt = engine
-            .head_snapshot()
-            .workspace
-            .run_meta
-            .prompt
-            .clone()
-            .expect("the run has a prompt");
+        let prompt = prompt.to_string();
 
         let tasks = tasks
             .into_iter()
@@ -2813,7 +2807,8 @@ mod system_one {
 
         for alone in ["operation.place_order", "operation.restock"] {
             let (_, seen, runs) = run_tasks(
-                workspace_of(&broken, "A shop."),
+                workspace_of(&broken),
+                "A shop.",
                 vec![(
                     TaskKind::RequirementRepair,
                     program_scope(&[alone]),
@@ -2836,7 +2831,8 @@ mod system_one {
         }
 
         let (engine, seen, runs) = run_tasks(
-            workspace_of(&broken, "A shop."),
+            workspace_of(&broken),
+            "A shop.",
             vec![(
                 TaskKind::RequirementRepair,
                 program_scope(&["operation.place_order", "operation.restock"]),
@@ -2874,7 +2870,7 @@ mod system_one {
         let broken = stock_without_its_locks();
 
         let engine =
-            DesignEngine::in_memory(workspace_of(&broken, "A shop.")).expect("engine starts");
+            DesignEngine::in_memory(workspace_of(&broken)).expect("engine starts");
 
         let seen = Seen::default();
         let idle: ScriptFn = Arc::new(|_, _| Box::pin(async {}));
@@ -2907,6 +2903,7 @@ mod system_one {
                 out_dir: out_dir.clone(),
                 analysis_timeout: Duration::from_secs(20),
                 max_iterations: 8,
+                prompt: Some("A shop.".to_string()),
                 objective: None,
             },
         );
@@ -2955,10 +2952,8 @@ mod system_one {
         conseqa::parser::yaml::parse(&source).expect("fixture parses")
     }
 
-    fn workspace_of(model: &conseqa::spec::Model, prompt: &str) -> WorkspaceState {
+    fn workspace_of(model: &conseqa::spec::Model) -> WorkspaceState {
         let mut run_meta = RunMetadata::new(RunId("repair-test".to_string()));
-
-        run_meta.prompt = Some(prompt.to_string());
 
         run_meta.policy = RunPolicy {
             strict_requirements: true,
@@ -3160,7 +3155,7 @@ mod system_one {
     /// `shop` with one operation's program taken away, as the fanout
     /// finds it.
     fn shop_without_program(operation: &str) -> WorkspaceState {
-        let mut workspace = workspace_of(&authored("shop.yaml"), "A small shop backend.");
+        let mut workspace = workspace_of(&authored("shop.yaml"));
 
         workspace
             .operations
@@ -3177,6 +3172,7 @@ mod system_one {
     ) -> (DesignEngine, Seen, Vec<conseqa::harness::TaskRun>) {
         run_tasks(
             shop_without_program(operation),
+            "A small shop backend.",
             vec![(
                 TaskKind::OperationSynthesis,
                 conseqa::design::WriteScope::operation_synthesis(id(operation)),
@@ -3449,6 +3445,7 @@ mod system_one {
                 out_dir: out_dir.clone(),
                 analysis_timeout: Duration::from_secs(20),
                 max_iterations: 8,
+                prompt: Some("A small shop backend.".to_string()),
                 objective: None,
             },
         );
@@ -3509,7 +3506,8 @@ mod system_one {
             model.runtime = None;
 
             let (engine, seen, runs) = run_tasks(
-                workspace_of(&model, "A system."),
+                workspace_of(&model),
+                "A system.",
                 vec![(
                     TaskKind::TopologySynthesis,
                     conseqa::design::WriteScope::runtime_topology(),
@@ -3696,7 +3694,7 @@ mod system_one {
     async fn a_waiting_program_is_written_before_any_discovery() {
         let authored = authored("shop.yaml");
 
-        let mut workspace = workspace_of(&authored, "A small shop backend.");
+        let mut workspace = workspace_of(&authored);
 
         for operation in [
             "operation.pay_order",
@@ -3752,6 +3750,7 @@ mod system_one {
                 out_dir: out_dir.clone(),
                 analysis_timeout: Duration::from_secs(20),
                 max_iterations: 3,
+                prompt: Some("A small shop backend.".to_string()),
                 objective: None,
             },
         );
@@ -3786,7 +3785,7 @@ mod system_one {
     async fn discovery_starts_before_the_slowest_program_lands() {
         let authored = authored("shop.yaml");
 
-        let mut workspace = workspace_of(&authored, "A small shop backend.");
+        let mut workspace = workspace_of(&authored);
 
         for operation in ["operation.restock", "operation.ship_order"] {
             let draft = workspace
@@ -3827,6 +3826,7 @@ mod system_one {
                 out_dir: out_dir.clone(),
                 analysis_timeout: Duration::from_secs(20),
                 max_iterations: 3,
+                prompt: Some("A small shop backend.".to_string()),
                 objective: None,
             },
         );
@@ -3857,7 +3857,7 @@ mod system_one {
     /// writes, discovers or repairs anything.
     #[tokio::test]
     async fn every_program_is_compiled_from_its_sketch_without_a_session() {
-        let mut workspace = workspace_of(&authored("shop.yaml"), "A small shop backend.");
+        let mut workspace = workspace_of(&authored("shop.yaml"));
 
         for (operation, sketch) in common::sketches::shop_sketches() {
             let draft = workspace
@@ -3903,6 +3903,7 @@ mod system_one {
                 out_dir: out_dir.clone(),
                 analysis_timeout: Duration::from_secs(20),
                 max_iterations: 8,
+                prompt: Some("A small shop backend.".to_string()),
                 objective: None,
             },
         );
@@ -3942,7 +3943,7 @@ mod system_one {
     async fn build(
         break_ship_order: bool,
     ) -> (DesignEngine, conseqa::harness::RunReport, Vec<conseqa::harness::HandOff>) {
-        let mut workspace = workspace_of(&authored("shop.yaml"), "A small shop backend.");
+        let mut workspace = workspace_of(&authored("shop.yaml"));
 
         for (operation, mut sketch) in common::sketches::shop_sketches() {
             if break_ship_order && operation == "operation.ship_order" {
@@ -3993,6 +3994,7 @@ mod system_one {
                 out_dir: out_dir.clone(),
                 analysis_timeout: Duration::from_secs(20),
                 max_iterations: 8,
+                prompt: Some("A small shop backend.".to_string()),
                 objective: None,
             },
         )
@@ -4066,7 +4068,7 @@ mod system_one {
     /// run, the same operation's question was asked ten times.
     #[tokio::test]
     async fn an_unsure_discovery_is_not_repeated_on_every_pass() {
-        let mut workspace = workspace_of(&authored("shop.yaml"), "A small shop backend.");
+        let mut workspace = workspace_of(&authored("shop.yaml"));
 
         for (operation, sketch) in common::sketches::shop_sketches() {
             let draft = workspace
@@ -4115,6 +4117,7 @@ mod system_one {
                 out_dir: out_dir.clone(),
                 analysis_timeout: Duration::from_secs(20),
                 max_iterations: 8,
+                prompt: Some("A small shop backend.".to_string()),
                 objective: None,
             },
         );
@@ -4168,6 +4171,7 @@ mod system_one {
 
         let (engine, seen, _) = run_tasks(
             workspace,
+            "A small shop backend.",
             vec![(
                 TaskKind::OperationSynthesis,
                 conseqa::design::WriteScope::operation_synthesis(id("operation.ship_order")),
@@ -4226,7 +4230,8 @@ mod system_one {
         opinions: &Opinions,
     ) -> (DesignEngine, Seen, Vec<conseqa::harness::TaskRun>) {
         run_tasks(
-            workspace_of(broken, "A ledger of entries per tenant."),
+            workspace_of(broken),
+            "A ledger of entries per tenant.",
             vec![(
                 TaskKind::RequirementRepair,
                 conseqa::design::WriteScope::requirement_repair(id(operation)),
@@ -4469,6 +4474,7 @@ mod system_one {
                 out_dir: out_dir.clone(),
                 analysis_timeout: Duration::from_secs(20),
                 max_iterations: 8,
+                prompt: Some(LEDGER_PROMPT.to_string()),
                 objective: None,
             },
         );

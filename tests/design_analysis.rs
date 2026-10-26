@@ -1,4 +1,4 @@
-//! Analysis integration tests (§102–§103 of the design spec):
+//! Analysis integration tests (§102–§103 of the harness spec):
 //! assembly gaps, revision-tagged analysis, coalescing, pinning,
 //! validation gating verification, summaries, reports, and tracked
 //! context bundles.

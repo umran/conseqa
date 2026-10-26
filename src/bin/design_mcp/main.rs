@@ -1,10 +1,12 @@
 //! conseqa-design-mcp: the standalone design daemon (§6.2, §88 of
-//! the design spec).
+//! the harness spec).
 //!
 //! `serve` exposes the shared MCP endpoint for interactive Claude
 //! Code / Codex sessions, IDE integration, and external orchestrators,
-//! plus a minimal localhost admin surface for creating tasks. Project
-//! lifecycle commands live in the project-local `conseqa` CLI.
+//! plus a minimal localhost admin surface for creating tasks. `decider`
+//! asks a System One decider directly and vets a server before it is
+//! trusted. Project lifecycle commands live in the project-local
+//! `conseqa` CLI.
 //!
 //! A project is the `.conseqa/` directory of the repository it
 //! describes (see `conseqa::design::store`).
@@ -23,10 +25,10 @@ use clap::{Parser, Subcommand, ValueEnum};
 use parking_lot::{Mutex, RwLock};
 use serde::Deserialize;
 
-use conseqa::design::mcp::{self, DesignLauncher};
+use conseqa::design::mcp::{self, DesignInput, DesignLauncher};
 use conseqa::design::{
-    AnalysisState, DesignEngine, CreateTask, PromptEvidence, RunId, RunMetadata,
-    TaskBudget, TaskId, TaskKind, WorkspaceState, WriteScope,
+    AnalysisState, CreateTask, DesignEngine, PromptEvidence, TaskBudget, TaskId, TaskKind,
+    WriteScope,
 };
 use conseqa::harness::backend::InvocationBudget;
 use conseqa::harness::backends::{ClaudeCliBackend, CodexCliBackend};
@@ -35,6 +37,9 @@ use conseqa::harness::{
     AgentBackend, RunReport, Scheduler, SchedulerPolicy, Supervisor, Workflow, WorkflowConfig,
 };
 use conseqa::spec::Revision;
+
+#[cfg(feature = "system-one")]
+mod decider;
 
 #[derive(Parser)]
 #[command(
@@ -62,11 +67,6 @@ enum Command {
         /// Adopt an existing Conseqa model when creating the project.
         #[arg(long)]
         model: Option<PathBuf>,
-
-        /// The natural-language application prompt when creating the
-        /// project.
-        #[arg(long)]
-        prompt: Option<String>,
 
         /// On startup, create an interactive authoring session and
         /// print a ready-to-paste `.mcp.json` for the Claude Code UI.
@@ -146,6 +146,14 @@ enum Command {
         #[command(flatten)]
         system_one: SystemOne,
     },
+
+    /// Ask a System One decider directly, or vet a server before it is
+    /// trusted.
+    #[cfg(feature = "system-one")]
+    Decider {
+        #[command(subcommand)]
+        command: Box<decider::DeciderCommand>,
+    },
 }
 
 #[tokio::main]
@@ -167,7 +175,6 @@ async fn main() -> ExitCode {
             project,
             bind,
             model,
-            prompt,
             session,
             backend,
             backend_program,
@@ -179,7 +186,6 @@ async fn main() -> ExitCode {
                 project,
                 bind,
                 model,
-                prompt,
                 session,
                 backend,
                 backend_program,
@@ -220,6 +226,15 @@ async fn main() -> ExitCode {
                 system_one,
             })
             .await
+        }
+
+        #[cfg(feature = "system-one")]
+        Command::Decider { command } => {
+            return decider::run(*command).await.unwrap_or_else(|message| {
+                eprintln!("error: {message}");
+
+                ExitCode::FAILURE
+            });
         }
     };
 
@@ -301,43 +316,6 @@ fn default_claude_program() -> Option<String> {
     .find(|candidate| std::path::Path::new(candidate).is_file())
 }
 
-/// A new project's workspace: `model` adopted when given, else empty.
-/// It is named `name`, or after the directory it is created in.
-fn initial_workspace(
-    dir: &std::path::Path,
-    name: Option<String>,
-    model: Option<PathBuf>,
-    prompt: Option<String>,
-) -> Result<WorkspaceState, String> {
-    let name = name.unwrap_or_else(|| {
-        dir.canonicalize()
-            .ok()
-            .and_then(|dir| {
-                dir.file_name()
-                    .map(|name| name.to_string_lossy().into_owned())
-            })
-            .unwrap_or_else(|| "project".to_string())
-    });
-
-    let mut run_meta = RunMetadata::new(RunId(name));
-
-    run_meta.prompt = prompt;
-
-    match model {
-        None => Ok(WorkspaceState::empty(run_meta)),
-
-        Some(path) => {
-            let source = std::fs::read_to_string(&path)
-                .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
-
-            let model = conseqa::parser::yaml::parse(&source)
-                .map_err(|error| format!("cannot parse {}: {error}", path.display()))?;
-
-            Ok(WorkspaceState::from_model(&model, run_meta))
-        }
-    }
-}
-
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum Backend {
     Claude,
@@ -378,7 +356,6 @@ struct ServeOptions {
     project: PathBuf,
     bind: SocketAddr,
     model: Option<PathBuf>,
-    prompt: Option<String>,
     session: bool,
     backend: Backend,
     backend_program: Option<String>,
@@ -390,7 +367,9 @@ struct ServeOptions {
 async fn serve(options: ServeOptions) -> Result<(), String> {
     let executor = design_executor(&options.system_one)?;
 
-    let initial = initial_workspace(&options.project, None, options.model, options.prompt)?;
+    let initial =
+        conseqa::design::new_project_workspace(&options.project, options.model.as_deref())
+            .map_err(|error| error.to_string())?;
 
     let engine = DesignEngine::open(&options.project, initial)
         .map_err(|error| format!("cannot open {}: {error}", options.project.display()))?;
@@ -768,7 +747,7 @@ impl DesignLauncher for DaemonDesignLauncher {
     fn launch(
         &self,
         engine: DesignEngine,
-        objective: Option<String>,
+        input: DesignInput,
     ) -> Result<serde_json::Value, String> {
         // One workflow at a time across the server: overlapping runs
         // would just contend for the same operations.
@@ -816,7 +795,8 @@ impl DesignLauncher for DaemonDesignLauncher {
                 out_dir: self.design_dir(&engine),
                 analysis_timeout: Duration::from_secs(180),
                 max_iterations: 8,
-                objective,
+                prompt: input.prompt,
+                objective: input.objective,
             },
         );
 
@@ -860,7 +840,7 @@ impl DesignLauncher for DaemonDesignLauncher {
     fn build(
         &self,
         engine: DesignEngine,
-        objective: Option<String>,
+        input: DesignInput,
     ) -> Result<futures::future::BoxFuture<'static, serde_json::Value>, String> {
         if self
             .state
@@ -904,7 +884,8 @@ impl DesignLauncher for DaemonDesignLauncher {
                 out_dir: self.design_dir(&engine),
                 analysis_timeout: Duration::from_secs(180),
                 max_iterations: 8,
-                objective,
+                prompt: input.prompt,
+                objective: input.objective,
             },
         )
         .with_halt(hand_off.halt());
@@ -1100,10 +1081,31 @@ async fn admin_create_session(State(state): State<AdminState>) -> Json<serde_jso
     }
 }
 
+/// What a terminal trigger asks of a design run; an empty or absent
+/// body asks nothing beyond the project's skeleton.
+#[derive(Deserialize, Default)]
+struct AdminCreateDesign {
+    #[serde(default)]
+    prompt: Option<String>,
+
+    #[serde(default)]
+    objective: Option<String>,
+}
+
 /// Launches the concurrent design workflow from a terminal trigger, the
 /// same one `request_design` uses from the UI.
-async fn admin_create_design(State(state): State<AdminState>) -> Json<serde_json::Value> {
-    match state.launcher.launch(state.engine.clone(), None) {
+async fn admin_create_design(
+    State(state): State<AdminState>,
+    body: Option<Json<AdminCreateDesign>>,
+) -> Json<serde_json::Value> {
+    let Json(request) = body.unwrap_or_default();
+
+    let input = DesignInput {
+        prompt: request.prompt,
+        objective: request.objective,
+    };
+
+    match state.launcher.launch(state.engine.clone(), input) {
         Ok(value) => Json(value),
         Err(error) => Json(serde_json::json!({ "launched": false, "error": error })),
     }

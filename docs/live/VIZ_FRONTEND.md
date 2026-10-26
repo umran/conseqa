@@ -7,15 +7,16 @@ development.
 
 ```
 npm install
+npm run data     # regenerate public/conseqa.json from the video-streaming example
 npm run dev      # http://localhost:5173
 npm run build    # typecheck + single-file bundle → dist/index.html
 ```
 
 `dist/index.html` is committed: the Rust binaries embed it with
 `include_str!`, so rebuild and commit it after changing the front end —
-and then `cargo build --release --bin conseqa-design-mcp`, which is what
-actually puts the new bundle inside the design MCP server (its
-`export_spec` renders through the same code). A running MCP
+and then `cargo build --release`, which is what actually puts the new
+bundle inside `conseqa` (its `viz` and `export` render) and the design
+MCP server (its `export_spec` renders through the same code). A running MCP
 server keeps the image it started with until it is restarted. See
 `docs/live/CONSEQA_VIZ.md` for the views, panels, and
 report format.

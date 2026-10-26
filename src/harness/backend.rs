@@ -1,4 +1,4 @@
-//! The agent backend abstraction (§55 of the design spec).
+//! The agent backend abstraction (§55 of the harness spec).
 //!
 //! A backend maps one logical design task to one coding-agent
 //! session, exposing the Conseqa tool surface through MCP and nothing

@@ -1,4 +1,4 @@
-//! Backend adapter tests (§105 of the design spec): process
+//! Backend adapter tests (§105 of the harness spec): process
 //! startup, MCP configuration injection, stdout streaming, completion
 //! parsing, cancellation, timeout, and non-zero exit — driven by fake
 //! executables that emit the same event shape as the real CLIs, so no

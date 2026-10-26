@@ -1,4 +1,4 @@
-//! Opt-in live smoke tests (§106 of the design spec).
+//! Opt-in live smoke tests (§106 of the harness spec).
 //!
 //! These launch a real coding agent against a local design server
 //! and incur model cost, so they run only when explicitly enabled:

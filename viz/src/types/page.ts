@@ -29,8 +29,8 @@ export async function loadPageData(): Promise<PageData> {
   if (!response.ok) {
     throw new Error(
       `no page data: ${response.status} ${response.statusText}. ` +
-        "Provide public/conseqa.json, or open the spec.html produced by " +
-        "the design MCP server's export_spec tool.",
+        "Run `npm run data` to generate public/conseqa.json, or open the " +
+        "spec.html that `conseqa viz` writes.",
     );
   }
 
