@@ -31,7 +31,7 @@ use std::collections::BTreeMap;
 use serde_json::json;
 use uuid::Uuid;
 
-use crate::confluence::{
+use crate::design::{
     BundleSpec, CommitRequest, DraftOperation, EngineError, EvidenceRef, Mutation, PatchId,
     PromptObligation, PromptObligationId, PromptObligationStatus, ProposedRequirement,
     RequirementOrigin, RequirementSubmission, SearchSpec, SpecPatch, SymbolKey, SymbolKind,

@@ -8,7 +8,7 @@
     "build": "tsc -p tsconfig.json && vite build",
     "preview": "vite preview",
     "typecheck": "tsc -p tsconfig.json",
-    "data": "cd .. && cargo run --quiet --bin conseqa-viz -- tests/fixtures/video_streaming.yaml --verify --json --out viz/public/conseqa.json"
+    "data": "cd .. && cargo test --quiet --test viz_page_data -- --ignored"
   },
   "dependencies": {
     "@cloudflare/kumo": "^2.12.0",

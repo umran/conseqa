@@ -1,7 +1,6 @@
 //! The command-line surface of the System One layer (§26 of the System
-//! One orchestration revision), shared by every entry point that can
-//! start a design run: `conseqa-harness design`, and the daemon whose
-//! `request_design` runs the same workflow.
+//! One orchestration revision), used by the design MCP daemon whose
+//! `request_design` tool runs the workflow.
 //!
 //! Nothing here is ever enabled implicitly. A run uses a decider only
 //! when one is named, sends state off the machine only to a URL that
@@ -13,7 +12,7 @@ use std::sync::Arc;
 
 use clap::{Args, ValueEnum};
 
-use crate::confluence::{ConfluenceEngine, TaskKind};
+use crate::design::{DesignEngine, TaskKind};
 use crate::harness::AgentBackend;
 use crate::system_one::{BackendSettings, ConfiguredDecider, DeciderKind, DeciderSettings};
 
@@ -229,7 +228,7 @@ impl Executor {
     /// against its own project's engine.
     pub fn wrap(
         &self,
-        engine: &ConfluenceEngine,
+        engine: &DesignEngine,
         fallback: Arc<dyn AgentBackend>,
     ) -> Arc<dyn AgentBackend> {
         let backend = SystemOneBackend::new(

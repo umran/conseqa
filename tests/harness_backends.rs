@@ -1,4 +1,4 @@
-//! Backend adapter tests (§105 of the confluence spec): process
+//! Backend adapter tests (§105 of the harness spec): process
 //! startup, MCP configuration injection, stdout streaming, completion
 //! parsing, cancellation, timeout, and non-zero exit — driven by fake
 //! executables that emit the same event shape as the real CLIs, so no
@@ -7,7 +7,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use conseqa::confluence::{TaskId, TaskKind};
+use conseqa::design::{TaskId, TaskKind};
 use conseqa::harness::backend::{
     AgentBackend, AgentEvent, AgentExitStatus, AgentHandle, AgentInvocation, InvocationBudget,
 };
@@ -109,7 +109,7 @@ async fn claude_backend_streams_events_injects_config_and_completes() {
 
     assert!(tool_calls.contains(&"mcp__conseqa__submit_patch"));
 
-    // The MCP config file was written with the confluence server and
+    // The MCP config file was written with the design server and
     // an env-var token placeholder — never the raw token (§57.1).
     let configs: Vec<PathBuf> = std::fs::read_dir(&dir)
         .expect("work dir")
@@ -261,7 +261,7 @@ async fn codex_backend_streams_events_and_injects_overrides() {
         AgentEvent::ToolCall { name } if name == "conseqa.task_context"
     )));
 
-    // The config overrides carried the confluence URL and the env-var
+    // The config overrides carried the design URL and the env-var
     // token reference, and the env injected the real token.
     // The fake strips quotes from the echoed override values to keep
     // its event JSON valid, so assert on the quote-free forms.

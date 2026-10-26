@@ -17,7 +17,7 @@ use async_trait::async_trait;
 use parking_lot::Mutex;
 use serde::Serialize;
 
-use crate::confluence::{AgentBackendMetadata, ConfluenceEngine, TaskKind};
+use crate::design::{AgentBackendMetadata, DesignEngine, TaskKind};
 
 use super::backend::{
     AgentBackend, AgentBackendError, AgentEventSink, AgentExit, AgentExitStatus, AgentHandle,
@@ -47,13 +47,13 @@ pub struct HandOff {
 /// Records every task it is given and asks the run to halt.
 #[derive(Clone)]
 pub struct HandOffBackend {
-    engine: ConfluenceEngine,
+    engine: DesignEngine,
     halt: Arc<AtomicBool>,
     handed: Arc<Mutex<Vec<HandOff>>>,
 }
 
 impl HandOffBackend {
-    pub fn new(engine: ConfluenceEngine) -> Self {
+    pub fn new(engine: DesignEngine) -> Self {
         Self {
             engine,
             halt: Arc::new(AtomicBool::new(false)),

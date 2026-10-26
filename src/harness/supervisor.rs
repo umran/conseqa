@@ -1,11 +1,11 @@
-//! Session supervision: run one confluence task to a terminal outcome
+//! Session supervision: run one design task to a terminal outcome
 //! through a backend, cancelling on invalidation and reporting the
 //! authoritative result.
 //!
 //! The supervisor is where the advisory event channel meets the
 //! backend: a `TaskInvalidated` event cancels the agent process early
 //! to save tokens (§34, §57.2), but the outcome the supervisor
-//! reports comes from the confluence engine's own task state, never
+//! reports comes from the design engine's own task state, never
 //! from parsing the agent's final message (§91).
 
 use std::path::PathBuf;
@@ -14,8 +14,8 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::confluence::{
-    ConfluenceEngine, EngineEvent, TaskHandle, TaskId, TaskKind, TaskState,
+use crate::design::{
+    DesignEngine, EngineEvent, TaskHandle, TaskId, TaskKind, TaskState,
 };
 
 use super::backend::{
@@ -24,12 +24,12 @@ use super::backend::{
 };
 
 /// How one supervised session ended, combining the agent's process
-/// outcome with the confluence engine's authoritative task state.
+/// outcome with the design engine's authoritative task state.
 #[derive(Debug, Clone)]
 pub struct SessionOutcome {
     pub task: TaskId,
 
-    /// The confluence task state after the session — the authoritative
+    /// The design task state after the session — the authoritative
     /// architectural outcome (§91).
     pub task_state: TaskState,
 
@@ -70,10 +70,10 @@ impl SessionOutcome {
     }
 }
 
-/// Drives backends and confluence tasks together.
+/// Drives backends and design tasks together.
 #[derive(Clone)]
 pub struct Supervisor {
-    engine: ConfluenceEngine,
+    engine: DesignEngine,
     backend: Arc<dyn AgentBackend>,
     mcp_url: String,
     repo: Option<PathBuf>,
@@ -82,7 +82,7 @@ pub struct Supervisor {
 
 impl Supervisor {
     pub fn new(
-        engine: ConfluenceEngine,
+        engine: DesignEngine,
         backend: Arc<dyn AgentBackend>,
         mcp_url: impl Into<String>,
         repo: Option<PathBuf>,
@@ -150,7 +150,7 @@ impl Supervisor {
                     session: None,
                     final_message: Some(format!("backend error: {error}")),
                     usage: Default::default(),
-                    backend: crate::confluence::AgentBackendMetadata {
+                    backend: crate::design::AgentBackendMetadata {
                         name: self.backend.name().to_string(),
                         version: None,
                         session: None,

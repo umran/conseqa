@@ -2,7 +2,7 @@
 //!
 //! A task is permanently tied to one snapshot revision, one agent
 //! session, one read tracker, and one write scope (§17 of the
-//! confluence spec). An invalidated task never runs again — its
+//! harness spec). An invalidated task never runs again — its
 //! replacement is a new task in a fresh agent session, because stale
 //! semantic facts may remain latent inside the old conversation
 //! (§2.6).
@@ -407,7 +407,7 @@ impl fmt::Display for DependencyResolution {
 #[cfg(test)]
 mod tests {
     use super::{WriteGrant, WriteScope};
-    use crate::confluence::patch::Mutation;
+    use crate::design::patch::Mutation;
     use crate::spec::{Id, OutboxDispatch, OutboxOrdering, OutboxPartitioning, OutboxRuntime};
 
     // The topology author's grant must cover every L1 mutation. The

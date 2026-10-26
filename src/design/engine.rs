@@ -1,4 +1,4 @@
-//! The confluence engine: pinned-snapshot reads, tracked observations,
+//! The design engine: pinned-snapshot reads, tracked observations,
 //! and the serializable commit gate.
 //!
 //! Reads are lock-free on the hot path — task auth, `Arc` snapshot
@@ -10,7 +10,7 @@
 //!
 //! A project's files are its source of truth, and they can change from
 //! outside the engine — a hand edit, a checkout, a pull. Before each
-//! commit, and whenever a client asks ([`ConfluenceEngine::sync_with_disk`]),
+//! commit, and whenever a client asks ([`DesignEngine::sync_with_disk`]),
 //! the engine adopts such a change as a revision of its own, under the
 //! same writer lock the commit worker holds, so the head still has one
 //! writer at a time.
@@ -254,7 +254,7 @@ struct EngineInner {
     store: ProjectStore,
 
     /// Held by whoever writes the head: the commit worker, for each
-    /// commit, and [`ConfluenceEngine::sync_with_disk`], adopting an
+    /// commit, and [`DesignEngine::sync_with_disk`], adopting an
     /// outside change.
     writer: Mutex<()>,
 
@@ -272,17 +272,17 @@ struct QueuedCommit {
     respond: oneshot::Sender<Result<CommitReceipt, CommitRejection>>,
 }
 
-/// Handle to one confluence engine. Cheap to clone; when every clone
+/// Handle to one design engine. Cheap to clone; when every clone
 /// drops, the commit sequencer drains and exits.
 #[derive(Clone)]
-pub struct ConfluenceEngine {
+pub struct DesignEngine {
     inner: Arc<EngineInner>,
     commits: mpsc::Sender<QueuedCommit>,
 }
 
-impl ConfluenceEngine {
+impl DesignEngine {
     /// Whether two handles drive the same engine.
-    pub fn same_engine(&self, other: &ConfluenceEngine) -> bool {
+    pub fn same_engine(&self, other: &DesignEngine) -> bool {
         Arc::ptr_eq(&self.inner, &other.inner)
     }
 
@@ -451,31 +451,16 @@ impl ConfluenceEngine {
         write_scope: WriteScope,
         objective: impl Into<String>,
     ) -> Result<TaskHandle, EngineError> {
-        // Surface the run's natural-language prompt to the session, so
-        // task_context grounds the agent even before the human types.
-        let prompt_evidence = self
-            .inner
-            .head
-            .load()
-            .workspace
-            .run_meta
-            .prompt
-            .clone()
-            .map(|prompt| {
-                vec![PromptEvidence {
-                    source: EvidenceRef("run.prompt".to_string()),
-                    excerpt: prompt,
-                }]
-            })
-            .unwrap_or_default();
-
+        // An interactive session's requester is the human driving it,
+        // whose request is in their own conversation; the project
+        // records none.
         let spec = TaskSpec {
             id: TaskId::fresh(),
             kind: TaskKind::Decompose,
             objective: objective.into(),
             snapshot_revision: self.inner.head.load().revision,
             write_scope,
-            prompt_evidence,
+            prompt_evidence: Vec::new(),
             budget: TaskBudget::default(),
             completion_gate: TaskCompletionGate::Interactive,
         };

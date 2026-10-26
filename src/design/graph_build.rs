@@ -1,7 +1,7 @@
 //! Full semantic-graph construction from one workspace revision.
 //!
 //! The whole graph is rebuilt after every accepted commit (§14 of the
-//! confluence spec): architecture graphs are small, traversal is
+//! harness spec): architecture graphs are small, traversal is
 //! cheap, and a full rebuild cannot hold stale-index bugs. The
 //! entry point is [`build`]; an incremental builder can replace the
 //! implementation later without changing callers.

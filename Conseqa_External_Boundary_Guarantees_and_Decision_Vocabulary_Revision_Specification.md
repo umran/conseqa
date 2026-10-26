@@ -407,7 +407,7 @@ Rewrite the `dsl_reference` worked example in `mcp.rs` wherever it shows the old
 
 # 25. Tests
 
-`tests/confluence_analysis.rs`, all through the commit gate:
+`tests/design_analysis.rs`, all through the commit gate:
 
 **`present`** — presence/absence over an optional field; nested optional-segment absence; `not(present)`; replay from a replay-stable triggering payload (the `notify_gallery_published` shape flips `unknown → proven`, with the `condition: unspecified` variant as the unproven regression pair); `eq` with left/right/both absent; selector `eq` against an absent stored optional; `present` over a required path stays valid and emits only `RedundantPresenceCheck`.
 
@@ -417,9 +417,9 @@ Rewrite the `dsl_reference` worked example in `mcp.rs` wherever it shows the old
 
 **Versioning** — exports lead with `dsl: 1`; `requirement_report` and `spec_status` carry `dsl: 1`; the version probe refuses a document declaring `dsl: 2` and a document declaring none, each with its named error; a patch envelope declaring a mismatched `dsl` is refused with `DslVersionMismatch` before shape validation; an absent patch `dsl` is accepted.
 
-**Server awareness** (`confluence_mcp` / `confluence_stdio`) — the initialize handshake's instructions state `dsl: 1` for both the worker and interactive backings; `Implementation.version` still reports the crate build, not the DSL version (the axes stay distinct); `dsl_guide` with no topic and `dsl_reference` lead with `dsl: 1` with no project open; initialize is never refused on a version axis.
+**Server awareness** (`design_mcp` / `design_stdio`) — the initialize handshake's instructions state `dsl: 1` for both the worker and interactive backings; `Implementation.version` still reports the crate build, not the DSL version (the axes stay distinct); `dsl_guide` with no topic and `dsl_reference` lead with `dsl: 1` with no project open; initialize is never refused on a version axis.
 
-`confluence_mcp` / `confluence_stdio`: one patch round-trip exercising the new external surface and `present`. Persistence: a format-2 database refuses to open with `FormatMismatch`.
+`design_mcp` / `design_stdio`: one patch round-trip exercising the new external surface and `present`. Persistence: a format-2 database refuses to open with `FormatMismatch`.
 
 # 26. Model re-authoring (pixieset-clone)
 

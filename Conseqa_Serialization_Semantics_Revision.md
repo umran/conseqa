@@ -48,7 +48,7 @@ SerializedBy(K)
 
 provided the lock key is established to be the same logical value as the serialization-requirement key.
 
-The primitive asserts the abstract exclusion guarantee, not its mechanism. PostgreSQL advisory locks, distributed mutexes, fenced lock services, etc. are Confluence realization concerns.
+The primitive asserts the abstract exclusion guarantee, not its mechanism. PostgreSQL advisory locks, distributed mutexes, fenced lock services, etc. are Design realization concerns.
 
 `InvocationLock` does not establish invocation ordering. In particular, it makes no FIFO acquisition guarantee.
 

@@ -27,7 +27,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use crate::confluence::{AgentBackendMetadata, ConfluenceEngine, TaskId, TaskKind};
+use crate::design::{AgentBackendMetadata, DesignEngine, TaskId, TaskKind};
 use crate::harness::backend::{
     AgentBackend, AgentBackendError, AgentEvent, AgentEventSink, AgentExit, AgentExitStatus,
     AgentHandle, AgentInvocation, AgentUsage, Escalation, SYSTEM_ONE_EXECUTOR as BACKEND_NAME,
@@ -114,7 +114,7 @@ impl Abstention {
 /// What a builder needs: the engine, under one task's capability, and
 /// a decider.
 pub struct BuildContext<'a> {
-    pub engine: &'a ConfluenceEngine,
+    pub engine: &'a DesignEngine,
     pub decider: &'a dyn Decider,
     pub task: TaskId,
 }
@@ -140,7 +140,7 @@ pub struct SystemOnePolicy {
 /// An [`AgentBackend`] that runs enabled task kinds in process and
 /// everything else — and every abstention — on its fallback.
 pub struct SystemOneBackend {
-    engine: ConfluenceEngine,
+    engine: DesignEngine,
     decider: Arc<dyn Decider>,
     kinds: Vec<TaskKind>,
     policy: SystemOnePolicy,
@@ -152,7 +152,7 @@ impl SystemOneBackend {
     /// `kinds` are the task kinds attempted in process; a kind with no
     /// builder is ignored.
     pub fn new(
-        engine: ConfluenceEngine,
+        engine: DesignEngine,
         decider: Arc<dyn Decider>,
         kinds: impl IntoIterator<Item = TaskKind>,
         fallback: Arc<dyn AgentBackend>,

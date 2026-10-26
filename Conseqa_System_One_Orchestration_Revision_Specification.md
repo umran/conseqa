@@ -4,13 +4,13 @@
 **DSL contract:** unchanged (`DSL_VERSION = 4`)  
 **Report format:** unchanged (`FORMAT = 7`)  
 **Persistence format:** unchanged (`FORMAT = 6`)  
-**Amends:** `CONSEQA_AGENT_CONFLUENCE_HARNESS_IMPLEMENTATION_SPEC.md` §40, §44, §50, §55, §74.1, §74.2, §87, §88
+**Amends:** `CONSEQA_AGENT_DESIGN_HARNESS_IMPLEMENTATION_SPEC.md` §40, §44, §50, §55, §74.1, §74.2, §87, §88
 
 ## 1. Purpose
 
 This revision does two things.
 
-First, it brings the confluence MCP surface, its embedded documentation, and the harness specification into agreement with DSL v4: transaction-level serializability and ordering, and an L1 that describes placement, transport and capacity and proves no transaction property.
+First, it brings the design MCP surface, its embedded documentation, and the harness specification into agreement with DSL v4: transaction-level serializability and ordering, and an L1 that describes placement, transport and capacity and proves no transaction property.
 
 Second, it moves authoring decisions out of opaque LLM agent sessions and into code, wherever the decision space is closed. Code owns the control flow. A *System One* model answers narrow closed-set questions. A generative model supplies open-set content and handles what the first two decline. The analyzer remains the only authority on correctness.
 
@@ -87,7 +87,7 @@ Conseqa is unusually suited to this:
 serialization, ordering, idempotency, result_replay, recoverability
 ```
 
-`property_matches` (`src/confluence/engine.rs`) accepts:
+`property_matches` (`src/design/engine.rs`) accepts:
 
 ```text
 transaction_serializability, transaction_ordering, idempotency, result_replay, recoverability
@@ -120,7 +120,7 @@ There is no alias for the v3 names.
 
 DSL v4 moved serializability and ordering requirements onto `Transaction.requirements`, inside the operation program.
 
-`adopt_requirement` (`src/confluence/commit.rs`) therefore writes the program:
+`adopt_requirement` (`src/design/commit.rs`) therefore writes the program:
 
 ```rust
 draft.program
@@ -129,7 +129,7 @@ draft.program
     .requirements.serializability.push(requirement)
 ```
 
-`Mutation::write_target` (`src/confluence/patch.rs`) still reports only:
+`Mutation::write_target` (`src/design/patch.rs`) still reports only:
 
 ```rust
 Self::ProposeRequirements { operation, .. } => SymbolKey::OperationRequirements(operation)
@@ -248,7 +248,7 @@ dsl_schema { kind?: <mutation kind> | <step kind> }
     -> the JSON Schema of that value, derived from the Rust type
 ```
 
-Spec types derive `schemars::JsonSchema` under the `confluence` feature only. The lean checker gains no dependency.
+Spec types derive `schemars::JsonSchema` under the `design` feature only. The lean checker gains no dependency.
 
 `coerce_stringified_json` is retained as tolerance.
 
@@ -260,8 +260,8 @@ The following are rewritten. None changes behaviour.
 
 | Location | Stale claim |
 | --- | --- |
-| `src/confluence/task.rs`, `shared_skeleton` doc | L1 exists to discharge serialization and ordering requirements |
-| `src/confluence/commit.rs`, skeleton diagnostics doc | L1 is authored once verification has said what it must discharge |
+| `src/design/task.rs`, `shared_skeleton` doc | L1 exists to discharge serialization and ordering requirements |
+| `src/design/commit.rs`, skeleton diagnostics doc | L1 is authored once verification has said what it must discharge |
 | `tests/harness_workflow.rs`, topology test doc | the runtime topology is authored to discharge unproven obligations |
 | harness spec §40 | `OperationSummary` carries `serialization` and `ordering` |
 | harness spec §74.1 | repair is partitioned by remedy layer, with a runtime partition |
@@ -477,7 +477,7 @@ Changing a spec's text bumps its version. The version is part of the replay key,
 
 ## 13.1 Run manifest
 
-`confluence-manifest.json` today records a task *count*. It gains `manifest_format: 2` and one record per logical task:
+`design-manifest.json` today records a task *count*. It gains `manifest_format: 2` and one record per logical task:
 
 ```text
 kind, operation?, executor (agent | system_one), backend,
@@ -529,13 +529,13 @@ The log is a run artifact. It is not persisted in the workspace store; the persi
 
 `AgentBackend` is documented as mapping a task to a provider session: implementations "never interpret Conseqa semantics".
 
-The test suite already contains the counterexample. `ScriptedBackend` is an in-process `AgentBackend` that holds a `ConfluenceEngine`, resolves the task token as a real MCP request would, and commits through the real engine, so that the OCC gate, analysis and invalidation behave normally.
+The test suite already contains the counterexample. `ScriptedBackend` is an in-process `AgentBackend` that holds a `DesignEngine`, resolves the task token as a real MCP request would, and commits through the real engine, so that the OCC gate, analysis and invalidation behave normally.
 
 ## 14.2 Revised
 
 ```rust
 pub struct SystemOneBackend {
-    engine: ConfluenceEngine,
+    engine: DesignEngine,
     decider: Arc<dyn Decider>,
     kinds: Vec<TaskKind>,                 // which task kinds are attempted in process
     policy: SystemOnePolicy,              // every builder's thresholds
@@ -983,10 +983,10 @@ src/harness/executors/
 ```
 
 ```toml
-system-one = ["confluence", "dep:reqwest"]
+system-one = ["design", "dep:reqwest"]
 ```
 
-`reqwest` becomes an optional dependency of this feature. The feature is on by default, so the harness CLI carries the `decider` commands; `--no-default-features --features confluence` and the lean checker still build without an HTTP client.
+`reqwest` becomes an optional dependency of this feature. The feature is on by default, so the harness CLI carries the `decider` commands; `--no-default-features --features design` and the lean checker still build without an HTTP client.
 
 ---
 
@@ -995,18 +995,18 @@ system-one = ["confluence", "dep:reqwest"]
 Contract refresh:
 
 ```text
-src/confluence/mcp.rs            family doc, DSL_REFERENCE, INTERACTIVE_INSTRUCTIONS, dsl_schema
-src/confluence/engine.rs         unknown family error
-src/confluence/patch.rs          conflict footprint
-src/confluence/read_set.rs       SearchSpec.targets
+src/design/mcp.rs            family doc, DSL_REFERENCE, INTERACTIVE_INSTRUCTIONS, dsl_schema
+src/design/engine.rs         unknown family error
+src/design/patch.rs          conflict footprint
+src/design/read_set.rs       SearchSpec.targets
 src/harness/scheduler.rs         footprint, task ledger
-src/confluence/task.rs           stale doc
-src/confluence/commit.rs         stale doc
+src/design/task.rs           stale doc
+src/design/commit.rs         stale doc
 src/harness/supervisor.rs        budget enforcement
 src/bin/harness/main.rs          default budget, decider flags
-src/bin/confluence/main.rs       decider flags
-src/spec/**                      JsonSchema derives, confluence feature only
-CONSEQA_AGENT_CONFLUENCE_HARNESS_IMPLEMENTATION_SPEC.md
+src/bin/design_mcp/main.rs   decider flags
+src/spec/**                      JsonSchema derives, design feature only
+CONSEQA_AGENT_DESIGN_HARNESS_IMPLEMENTATION_SPEC.md
 ```
 
 System One layer:
@@ -1014,9 +1014,9 @@ System One layer:
 ```text
 src/system_one/**                new
 src/harness/executors/**         new
-src/confluence/candidate.rs      new: CandidateVerdict, standing, regressions
-src/confluence/engine.rs         evaluate_candidate
-src/confluence/mcp.rs            suggest_requirements, suggest_remedies
+src/design/candidate.rs      new: CandidateVerdict, standing, regressions
+src/design/engine.rs         evaluate_candidate
+src/design/mcp.rs            suggest_requirements, suggest_remedies
 src/harness/backend.rs           AgentExit.escalation
 src/harness/workflow.rs          manifest format 2, closure-scoped repair tasks
 src/harness/task_prompt.rs       targeted obligation search, advisor hints
@@ -1029,7 +1029,7 @@ Cargo.toml                       system-one feature
 
 `DSL_VERSION`, report `FORMAT` and persistence `FORMAT` are unchanged.
 
-`confluence-manifest.json` gains `manifest_format: 2`. Its additions are additive.
+`design-manifest.json` gains `manifest_format: 2`. Its additions are additive.
 
 The MCP surface gains `dsl_schema`, `suggest_requirements` and `suggest_remedies`, and changes one behaviour: an unknown `requirement_report` family is an error.
 

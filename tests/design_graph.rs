@@ -1,10 +1,10 @@
-//! Symbol-graph tests (§99 of the confluence spec): fingerprint and
+//! Symbol-graph tests (§99 of the harness spec): fingerprint and
 //! version behavior, derived program symbols, edge derivation, reverse
 //! references, and canonical deterministic query results.
 
 use std::collections::BTreeMap;
 
-use conseqa::confluence::{
+use conseqa::design::{
     DraftOperation, EdgeKind, EffectRef, GraphQuery, OperationInterfaceDraft, ProvenanceRoot,
     QueryRow, RunId, RunMetadata, SymbolGraph, SymbolKey, WorkspaceState, graph_build, graph_query,
 };

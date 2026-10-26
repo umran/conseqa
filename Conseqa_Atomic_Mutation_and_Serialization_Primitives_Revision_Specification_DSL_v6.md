@@ -1503,7 +1503,7 @@ Infrastructure/database errors remain outside this logical rejection model.
 
 ---
 
-# 31. Confluence sketch compiler
+# 31. Design sketch compiler
 
 The sketch compiler currently generates `ValidateVersion` automatically for versioned single-record reads and later inserts `BumpVersion` for mutation.
 
@@ -1688,19 +1688,19 @@ with additional observed-state comparisons shown as guards.
 
 ---
 
-# 35. Confluence graph and reference extraction
+# 35. Design graph and reference extraction
 
 All exhaustive matches over `TransactionStep` must be updated.
 
 This includes at least:
 
 ```text
-src/confluence/patch.rs
-src/confluence/sketch.rs
-src/confluence/graph_build.rs
-src/confluence/graph_query.rs
-src/confluence/commit.rs
-src/confluence/mcp.rs
+src/design/patch.rs
+src/design/sketch.rs
+src/design/graph_build.rs
+src/design/graph_query.rs
+src/design/commit.rs
+src/design/mcp.rs
 ```
 
 `CompareAndSet` contributes:
@@ -2054,7 +2054,7 @@ Introduce conditional-mutation repair only when an actual same-instance mutation
 
 Fall back to lock or serializable isolation when it does not.
 
-## 38.10 `src/confluence/sketch.rs`
+## 38.10 `src/design/sketch.rs`
 
 Remove automatic `ValidateVersion` generation.
 

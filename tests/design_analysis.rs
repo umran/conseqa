@@ -1,4 +1,4 @@
-//! Analysis integration tests (§102–§103 of the confluence spec):
+//! Analysis integration tests (§102–§103 of the harness spec):
 //! assembly gaps, revision-tagged analysis, coalescing, pinning,
 //! validation gating verification, summaries, reports, and tracked
 //! context bundles.
@@ -11,9 +11,9 @@ use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::time::Duration;
 
-use conseqa::confluence::{
+use conseqa::design::{
     AnalysisHub, AnalysisState, BundleSpec, CommitReceipt, CommitRejection, CommitRequest,
-    ConfluenceEngine, CreateTask, EventBus, Mutation, OperationInterfaceDraft, OperationReadMode,
+    DesignEngine, CreateTask, EventBus, Mutation, OperationInterfaceDraft, OperationReadMode,
     PatchId, RequirementFamily, RunId, RunMetadata, SpecPatch, SymbolKey, TaskBudget, TaskHandle,
     TaskKind, TaskState, WorkspaceSnapshot, WorkspaceState, WriteGrant, WriteScope,
 };
@@ -36,7 +36,7 @@ fn fixture_workspace() -> WorkspaceState {
     WorkspaceState::from_model(&model, RunMetadata::new(RunId("analysis-test".to_string())))
 }
 
-fn task(engine: &ConfluenceEngine, kind: TaskKind, scope: WriteScope) -> TaskHandle {
+fn task(engine: &DesignEngine, kind: TaskKind, scope: WriteScope) -> TaskHandle {
     engine
         .create_task(CreateTask {
             kind,
@@ -49,7 +49,7 @@ fn task(engine: &ConfluenceEngine, kind: TaskKind, scope: WriteScope) -> TaskHan
 }
 
 async fn submit(
-    engine: &ConfluenceEngine,
+    engine: &DesignEngine,
     task: &TaskHandle,
     mutations: Vec<Mutation>,
 ) -> Result<CommitReceipt, CommitRejection> {
@@ -65,7 +65,7 @@ async fn submit(
         .expect("the sequencer is running")
 }
 
-async fn ready(engine: &ConfluenceEngine, revision: Revision) -> AnalysisState {
+async fn ready(engine: &DesignEngine, revision: Revision) -> AnalysisState {
     tokio::time::timeout(Duration::from_secs(20), engine.analysis_ready(revision))
         .await
         .expect("analysis reaches a terminal state")
@@ -97,7 +97,7 @@ fn truncate_program(operation: &str) -> Mutation {
 
 #[tokio::test]
 async fn commits_publish_before_analysis_finishes() {
-    let engine = ConfluenceEngine::in_memory(fixture_workspace()).expect("engine starts");
+    let engine = DesignEngine::in_memory(fixture_workspace()).expect("engine starts");
 
     let a = task(
         &engine,
@@ -127,7 +127,7 @@ async fn commits_publish_before_analysis_finishes() {
 
 #[tokio::test]
 async fn analysis_is_tagged_per_revision_and_summaries_abstract_implementations() {
-    let engine = ConfluenceEngine::in_memory(fixture_workspace()).expect("engine starts");
+    let engine = DesignEngine::in_memory(fixture_workspace()).expect("engine starts");
 
     let first = engine.head_revision();
 
@@ -178,7 +178,7 @@ async fn draft_heads_report_precise_assembly_gaps_until_programs_arrive() {
 
     workspace.operations.insert(
         id("operation.noop"),
-        conseqa::confluence::DraftOperation::planned(OperationInterfaceDraft {
+        conseqa::design::DraftOperation::planned(OperationInterfaceDraft {
             service: id("service.checkout"),
             description: None,
             inputs: BTreeMap::new(),
@@ -186,7 +186,7 @@ async fn draft_heads_report_precise_assembly_gaps_until_programs_arrive() {
         }),
     );
 
-    let engine = ConfluenceEngine::in_memory(workspace).expect("engine starts");
+    let engine = DesignEngine::in_memory(workspace).expect("engine starts");
 
     let initial = engine.head_revision();
 
@@ -230,7 +230,7 @@ async fn validation_failure_prevents_verification() {
 
     workspace.schemas.remove(&id("schema.OrderCreated"));
 
-    let engine = ConfluenceEngine::in_memory(workspace).expect("engine starts");
+    let engine = DesignEngine::in_memory(workspace).expect("engine starts");
 
     let AnalysisState::ValidationFailed { errors } = ready(&engine, engine.head_revision()).await
     else {
@@ -303,7 +303,7 @@ async fn rapid_revisions_coalesce_but_pinned_ones_run() {
 
 #[tokio::test]
 async fn requirement_reports_serve_verdicts_and_guard_repairs() {
-    let engine = ConfluenceEngine::in_memory(fixture_workspace()).expect("engine starts");
+    let engine = DesignEngine::in_memory(fixture_workspace()).expect("engine starts");
 
     let head = engine.head_revision();
 
@@ -372,7 +372,7 @@ async fn requirement_reports_serve_verdicts_and_guard_repairs() {
 
 #[tokio::test]
 async fn proof_summaries_are_read_through_tracked_reads() {
-    let engine = ConfluenceEngine::in_memory(fixture_workspace()).expect("engine starts");
+    let engine = DesignEngine::in_memory(fixture_workspace()).expect("engine starts");
 
     ready(&engine, engine.head_revision()).await;
 
@@ -423,7 +423,7 @@ async fn proof_summaries_are_read_through_tracked_reads() {
 
 #[tokio::test]
 async fn context_bundles_slice_and_track() {
-    let engine = ConfluenceEngine::in_memory(fixture_workspace()).expect("engine starts");
+    let engine = DesignEngine::in_memory(fixture_workspace()).expect("engine starts");
 
     ready(&engine, engine.head_revision()).await;
 
@@ -523,7 +523,7 @@ async fn bundles_fall_back_to_interfaces_before_analysis_and_use_summaries_after
 
     workspace.operations.insert(
         id("operation.gateway"),
-        conseqa::confluence::DraftOperation::planned(OperationInterfaceDraft {
+        conseqa::design::DraftOperation::planned(OperationInterfaceDraft {
             service: id("service.checkout"),
             description: None,
             inputs: BTreeMap::from([(
@@ -567,7 +567,7 @@ async fn bundles_fall_back_to_interfaces_before_analysis_and_use_summaries_after
         draft.recompute_stage();
     }
 
-    let engine = ConfluenceEngine::in_memory(workspace).expect("engine starts");
+    let engine = DesignEngine::in_memory(workspace).expect("engine starts");
 
     // Before analysis is ready, the bundle carries the callee's
     // interface among the shared symbols.
@@ -631,7 +631,7 @@ async fn bundles_fall_back_to_interfaces_before_analysis_and_use_summaries_after
     );
 }
 
-fn create_order_program(engine: &ConfluenceEngine) -> OperationBlock {
+fn create_order_program(engine: &DesignEngine) -> OperationBlock {
     engine
         .head_snapshot()
         .workspace
@@ -651,7 +651,7 @@ fn create_order_program(engine: &ConfluenceEngine) -> OperationBlock {
 /// failing whole-model validation asynchronously.
 #[tokio::test]
 async fn a_broken_program_is_rejected_in_session_then_repaired() {
-    let engine = ConfluenceEngine::in_memory(fixture_workspace()).expect("engine starts");
+    let engine = DesignEngine::in_memory(fixture_workspace()).expect("engine starts");
 
     let valid = create_order_program(&engine);
 

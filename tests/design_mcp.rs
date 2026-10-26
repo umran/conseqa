@@ -3,8 +3,8 @@
 //! per-task bearer capabilities; a stale client's submission is
 //! rejected with restart guidance.
 
-use conseqa::confluence::{
-    ConfluenceEngine, CreateTask, RunId, RunMetadata, TaskBudget, TaskHandle, TaskKind,
+use conseqa::design::{
+    DesignEngine, CreateTask, RunId, RunMetadata, TaskBudget, TaskHandle, TaskKind,
     WorkspaceState, WriteScope, mcp,
 };
 use conseqa::spec::Id;
@@ -18,7 +18,7 @@ fn fixture_workspace() -> WorkspaceState {
     WorkspaceState::from_model(&model, RunMetadata::new(RunId("mcp-test".to_string())))
 }
 
-fn task(engine: &ConfluenceEngine, operation: &str) -> TaskHandle {
+fn task(engine: &DesignEngine, operation: &str) -> TaskHandle {
     engine
         .create_task(CreateTask {
             kind: TaskKind::OperationSynthesis,
@@ -221,7 +221,7 @@ async fn shared_skeleton_put_service_commits_over_mcp() {
     // workspace, a shared-skeleton task, and one put_service mutation
     // submitted through MCP. Existing tests only exercised
     // operation-scoped writes, so this path was untested.
-    let engine = ConfluenceEngine::in_memory(WorkspaceState::empty(RunMetadata::new(RunId(
+    let engine = DesignEngine::in_memory(WorkspaceState::empty(RunMetadata::new(RunId(
         "skeleton".to_string(),
     ))))
     .expect("engine starts");
@@ -320,7 +320,7 @@ async fn a_multi_project_server_isolates_projects_behind_one_api_key() {
     std::fs::create_dir_all(&checkout).expect("checkout repository");
     std::fs::create_dir_all(&billing).expect("billing repository");
 
-    let manager = Arc::new(conseqa::confluence::WorkspaceManager::new());
+    let manager = Arc::new(conseqa::design::WorkspaceManager::new());
     let api_key = "test-api-key-xyz".to_string();
 
     let server = mcp::serve_router(
@@ -352,21 +352,25 @@ async fn a_multi_project_server_isolates_projects_behind_one_api_key() {
         .await;
     assert!(is_error, "{missing}");
 
-    // Create "checkout", grounded by its prompt, and commit a service.
+    // Create "checkout" and commit a service.
     let (created, is_error) = client
-        .call(
-            "create_project",
-            serde_json::json!({"path": checkout, "prompt": "A checkout system."}),
-        )
+        .call("create_project", serde_json::json!({"path": checkout}))
         .await;
     assert!(!is_error, "{created}");
     assert_eq!(created["created"], true);
     assert_eq!(created["project"], "checkout", "named after its directory");
 
+    // What to design is a run's input, never project state.
     let (context, _) = client.call("task_context", serde_json::json!({})).await;
     assert_eq!(
-        context["prompt_evidence"][0]["excerpt"],
-        "A checkout system."
+        context["prompt_evidence"],
+        serde_json::json!([]),
+        "{context}"
+    );
+    assert!(
+        !std::fs::read_to_string(checkout.join(".conseqa/project.yaml"))
+            .expect("project.yaml")
+            .contains("prompt"),
     );
 
     let (committed, is_error) = client
@@ -454,7 +458,7 @@ async fn request_design_invokes_the_injected_launcher() {
 
     // A stand-in launcher records how many times the tool triggered it,
     // proving the MCP tool reaches the injected orchestrator without
-    // confluence depending on the harness.
+    // design depending on the harness.
     struct MockLauncher {
         calls: Arc<AtomicUsize>,
     }
@@ -462,8 +466,8 @@ async fn request_design_invokes_the_injected_launcher() {
     impl mcp::DesignLauncher for MockLauncher {
         fn launch(
             &self,
-            _engine: ConfluenceEngine,
-            _objective: Option<String>,
+            _engine: DesignEngine,
+            _input: mcp::DesignInput,
         ) -> Result<serde_json::Value, String> {
             self.calls.fetch_add(1, Ordering::SeqCst);
 
@@ -471,7 +475,7 @@ async fn request_design_invokes_the_injected_launcher() {
         }
     }
 
-    let engine = ConfluenceEngine::in_memory(WorkspaceState::empty(RunMetadata::new(RunId(
+    let engine = DesignEngine::in_memory(WorkspaceState::empty(RunMetadata::new(RunId(
         "design".to_string(),
     ))))
     .expect("engine starts");
@@ -495,7 +499,25 @@ async fn request_design_invokes_the_injected_launcher() {
 
     let mut client = McpClient::connect(&url, &handle.token.0).await;
 
-    let (result, is_error) = client.call("request_design", serde_json::json!({})).await;
+    // An empty project with no prompt gives a run nothing to design.
+    let (refused, is_error) = client.call("request_design", serde_json::json!({})).await;
+
+    assert!(is_error, "{refused}");
+    assert!(
+        refused["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("nothing to design"),
+        "{refused}"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+    let (result, is_error) = client
+        .call(
+            "request_design",
+            serde_json::json!({"prompt": "A ping service."}),
+        )
+        .await;
 
     assert!(!is_error, "{result}");
     assert_eq!(result["launched"], true);
@@ -507,9 +529,9 @@ async fn request_design_invokes_the_injected_launcher() {
 
 #[tokio::test]
 async fn request_design_reports_when_no_launcher_is_configured() {
-    // A plain confluence server (no orchestration backend) reports the
+    // A plain design server (no orchestration backend) reports the
     // feature is unavailable rather than erroring at the protocol level.
-    let engine = ConfluenceEngine::in_memory(WorkspaceState::empty(RunMetadata::new(RunId(
+    let engine = DesignEngine::in_memory(WorkspaceState::empty(RunMetadata::new(RunId(
         "no-design".to_string(),
     ))))
     .expect("engine starts");
@@ -546,7 +568,7 @@ async fn an_interactive_session_commits_repeatedly_under_one_bearer_token() {
     // The UI demo shape: one interactive session token, driven over MCP,
     // committing several patches in a row. The token rolls to a fresh
     // task after each commit, so the client's bearer value never changes.
-    let engine = ConfluenceEngine::in_memory(WorkspaceState::empty(RunMetadata::new(RunId(
+    let engine = DesignEngine::in_memory(WorkspaceState::empty(RunMetadata::new(RunId(
         "interactive".to_string(),
     ))))
     .expect("engine starts");
@@ -599,7 +621,7 @@ async fn a_malformed_patch_returns_actionable_feedback_not_a_protocol_error() {
     // The live decomposer read a malformed submit_patch response as a
     // "transport issue" because the handler returned a JSON-RPC error.
     // A bad argument must come back as a readable tool result instead.
-    let engine = ConfluenceEngine::in_memory(WorkspaceState::empty(RunMetadata::new(RunId(
+    let engine = DesignEngine::in_memory(WorkspaceState::empty(RunMetadata::new(RunId(
         "malformed".to_string(),
     ))))
     .expect("engine starts");
@@ -686,7 +708,7 @@ async fn a_malformed_patch_returns_actionable_feedback_not_a_protocol_error() {
 
 #[tokio::test]
 async fn two_mcp_clients_read_pinned_snapshots_and_commit_safely() {
-    let engine = ConfluenceEngine::in_memory(fixture_workspace()).expect("engine starts");
+    let engine = DesignEngine::in_memory(fixture_workspace()).expect("engine starts");
 
     let server = mcp::serve(engine.clone(), "127.0.0.1:0".parse().expect("bind addr"))
         .await
@@ -757,7 +779,7 @@ async fn two_mcp_clients_read_pinned_snapshots_and_commit_safely() {
 
 #[tokio::test]
 async fn a_stale_client_is_rejected_with_restart_guidance() {
-    let engine = ConfluenceEngine::in_memory(fixture_workspace()).expect("engine starts");
+    let engine = DesignEngine::in_memory(fixture_workspace()).expect("engine starts");
 
     let server = mcp::serve(engine.clone(), "127.0.0.1:0".parse().expect("bind addr"))
         .await
@@ -836,7 +858,7 @@ async fn a_stale_client_is_rejected_with_restart_guidance() {
 
 #[tokio::test]
 async fn an_unknown_capability_is_refused() {
-    let engine = ConfluenceEngine::in_memory(fixture_workspace()).expect("engine starts");
+    let engine = DesignEngine::in_memory(fixture_workspace()).expect("engine starts");
 
     let server = mcp::serve(engine.clone(), "127.0.0.1:0".parse().expect("bind addr"))
         .await
@@ -872,7 +894,7 @@ async fn an_unknown_capability_is_refused() {
 /// so an agent never needs the crate's source to author or deliver.
 #[tokio::test]
 async fn status_export_and_guide_serve_the_authoring_loop() {
-    let engine = ConfluenceEngine::in_memory(fixture_workspace()).expect("engine starts");
+    let engine = DesignEngine::in_memory(fixture_workspace()).expect("engine starts");
 
     let server = mcp::serve(engine.clone(), "127.0.0.1:0".parse().expect("bind addr"))
         .await
@@ -998,8 +1020,8 @@ async fn request_design_refuses_a_skeleton_that_is_not_ready() {
     impl mcp::DesignLauncher for CountingLauncher {
         fn launch(
             &self,
-            _engine: ConfluenceEngine,
-            _objective: Option<String>,
+            _engine: DesignEngine,
+            _input: mcp::DesignInput,
         ) -> Result<serde_json::Value, String> {
             self.calls.fetch_add(1, Ordering::SeqCst);
 
@@ -1016,7 +1038,7 @@ async fn request_design_refuses_a_skeleton_that_is_not_ready() {
         .schemas
         .remove(&Id("schema.CreateOrderRequest".to_string()));
 
-    let engine = ConfluenceEngine::in_memory(workspace).expect("engine starts");
+    let engine = DesignEngine::in_memory(workspace).expect("engine starts");
 
     let calls = Arc::new(AtomicUsize::new(0));
     let launcher = Arc::new(CountingLauncher {
@@ -1078,8 +1100,8 @@ async fn a_ready_skeleton_launches_and_names_its_operations() {
     impl mcp::DesignLauncher for OkLauncher {
         fn launch(
             &self,
-            _engine: ConfluenceEngine,
-            _objective: Option<String>,
+            _engine: DesignEngine,
+            _input: mcp::DesignInput,
         ) -> Result<serde_json::Value, String> {
             Ok(serde_json::json!({"launched": true}))
         }
@@ -1095,7 +1117,7 @@ async fn a_ready_skeleton_launches_and_names_its_operations() {
         .expect("the fixture declares create_order")
         .program = None;
 
-    let engine = ConfluenceEngine::in_memory(workspace).expect("engine starts");
+    let engine = DesignEngine::in_memory(workspace).expect("engine starts");
 
     let router = mcp::router_with_launcher(engine.clone(), Arc::new(OkLauncher));
 
@@ -1143,8 +1165,8 @@ async fn await_design_blocks_until_the_run_finishes() {
     impl mcp::DesignLauncher for FinishingLauncher {
         fn launch(
             &self,
-            _engine: ConfluenceEngine,
-            _objective: Option<String>,
+            _engine: DesignEngine,
+            _input: mcp::DesignInput,
         ) -> Result<serde_json::Value, String> {
             Ok(serde_json::json!({"launched": true}))
         }
@@ -1164,7 +1186,7 @@ async fn await_design_blocks_until_the_run_finishes() {
     }
 
     for (finish_after, wait_secs, finished) in [(3, 5, true), (usize::MAX, 1, false)] {
-        let engine = ConfluenceEngine::in_memory(fixture_workspace()).expect("engine starts");
+        let engine = DesignEngine::in_memory(fixture_workspace()).expect("engine starts");
 
         let launcher = Arc::new(FinishingLauncher {
             polls: AtomicUsize::new(0),
@@ -1200,27 +1222,27 @@ async fn await_design_blocks_until_the_run_finishes() {
     }
 }
 
-/// The fanout hand-off an interactive agent depends on: its objective
-/// reaches the orchestrator, and while workers are committing,
+/// The fanout hand-off an interactive agent depends on: its prompt and
+/// objective reach the orchestrator, and while workers are committing,
 /// spec_status reports the run rather than a verdict read off a head
 /// that is still moving — so the agent polls instead of synthesizing
 /// operations serially or patching into a live run.
 #[tokio::test]
-async fn spec_status_reports_a_running_design_and_passes_the_objective() {
+async fn spec_status_reports_a_running_design_and_passes_the_prompt_and_objective() {
     use std::sync::Arc;
     use std::sync::Mutex;
 
     struct MockLauncher {
-        objectives: Arc<Mutex<Vec<Option<String>>>>,
+        inputs: Arc<Mutex<Vec<mcp::DesignInput>>>,
     }
 
     impl mcp::DesignLauncher for MockLauncher {
         fn launch(
             &self,
-            _engine: ConfluenceEngine,
-            objective: Option<String>,
+            _engine: DesignEngine,
+            input: mcp::DesignInput,
         ) -> Result<serde_json::Value, String> {
-            self.objectives.lock().expect("lock").push(objective);
+            self.inputs.lock().expect("lock").push(input);
 
             Ok(serde_json::json!({"launched": true}))
         }
@@ -1231,11 +1253,11 @@ async fn spec_status_reports_a_running_design_and_passes_the_objective() {
         }
     }
 
-    let engine = ConfluenceEngine::in_memory(fixture_workspace()).expect("engine starts");
+    let engine = DesignEngine::in_memory(fixture_workspace()).expect("engine starts");
 
-    let objectives = Arc::new(Mutex::new(Vec::new()));
+    let inputs = Arc::new(Mutex::new(Vec::new()));
     let launcher = Arc::new(MockLauncher {
-        objectives: Arc::clone(&objectives),
+        inputs: Arc::clone(&inputs),
     });
 
     let router = mcp::router_with_launcher(engine.clone(), launcher);
@@ -1255,16 +1277,29 @@ async fn spec_status_reports_a_running_design_and_passes_the_objective() {
     let (launched, is_error) = client
         .call(
             "request_design",
-            serde_json::json!({"objective": "prioritize the checkout path"}),
+            serde_json::json!({
+                "prompt": "A flash-sale checkout.",
+                "objective": "prioritize the checkout path",
+            }),
         )
         .await;
 
     assert!(!is_error, "{launched}");
-    assert_eq!(
-        objectives.lock().expect("lock").as_slice(),
-        [Some("prioritize the checkout path".to_string())],
-        "the caller's objective reaches the orchestrator"
-    );
+    {
+        let inputs = inputs.lock().expect("lock");
+
+        assert_eq!(inputs.len(), 1, "{inputs:?}");
+        assert_eq!(
+            inputs[0].prompt.as_deref(),
+            Some("A flash-sale checkout."),
+            "the caller's prompt reaches the orchestrator"
+        );
+        assert_eq!(
+            inputs[0].objective.as_deref(),
+            Some("prioritize the checkout path"),
+            "the caller's objective reaches the orchestrator"
+        );
+    }
 
     let (status, is_error) = client.call("spec_status", serde_json::json!({})).await;
 
@@ -1284,7 +1319,7 @@ async fn spec_status_reports_a_running_design_and_passes_the_objective() {
 /// boundary, where a stale authored claim actually meets the server.
 #[tokio::test]
 async fn the_server_and_its_artifacts_declare_the_dsl_contract_version() {
-    let engine = ConfluenceEngine::in_memory(fixture_workspace()).expect("engine starts");
+    let engine = DesignEngine::in_memory(fixture_workspace()).expect("engine starts");
 
     let server = mcp::serve(engine.clone(), "127.0.0.1:0".parse().expect("bind addr"))
         .await

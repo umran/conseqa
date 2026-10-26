@@ -1,6 +1,6 @@
 //! Operation proof summaries: the deterministic derived abstraction
 //! downstream agents read instead of callee internals (§40–§41 of the
-//! confluence spec).
+//! harness spec).
 //!
 //! A summary carries the operation's caller-facing contracts and one
 //! line per declared requirement with its verdict. `summary_hash` is

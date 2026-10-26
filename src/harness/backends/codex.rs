@@ -1,8 +1,8 @@
-//! The Codex backend (§58 of the confluence spec).
+//! The Codex backend (§58 of the harness spec).
 //!
 //! Launches `codex exec --json --ephemeral --sandbox read-only` with
 //! one-shot `-c` config overrides pointing its `conseqa` MCP server at
-//! the confluence endpoint, the task token supplied through a
+//! the design endpoint, the task token supplied through a
 //! per-server environment variable. CLI overrides are used rather than
 //! editing the user's repository. On invalidation the harness
 //! terminates the process and spawns a fresh session (§58.1).
@@ -14,7 +14,7 @@
 
 use async_trait::async_trait;
 
-use crate::confluence::AgentBackendMetadata;
+use crate::design::AgentBackendMetadata;
 use crate::harness::backend::{
     AgentBackend, AgentBackendError, AgentEvent, AgentEventSink, AgentExit, AgentHandle,
     AgentInvocation, AgentUsage,

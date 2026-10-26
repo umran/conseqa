@@ -1,4 +1,4 @@
-//! Multiple confluence projects hosted by one server.
+//! Multiple design projects hosted by one server.
 //!
 //! A project is a directory holding a `.conseqa/` (see
 //! [`super::store`]), so a single server can serve any project on the
@@ -13,8 +13,8 @@ use rustc_hash::FxHashMap;
 
 use crate::spec::Revision;
 
-use super::engine::{ConfluenceEngine, EngineError};
-use super::store::{ProjectStore, StoreError};
+use super::engine::{DesignEngine, EngineError};
+use super::store::{ProjectStore, StoreError, default_project_name};
 use super::workspace::{RunId, RunMetadata, WorkspaceState};
 
 #[derive(Debug, thiserror::Error)]
@@ -29,10 +29,10 @@ pub enum ProjectError {
     Engine(#[from] EngineError),
 }
 
-/// Hosts one lazily-opened confluence engine per project directory.
+/// Hosts one lazily-opened design engine per project directory.
 #[derive(Default)]
 pub struct WorkspaceManager {
-    projects: RwLock<FxHashMap<PathBuf, ConfluenceEngine>>,
+    projects: RwLock<FxHashMap<PathBuf, DesignEngine>>,
 }
 
 impl WorkspaceManager {
@@ -42,7 +42,7 @@ impl WorkspaceManager {
 
     /// Opens the project at or above `path`. Cached after first open,
     /// so the same engine is returned for the life of the server.
-    pub fn open(&self, path: &Path) -> Result<ConfluenceEngine, ProjectError> {
+    pub fn open(&self, path: &Path) -> Result<DesignEngine, ProjectError> {
         let project = ProjectStore::discover(path)
             .ok_or_else(|| StoreError::NotAProject(path.to_path_buf()))?;
 
@@ -57,7 +57,7 @@ impl WorkspaceManager {
             return Ok(engine.clone());
         }
 
-        let engine = ConfluenceEngine::open_project(&project)?;
+        let engine = DesignEngine::open_project(&project)?;
 
         guard.insert(project, engine.clone());
 
@@ -65,35 +65,19 @@ impl WorkspaceManager {
     }
 
     /// Creates a project in `path`, named `name` (the directory's name
-    /// when omitted) and seeded with `prompt`.
-    pub fn create(
-        &self,
-        path: &Path,
-        name: Option<String>,
-        prompt: Option<String>,
-    ) -> Result<ConfluenceEngine, ProjectError> {
-        let name = match name {
-            Some(name) => name,
-            None => path
-                .canonicalize()
-                .ok()
-                .and_then(|dir| {
-                    dir.file_name()
-                        .map(|name| name.to_string_lossy().into_owned())
-                })
-                .unwrap_or_else(|| "project".to_string()),
-        };
+    /// when omitted).
+    pub fn create(&self, path: &Path, name: Option<String>) -> Result<DesignEngine, ProjectError> {
+        let name = name.unwrap_or_else(|| default_project_name(path));
 
         if name.trim().is_empty() || name.contains('\n') {
             return Err(ProjectError::InvalidName(name));
         }
 
-        let mut run_meta = RunMetadata::new(RunId(name));
-        run_meta.prompt = prompt;
+        let run_meta = RunMetadata::new(RunId(name));
 
         let mut guard = self.projects.write();
 
-        let engine = ConfluenceEngine::create_project(path, WorkspaceState::empty(run_meta))?;
+        let engine = DesignEngine::create_project(path, WorkspaceState::empty(run_meta))?;
 
         if let Some(project) = engine.project_dir() {
             guard.insert(project, engine.clone());
@@ -118,7 +102,7 @@ impl WorkspaceManager {
 
     /// Every currently-open engine — the set worker capability tokens
     /// are searched against.
-    pub fn open_engines(&self) -> Vec<ConfluenceEngine> {
+    pub fn open_engines(&self) -> Vec<DesignEngine> {
         self.projects.read().values().cloned().collect()
     }
 }
@@ -132,7 +116,7 @@ pub struct ProjectInfo {
 }
 
 impl ProjectInfo {
-    pub fn of(path: PathBuf, engine: &ConfluenceEngine) -> Self {
+    pub fn of(path: PathBuf, engine: &DesignEngine) -> Self {
         let head = engine.head_snapshot();
 
         Self {

@@ -1,30 +1,30 @@
-//! Opt-in live smoke tests (§106 of the confluence spec).
+//! Opt-in live smoke tests (§106 of the harness spec).
 //!
-//! These launch a real coding agent against a local confluence server
+//! These launch a real coding agent against a local design server
 //! and incur model cost, so they run only when explicitly enabled:
 //!
 //! ```text
-//! CONSEQA_TEST_CLAUDE=1 cargo test --features confluence --test harness_live
-//! CONSEQA_TEST_CODEX=1  cargo test --features confluence --test harness_live
+//! CONSEQA_TEST_CLAUDE=1 cargo test --features design --test harness_live
+//! CONSEQA_TEST_CODEX=1  cargo test --features design --test harness_live
 //! ```
 //!
 //! Kept small and outside default CI. The agent is given one trivial
 //! decomposition task and the test asserts only that a real session
-//! connected to the MCP endpoint and reached a terminal confluence
+//! connected to the MCP endpoint and reached a terminal design
 //! state — never a specific architecture, which depends on the model.
 
 use std::sync::Arc;
 use std::time::Duration;
 
-use conseqa::confluence::{
-    BundleSpec, ConfluenceEngine, RunId, RunMetadata, WorkspaceState, WriteScope, mcp,
+use conseqa::design::{
+    BundleSpec, DesignEngine, RunId, RunMetadata, WorkspaceState, WriteScope, mcp,
 };
 use conseqa::harness::backend::InvocationBudget;
 use conseqa::harness::backends::{ClaudeCliBackend, CodexCliBackend};
 use conseqa::harness::{
     AgentBackend, LogicalTask, Scheduler, SchedulerPolicy, Supervisor,
 };
-use conseqa::confluence::TaskKind;
+use conseqa::design::TaskKind;
 
 fn enabled(var: &str) -> bool {
     std::env::var(var).map(|value| value == "1").unwrap_or(false)
@@ -41,7 +41,7 @@ async fn run_live(backend: Arc<dyn AgentBackend>, label: &str) {
         .with_test_writer()
         .try_init();
 
-    let engine = ConfluenceEngine::in_memory(WorkspaceState::empty(RunMetadata::new(RunId(
+    let engine = DesignEngine::in_memory(WorkspaceState::empty(RunMetadata::new(RunId(
         format!("live-{label}"),
     ))))
     .expect("engine starts");
@@ -77,7 +77,7 @@ async fn run_live(backend: Arc<dyn AgentBackend>, label: &str) {
 
     // A concrete task with a definite engine-side effect: creating one
     // service through submit_patch. The assertion below proves a real
-    // agent process reached through MCP into the confluence engine and
+    // agent process reached through MCP into the design engine and
     // committed — not merely that a subprocess started.
     let run = scheduler
         .run(&LogicalTask {
@@ -112,7 +112,7 @@ async fn run_live(backend: Arc<dyn AgentBackend>, label: &str) {
         attempt.agent_exit
     );
 
-    // The definitive end-to-end proof: the agent reached the confluence
+    // The definitive end-to-end proof: the agent reached the design
     // engine over MCP and committed, advancing the head past the empty
     // initial revision, and its service is in the workspace.
     assert!(

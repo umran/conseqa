@@ -3,7 +3,7 @@
 //! A dense custom representation rather than a generic graph
 //! framework: node kinds, edge kinds, and the hot queries are all
 //! known, and the graph is rebuilt whole after every accepted commit
-//! (§14 of the confluence spec), so simplicity beats generality.
+//! (§14 of the harness spec), so simplicity beats generality.
 
 use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};

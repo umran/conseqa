@@ -4,12 +4,12 @@ version = "0.1.0"
 edition = "2024"
 
 [features]
-default = ["confluence", "system-one"]
+default = ["design", "system-one"]
 
-# The agent-confluence layer: versioned draft workspaces, the semantic
+# The agent-design layer: versioned draft workspaces, the semantic
 # symbol graph, the OCC commit engine, and the MCP surface. On by
-# default; `--no-default-features` still builds the lean checker.
-confluence = [
+# default; `--no-default-features` still builds the core library.
+design = [
     "dep:arc-swap",
     "dep:async-trait",
     "dep:axum",
@@ -37,10 +37,10 @@ confluence = [
 # The System One layer: typed closed-set decisions behind the `Decider`
 # trait, with the wire-format HTTP backend (the hosted service or any
 # local server that speaks the format), deterministic replay, and a
-# shadow comparator. On by default so the harness CLI carries the
-# `decider` commands; `--no-default-features --features confluence`
-# still builds without an HTTP client.
-system-one = ["confluence", "dep:reqwest"]
+# shadow comparator. On by default so design runs launched by the MCP
+# server can use a configured decider; `--no-default-features
+# --features design` still builds without an HTTP client.
+system-one = ["design", "dep:reqwest"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -91,36 +91,40 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 uuid = { version = "1", features = ["v4"] }
 
 [[test]]
-name = "confluence_graph"
-required-features = ["confluence"]
+name = "design_graph"
+required-features = ["design"]
 
 [[test]]
-name = "confluence_occ"
-required-features = ["confluence"]
+name = "design_occ"
+required-features = ["design"]
 
 [[test]]
-name = "confluence_mcp"
-required-features = ["confluence"]
+name = "design_mcp"
+required-features = ["design"]
 
 [[test]]
-name = "confluence_stdio"
-required-features = ["confluence"]
+name = "design_stdio"
+required-features = ["design"]
 
 [[test]]
-name = "confluence_analysis"
-required-features = ["confluence"]
+name = "conseqa_cli"
+required-features = ["design"]
+
+[[test]]
+name = "design_analysis"
+required-features = ["design"]
 
 [[test]]
 name = "harness_backends"
-required-features = ["confluence"]
+required-features = ["design"]
 
 [[test]]
 name = "harness_workflow"
-required-features = ["confluence"]
+required-features = ["design"]
 
 [[test]]
 name = "harness_live"
-required-features = ["confluence"]
+required-features = ["design"]
 
 [[test]]
 name = "system_one"
@@ -129,17 +133,9 @@ required-features = ["system-one"]
 [[bin]]
 name = "conseqa"
 path = "src/main.rs"
+required-features = ["design"]
 
 [[bin]]
-name = "conseqa-confluence"
-path = "src/bin/confluence/main.rs"
-required-features = ["confluence"]
-
-[[bin]]
-name = "conseqa-harness"
-path = "src/bin/harness/main.rs"
-required-features = ["confluence"]
-
-[[bin]]
-name = "conseqa-viz"
-path = "src/bin/viz/main.rs"
+name = "conseqa-design-mcp"
+path = "src/bin/design_mcp/main.rs"
+required-features = ["design"]

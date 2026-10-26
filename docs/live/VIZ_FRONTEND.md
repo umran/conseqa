@@ -1,7 +1,7 @@
-# conseqa-viz front end
+# Conseqa visualization front end
 
 React + TypeScript + Vite, styled with Tailwind CSS v4 and Cloudflare's
-Kumo design system. Consumes the page data `conseqa-viz` produces —
+Kumo design system. Consumes the page data the Rust visualization library produces —
 `window.CONSEQA` in the embedded build, `public/conseqa.json` in
 development.
 
@@ -15,8 +15,8 @@ npm run build    # typecheck + single-file bundle → dist/index.html
 `dist/index.html` is committed: the Rust binaries embed it with
 `include_str!`, so rebuild and commit it after changing the front end —
 and then `cargo build --release`, which is what actually puts the new
-bundle inside `conseqa-viz`, `conseqa-confluence` (its `export_spec`
-renders through the same code) and `conseqa-harness`. A running MCP
+bundle inside `conseqa` (its `viz` and `export` render) and the design
+MCP server (its `export_spec` renders through the same code). A running MCP
 server keeps the image it started with until it is restarted. See
 `docs/live/CONSEQA_VIZ.md` for the views, panels, and
 report format.

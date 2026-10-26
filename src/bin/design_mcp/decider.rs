@@ -1,6 +1,8 @@
-//! `conseqa-harness decider`: ask a System One decider directly, and
+//! `conseqa-design-mcp decider`: ask a System One decider directly, and
 //! vet a server before it is trusted (§11.2, §26 of the System One
-//! orchestration revision).
+//! orchestration revision). The daemon is what puts a decider to work,
+//! so the check that one is fit for it lives beside the flags that
+//! configure it.
 //!
 //! Both commands send only synthetic material — three made-up support
 //! messages — so neither puts a prompt or a specification on the wire.

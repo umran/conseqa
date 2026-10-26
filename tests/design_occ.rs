@@ -1,4 +1,4 @@
-//! OCC commit-engine tests (§100–§102 of the confluence spec):
+//! OCC commit-engine tests (§100–§102 of the harness spec):
 //! non-conflicting commits, read-write / write-write conflicts,
 //! phantoms, removed dependencies, unobserved references, duplicate
 //! submission, task invalidation, and draft workspace behavior.
@@ -8,8 +8,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use conseqa::confluence::{
-    CommitReceipt, CommitRejection, CommitRequest, ConfluenceEngine, CreateTask, EngineError,
+use conseqa::design::{
+    CommitReceipt, CommitRejection, CommitRequest, DesignEngine, CreateTask, EngineError,
     EngineEvent, GraphQuery, InvalidationCause, Mutation, OperationDraftStage,
     OperationInterfaceDraft, OperationReadMode, PatchId, PromptObligation, PromptObligationId,
     PromptObligationStatus, ProposalStatus, ProposedRequirement, RequirementOrigin,
@@ -42,11 +42,11 @@ fn fixture_workspace() -> WorkspaceState {
     WorkspaceState::from_model(&model, RunMetadata::new(RunId("occ-test".to_string())))
 }
 
-fn engine() -> ConfluenceEngine {
-    ConfluenceEngine::in_memory(fixture_workspace()).expect("engine starts")
+fn engine() -> DesignEngine {
+    DesignEngine::in_memory(fixture_workspace()).expect("engine starts")
 }
 
-fn task(engine: &ConfluenceEngine, kind: TaskKind, scope: WriteScope) -> TaskHandle {
+fn task(engine: &DesignEngine, kind: TaskKind, scope: WriteScope) -> TaskHandle {
     engine
         .create_task(CreateTask {
             kind,
@@ -59,7 +59,7 @@ fn task(engine: &ConfluenceEngine, kind: TaskKind, scope: WriteScope) -> TaskHan
 }
 
 fn submit(
-    engine: &ConfluenceEngine,
+    engine: &DesignEngine,
     task: &TaskHandle,
     mutations: Vec<Mutation>,
 ) -> Result<CommitReceipt, CommitRejection> {
@@ -109,7 +109,7 @@ fn probe_program(operation: &str, marker: u32) -> Mutation {
 
 /// Commits a patch through the current task in an interactive session's
 /// token chain, using that task's live pinned revision as the base.
-fn submit_session(engine: &ConfluenceEngine, token: &str, mutations: Vec<Mutation>) {
+fn submit_session(engine: &DesignEngine, token: &str, mutations: Vec<Mutation>) {
     let task = engine.resolve_token(token).expect("session token valid");
 
     let base_revision = engine
@@ -319,29 +319,12 @@ fn interactive_session_commits_repeatedly_under_one_token() {
 }
 
 #[test]
-fn an_interactive_session_surfaces_the_run_prompt() {
-    let mut run_meta = RunMetadata::new(RunId("prompted".to_string()));
-    run_meta.prompt = Some("Build a URL shortener.".to_string());
-
-    let engine = ConfluenceEngine::in_memory(WorkspaceState::empty(run_meta)).expect("engine");
-
-    let session = engine
-        .create_session(WriteScope::of([WriteGrant::All]), "build")
-        .expect("session");
-
-    let context = engine.task_context(session.id).expect("context");
-
-    assert_eq!(context.prompt_evidence.len(), 1);
-    assert_eq!(context.prompt_evidence[0].excerpt, "Build a URL shortener.");
-}
-
-#[test]
 fn an_interactive_session_builds_a_new_project_from_empty() {
     // The new-project flow: an empty workspace, an interactive session
     // with the full authoring grant, building an architecture across
     // commits — including authoring an operation it created earlier in
     // the same session, which a per-existing-operation scope could not.
-    let engine = ConfluenceEngine::in_memory(WorkspaceState::empty(RunMetadata::new(RunId(
+    let engine = DesignEngine::in_memory(WorkspaceState::empty(RunMetadata::new(RunId(
         "new-project".to_string(),
     ))))
     .expect("engine starts");
@@ -679,7 +662,7 @@ fn phantom_new_writer_invalidates_the_querying_task() {
 }
 
 async fn submit_async(
-    engine: &ConfluenceEngine,
+    engine: &DesignEngine,
     task: &TaskHandle,
     mutations: Vec<Mutation>,
 ) -> Result<CommitReceipt, CommitRejection> {
@@ -791,7 +774,7 @@ async fn a_candidate_that_unproves_a_requirement_reports_the_regression() {
 
     let model = conseqa::parser::yaml::parse(&source).expect("fixture parses");
 
-    let engine = ConfluenceEngine::in_memory(WorkspaceState::from_model(
+    let engine = DesignEngine::in_memory(WorkspaceState::from_model(
         &model,
         RunMetadata::new(RunId("regression-test".to_string())),
     ))
@@ -1777,7 +1760,7 @@ fn recovery_restores_the_head_and_invalidates_active_tasks() {
     let orphaned_task;
 
     {
-        let engine = ConfluenceEngine::open(&dir, fixture_workspace()).expect("engine opens");
+        let engine = DesignEngine::open(&dir, fixture_workspace()).expect("engine opens");
 
         let a = task(
             &engine,
@@ -1808,7 +1791,7 @@ fn recovery_restores_the_head_and_invalidates_active_tasks() {
         let mut attempt = 0;
 
         loop {
-            match ConfluenceEngine::open(&dir, fixture_workspace()) {
+            match DesignEngine::open(&dir, fixture_workspace()) {
                 Ok(engine) => break engine,
                 Err(_) if attempt < 50 => {
                     attempt += 1;
@@ -1844,12 +1827,12 @@ fn recovery_restores_the_head_and_invalidates_active_tasks() {
 }
 
 /// A project on disk, created from the fixture in a fresh directory.
-fn project() -> (std::path::PathBuf, ConfluenceEngine) {
+fn project() -> (std::path::PathBuf, DesignEngine) {
     let dir = std::env::temp_dir().join(format!("conseqa-occ-{}", Uuid::new_v4()));
     std::fs::create_dir_all(&dir).expect("project dir");
 
     let engine =
-        ConfluenceEngine::create_project(&dir, fixture_workspace()).expect("project created");
+        DesignEngine::create_project(&dir, fixture_workspace()).expect("project created");
 
     (dir, engine)
 }

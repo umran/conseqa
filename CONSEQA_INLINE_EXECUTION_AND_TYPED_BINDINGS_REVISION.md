@@ -1280,7 +1280,7 @@ Those cases expose exactly the execution-site ambiguity this revision removes.
 
 ---
 
-## 24. Impact on agent confluence
+## 24. Impact on agent design
 
 This revision should improve LLM architecture synthesis and patch merging.
 

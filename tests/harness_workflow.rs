@@ -1,7 +1,7 @@
-//! Full design-workflow test (§104, §107 phase 7 of the confluence
+//! Full design-workflow test (§104, §107 phase 7 of the design
 //! spec): prompt to validated Conseqa YAML with an all-adopted,
 //! all-proven requirement report — driven by a scripted in-process
-//! backend that performs real commits through the confluence engine,
+//! backend that performs real commits through the design engine,
 //! so the phase machine, OCC gate, analysis, and finalization are all
 //! exercised without a live coding agent.
 //!
@@ -21,8 +21,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use conseqa::confluence::{
-    AgentBackendMetadata, CommitRequest, ConfluenceEngine, Mutation, OperationInterfaceDraft,
+use conseqa::design::{
+    AgentBackendMetadata, CommitRequest, DesignEngine, Mutation, OperationInterfaceDraft,
     PatchId, PromptObligation, PromptObligationId, PromptObligationStatus, ProposedRequirement,
     RequirementOrigin, RequirementSubmission, RunId, RunMetadata, RunPolicy, SpecPatch,
     WorkspaceState,
@@ -55,14 +55,14 @@ type ScriptFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
 
 /// The scripted plan: given the engine and the invocation (whose kind
 /// selects the behavior), perform the task's commits.
-type ScriptFn = Arc<dyn Fn(ConfluenceEngine, AgentInvocation) -> ScriptFuture + Send + Sync>;
+type ScriptFn = Arc<dyn Fn(DesignEngine, AgentInvocation) -> ScriptFuture + Send + Sync>;
 
 /// An in-process backend that executes a fixed plan instead of
 /// launching a coding agent. It commits through the real engine, so
 /// the OCC gate, analysis, and invalidation all behave normally.
 #[derive(Clone)]
 struct ScriptedBackend {
-    engine: ConfluenceEngine,
+    engine: DesignEngine,
     script: ScriptFn,
 }
 
@@ -102,7 +102,7 @@ impl AgentBackend for ScriptedBackend {
     }
 }
 
-async fn commit(engine: &ConfluenceEngine, invocation: &AgentInvocation, mutations: Vec<Mutation>) {
+async fn commit(engine: &DesignEngine, invocation: &AgentInvocation, mutations: Vec<Mutation>) {
     let task = engine
         .resolve_token(&invocation.task_token)
         .expect("the task capability resolves");
@@ -203,7 +203,7 @@ fn success_script() -> ScriptFn {
                 .expect("token resolves");
 
             match invocation.kind {
-                conseqa::confluence::TaskKind::Decompose => {
+                conseqa::design::TaskKind::Decompose => {
                     commit(
                         &engine,
                         &invocation,
@@ -248,7 +248,7 @@ fn success_script() -> ScriptFn {
                 // after L0 has converged and requirement discovery has
                 // said what the runtime must discharge. The decomposer
                 // cannot write it, and no operation-scoped task can.
-                conseqa::confluence::TaskKind::TopologySynthesis => {
+                conseqa::design::TaskKind::TopologySynthesis => {
                     commit(
                         &engine,
                         &invocation,
@@ -281,7 +281,7 @@ fn success_script() -> ScriptFn {
                     .await;
                 }
 
-                conseqa::confluence::TaskKind::OperationSynthesis => {
+                conseqa::design::TaskKind::OperationSynthesis => {
                     // read-before-reference: the program references no
                     // external symbols (only its own input), so no
                     // extra reads are required beyond the bundle.
@@ -298,7 +298,7 @@ fn success_script() -> ScriptFn {
                     .await;
                 }
 
-                conseqa::confluence::TaskKind::RequirementDiscovery => {
+                conseqa::design::TaskKind::RequirementDiscovery => {
                     commit(
                         &engine,
                         &invocation,
@@ -345,7 +345,7 @@ fn incomplete_script() -> ScriptFn {
     Arc::new(|engine, invocation| {
         Box::pin(async move {
             match invocation.kind {
-                conseqa::confluence::TaskKind::Decompose => {
+                conseqa::design::TaskKind::Decompose => {
                     commit(
                         &engine,
                         &invocation,
@@ -390,7 +390,7 @@ fn incomplete_script() -> ScriptFn {
                 // after L0 has converged and requirement discovery has
                 // said what the runtime must discharge. The decomposer
                 // cannot write it, and no operation-scoped task can.
-                conseqa::confluence::TaskKind::TopologySynthesis => {
+                conseqa::design::TaskKind::TopologySynthesis => {
                     commit(
                         &engine,
                         &invocation,
@@ -423,7 +423,7 @@ fn incomplete_script() -> ScriptFn {
                     .await;
                 }
 
-                conseqa::confluence::TaskKind::OperationSynthesis => {
+                conseqa::design::TaskKind::OperationSynthesis => {
                     commit(
                         &engine,
                         &invocation,
@@ -435,7 +435,7 @@ fn incomplete_script() -> ScriptFn {
                     .await;
                 }
 
-                conseqa::confluence::TaskKind::RequirementDiscovery => {
+                conseqa::design::TaskKind::RequirementDiscovery => {
                     // A guaranteed-recoverability requirement: the echo
                     // program has no modeled retry driver, so it cannot
                     // be proven, and it is tied to the explicit
@@ -486,7 +486,7 @@ fn no_requirements_script() -> ScriptFn {
     Arc::new(|engine, invocation| {
         Box::pin(async move {
             match invocation.kind {
-                conseqa::confluence::TaskKind::Decompose => {
+                conseqa::design::TaskKind::Decompose => {
                     commit(
                         &engine,
                         &invocation,
@@ -518,7 +518,7 @@ fn no_requirements_script() -> ScriptFn {
                     .await;
                 }
 
-                conseqa::confluence::TaskKind::OperationSynthesis => {
+                conseqa::design::TaskKind::OperationSynthesis => {
                     commit(
                         &engine,
                         &invocation,
@@ -541,7 +541,7 @@ fn workflow(
     out_dir: PathBuf,
     script: ScriptFn,
     max_iterations: u32,
-) -> (Workflow, ConfluenceEngine) {
+) -> (Workflow, DesignEngine) {
     workflow_with_objective(out_dir, script, max_iterations, None)
 }
 
@@ -552,7 +552,7 @@ fn workflow_with_objective(
     script: ScriptFn,
     max_iterations: u32,
     objective: Option<String>,
-) -> (Workflow, ConfluenceEngine) {
+) -> (Workflow, DesignEngine) {
     workflow_over(out_dir, max_iterations, objective, |engine| {
         Arc::new(ScriptedBackend {
             engine: engine.clone(),
@@ -566,17 +566,16 @@ fn workflow_over(
     out_dir: PathBuf,
     max_iterations: u32,
     objective: Option<String>,
-    backend: impl FnOnce(&ConfluenceEngine) -> Arc<dyn AgentBackend>,
-) -> (Workflow, ConfluenceEngine) {
+    backend: impl FnOnce(&DesignEngine) -> Arc<dyn AgentBackend>,
+) -> (Workflow, DesignEngine) {
     let mut run_meta = RunMetadata::new(RunId("workflow-test".to_string()));
-    run_meta.prompt = Some("A ping service.".to_string());
     run_meta.policy = RunPolicy {
         strict_requirements: true,
         adopt_recommended: false,
     };
 
     let engine =
-        ConfluenceEngine::in_memory(WorkspaceState::empty(run_meta)).expect("engine starts");
+        DesignEngine::in_memory(WorkspaceState::empty(run_meta)).expect("engine starts");
 
     let backend = backend(&engine);
 
@@ -596,6 +595,7 @@ fn workflow_over(
             out_dir,
             analysis_timeout: Duration::from_secs(20),
             max_iterations,
+            prompt: Some("A ping service.".to_string()),
             objective,
         },
     );
@@ -621,7 +621,7 @@ async fn prompt_to_validated_model_with_all_requirements_proven() {
     // The finalized artifacts were written (§76).
     let yaml = out_dir.join("conseqa.yaml");
     let verification = out_dir.join("verification-report.json");
-    let manifest = out_dir.join("confluence-manifest.json");
+    let manifest = out_dir.join("design-manifest.json");
 
     assert!(yaml.exists());
     assert!(verification.exists());
@@ -674,7 +674,7 @@ async fn prompt_to_validated_model_with_all_requirements_proven() {
 async fn an_unmapped_obligation_is_discovered_despite_declared_requirements() {
     let out_dir = std::env::temp_dir().join(format!("conseqa-wf-{}", Uuid::new_v4()));
 
-    let seen: Arc<std::sync::Mutex<Vec<conseqa::confluence::TaskKind>>> =
+    let seen: Arc<std::sync::Mutex<Vec<conseqa::design::TaskKind>>> =
         Arc::new(std::sync::Mutex::new(Vec::new()));
 
     let inner = success_script();
@@ -691,10 +691,10 @@ async fn an_unmapped_obligation_is_discovered_despite_declared_requirements() {
 
             // An author declares the requirement right after the
             // program lands, without naming the obligation.
-            if kind == conseqa::confluence::TaskKind::OperationSynthesis {
+            if kind == conseqa::design::TaskKind::OperationSynthesis {
                 let author = engine
                     .create_session(
-                        conseqa::confluence::WriteScope::requirement_discovery(id(
+                        conseqa::design::WriteScope::requirement_discovery(id(
                             "operation.ping",
                         )),
                         "author",
@@ -749,7 +749,7 @@ async fn an_unmapped_obligation_is_discovered_despite_declared_requirements() {
     let kinds = seen.lock().expect("not poisoned").clone();
 
     assert!(
-        kinds.contains(&conseqa::confluence::TaskKind::RequirementDiscovery),
+        kinds.contains(&conseqa::design::TaskKind::RequirementDiscovery),
         "discovery ran for the unmapped obligation: {kinds:?}"
     );
 
@@ -786,7 +786,7 @@ async fn an_unmapped_obligation_is_discovered_despite_declared_requirements() {
 async fn the_runtime_topology_is_authored_after_l0_converges() {
     let out_dir = std::env::temp_dir().join(format!("conseqa-wf-{}", Uuid::new_v4()));
 
-    let seen: Arc<std::sync::Mutex<Vec<conseqa::confluence::TaskKind>>> =
+    let seen: Arc<std::sync::Mutex<Vec<conseqa::design::TaskKind>>> =
         Arc::new(std::sync::Mutex::new(Vec::new()));
 
     let inner = success_script();
@@ -810,17 +810,17 @@ async fn the_runtime_topology_is_authored_after_l0_converges() {
 
     let kinds = seen.lock().expect("not poisoned").clone();
 
-    let first = |kind: conseqa::confluence::TaskKind| {
+    let first = |kind: conseqa::design::TaskKind| {
         kinds
             .iter()
             .position(|seen| *seen == kind)
             .unwrap_or_else(|| panic!("no {kind} task ran: {kinds:?}"))
     };
 
-    let decompose = first(conseqa::confluence::TaskKind::Decompose);
-    let synthesis = first(conseqa::confluence::TaskKind::OperationSynthesis);
-    let discovery = first(conseqa::confluence::TaskKind::RequirementDiscovery);
-    let topology = first(conseqa::confluence::TaskKind::TopologySynthesis);
+    let decompose = first(conseqa::design::TaskKind::Decompose);
+    let synthesis = first(conseqa::design::TaskKind::OperationSynthesis);
+    let discovery = first(conseqa::design::TaskKind::RequirementDiscovery);
+    let topology = first(conseqa::design::TaskKind::TopologySynthesis);
 
     assert!(decompose < synthesis, "{kinds:?}");
     assert!(synthesis < discovery, "{kinds:?}");
@@ -831,7 +831,7 @@ async fn the_runtime_topology_is_authored_after_l0_converges() {
     assert_eq!(
         kinds
             .iter()
-            .filter(|kind| **kind == conseqa::confluence::TaskKind::TopologySynthesis)
+            .filter(|kind| **kind == conseqa::design::TaskKind::TopologySynthesis)
             .count(),
         1,
         "{kinds:?}"
@@ -863,7 +863,7 @@ async fn a_dependency_request_is_dispatched_to_a_task_scoped_to_its_target() {
         Box::pin(async move {
             // The topology author discovers the L0 model cannot carry
             // what it needs, and asks for the change once.
-            if invocation.kind == conseqa::confluence::TaskKind::TopologySynthesis
+            if invocation.kind == conseqa::design::TaskKind::TopologySynthesis
                 && !filed_once.swap(true, std::sync::atomic::Ordering::SeqCst)
             {
                 let task = engine
@@ -873,7 +873,7 @@ async fn a_dependency_request_is_dispatched_to_a_task_scoped_to_its_target() {
                 engine
                     .dependency_request(
                         task,
-                        conseqa::confluence::SymbolKey::Schema(id("schema.PingRequest")),
+                        conseqa::design::SymbolKey::Schema(id("schema.PingRequest")),
                         "carry a tenant_id field so deliveries can be grouped by tenant"
                             .to_string(),
                         "no declared field bears the serialization key".to_string(),
@@ -884,7 +884,7 @@ async fn a_dependency_request_is_dispatched_to_a_task_scoped_to_its_target() {
                 return;
             }
 
-            if invocation.kind == conseqa::confluence::TaskKind::SharedDependencyRepair {
+            if invocation.kind == conseqa::design::TaskKind::SharedDependencyRepair {
                 seen.lock()
                     .expect("not poisoned")
                     .push(invocation.prompt.clone());
@@ -942,7 +942,7 @@ async fn an_open_dependency_request_blocks_success() {
         let filed_once = Arc::clone(&filed_once);
 
         Box::pin(async move {
-            if invocation.kind == conseqa::confluence::TaskKind::RequirementDiscovery
+            if invocation.kind == conseqa::design::TaskKind::RequirementDiscovery
                 && !filed_once.swap(true, std::sync::atomic::Ordering::SeqCst)
             {
                 let task = engine
@@ -952,7 +952,7 @@ async fn an_open_dependency_request_blocks_success() {
                 engine
                     .dependency_request(
                         task,
-                        conseqa::confluence::SymbolKey::Schema(id("schema.PingResponse")),
+                        conseqa::design::SymbolKey::Schema(id("schema.PingResponse")),
                         "add an echoed_at timestamp".to_string(),
                         "the result contract needs it".to_string(),
                         Vec::new(),
@@ -1088,7 +1088,7 @@ fn planned_workspace(count: usize) -> WorkspaceState {
 
         workspace.operations.insert(
             operation,
-            conseqa::confluence::DraftOperation::planned(OperationInterfaceDraft {
+            conseqa::design::DraftOperation::planned(OperationInterfaceDraft {
                 service: id("service.api"),
                 description: Some(format!("Worker {index}.")),
                 inputs: BTreeMap::from([(
@@ -1109,8 +1109,8 @@ fn planned_workspace(count: usize) -> WorkspaceState {
 
 /// The operation a task's write scope names, read from its context —
 /// how the scripted agent learns which operation it owns.
-fn scoped_operation(engine: &ConfluenceEngine, invocation: &AgentInvocation) -> Option<Id> {
-    use conseqa::confluence::WriteGrant;
+fn scoped_operation(engine: &DesignEngine, invocation: &AgentInvocation) -> Option<Id> {
+    use conseqa::design::WriteGrant;
 
     let task = engine.resolve_token(&invocation.task_token)?;
     let context = engine.task_context(task).ok()?;
@@ -1131,7 +1131,7 @@ async fn operation_fanout_runs_agents_concurrently() {
 
     const OPERATIONS: usize = 4;
 
-    let engine = ConfluenceEngine::in_memory(planned_workspace(OPERATIONS)).expect("engine starts");
+    let engine = DesignEngine::in_memory(planned_workspace(OPERATIONS)).expect("engine starts");
 
     // Each session records the concurrent-session high-water mark, then
     // holds itself open long enough for the others to overlap before
@@ -1199,12 +1199,12 @@ async fn operation_fanout_runs_agents_concurrently() {
 
     let tasks: Vec<conseqa::harness::LogicalTask> = (0..OPERATIONS)
         .map(|index| conseqa::harness::LogicalTask {
-            kind: conseqa::confluence::TaskKind::OperationSynthesis,
+            kind: conseqa::design::TaskKind::OperationSynthesis,
             objective: format!("synthesize worker{index}"),
-            write_scope: conseqa::confluence::WriteScope::operation_synthesis(id(&format!(
+            write_scope: conseqa::design::WriteScope::operation_synthesis(id(&format!(
                 "operation.worker{index}"
             ))),
-            bundle: conseqa::confluence::BundleSpec {
+            bundle: conseqa::design::BundleSpec {
                 operation: Some(id(&format!("operation.worker{index}"))),
                 requirements: Vec::new(),
                 include: Vec::new(),
@@ -1332,7 +1332,7 @@ async fn a_run_objective_reaches_every_worker_prompt() {
 /// reviews and resubmits instead of re-deriving everything.
 #[tokio::test]
 async fn an_invalidated_attempt_hands_its_patch_to_the_replacement() {
-    let engine = ConfluenceEngine::in_memory(planned_workspace(1)).expect("engine starts");
+    let engine = DesignEngine::in_memory(planned_workspace(1)).expect("engine starts");
 
     let prompts: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
     let attempt_counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -1357,11 +1357,11 @@ async fn an_invalidated_attempt_hands_its_patch_to_the_replacement() {
     }
 
     async fn try_commit(
-        engine: &ConfluenceEngine,
-        task: conseqa::confluence::TaskId,
+        engine: &DesignEngine,
+        task: conseqa::design::TaskId,
         base_revision: conseqa::spec::Revision,
         mutations: Vec<Mutation>,
-    ) -> Result<conseqa::confluence::CommitReceipt, conseqa::confluence::CommitRejection> {
+    ) -> Result<conseqa::design::CommitReceipt, conseqa::design::CommitRejection> {
         engine
             .submit(CommitRequest {
                 task,
@@ -1405,14 +1405,14 @@ async fn an_invalidated_attempt_hands_its_patch_to_the_replacement() {
                     // An interloper rewrites the same program first, so
                     // this attempt's submission arrives stale.
                     let interloper = engine
-                        .create_task(conseqa::confluence::CreateTask {
-                            kind: conseqa::confluence::TaskKind::Decompose,
+                        .create_task(conseqa::design::CreateTask {
+                            kind: conseqa::design::TaskKind::Decompose,
                             objective: "interlope".to_string(),
-                            write_scope: conseqa::confluence::WriteScope::of([
-                                conseqa::confluence::WriteGrant::All,
+                            write_scope: conseqa::design::WriteScope::of([
+                                conseqa::design::WriteGrant::All,
                             ]),
                             prompt_evidence: Vec::new(),
-                            budget: conseqa::confluence::TaskBudget::default(),
+                            budget: conseqa::design::TaskBudget::default(),
                         })
                         .expect("interloper task");
 
@@ -1466,12 +1466,12 @@ async fn an_invalidated_attempt_hands_its_patch_to_the_replacement() {
 
     let run = scheduler
         .run(&conseqa::harness::LogicalTask {
-            kind: conseqa::confluence::TaskKind::OperationSynthesis,
+            kind: conseqa::design::TaskKind::OperationSynthesis,
             objective: "synthesize worker0".to_string(),
-            write_scope: conseqa::confluence::WriteScope::operation_synthesis(id(
+            write_scope: conseqa::design::WriteScope::operation_synthesis(id(
                 "operation.worker0",
             )),
-            bundle: conseqa::confluence::BundleSpec {
+            bundle: conseqa::design::BundleSpec {
                 operation: Some(id("operation.worker0")),
                 requirements: Vec::new(),
                 include: Vec::new(),
@@ -1527,7 +1527,7 @@ async fn an_invalidated_attempt_hands_its_patch_to_the_replacement() {
 #[tokio::test]
 async fn attempt_exhaustion_is_reported_without_discarding_siblings() {
     struct MixedBackend {
-        engine: ConfluenceEngine,
+        engine: DesignEngine,
     }
 
     #[async_trait]
@@ -1584,7 +1584,7 @@ async fn attempt_exhaustion_is_reported_without_discarding_siblings() {
         }
     }
 
-    let engine = ConfluenceEngine::in_memory(planned_workspace(2)).expect("engine starts");
+    let engine = DesignEngine::in_memory(planned_workspace(2)).expect("engine starts");
 
     let supervisor = Supervisor::new(
         engine.clone(),
@@ -1607,12 +1607,12 @@ async fn attempt_exhaustion_is_reported_without_discarding_siblings() {
 
     let tasks: Vec<conseqa::harness::LogicalTask> = (0..2)
         .map(|index| conseqa::harness::LogicalTask {
-            kind: conseqa::confluence::TaskKind::OperationSynthesis,
+            kind: conseqa::design::TaskKind::OperationSynthesis,
             objective: format!("synthesize operation.worker{index}"),
-            write_scope: conseqa::confluence::WriteScope::operation_synthesis(id(&format!(
+            write_scope: conseqa::design::WriteScope::operation_synthesis(id(&format!(
                 "operation.worker{index}"
             ))),
-            bundle: conseqa::confluence::BundleSpec {
+            bundle: conseqa::design::BundleSpec {
                 operation: Some(id(&format!("operation.worker{index}"))),
                 requirements: Vec::new(),
                 include: Vec::new(),
@@ -1663,7 +1663,7 @@ async fn attempt_exhaustion_is_reported_without_discarding_siblings() {
 mod system_one {
     use std::sync::Mutex;
 
-    use conseqa::confluence::TaskKind;
+    use conseqa::design::TaskKind;
     use conseqa::harness::executors::SystemOneBackend;
     use conseqa::spec::ResultReplayRequirement;
     use conseqa::system_one::{
@@ -1854,7 +1854,7 @@ mod system_one {
         out_dir: PathBuf,
         script: ScriptFn,
         opinions: &Opinions,
-    ) -> (Workflow, ConfluenceEngine, Seen) {
+    ) -> (Workflow, DesignEngine, Seen) {
         let seen = Seen::default();
 
         let decider: Arc<dyn Decider> = Arc::new(opinions.clone());
@@ -1880,7 +1880,7 @@ mod system_one {
 
     fn manifest_of(out_dir: &std::path::Path) -> serde_json::Value {
         serde_json::from_str(
-            &std::fs::read_to_string(out_dir.join("confluence-manifest.json"))
+            &std::fs::read_to_string(out_dir.join("design-manifest.json"))
                 .expect("manifest readable"),
         )
         .expect("manifest is json")
@@ -1896,7 +1896,7 @@ mod system_one {
     }
 
     fn adopted_idempotency(
-        engine: &ConfluenceEngine,
+        engine: &DesignEngine,
     ) -> Vec<conseqa::spec::IdempotencyRequirement> {
         engine.head_snapshot().workspace.operations[&id("operation.ping")]
             .requirements
@@ -2181,6 +2181,11 @@ mod system_one {
 
     /// A model a person authored and the checker proves, with everything
     /// its author declared taken out — so discovery has it all to find.
+    /// What the ledger runs are asked to build.
+    const LEDGER_PROMPT: &str = "Entries must be applied to each tenant's ledger exactly once \
+                                 and in sequence order, even when events are redelivered or \
+                                 the service restarts.";
+
     fn undeclared(fixture: &str, operation: &Id) -> (WorkspaceState, conseqa::spec::Operation) {
         let source = std::fs::read_to_string(
             PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -2214,12 +2219,6 @@ mod system_one {
 
         let mut run_meta = RunMetadata::new(RunId("discovery-test".to_string()));
 
-        run_meta.prompt = Some(
-            "Entries must be applied to each tenant's ledger exactly once and in sequence \
-             order, even when events are redelivered or the service restarts."
-                .to_string(),
-        );
-
         run_meta.policy = RunPolicy {
             strict_requirements: true,
             adopt_recommended: false,
@@ -2237,7 +2236,7 @@ mod system_one {
         workspace: WorkspaceState,
         operation: &Id,
         opinions: &Opinions,
-    ) -> (ConfluenceEngine, Seen) {
+    ) -> (DesignEngine, Seen) {
         let (engine, seen, _) =
             discover_all(workspace, std::slice::from_ref(operation), opinions).await;
 
@@ -2250,29 +2249,30 @@ mod system_one {
         workspace: WorkspaceState,
         operations: &[Id],
         opinions: &Opinions,
-    ) -> (ConfluenceEngine, Seen, Vec<conseqa::harness::TaskRun>) {
+    ) -> (DesignEngine, Seen, Vec<conseqa::harness::TaskRun>) {
         let tasks = operations
             .iter()
             .map(|operation| {
                 (
                     TaskKind::RequirementDiscovery,
-                    conseqa::confluence::WriteScope::requirement_discovery(operation.clone()),
+                    conseqa::design::WriteScope::requirement_discovery(operation.clone()),
                     operation.clone(),
                 )
             })
             .collect();
 
-        run_tasks(workspace, tasks, opinions).await
+        run_tasks(workspace, LEDGER_PROMPT, tasks, opinions).await
     }
 
     /// Runs operation-scoped tasks with every builder in front of an
     /// agent backend that does nothing but record what reaches it.
     async fn run_tasks(
         workspace: WorkspaceState,
-        tasks: Vec<(TaskKind, conseqa::confluence::WriteScope, Id)>,
+        prompt: &str,
+        tasks: Vec<(TaskKind, conseqa::design::WriteScope, Id)>,
         opinions: &Opinions,
-    ) -> (ConfluenceEngine, Seen, Vec<conseqa::harness::TaskRun>) {
-        let engine = ConfluenceEngine::in_memory(workspace).expect("engine starts");
+    ) -> (DesignEngine, Seen, Vec<conseqa::harness::TaskRun>) {
+        let engine = DesignEngine::in_memory(workspace).expect("engine starts");
 
         let seen = Seen::default();
 
@@ -2306,13 +2306,7 @@ mod system_one {
             },
         );
 
-        let prompt = engine
-            .head_snapshot()
-            .workspace
-            .run_meta
-            .prompt
-            .clone()
-            .expect("the run has a prompt");
+        let prompt = prompt.to_string();
 
         let tasks = tasks
             .into_iter()
@@ -2321,14 +2315,14 @@ mod system_one {
                     kind,
                     objective: format!("Work on {operation}."),
                     write_scope,
-                    bundle: conseqa::confluence::BundleSpec {
+                    bundle: conseqa::design::BundleSpec {
                         operation: Some(operation),
                         requirements: Vec::new(),
                         include: Vec::new(),
                         peers: Vec::new(),
                     },
-                    prompt_evidence: vec![conseqa::confluence::PromptEvidence {
-                        source: conseqa::confluence::EvidenceRef("run.prompt".to_string()),
+                    prompt_evidence: vec![conseqa::design::PromptEvidence {
+                        source: conseqa::design::EvidenceRef("run.prompt".to_string()),
                         excerpt: prompt.clone(),
                     }],
                     interactive: false,
@@ -2791,11 +2785,11 @@ mod system_one {
         broken
     }
 
-    fn program_scope(operations: &[&str]) -> conseqa::confluence::WriteScope {
-        conseqa::confluence::WriteScope::of(
+    fn program_scope(operations: &[&str]) -> conseqa::design::WriteScope {
+        conseqa::design::WriteScope::of(
             operations
                 .iter()
-                .map(|operation| conseqa::confluence::WriteGrant::OperationProgram(id(operation))),
+                .map(|operation| conseqa::design::WriteGrant::OperationProgram(id(operation))),
         )
     }
 
@@ -2813,7 +2807,8 @@ mod system_one {
 
         for alone in ["operation.place_order", "operation.restock"] {
             let (_, seen, runs) = run_tasks(
-                workspace_of(&broken, "A shop."),
+                workspace_of(&broken),
+                "A shop.",
                 vec![(
                     TaskKind::RequirementRepair,
                     program_scope(&[alone]),
@@ -2836,7 +2831,8 @@ mod system_one {
         }
 
         let (engine, seen, runs) = run_tasks(
-            workspace_of(&broken, "A shop."),
+            workspace_of(&broken),
+            "A shop.",
             vec![(
                 TaskKind::RequirementRepair,
                 program_scope(&["operation.place_order", "operation.restock"]),
@@ -2874,7 +2870,7 @@ mod system_one {
         let broken = stock_without_its_locks();
 
         let engine =
-            ConfluenceEngine::in_memory(workspace_of(&broken, "A shop.")).expect("engine starts");
+            DesignEngine::in_memory(workspace_of(&broken)).expect("engine starts");
 
         let seen = Seen::default();
         let idle: ScriptFn = Arc::new(|_, _| Box::pin(async {}));
@@ -2907,6 +2903,7 @@ mod system_one {
                 out_dir: out_dir.clone(),
                 analysis_timeout: Duration::from_secs(20),
                 max_iterations: 8,
+                prompt: Some("A shop.".to_string()),
                 objective: None,
             },
         );
@@ -2955,10 +2952,8 @@ mod system_one {
         conseqa::parser::yaml::parse(&source).expect("fixture parses")
     }
 
-    fn workspace_of(model: &conseqa::spec::Model, prompt: &str) -> WorkspaceState {
+    fn workspace_of(model: &conseqa::spec::Model) -> WorkspaceState {
         let mut run_meta = RunMetadata::new(RunId("repair-test".to_string()));
-
-        run_meta.prompt = Some(prompt.to_string());
 
         run_meta.policy = RunPolicy {
             strict_requirements: true,
@@ -3011,11 +3006,11 @@ mod system_one {
     async fn repaired_program(
         broken: &conseqa::spec::Model,
         opinions: &Opinions,
-    ) -> (ConfluenceEngine, Seen, Vec<conseqa::harness::TaskRun>) {
+    ) -> (DesignEngine, Seen, Vec<conseqa::harness::TaskRun>) {
         repair(broken, "operation.apply_entry", opinions).await
     }
 
-    fn apply_program(engine: &ConfluenceEngine) -> Option<conseqa::spec::OperationBlock> {
+    fn apply_program(engine: &DesignEngine) -> Option<conseqa::spec::OperationBlock> {
         engine.head_snapshot().workspace.operations[&id("operation.apply_entry")]
             .program
             .clone()
@@ -3160,7 +3155,7 @@ mod system_one {
     /// `shop` with one operation's program taken away, as the fanout
     /// finds it.
     fn shop_without_program(operation: &str) -> WorkspaceState {
-        let mut workspace = workspace_of(&authored("shop.yaml"), "A small shop backend.");
+        let mut workspace = workspace_of(&authored("shop.yaml"));
 
         workspace
             .operations
@@ -3174,12 +3169,13 @@ mod system_one {
     async fn synthesize(
         operation: &str,
         opinions: &Opinions,
-    ) -> (ConfluenceEngine, Seen, Vec<conseqa::harness::TaskRun>) {
+    ) -> (DesignEngine, Seen, Vec<conseqa::harness::TaskRun>) {
         run_tasks(
             shop_without_program(operation),
+            "A small shop backend.",
             vec![(
                 TaskKind::OperationSynthesis,
-                conseqa::confluence::WriteScope::operation_synthesis(id(operation)),
+                conseqa::design::WriteScope::operation_synthesis(id(operation)),
                 id(operation),
             )],
             opinions,
@@ -3196,7 +3192,7 @@ mod system_one {
             .collect()
     }
 
-    fn program_of(engine: &ConfluenceEngine, operation: &str) -> conseqa::spec::OperationBlock {
+    fn program_of(engine: &DesignEngine, operation: &str) -> conseqa::spec::OperationBlock {
         engine.head_snapshot().workspace.operations[&id(operation)]
             .program
             .clone()
@@ -3417,7 +3413,7 @@ mod system_one {
             .choosing_for("operation.restock", "record", "object.product", 0.9)
             .stating_for("operation.restock", "changes_object_product_stock", 0.93);
 
-        let engine = ConfluenceEngine::in_memory(workspace).expect("engine starts");
+        let engine = DesignEngine::in_memory(workspace).expect("engine starts");
         let seen = Seen::default();
         let idle: ScriptFn = Arc::new(|_, _| Box::pin(async {}));
 
@@ -3449,6 +3445,7 @@ mod system_one {
                 out_dir: out_dir.clone(),
                 analysis_timeout: Duration::from_secs(20),
                 max_iterations: 8,
+                prompt: Some("A small shop backend.".to_string()),
                 objective: None,
             },
         );
@@ -3509,10 +3506,11 @@ mod system_one {
             model.runtime = None;
 
             let (engine, seen, runs) = run_tasks(
-                workspace_of(&model, "A system."),
+                workspace_of(&model),
+                "A system.",
                 vec![(
                     TaskKind::TopologySynthesis,
-                    conseqa::confluence::WriteScope::runtime_topology(),
+                    conseqa::design::WriteScope::runtime_topology(),
                     id(any_operation),
                 )],
                 &Opinions::default(),
@@ -3592,8 +3590,8 @@ mod system_one {
                     .grants
                     .iter()
                     .find_map(|grant| match grant {
-                        conseqa::confluence::WriteGrant::OperationProgram(operation)
-                        | conseqa::confluence::WriteGrant::OperationRequirements(operation) => {
+                        conseqa::design::WriteGrant::OperationProgram(operation)
+                        | conseqa::design::WriteGrant::OperationRequirements(operation) => {
                             Some(operation.clone())
                         }
                         _ => None,
@@ -3617,16 +3615,16 @@ mod system_one {
                         // Observe what the program references, as a
                         // session would before committing it.
                         for kind in [
-                            conseqa::confluence::SymbolKind::DataModel,
-                            conseqa::confluence::SymbolKind::DataObject,
-                            conseqa::confluence::SymbolKind::Schema,
-                            conseqa::confluence::SymbolKind::StateMachine,
-                            conseqa::confluence::SymbolKind::Transition,
+                            conseqa::design::SymbolKind::DataModel,
+                            conseqa::design::SymbolKind::DataObject,
+                            conseqa::design::SymbolKind::Schema,
+                            conseqa::design::SymbolKind::StateMachine,
+                            conseqa::design::SymbolKind::Transition,
                         ] {
                             for key in engine
                                 .search_symbols(
                                     task,
-                                    &conseqa::confluence::SearchSpec {
+                                    &conseqa::design::SearchSpec {
                                         kind: Some(kind),
                                         ..Default::default()
                                     },
@@ -3696,7 +3694,7 @@ mod system_one {
     async fn a_waiting_program_is_written_before_any_discovery() {
         let authored = authored("shop.yaml");
 
-        let mut workspace = workspace_of(&authored, "A small shop backend.");
+        let mut workspace = workspace_of(&authored);
 
         for operation in [
             "operation.pay_order",
@@ -3712,7 +3710,7 @@ mod system_one {
             draft.requirements = Default::default();
         }
 
-        let engine = ConfluenceEngine::in_memory(workspace).expect("engine starts");
+        let engine = DesignEngine::in_memory(workspace).expect("engine starts");
 
         let events: Events = Arc::default();
 
@@ -3752,6 +3750,7 @@ mod system_one {
                 out_dir: out_dir.clone(),
                 analysis_timeout: Duration::from_secs(20),
                 max_iterations: 3,
+                prompt: Some("A small shop backend.".to_string()),
                 objective: None,
             },
         );
@@ -3786,7 +3785,7 @@ mod system_one {
     async fn discovery_starts_before_the_slowest_program_lands() {
         let authored = authored("shop.yaml");
 
-        let mut workspace = workspace_of(&authored, "A small shop backend.");
+        let mut workspace = workspace_of(&authored);
 
         for operation in ["operation.restock", "operation.ship_order"] {
             let draft = workspace
@@ -3798,7 +3797,7 @@ mod system_one {
             draft.requirements = Default::default();
         }
 
-        let engine = ConfluenceEngine::in_memory(workspace).expect("engine starts");
+        let engine = DesignEngine::in_memory(workspace).expect("engine starts");
 
         let events: Events = Arc::default();
 
@@ -3827,6 +3826,7 @@ mod system_one {
                 out_dir: out_dir.clone(),
                 analysis_timeout: Duration::from_secs(20),
                 max_iterations: 3,
+                prompt: Some("A small shop backend.".to_string()),
                 objective: None,
             },
         );
@@ -3857,7 +3857,7 @@ mod system_one {
     /// writes, discovers or repairs anything.
     #[tokio::test]
     async fn every_program_is_compiled_from_its_sketch_without_a_session() {
-        let mut workspace = workspace_of(&authored("shop.yaml"), "A small shop backend.");
+        let mut workspace = workspace_of(&authored("shop.yaml"));
 
         for (operation, sketch) in common::sketches::shop_sketches() {
             let draft = workspace
@@ -3871,7 +3871,7 @@ mod system_one {
 
         let opinions = Opinions::default().stating("fidelity", 0.92);
 
-        let engine = ConfluenceEngine::in_memory(workspace).expect("engine starts");
+        let engine = DesignEngine::in_memory(workspace).expect("engine starts");
         let seen = Seen::default();
         let idle: ScriptFn = Arc::new(|_, _| Box::pin(async {}));
 
@@ -3903,6 +3903,7 @@ mod system_one {
                 out_dir: out_dir.clone(),
                 analysis_timeout: Duration::from_secs(20),
                 max_iterations: 8,
+                prompt: Some("A small shop backend.".to_string()),
                 objective: None,
             },
         );
@@ -3941,8 +3942,8 @@ mod system_one {
     /// does not exist.
     async fn build(
         break_ship_order: bool,
-    ) -> (ConfluenceEngine, conseqa::harness::RunReport, Vec<conseqa::harness::HandOff>) {
-        let mut workspace = workspace_of(&authored("shop.yaml"), "A small shop backend.");
+    ) -> (DesignEngine, conseqa::harness::RunReport, Vec<conseqa::harness::HandOff>) {
+        let mut workspace = workspace_of(&authored("shop.yaml"));
 
         for (operation, mut sketch) in common::sketches::shop_sketches() {
             if break_ship_order && operation == "operation.ship_order" {
@@ -3958,7 +3959,7 @@ mod system_one {
             draft.sketch = Some(serde_json::from_value(sketch).expect("parses"));
         }
 
-        let engine = ConfluenceEngine::in_memory(workspace).expect("engine starts");
+        let engine = DesignEngine::in_memory(workspace).expect("engine starts");
         let hand_off = conseqa::harness::HandOffBackend::new(engine.clone());
 
         let backend = Arc::new(SystemOneBackend::new(
@@ -3993,6 +3994,7 @@ mod system_one {
                 out_dir: out_dir.clone(),
                 analysis_timeout: Duration::from_secs(20),
                 max_iterations: 8,
+                prompt: Some("A small shop backend.".to_string()),
                 objective: None,
             },
         )
@@ -4066,7 +4068,7 @@ mod system_one {
     /// run, the same operation's question was asked ten times.
     #[tokio::test]
     async fn an_unsure_discovery_is_not_repeated_on_every_pass() {
-        let mut workspace = workspace_of(&authored("shop.yaml"), "A small shop backend.");
+        let mut workspace = workspace_of(&authored("shop.yaml"));
 
         for (operation, sketch) in common::sketches::shop_sketches() {
             let draft = workspace
@@ -4083,7 +4085,7 @@ mod system_one {
             .stating("fidelity", 0.92)
             .stating("idempotency", 0.5);
 
-        let engine = ConfluenceEngine::in_memory(workspace).expect("engine starts");
+        let engine = DesignEngine::in_memory(workspace).expect("engine starts");
         let seen = Seen::default();
         let idle: ScriptFn = Arc::new(|_, _| Box::pin(async {}));
 
@@ -4115,6 +4117,7 @@ mod system_one {
                 out_dir: out_dir.clone(),
                 analysis_timeout: Duration::from_secs(20),
                 max_iterations: 8,
+                prompt: Some("A small shop backend.".to_string()),
                 objective: None,
             },
         );
@@ -4168,9 +4171,10 @@ mod system_one {
 
         let (engine, seen, _) = run_tasks(
             workspace,
+            "A small shop backend.",
             vec![(
                 TaskKind::OperationSynthesis,
-                conseqa::confluence::WriteScope::operation_synthesis(id("operation.ship_order")),
+                conseqa::design::WriteScope::operation_synthesis(id("operation.ship_order")),
                 id("operation.ship_order"),
             )],
             &Opinions::default().stating("fidelity", 0.04),
@@ -4224,12 +4228,13 @@ mod system_one {
         broken: &conseqa::spec::Model,
         operation: &str,
         opinions: &Opinions,
-    ) -> (ConfluenceEngine, Seen, Vec<conseqa::harness::TaskRun>) {
+    ) -> (DesignEngine, Seen, Vec<conseqa::harness::TaskRun>) {
         run_tasks(
-            workspace_of(broken, "A ledger of entries per tenant."),
+            workspace_of(broken),
+            "A ledger of entries per tenant.",
             vec![(
                 TaskKind::RequirementRepair,
-                conseqa::confluence::WriteScope::requirement_repair(id(operation)),
+                conseqa::design::WriteScope::requirement_repair(id(operation)),
                 id(operation),
             )],
             opinions,
@@ -4237,9 +4242,9 @@ mod system_one {
         .await
     }
 
-    async fn head_model_is_proven(engine: &ConfluenceEngine) -> bool {
+    async fn head_model_is_proven(engine: &DesignEngine) -> bool {
         match engine.analysis_ready(engine.head_revision()).await {
-            conseqa::confluence::AnalysisState::Ready(analysis) => {
+            conseqa::design::AnalysisState::Ready(analysis) => {
                 analysis.verification.all_proven()
             }
             other => panic!("the repaired head does not verify: {other:?}"),
@@ -4437,7 +4442,7 @@ mod system_one {
             .stating_for("operation.post_entry", "idempotency", 0.9)
             .stating_for("operation.post_entry", "result_replay", 0.88);
 
-        let engine = ConfluenceEngine::in_memory(workspace).expect("engine starts");
+        let engine = DesignEngine::in_memory(workspace).expect("engine starts");
 
         let seen = Seen::default();
 
@@ -4469,6 +4474,7 @@ mod system_one {
                 out_dir: out_dir.clone(),
                 analysis_timeout: Duration::from_secs(20),
                 max_iterations: 8,
+                prompt: Some(LEDGER_PROMPT.to_string()),
                 objective: None,
             },
         );
@@ -4616,15 +4622,15 @@ mod system_one {
         // stands — including this transaction's ordering requirement,
         // which the builder did not target and which rests on the same
         // closure.
-        let conseqa::confluence::AnalysisState::Ready(analysis) =
+        let conseqa::design::AnalysisState::Ready(analysis) =
             engine.analysis_ready(engine.head_revision()).await
         else {
             panic!("the repaired head does not verify");
         };
 
         assert_eq!(
-            conseqa::confluence::standing(&analysis.verification),
-            conseqa::confluence::standing(&conseqa::analyzer::verification::verify(&authored))
+            conseqa::design::standing(&analysis.verification),
+            conseqa::design::standing(&conseqa::analyzer::verification::verify(&authored))
         );
 
         let head = engine.head_snapshot();
