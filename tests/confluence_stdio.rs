@@ -2,8 +2,9 @@
 //! serves multi-project MCP over stdin/stdout, the transport Claude
 //! Desktop / Code accepts for a local server without TLS. Spawns the
 //! real binary and speaks newline-delimited JSON-RPC to it, so the
-//! whole path — no session id, no bearer, project tools, a commit — is
-//! exercised as the UI would.
+//! whole path — no session id, no bearer, project tools, a commit
+//! landing in the project's files, and a server started inside the
+//! project opening it unasked — is exercised as the UI would.
 
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
@@ -17,11 +18,14 @@ struct StdioClient {
 }
 
 impl StdioClient {
-    fn spawn(data_dir: &std::path::Path) -> Self {
+    /// Starts the server in `cwd`, as the app starts it in the user's
+    /// working directory.
+    fn spawn(cwd: &std::path::Path) -> Self {
         let mut child = Command::new(env!("CARGO_BIN_EXE_conseqa-confluence"))
             .arg("stdio")
-            .arg("--data-dir")
-            .arg(data_dir)
+            .current_dir(cwd)
+            // Hermetic: never this machine's own `~/.conseqa/stdio.args`.
+            .env("CONSEQA_STDIO_ARGS", "/dev/null")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -128,7 +132,7 @@ impl Drop for StdioClient {
 #[test]
 fn stdio_server_hosts_projects_without_a_session_id_or_bearer() {
     let dir = std::env::temp_dir().join(format!("conseqa-stdio-{}", uuid::Uuid::new_v4()));
-    std::fs::create_dir_all(&dir).expect("data dir");
+    std::fs::create_dir_all(dir.join("src")).expect("repository dir");
 
     // A watchdog: fail loudly rather than hang if the protocol stalls.
     let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -156,16 +160,12 @@ fn stdio_server_hosts_projects_without_a_session_id_or_bearer() {
         "{early}"
     );
 
-    // list_projects works with no Mcp-Session-Id and no bearer — the
-    // exact conditions that broke the http multi-project server.
-    let (list, is_error) = client.call("list_projects", serde_json::json!({}));
-    assert!(!is_error, "{list}");
-    assert_eq!(list["projects"].as_array().map(Vec::len), Some(0));
-
-    // Create a project, grounded by its prompt, and commit into it.
+    // Project tools work with no Mcp-Session-Id and no bearer — the
+    // exact conditions that broke the http multi-project server. Create
+    // a project, grounded by its prompt, and commit into it.
     let (created, is_error) = client.call(
         "create_project",
-        serde_json::json!({"project": "todo", "prompt": "A todo service."}),
+        serde_json::json!({"path": dir, "prompt": "A todo service."}),
     );
     assert!(!is_error, "{created}");
     assert_eq!(created["created"], true);
@@ -190,6 +190,26 @@ fn stdio_server_hosts_projects_without_a_session_id_or_bearer() {
         .filter_map(|symbol| symbol["value"].as_str())
         .collect();
     assert!(services.contains(&"service.todo"), "{search}");
+
+    // The commit is in the project's own files.
+    assert!(
+        dir.join(".conseqa/spec/services/service.todo.yaml")
+            .is_file(),
+        "the service has its file"
+    );
+
+    drop(client);
+
+    // A server started anywhere inside the repository opens its project
+    // on the first call, with no open_project.
+    let mut client = StdioClient::spawn(&dir.join("src"));
+
+    let (context, is_error) = client.call("task_context", serde_json::json!({}));
+    assert!(!is_error, "{context}");
+    assert_eq!(context["prompt_evidence"][0]["excerpt"], "A todo service.");
+
+    let (search, _) = client.call("search_symbols", serde_json::json!({"kind": "service"}));
+    assert!(search.to_string().contains("service.todo"), "{search}");
 
     done.store(true, std::sync::atomic::Ordering::SeqCst);
 

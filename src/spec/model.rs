@@ -63,7 +63,7 @@ use super::{
 /// state or version — prevents it from participating in a commit, so
 /// dsl 4 and 5 documents are no longer read ([`DSL_READS`]).
 ///
-/// Independent of the stored-workspace `FORMAT` (a storage-encoding
+/// Independent of the project store's `FORMAT` (a storage-encoding
 /// counter): a DSL bump forces a `FORMAT` bump, never conversely, and
 /// the numbers are not aligned.
 pub const DSL_VERSION: DslVersion = DslVersion(6);

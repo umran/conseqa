@@ -1771,13 +1771,13 @@ fn planned_operation_commits_as_draft_and_requirements_flow_through_proposals() 
 #[test]
 fn recovery_restores_the_head_and_invalidates_active_tasks() {
     let dir = std::env::temp_dir().join(format!("conseqa-occ-{}", Uuid::new_v4()));
-    let database = dir.join("confluence.redb");
+    std::fs::create_dir_all(&dir).expect("project dir");
 
     let committed_revision;
     let orphaned_task;
 
     {
-        let engine = ConfluenceEngine::open(&database, fixture_workspace()).expect("engine opens");
+        let engine = ConfluenceEngine::open(&dir, fixture_workspace()).expect("engine opens");
 
         let a = task(
             &engine,
@@ -1802,12 +1802,13 @@ fn recovery_restores_the_head_and_invalidates_active_tasks() {
     }
 
     // The old engine (and its sequencer thread) shut down when every
-    // handle dropped; redb releases its lock with it. Retry briefly.
+    // handle dropped; the project's lock is released with it. Retry
+    // briefly.
     let reopened = {
         let mut attempt = 0;
 
         loop {
-            match ConfluenceEngine::open(&database, fixture_workspace()) {
+            match ConfluenceEngine::open(&dir, fixture_workspace()) {
                 Ok(engine) => break engine,
                 Err(_) if attempt < 50 => {
                     attempt += 1;
@@ -1838,6 +1839,190 @@ fn recovery_restores_the_head_and_invalidates_active_tasks() {
         reopened.task_status(orphaned_task).unwrap(),
         TaskState::Invalidated
     );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A project on disk, created from the fixture in a fresh directory.
+fn project() -> (std::path::PathBuf, ConfluenceEngine) {
+    let dir = std::env::temp_dir().join(format!("conseqa-occ-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).expect("project dir");
+
+    let engine =
+        ConfluenceEngine::create_project(&dir, fixture_workspace()).expect("project created");
+
+    (dir, engine)
+}
+
+fn service_file(dir: &std::path::Path, service: &str) -> std::path::PathBuf {
+    dir.join(".conseqa/spec/services")
+        .join(format!("{service}.yaml"))
+}
+
+/// The project's files are its source of truth: an edit made outside
+/// the engine — by hand, a checkout, a pull — becomes the next
+/// revision, and invalidates exactly the tasks that observed what it
+/// changed. The rest commit on, against the adopted head, into the
+/// files.
+#[test]
+fn an_outside_edit_is_adopted_and_invalidates_the_tasks_that_observed_it() {
+    let (dir, engine) = project();
+    let before = engine.head_revision();
+
+    let observer = task(
+        &engine,
+        TaskKind::OperationSynthesis,
+        WriteScope::operation_synthesis(id("operation.create_order")),
+    );
+
+    engine
+        .read_symbol(observer.id, &SymbolKey::Service(id("service.checkout")))
+        .expect("reads");
+
+    let bystander = task(
+        &engine,
+        TaskKind::OperationSynthesis,
+        WriteScope::operation_synthesis(id("operation.transfer_stock")),
+    );
+
+    engine
+        .read_symbol(bystander.id, &SymbolKey::Service(id("service.payments")))
+        .expect("reads");
+
+    assert_eq!(
+        engine.sync_with_disk().expect("syncs"),
+        None,
+        "nothing changed yet"
+    );
+
+    std::fs::write(service_file(&dir, "service.checkout"), "kind: worker\n").expect("edit");
+
+    let adopted = engine
+        .sync_with_disk()
+        .expect("syncs")
+        .expect("the edit is adopted");
+
+    assert_eq!(adopted, Revision(before.0 + 1));
+    assert_eq!(
+        engine.head_snapshot().workspace.services[&id("service.checkout")].kind,
+        ServiceKind::Worker
+    );
+
+    assert_eq!(
+        engine.task_status(observer.id).unwrap(),
+        TaskState::Invalidated
+    );
+    assert_eq!(
+        engine.task_status(bystander.id).unwrap(),
+        TaskState::Running
+    );
+
+    submit(
+        &engine,
+        &bystander,
+        vec![probe_program("operation.transfer_stock", 1)],
+    )
+    .expect("the bystander commits against the adopted head");
+
+    let written =
+        std::fs::read_to_string(dir.join(".conseqa/spec/operations/operation.transfer_stock.yaml"))
+            .expect("the operation has its file");
+
+    assert!(written.contains("tx.transfer_stock.probe1"), "{written}");
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// An interactive session reads its pinned snapshot, so after an
+/// outside edit its token moves to a successor at the adopted head —
+/// it reads what the files now say, and commits there.
+#[test]
+fn an_interactive_session_moves_to_the_head_after_an_outside_edit() {
+    let (dir, engine) = project();
+
+    let session = engine
+        .create_session(WriteScope::of([WriteGrant::All]), "interactive")
+        .expect("session");
+
+    let token = session.token.0.clone();
+
+    engine
+        .read_symbol(session.id, &SymbolKey::Service(id("service.checkout")))
+        .expect("reads");
+
+    std::fs::write(service_file(&dir, "service.checkout"), "kind: job\n").expect("edit");
+
+    let adopted = engine
+        .sync_with_disk()
+        .expect("syncs")
+        .expect("the edit is adopted");
+
+    let successor = engine
+        .resolve_token(&token)
+        .expect("the token still resolves");
+
+    assert_ne!(successor, session.id);
+    assert_eq!(
+        engine.task_context(successor).unwrap().snapshot_revision,
+        adopted
+    );
+
+    let view = engine
+        .read_symbol(successor, &SymbolKey::Service(id("service.checkout")))
+        .expect("reads");
+
+    assert!(format!("{:?}", view.content).contains("job"), "{view:?}");
+
+    submit_session(
+        &engine,
+        &token,
+        vec![probe_program("operation.create_order", 3)],
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A file broken mid-edit is never written over: reads report it, and
+/// every commit is refused until the file loads again.
+#[test]
+fn a_file_that_no_longer_loads_refuses_every_commit_until_it_does() {
+    let (dir, engine) = project();
+
+    let writer = task(
+        &engine,
+        TaskKind::OperationSynthesis,
+        WriteScope::operation_synthesis(id("operation.create_order")),
+    );
+
+    let file = service_file(&dir, "service.checkout");
+    let original = std::fs::read_to_string(&file).expect("service file");
+
+    std::fs::write(&file, "kind: [").expect("break");
+
+    assert!(engine.sync_with_disk().is_err());
+
+    let rejection = submit(
+        &engine,
+        &writer,
+        vec![probe_program("operation.create_order", 1)],
+    )
+    .expect_err("nothing commits over a broken file");
+
+    assert!(
+        matches!(rejection, CommitRejection::DraftValidationFailed { .. }),
+        "{rejection:?}"
+    );
+
+    assert_eq!(std::fs::read_to_string(&file).expect("file"), "kind: [");
+
+    std::fs::write(&file, original).expect("fix");
+
+    submit(
+        &engine,
+        &writer,
+        vec![probe_program("operation.create_order", 1)],
+    )
+    .expect("commits once the file loads");
 
     std::fs::remove_dir_all(&dir).ok();
 }

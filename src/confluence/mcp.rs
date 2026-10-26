@@ -11,7 +11,7 @@
 //! the shapes compactly for agents.
 
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -67,10 +67,18 @@ Conseqa architecture authoring. You design a system as a Conseqa model \
 — services, schemas, data models, topics, state machines, and \
 operations with explicit causal programs — and a deterministic checker \
 validates it and proves or refuses its correctness obligations. Model \
-state lives in this server, never in files you edit.
+state lives in the project's `.conseqa/` directory, committed with its \
+code: those files are the source of truth, and what changes them \
+outside this server — a hand edit, a checkout, a pull — is picked up \
+on your next call. Change the model through submit_patch, which \
+validates every change; edit the files directly only when the user \
+asks you to.
 
 The authoring loop:
-1. create_project or open_project selects the model you are building.
+1. open_project selects the model you are building: pass the \
+repository's absolute path (or any directory inside it). A server \
+started inside a project opens it on its own. create_project starts a \
+new one in a directory, normally the repository root.
 2. Learn the DSL from this server, not from source code: dsl_guide \
 explains the semantics by topic — pass every section you need as \
 topics in ONE call rather than one call per section; dsl_reference \
@@ -251,18 +259,24 @@ const AWAIT_DESIGN_MAX_SECS: u64 = 55;
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct OpenProjectParams {
-    /// The project name (letters, digits, `.`, `_`, `-`).
-    pub project: String,
-
-    /// Seed a newly created project with this natural-language intent.
+    /// The project's directory, or any directory inside it, as an
+    /// absolute path. Omit to reopen the active project at its current
+    /// head — or, with none active, the project this server was started
+    /// in.
     #[serde(default)]
-    pub prompt: Option<String>,
+    pub path: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct CreateProjectParams {
-    /// The new project's name (letters, digits, `.`, `_`, `-`).
-    pub project: String,
+    /// The directory to create the project in, as an absolute path —
+    /// normally the repository root. Its state goes in a `.conseqa/`
+    /// directory there, to be committed with the code.
+    pub path: String,
+
+    /// A short name for the project; the directory's name when omitted.
+    #[serde(default)]
+    pub name: Option<String>,
 
     /// Natural-language description of the system to build.
     #[serde(default)]
@@ -348,13 +362,19 @@ struct ProjectSession {
 struct ProjectHost {
     manager: Arc<WorkspaceManager>,
     active: Arc<parking_lot::RwLock<Option<ProjectSession>>>,
+
+    /// The directory the server runs in, when its project is the one a
+    /// client means without naming one: a stdio server started inside a
+    /// repository.
+    home: Option<PathBuf>,
 }
 
 impl ProjectHost {
-    fn new(manager: Arc<WorkspaceManager>) -> Self {
+    fn new(manager: Arc<WorkspaceManager>, home: Option<PathBuf>) -> Self {
         Self {
             manager,
             active: Arc::new(parking_lot::RwLock::new(None)),
+            home,
         }
     }
 }
@@ -391,6 +411,10 @@ enum ResolveError {
 
     /// Authenticated, but no project is open on this connection.
     NoProject,
+
+    /// The project cannot be read: its files no longer load, or
+    /// another process holds it.
+    Project(String),
 }
 
 #[derive(Clone)]
@@ -425,7 +449,7 @@ impl ConseqaMcp {
     ) -> Self {
         Self {
             backing: Backing::Multi {
-                host: ProjectHost::new(manager),
+                host: ProjectHost::new(manager, None),
                 api_key: api_key.into(),
             },
             launcher,
@@ -434,12 +458,15 @@ impl ConseqaMcp {
 
     /// A multi-project stdio server: no API key, since the single local
     /// client is inherently trusted. For the Claude Desktop / Code UI.
+    /// `home` is the directory it runs in: the project there, if any,
+    /// opens on the first call that needs one.
     pub fn local(
         manager: Arc<WorkspaceManager>,
         launcher: Option<Arc<dyn DesignLauncher>>,
+        home: Option<PathBuf>,
     ) -> Self {
         Self {
-            backing: Backing::Local(ProjectHost::new(manager)),
+            backing: Backing::Local(ProjectHost::new(manager, home)),
             launcher,
         }
     }
@@ -474,6 +501,8 @@ impl ConseqaMcp {
             Backing::Single(engine) => {
                 let bearer = Self::bearer(context)?;
 
+                sync(engine)?;
+
                 let task = engine.resolve_token(&bearer).ok_or_else(|| {
                     ResolveError::Unauthorized(
                         "the task capability is not recognized; the task may have ended"
@@ -496,8 +525,12 @@ impl ConseqaMcp {
                     // Worker agent: its capability token resolves in
                     // whichever open project engine minted it.
                     for engine in host.manager.open_engines() {
-                        if let Some(task) = engine.resolve_token(&bearer) {
-                            return Ok(Resolved { engine, task });
+                        if engine.resolve_token(&bearer).is_some() {
+                            sync(&engine)?;
+
+                            if let Some(task) = engine.resolve_token(&bearer) {
+                                return Ok(Resolved { engine, task });
+                            }
                         }
                     }
 
@@ -566,9 +599,27 @@ impl ProjectHost {
         Ok(())
     }
 
-    /// Resolves the active project to `(engine, task)`.
+    /// Resolves the active project to `(engine, task)`, first opening
+    /// the server's own project when none is active, and adopting any
+    /// change made to the files outside the server.
     fn active_resolved(&self) -> Result<Resolved, ResolveError> {
+        if self.active.read().is_none()
+            && let Some(home) = &self.home
+            && super::store::ProjectStore::discover(home).is_some()
+        {
+            let engine = self
+                .manager
+                .open(home)
+                .map_err(|error| ResolveError::Project(error.to_string()))?;
+
+            self.activate(engine).map_err(ResolveError::Project)?;
+        }
+
         let session = self.active.read().clone().ok_or(ResolveError::NoProject)?;
+
+        // Before the token resolves: adopting a change moves the
+        // session's token to a successor at the new head.
+        sync(&session.engine)?;
 
         let task = session
             .engine
@@ -585,21 +636,20 @@ impl ProjectHost {
         })
     }
 
-    /// Opens or creates a project and makes it the active one.
+    /// Makes `engine`'s project the active one, under a fresh session
+    /// at its current head.
     fn activate(
         &self,
-        project: &str,
-        prompt: Option<String>,
+        engine: ConfluenceEngine,
     ) -> Result<super::workspace_manager::ProjectInfo, String> {
-        let engine = self
-            .manager
-            .open_or_create(project, prompt)
-            .map_err(|error| error.to_string())?;
+        engine.sync_with_disk().map_err(|error| error.to_string())?;
+
+        let path = engine.project_dir().unwrap_or_default();
 
         let handle = engine
             .create_session(
                 super::task::WriteScope::of([super::task::WriteGrant::All]),
-                format!("interactive session for project {project}"),
+                format!("interactive session for the project at {}", path.display()),
             )
             .map_err(|error| error.to_string())?;
 
@@ -608,12 +658,34 @@ impl ProjectHost {
             token: handle.token.0,
         });
 
-        Ok(super::workspace_manager::ProjectInfo {
-            name: project.to_string(),
-            open: true,
-            revision: Some(engine.head_revision()),
-        })
+        Ok(super::workspace_manager::ProjectInfo::of(path, &engine))
     }
+
+    /// The project `open_project` means: the one at `path`, else the
+    /// active one, else the server's own.
+    fn project_at(&self, path: Option<&str>) -> Result<ConfluenceEngine, String> {
+        let opened = match (path, self.active.read().clone(), &self.home) {
+            (Some(path), _, _) => self.manager.open(Path::new(path)),
+            (None, Some(session), _) => return Ok(session.engine),
+            (None, None, Some(home)) => self.manager.open(home),
+            (None, None, None) => {
+                return Err("no project is active and none was named; pass the \
+                            repository's absolute path"
+                    .to_string());
+            }
+        };
+
+        opened.map_err(|error| error.to_string())
+    }
+}
+
+/// Adopts what changed a project's files outside the server, before a
+/// request reads or writes it.
+fn sync(engine: &ConfluenceEngine) -> Result<(), ResolveError> {
+    engine
+        .sync_with_disk()
+        .map(|_| ())
+        .map_err(|error| ResolveError::Project(error.to_string()))
 }
 
 /// Converts an internal resolve error into the tool-facing MCP error.
@@ -624,6 +696,7 @@ fn resolve_to_mcp_error(error: ResolveError) -> McpError {
             "no project is open on this connection; call open_project or create_project first",
             None,
         ),
+        ResolveError::Project(message) => McpError::invalid_request(message, None),
     }
 }
 
@@ -632,9 +705,21 @@ fn resolve_to_mcp_error(error: ResolveError) -> McpError {
 fn no_project_result() -> Result<CallToolResult, McpError> {
     json_error(serde_json::json!({
         "error": "no project is open on this connection",
-        "guidance": "Call list_projects to see existing projects, open_project to select \
-                     one, or create_project to start a new one. Then use the architecture \
-                     tools.",
+        "guidance": "Call open_project with the repository's absolute path to select its \
+                     project (the `.conseqa/` directory), or create_project to start one \
+                     there. Then use the architecture tools.",
+    }))
+}
+
+/// The tool-result form of a project that cannot be read.
+fn project_error_result(message: String) -> Result<CallToolResult, McpError> {
+    json_error(serde_json::json!({
+        "error": message,
+        "guidance": "Nothing is read from or committed to the project until this is \
+                     resolved. A file under `.conseqa/` that no longer loads is never \
+                     written over: fix or revert the file named. A project open in \
+                     another conseqa process is that process's until it exits. Then call \
+                     again.",
     }))
 }
 
@@ -730,6 +815,7 @@ macro_rules! resolved {
         match $self.resolve(&$context) {
             Ok(resolved) => resolved,
             Err(ResolveError::NoProject) => return no_project_result(),
+            Err(ResolveError::Project(message)) => return project_error_result(message),
             Err(error) => return Err(resolve_to_mcp_error(error)),
         }
     };
@@ -1318,36 +1404,12 @@ impl ConseqaMcp {
     }
 
     #[tool(
-        description = "List the projects this server hosts, each an isolated architecture \
-                       model with its own history. Use open_project to make one \
-                       active, or create_project to start a new one."
-    )]
-    async fn list_projects(
-        &self,
-        context: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, McpError> {
-        let host = self.project_host(&context)?;
-
-        let projects: Vec<serde_json::Value> = host
-            .manager
-            .list()
-            .into_iter()
-            .map(|project| {
-                serde_json::json!({
-                    "name": project.name,
-                    "open": project.open,
-                    "revision": project.revision.map(|revision| revision.0),
-                })
-            })
-            .collect();
-
-        json_result(serde_json::json!({ "projects": projects }))
-    }
-
-    #[tool(
-        description = "Select a project as the active one. Every subsequent architecture \
-                       tool call operates on it. Creates the project if it does not exist. \
-                       Pass an optional prompt to seed a new project's intent."
+        description = "Select a project as the active one; every subsequent architecture \
+                       tool call operates on it. A project is the `.conseqa/` directory of a \
+                       repository, committed with its code: pass the repository's absolute \
+                       path, or any directory inside it. Omit the path to reopen the active \
+                       project at its current head (after a design run, say) or, with none \
+                       active, the project this server was started in."
     )]
     async fn open_project(
         &self,
@@ -1355,32 +1417,42 @@ impl ConseqaMcp {
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         let host = self.project_host(&context)?;
-        let params = params.0;
 
-        match host.activate(&params.project, params.prompt) {
+        let opened = host
+            .project_at(params.0.path.as_deref())
+            .and_then(|engine| host.activate(engine));
+
+        match opened {
             Ok(info) => json_result(serde_json::json!({
                 "project": info.name,
+                "path": info.path,
                 "opened": true,
-                "revision": info.revision.map(|revision| revision.0),
+                "revision": info.revision.0,
                 "note": "This is now the active project. Explore it with task_context and \
                          the read tools, learn the DSL with dsl_guide, change it with \
                          submit_patch, check spec_status for the checker's verdict, and \
                          export_spec to deliver YAML, report, and visualization. \
                          Author the skeleton with a sketch on every interface, then \
-                         call build_design. Opening another project switches the \
-                         active one.",
+                         call build_design. Every accepted patch is written to the \
+                         project's `.conseqa/` files; remind the user to commit them.",
             })),
 
             Err(error) => json_error(serde_json::json!({
                 "opened": false,
                 "error": error,
+                "guidance": "Pass the absolute path of a repository holding a \
+                             `.conseqa/project.yaml`, or call create_project to start one.",
             })),
         }
     }
 
-    #[tool(description = "Create a new isolated project and make it active, \
-                       seeded with an optional natural-language prompt describing the system \
-                       to build. Errors if a project of that name already exists.")]
+    #[tool(
+        description = "Create a new project in a directory — normally the repository \
+                       root — and make it active, seeded with an optional natural-language \
+                       prompt describing the system to build. Its state is a `.conseqa/` \
+                       directory there, to be committed with the code. Errors if the \
+                       directory, or one above it, already holds a project."
+    )]
     async fn create_project(
         &self,
         params: Parameters<CreateProjectParams>,
@@ -1389,35 +1461,32 @@ impl ConseqaMcp {
         let host = self.project_host(&context)?;
         let params = params.0;
 
-        if host
+        let created = host
             .manager
-            .list()
-            .into_iter()
-            .any(|project| project.name == params.project)
-        {
-            return json_error(serde_json::json!({
-                "created": false,
-                "error": format!("a project named `{}` already exists", params.project),
-                "guidance": "Use open_project to work on it, or choose a different name.",
-            }));
-        }
+            .create(Path::new(&params.path), params.name, params.prompt)
+            .map_err(|error| error.to_string())
+            .and_then(|engine| host.activate(engine));
 
-        match host.activate(&params.project, params.prompt) {
+        match created {
             Ok(info) => json_result(serde_json::json!({
                 "project": info.name,
+                "path": info.path,
                 "created": true,
-                "note": "New project created and now active. Its prompt is in task_context. \
-                         Learn the DSL with dsl_guide and dsl_reference, then author the \
-                         skeleton with submit_patch — services, schemas, data models, \
-                         topics, machines, and one sketched interface per planned \
-                         operation — and call build_design, which compiles, verifies and \
-                         repairs in one call and hands back only what code cannot settle. \
-                         Check spec_status as you go, and export_spec to deliver.",
+                "note": "New project created and now active; its files are in `.conseqa/` \
+                         under the path above, and the user should commit them. Its prompt \
+                         is in task_context. Learn the DSL with dsl_guide and \
+                         dsl_reference, then author the skeleton with submit_patch — \
+                         services, schemas, data models, topics, machines, and one sketched \
+                         interface per planned operation — and call build_design, which \
+                         compiles, verifies and repairs in one call and hands back only \
+                         what code cannot settle. Check spec_status as you go, and \
+                         export_spec to deliver.",
             })),
 
             Err(error) => json_error(serde_json::json!({
                 "created": false,
                 "error": error,
+                "guidance": "Use open_project for a directory that already holds a project.",
             })),
         }
     }
@@ -1838,14 +1907,17 @@ impl ServerHandler for ConseqaMcp {
 ///
 /// This is the transport Claude Desktop / Code accepts for a local
 /// server without TLS: the app spawns the command and speaks MCP over
-/// its stdin/stdout, so there is no `https` URL to satisfy.
+/// its stdin/stdout, so there is no `https` URL to satisfy. `home` is
+/// the directory the app started it in; the project there, if any, is
+/// the one a client means without naming one.
 pub async fn serve_stdio(
     manager: Arc<WorkspaceManager>,
     launcher: Option<Arc<dyn DesignLauncher>>,
+    home: Option<PathBuf>,
 ) -> std::io::Result<()> {
     use rmcp::{ServiceExt, transport::stdio};
 
-    let mcp = ConseqaMcp::local(manager, launcher);
+    let mcp = ConseqaMcp::local(manager, launcher, home);
 
     let service = mcp.serve(stdio()).await.map_err(std::io::Error::other)?;
 

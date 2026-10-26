@@ -7,7 +7,16 @@
 //! single worker thread that validates, applies, persists, publishes,
 //! and invalidates (§28). The worker is the only head writer, so
 //! commit-time validation races nothing.
+//!
+//! A project's files are its source of truth, and they can change from
+//! outside the engine — a hand edit, a checkout, a pull. Before each
+//! commit, and whenever a client asks ([`ConfluenceEngine::sync_with_disk`]),
+//! the engine adopts such a change as a revision of its own, under the
+//! same writer lock the commit worker holds, so the head still has one
+//! writer at a time.
 
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -27,12 +36,12 @@ use super::events::{EngineEvent, EventBus, InvalidationCause};
 use super::graph_query::{self, GraphQuery, QueryResult};
 use super::invalidation::stale_causes;
 use super::patch::SpecPatch;
-use super::persistence::{Persistence, PersistenceError, TaskRecord};
 use super::read_set::{
     QueryObservation, SearchSpec, SummaryObservation, SymbolObservation, TaskReadSet, run_search,
     search_fingerprint,
 };
 use super::snapshot::{Head, WorkspaceSnapshot};
+use super::store::{ExternalChange, ProjectStore, StoreError, TaskRecord};
 use super::summary::OperationSummary;
 use super::symbol::{SymbolKey, SymbolKind, SymbolOwner, SymbolVersion};
 use super::task::{
@@ -69,8 +78,8 @@ pub enum EngineError {
         accepted: Vec<String>,
     },
 
-    #[error("persistence: {0}")]
-    Persistence(#[from] PersistenceError),
+    #[error("project store: {0}")]
+    Store(#[from] StoreError),
 
     #[error("the commit sequencer is shut down")]
     Shutdown,
@@ -242,7 +251,20 @@ struct EngineInner {
     tokens: TokenMap,
     events: EventBus,
     analysis: AnalysisHub,
-    persistence: Persistence,
+    store: ProjectStore,
+
+    /// Held by whoever writes the head: the commit worker, for each
+    /// commit, and [`ConfluenceEngine::sync_with_disk`], adopting an
+    /// outside change.
+    writer: Mutex<()>,
+
+    /// Each committed `(task, client nonce)`, for idempotent
+    /// resubmission (§84). Not persisted: a task's token dies with the
+    /// process, so no resubmission can outlive it.
+    nonces: Mutex<FxHashMap<(TaskId, uuid::Uuid), Revision>>,
+
+    /// Every dependency request filed, keyed by id.
+    dependency_requests: Mutex<BTreeMap<String, DependencyRequest>>,
 }
 
 struct QueuedCommit {
@@ -264,44 +286,43 @@ impl ConfluenceEngine {
         Arc::ptr_eq(&self.inner, &other.inner)
     }
 
-    /// An engine over in-memory persistence, for tests and ephemeral
-    /// runs.
+    /// An engine that keeps nothing, for tests and ephemeral runs.
     pub fn in_memory(initial: WorkspaceState) -> Result<Self, EngineError> {
-        Self::start(Persistence::in_memory()?, initial)
+        Self::start(ProjectStore::in_memory(), initial)
     }
 
-    /// Opens (or creates) a file-backed engine. When the database
-    /// already holds a head, that head is authoritative and `initial`
-    /// is ignored; persisted tasks that were active are conservatively
-    /// invalidated, because their live read tracking died with the
-    /// previous process (§84).
-    pub fn open(path: &std::path::Path, initial: WorkspaceState) -> Result<Self, EngineError> {
-        Self::start(Persistence::open_file(path)?, initial)
+    /// Opens the project at or above `dir`, or creates one in `dir`
+    /// holding `initial` when there is none. An existing project's
+    /// files are authoritative and `initial` is ignored.
+    pub fn open(dir: &Path, initial: WorkspaceState) -> Result<Self, EngineError> {
+        match ProjectStore::discover(dir) {
+            Some(project) => Self::open_project(&project),
+            None => Self::create_project(dir, initial),
+        }
     }
 
-    fn start(persistence: Persistence, initial: WorkspaceState) -> Result<Self, EngineError> {
-        let recovered = match persistence.head()? {
-            Some(revision) => {
-                let workspace = persistence
-                    .load_workspace(revision)?
-                    .expect("the head revision is persisted with its workspace");
+    /// Opens the project in `dir`. Tasks the log records as active
+    /// are conservatively invalidated, because their live read
+    /// tracking died with the previous process (§84).
+    pub fn open_project(dir: &Path) -> Result<Self, EngineError> {
+        let (store, head) = ProjectStore::open(dir)?;
 
-                Some(workspace)
-            }
+        Self::start(store, head)
+    }
 
-            None => None,
-        };
+    /// Creates a project in `dir` holding `initial`.
+    pub fn create_project(dir: &Path, initial: WorkspaceState) -> Result<Self, EngineError> {
+        let store = ProjectStore::create(dir, &initial)?;
 
-        let recovering = recovered.is_some();
+        Self::start(store, initial)
+    }
 
-        let workspace = match recovered {
-            Some(workspace) => workspace,
-            None => {
-                persistence.init_head(&initial)?;
-
-                initial
-            }
-        };
+    fn start(store: ProjectStore, workspace: WorkspaceState) -> Result<Self, EngineError> {
+        let dependency_requests = store
+            .load_dependency_requests()?
+            .into_iter()
+            .map(|request| (request.id.0.to_string(), request))
+            .collect();
 
         let snapshot = WorkspaceSnapshot::build(workspace, None);
 
@@ -314,15 +335,16 @@ impl ConfluenceEngine {
             tokens: TokenMap::default(),
             events,
             analysis,
-            persistence,
+            store,
+            writer: Mutex::new(()),
+            nonces: Mutex::new(FxHashMap::default()),
+            dependency_requests: Mutex::new(dependency_requests),
         });
 
         // The initial head gets its analysis like any commit's.
         inner.analysis.enqueue(inner.head.load());
 
-        if recovering {
-            recover_tasks(&inner)?;
-        }
+        recover_tasks(&inner)?;
 
         let (sender, receiver) = mpsc::channel(64);
 
@@ -339,6 +361,31 @@ impl ConfluenceEngine {
             inner,
             commits: sender,
         })
+    }
+
+    /// The directory of the project this engine writes, when it writes
+    /// one.
+    pub fn project_dir(&self) -> Option<PathBuf> {
+        self.inner.store.project_dir().map(Path::to_path_buf)
+    }
+
+    /// The project's machine-local, uncommitted directory, for
+    /// artifacts that belong to the project but not in version control.
+    pub fn local_dir(&self) -> Option<PathBuf> {
+        self.inner.store.local_dir()
+    }
+
+    /// Adopts what changed the project's files from outside the
+    /// engine since it last wrote or read them, as the next revision:
+    /// tasks that observed a changed symbol are invalidated, and
+    /// interactive sessions move to the new head. Returns the adopted
+    /// revision, if there was a change. An error when the files no
+    /// longer load; the head is then left as it was, and every commit
+    /// is refused until they do.
+    pub fn sync_with_disk(&self) -> Result<Option<Revision>, EngineError> {
+        let _writer = self.inner.writer.lock();
+
+        adopt_disk_change(&self.inner)
     }
 
     pub fn head_snapshot(&self) -> Arc<WorkspaceSnapshot> {
@@ -912,7 +959,7 @@ impl ConfluenceEngine {
             resolution: None,
         };
 
-        self.inner.persistence.record_dependency_request(&request)?;
+        self.record_dependency_request(request.clone())?;
 
         self.inner.events.emit(EngineEvent::DependencyRequested {
             request: request.clone(),
@@ -928,11 +975,11 @@ impl ConfluenceEngine {
     /// outstanding has not converged (§75).
     pub fn open_dependency_requests(&self) -> Vec<DependencyRequest> {
         self.inner
-            .persistence
-            .load_dependency_requests()
-            .unwrap_or_default()
-            .into_iter()
+            .dependency_requests
+            .lock()
+            .values()
             .filter(|request| request.resolution.is_none())
+            .cloned()
             .collect()
     }
 
@@ -946,10 +993,10 @@ impl ConfluenceEngine {
     ) -> Result<(), EngineError> {
         let Some(mut request) = self
             .inner
-            .persistence
-            .load_dependency_requests()?
-            .into_iter()
-            .find(|request| request.id == id)
+            .dependency_requests
+            .lock()
+            .get(&id.0.to_string())
+            .cloned()
         else {
             return Ok(());
         };
@@ -960,7 +1007,22 @@ impl ConfluenceEngine {
 
         request.resolution = Some(resolution);
 
-        self.inner.persistence.record_dependency_request(&request)?;
+        self.record_dependency_request(request)
+    }
+
+    /// Files or updates one dependency request, kept only once the
+    /// store has it.
+    fn record_dependency_request(&self, request: DependencyRequest) -> Result<(), EngineError> {
+        let mut requests = self.inner.dependency_requests.lock();
+
+        let mut next = requests.clone();
+        next.insert(request.id.0.to_string(), request);
+
+        self.inner
+            .store
+            .save_dependency_requests(&next.values().cloned().collect::<Vec<_>>())?;
+
+        *requests = next;
 
         Ok(())
     }
@@ -1012,7 +1074,7 @@ impl ConfluenceEngine {
         self.inner.tokens.revoke(task);
 
         self.inner
-            .persistence
+            .store
             .update_task_state(task, state, now_unix_ms())?;
 
         self.inner
@@ -1304,13 +1366,13 @@ impl ConfluenceEngine {
 /// conservatively invalidated: their live read tracking died with the
 /// previous process (§84). Terminal tasks are kept for audit.
 fn recover_tasks(inner: &Arc<EngineInner>) -> Result<(), EngineError> {
-    let records = inner.persistence.load_tasks()?;
+    let records = inner.store.load_tasks();
     let snapshot = inner.head.load();
 
     for TaskRecord { spec, state } in records {
         let state = if state.is_active() || state == TaskState::Planned {
             inner
-                .persistence
+                .store
                 .update_task_state(spec.id, TaskState::Invalidated, now_unix_ms())?;
 
             TaskState::Invalidated
@@ -1352,7 +1414,7 @@ fn install_task(
     spec.snapshot_revision = snapshot.revision;
 
     inner
-        .persistence
+        .store
         .record_task(&spec, TaskState::Running, now_unix_ms())?;
 
     let handle = TaskHandle {
@@ -1405,9 +1467,27 @@ fn spawn_interactive_successor(inner: &Arc<EngineInner>, predecessor: &TaskSpec,
 }
 
 /// The commit sequencer: one logical writer draining the queue (§28).
+/// Each commit is judged against the files as they are: an outside
+/// change is adopted first, so a commit built on what it replaced is
+/// refused like any stale one.
 fn commit_worker(inner: Arc<EngineInner>, mut queue: mpsc::Receiver<QueuedCommit>) {
     while let Some(QueuedCommit { request, respond }) = queue.blocking_recv() {
-        let outcome = process_commit(&inner, request);
+        let _writer = inner.writer.lock();
+
+        let outcome = match adopt_disk_change(&inner) {
+            Ok(_) => process_commit(&inner, request),
+
+            Err(error) => Err(CommitRejection::DraftValidationFailed {
+                diagnostics: vec![super::commit::DraftDiagnostic {
+                    subject: None,
+                    message: format!(
+                        "the project's files changed on disk and no longer load, so \
+                         nothing is committed over them: {error}. Fix or revert the \
+                         file, then resubmit."
+                    ),
+                }],
+            }),
+        };
 
         // A dropped receiver means the submitter went away; the commit
         // decision stands either way.
@@ -1434,10 +1514,13 @@ fn process_commit(
 
     // Idempotent resubmission: an identical nonce returns the
     // previously committed revision (§84).
-    if let Ok(Some(revision)) = inner
-        .persistence
-        .nonce_revision(request.task, request.client_nonce)
-    {
+    let replayed = inner
+        .nonces
+        .lock()
+        .get(&(request.task, request.client_nonce))
+        .copied();
+
+    if let Some(revision) = replayed {
         return Ok(CommitReceipt {
             revision,
             replayed: true,
@@ -1518,7 +1601,7 @@ fn process_commit(
                     rejected_patch: Some(request.patch.clone()),
                 });
 
-                let _ = inner.persistence.update_task_state(
+                let _ = inner.store.update_task_state(
                     request.task,
                     TaskState::Invalidated,
                     now_unix_ms(),
@@ -1664,11 +1747,7 @@ fn validate_and_commit(
     };
 
     // 14. Atomic persistence, then 15. publication.
-    if let Err(error) =
-        inner
-            .persistence
-            .persist_commit(&snapshot.workspace, &record, TaskState::Committed)
-    {
+    if let Err(error) = inner.store.persist_commit(&snapshot.workspace, &record) {
         // Persistence failure keeps the old head authoritative; the
         // task context is not stale, so this is fixable by resubmitting.
         return Err(CommitRejection::DraftValidationFailed {
@@ -1678,6 +1757,18 @@ fn validate_and_commit(
             }],
         });
     }
+
+    inner
+        .nonces
+        .lock()
+        .insert((record.task, record.client_nonce), record.revision);
+
+    // The task log records the commit; a commit already on disk does
+    // not fail over its audit trail.
+    let _ =
+        inner
+            .store
+            .update_task_state(record.task, TaskState::Committed, record.timestamp_unix_ms);
 
     let snapshot = Arc::new(snapshot);
 
@@ -1692,12 +1783,77 @@ fn validate_and_commit(
 
     // 16. Invalidate active tasks whose observed context changed
     // (§34).
-    invalidate_stale_tasks(inner, request.task, &changed, &snapshot);
+    invalidate_stale_tasks(inner, Some(request.task), &changed, &snapshot);
 
     Ok(CommitReceipt {
         revision: snapshot.revision,
         replayed: false,
     })
+}
+
+/// Adopts an outside change to the project's files as the next
+/// revision. The caller holds the writer lock.
+fn adopt_disk_change(inner: &Arc<EngineInner>) -> Result<Option<Revision>, EngineError> {
+    let Some(mut change) = inner.store.disk_change()? else {
+        return Ok(None);
+    };
+
+    let head = inner.head.load();
+
+    change.workspace.revision = Revision(head.revision.0 + 1);
+
+    let snapshot = WorkspaceSnapshot::build(change.workspace.clone(), Some(&head.graph));
+    let changed = changed_symbols(&head, &snapshot);
+
+    inner.store.record_disk_change(
+        change,
+        ExternalChange {
+            revision: snapshot.revision,
+            parent: head.revision,
+            changed_symbols: changed.clone(),
+            timestamp_unix_ms: now_unix_ms(),
+        },
+    )?;
+
+    let snapshot = Arc::new(snapshot);
+
+    inner.head.publish(Arc::clone(&snapshot));
+
+    inner.events.emit(EngineEvent::HeadPublished {
+        revision: snapshot.revision,
+    });
+
+    inner.analysis.enqueue(Arc::clone(&snapshot));
+
+    invalidate_stale_tasks(inner, None, &changed, &snapshot);
+    move_interactive_sessions(inner);
+
+    Ok(Some(snapshot.revision))
+}
+
+/// Moves every live interactive session to the head. A session reads
+/// its pinned snapshot, and only its own commits re-pin it, so after an
+/// outside change it would go on reading what the files no longer say.
+/// Its token rolls to a successor at the head, which — like any fresh
+/// session — re-reads before it references.
+fn move_interactive_sessions(inner: &Arc<EngineInner>) {
+    let sessions: Vec<Arc<TaskEntry>> = inner
+        .tasks
+        .read()
+        .values()
+        .filter(|entry| entry.interactive() && *entry.state.lock() == TaskState::Running)
+        .cloned()
+        .collect();
+
+    for entry in sessions {
+        *entry.state.lock() = TaskState::Invalidated;
+
+        let _ = inner
+            .store
+            .update_task_state(entry.spec.id, TaskState::Invalidated, now_unix_ms());
+
+        spawn_interactive_successor(inner, &entry.spec, entry.token.clone());
+    }
 }
 
 fn changed_symbols(head: &WorkspaceSnapshot, candidate: &WorkspaceSnapshot) -> Vec<SymbolKey> {
@@ -1724,7 +1880,7 @@ fn changed_symbols(head: &WorkspaceSnapshot, candidate: &WorkspaceSnapshot) -> V
 
 fn invalidate_stale_tasks(
     inner: &Arc<EngineInner>,
-    committing: TaskId,
+    committing: Option<TaskId>,
     changed: &[SymbolKey],
     head: &Arc<WorkspaceSnapshot>,
 ) {
@@ -1732,7 +1888,7 @@ fn invalidate_stale_tasks(
         .tasks
         .read()
         .iter()
-        .filter(|(id, _)| **id != committing)
+        .filter(|(id, _)| Some(**id) != committing)
         .map(|(id, entry)| (*id, Arc::clone(entry)))
         .collect();
 
@@ -1782,7 +1938,7 @@ fn invalidate_stale_tasks(
         });
 
         let _ = inner
-            .persistence
+            .store
             .update_task_state(id, TaskState::Invalidated, now_unix_ms());
 
         inner.events.emit(EngineEvent::TaskInvalidated {

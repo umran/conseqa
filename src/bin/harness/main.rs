@@ -11,7 +11,9 @@ use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
-use conseqa::confluence::{ConfluenceEngine, RunId, RunMetadata, RunPolicy, WorkspaceState, mcp};
+use conseqa::confluence::{
+    ConfluenceEngine, ProjectStore, RunId, RunMetadata, RunPolicy, WorkspaceState, mcp,
+};
 use conseqa::harness::backends::{ClaudeCliBackend, CodexCliBackend};
 use conseqa::harness::{
     AgentBackend, Scheduler, SchedulerPolicy, Supervisor, Workflow, WorkflowConfig,
@@ -66,9 +68,11 @@ struct DesignArgs {
     #[arg(long, value_enum, default_value_t = Backend::Claude)]
     backend: Backend,
 
-    /// Authoring database path.
-    #[arg(long, default_value = ".conseqa/confluence.redb")]
-    database: PathBuf,
+    /// The project: its directory or any directory inside it. Created
+    /// there from the prompt or model when none exists; an existing
+    /// project resumes from its files.
+    #[arg(long, default_value = ".")]
+    project: PathBuf,
 
     /// Where to write the finalized model and reports.
     #[arg(long, default_value = ".")]
@@ -86,10 +90,6 @@ struct DesignArgs {
     /// fanout.
     #[arg(long, default_value_t = 4)]
     max_agents: usize,
-
-    /// Keep the authoring database after the run.
-    #[arg(long)]
-    keep_workspace: bool,
 
     /// Path to the backend executable (for a non-default install).
     #[arg(long)]
@@ -144,12 +144,11 @@ async fn design(args: DesignArgs) -> Result<ExitCode, String> {
         repo,
         model,
         backend,
-        database,
+        project,
         out,
         strict_requirements,
         max_restarts,
         max_agents,
-        keep_workspace,
         backend_program,
         #[cfg(feature = "system-one")]
         system_one,
@@ -164,8 +163,22 @@ async fn design(args: DesignArgs) -> Result<ExitCode, String> {
         (None, None) => None,
     };
 
-    if prompt.is_none() && model.is_none() {
-        return Err("provide --prompt/--prompt-file or --model".to_string());
+    let existing = ProjectStore::discover(&project);
+
+    match &existing {
+        None if prompt.is_none() && model.is_none() => {
+            return Err(format!(
+                "no project at {} yet: provide --prompt/--prompt-file or --model to create one",
+                project.display()
+            ));
+        }
+
+        Some(found) if prompt.is_some() || model.is_some() => eprintln!(
+            "note: resuming the project at {}; --prompt and --model apply only when creating one",
+            found.display()
+        ),
+
+        _ => {}
     }
 
     // Validated before anything is opened or served: a run must not
@@ -173,7 +186,16 @@ async fn design(args: DesignArgs) -> Result<ExitCode, String> {
     #[cfg(feature = "system-one")]
     let executor = system_one.configure()?;
 
-    let mut run_meta = RunMetadata::new(RunId(uuid::Uuid::new_v4().to_string()));
+    let name = project
+        .canonicalize()
+        .ok()
+        .and_then(|dir| {
+            dir.file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+        })
+        .unwrap_or_else(|| "project".to_string());
+
+    let mut run_meta = RunMetadata::new(RunId(name));
 
     run_meta.prompt = prompt;
     run_meta.policy = RunPolicy {
@@ -195,8 +217,8 @@ async fn design(args: DesignArgs) -> Result<ExitCode, String> {
         }
     };
 
-    let engine = ConfluenceEngine::open(&database, initial)
-        .map_err(|error| format!("cannot open {}: {error}", database.display()))?;
+    let engine = ConfluenceEngine::open(&project, initial)
+        .map_err(|error| format!("cannot open {}: {error}", project.display()))?;
 
     // The workers connect to a loopback MCP endpoint on an ephemeral
     // port.
@@ -238,17 +260,15 @@ async fn design(args: DesignArgs) -> Result<ExitCode, String> {
         None => backend_impl,
     };
 
-    let work_dir = database
-        .parent()
-        .map(|parent| parent.join("harness-work"))
-        .unwrap_or_else(|| PathBuf::from(".conseqa/harness-work"));
-
+    // The workers' scratch directories hold only their MCP
+    // configuration; outside every repository, so no worker picks up a
+    // project's own agent settings.
     let supervisor = Supervisor::new(
         engine.clone(),
         backend_impl,
         mcp_url,
         repo,
-        work_dir,
+        std::env::temp_dir().join("conseqa-work"),
     );
 
     let scheduler = Scheduler::new(
@@ -274,13 +294,6 @@ async fn design(args: DesignArgs) -> Result<ExitCode, String> {
     let report = workflow.run().await.map_err(|error| error.to_string())?;
 
     server.shutdown().await;
-
-    if !keep_workspace {
-        // Leave the database in place by default for audit; a future
-        // flag could remove it. keep_workspace is accepted for CLI
-        // stability.
-        let _ = keep_workspace;
-    }
 
     let json = serde_json::to_string_pretty(&report)
         .map_err(|error| format!("cannot serialize report: {error}"))?;

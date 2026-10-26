@@ -15,6 +15,7 @@ When sources disagree, use this precedence:
 | [`CONSEQA_DSL_SEMANTICS.md`](CONSEQA_DSL_SEMANTICS.md) | Normative DSL and V1 verifier semantics. | Declares DSL contract version 6 and names itself as the single authoritative semantics document. Embedded into the MCP `dsl_guide` by `src/confluence/mcp.rs`. |
 | [`SERIALIZATION_AND_ORDERING_PRIMITIVES_MAP.md`](SERIALIZATION_AND_ORDERING_PRIMITIVES_MAP.md) | Implementation-oriented map of serialization and ordering vocabulary, validation, proof logic, diagnostics, and tests. | Written against the DSL 6 implementation on the current branch. |
 | [`TRANSACTION_SERIALIZATION_GRAPH.md`](TRANSACTION_SERIALIZATION_GRAPH.md) | Detailed explanation of the current static transaction-conflict and serialization-graph analysis. | Explicitly revised for DSL 6 atomic conditional mutations. |
+| [`PROJECT_STATE.md`](PROJECT_STATE.md) | How a project's state lives in its repository's `.conseqa/` directory: layout, file format, outside edits, locking, crash safety, and the CLI and MCP surfaces that open projects. | Written against the format 9 project store in `src/confluence/store.rs`. |
 | [`CONSEQA_VIZ.md`](CONSEQA_VIZ.md) | User-facing guide to the current self-contained visualization. | Matches the current report overlay, pages, panels, and CLI surface. |
 | [`VIZ_FRONTEND.md`](VIZ_FRONTEND.md) | Developer guide for the current React/Vite visualization frontend and embedded bundle workflow. | Matches the current `viz/` source tree and build commands. |
 
