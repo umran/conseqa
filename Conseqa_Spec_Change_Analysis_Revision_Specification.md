@@ -7,6 +7,7 @@
 **Target DSL version:** 6 (unchanged)  
 **Project store format:** 10 (unchanged)  
 **Obligation report format:** 9 → 10  
+**Fact format:** 1 (new, §10.9)  
 **Baseline:** Conseqa `master`, commit `00c029f64738157c33e65d8e1cb41121c38ca831`  
 **Primary affected subsystems:** the obligation report, the project store reader, the `conseqa` CLI, the design MCP server
 
@@ -21,7 +22,7 @@ The revision introduces:
 
 - the **declaration partition**, an attribution of every semantic fact of a workspace to exactly one declaration;
 - the **obligation key**, a position-free identity for an obligation that survives reordering;
-- the **basis**, the structured, position-free set of facts a proof consumed;
+- the **basis**, the structured, position-free set of facts a proof consumed, with a durable and versioned form for facts stored outside the run that computed them;
 - the **obligation diff**, the **explanation invariant**, and the **reliance delta**;
 - `conseqa diff`, the design MCP tool `diff_spec`, and obligation report format 10.
 
@@ -348,7 +349,7 @@ pub struct BasisFact {
 }
 ```
 
-`Fact` is a closed enum, one variant per kind of fact (§10.5). Two basis facts are **the same fact** when their `fact` values are equal. Anchors, and the anchors' residuals, take no part in fact equality. A fact that still holds after its anchoring declaration was modified elsewhere is the same fact.
+`Fact` is a closed enum, one variant per kind of fact (§10.5). Two basis facts are **the same fact** when their `fact` values are equal. Anchors, and the anchors' residuals, take no part in fact equality. A fact that still holds after its anchoring declaration was modified elsewhere is the same fact. A fact has a durable form, which is what makes this equality meaningful across runs and builds (§10.9).
 
 ## 10.3 Position-free
 
@@ -365,7 +366,7 @@ A basis fact SHALL NOT carry a step index, a `StepLocation`, a `read_step`, or a
 
 ## 10.5 Catalogue
 
-The basis is extracted from the structured proofs, never from the rendered report. At the baseline the proof structures map to facts as follows. The catalogue is normative for the baseline and grows with the proof routes.
+The basis is extracted from the structured proofs, never from the rendered report. At the baseline the proof structures map to facts as follows. The catalogue is normative for the baseline and grows with the proof routes. The table writes each fact in a functional shorthand named after its durable kind. The kinds and their fields are §10.9.
 
 | Proof structure (`src/analyzer/verification/`) | Basis facts | Anchors |
 |---|---|---|
@@ -373,7 +374,7 @@ The basis is extracted from the structured proofs, never from the rendered repor
 | `TransactionSerializabilityProof::ConflictGraph` | the closure query; `cyclic_components(closure)` (query); one fact per constraining `CommitOrderEvidence` below | as below |
 | `CommitOrderEvidence::IntrinsicCommittedRead`, `ReadOnlyObservation` | `isolation(t) = level` | `transaction` |
 | `CommitOrderEvidence::AtomicWriteOrder` | `isolation` of both sides | both `transaction`s |
-| `CommitOrderEvidence::StrictLock` | `lock(t, object, mode)` per side | `transaction`, `data_object` |
+| `CommitOrderEvidence::StrictLock` | `lock(t, object, selector, mode)` per side | `transaction`, `data_object` |
 | `CommitOrderEvidence::AtomicConditionalMutation` | `guarded_mutation(t, object, mechanism, coverage, compared_fields)`, where `coverage` is the `GuardCoverage` kind with its read binding id and version field, and without steps | `transaction`, `data_object` |
 | the observed-version leg's "no transaction deletes the object" | `no_deleters(object)` (query) | `data_object` |
 | `CommitOrderEvidence::OrderedCursor` | `cursor(object, field, rule)` | `data_object` |
@@ -381,16 +382,16 @@ The basis is extracted from the structured proofs, never from the rendered repor
 | `ResultReplayProof::NoAdmittedInvocations`, `IdempotencyProof::NoAdmittedInvocations`, `RecoverabilityProof::NoAdmittedInvocations` | `admits_no_messages(input)` | `input`, `topic` or `outbox` |
 | `IdempotencyProof::NoAdmittedPaths` | `no_admitted_paths(operation, input)` | `program`, `input` |
 | `ResultReplayProof::NoReturnedResult` | `returns_no_result(operation, input)` | `program` |
-| `ResultReplayProof::ClassFixedResult` | one fact per `StabilityRule` and `ResultStabilityRule` cited: requirement key component, identified payload, recovered artifact, reconstructed artifact, replay-consistent target result, replay-stable external result | the requirement; the `topic` or `outbox` with its `schema`; the `transaction`; the target obligation (§10.6); the `effect_site` |
+| `ResultReplayProof::ClassFixedResult` | one `stable_root(operation, rule, root)` per `StabilityRule` and `ResultStabilityRule` cited (requirement key component, identified payload, recovered artifact, reconstructed artifact, replay-stable external result); `relies_on` for a replay-consistent target result (§10.6) | the requirement; the `topic` or `outbox` with its `schema`; the `transaction`; the target's `requirement`; the `effect_site` |
 | `IdempotencyProof::SingleDelivery` | `delivery(input) = at_most_once` (L1); `message_identity(topic)` | `subscription_runtime`, `topic` |
-| `EffectSafety::*` | one fact per variant: external idempotency, external side-effect freedom, same logical message, target deduplication (§10.6), transaction deduplication, same logical outbox message | `effect_site`; `topic`/`outbox`; `transaction` |
+| `EffectSafety::*` | per variant: `external_guarantee` for external idempotency and external side-effect freedom; `message_identity` for the same logical message, on a topic or an outbox; `relies_on` for target deduplication (§10.6); `deduplicated_by` for transaction deduplication | `effect_site`; `topic`/`outbox`; the target's `requirement`; `transaction` |
 | `RetryRoute::KeyedCommit`, `Resolution::KeyedCommit` | `deduplicated_by(t, key)` | `transaction` |
 | `RetryRoute::NaturalReplay`, `Resolution::NaturalReplay` | `naturally_replayable(t)` | `transaction` |
 | `Resolution::TerminalStep` | `terminal(operation, input)` | `program` |
 | `ArtifactReplay::Recovered`, `::Reconstructed` | `artifact_route(t, artifact, route)` | `transaction` |
 | `RetryDriver::AtLeastOnceDelivery` | `delivery(input) = at_least_once` (L1) | `subscription_runtime` |
 | `RetryDriver::IntrinsicOutboxRedrive` | `outbox_redrive(input)` | `input`, `outbox` |
-| `RetryDriver::InboundRepeatableRequest`, `::InboundRepeatableTransitionEffect` | `retry(effect) = may_repeat` | the caller's `effect_site` or `transition` |
+| `RetryDriver::InboundRepeatableRequest`, `::InboundRepeatableTransitionEffect` | `retry_may_repeat(effect)` | the caller's `effect_site` or `transition` |
 | `LineageFact::Propagated` | `propagation(producer, schema, source)` | the producer's `effect_site` or `transition` |
 
 A fact whose truth was read from a schema field (its type, its optionality) also anchors that `schema`. The general rule is that a fact anchors **every declaration whose content its truth was read from**.
@@ -406,6 +407,106 @@ An unproven verdict has no basis. It has a **blocked-on set**: the basis facts i
 ## 10.8 Exhaustiveness
 
 Basis and blocked-on extraction SHALL match every proof, obstacle, evidence, and gap variant without a wildcard arm, so that adding a proof route without extending the catalogue fails to compile instead of producing an empty basis.
+
+## 10.9 Durable form
+
+Facts are stored outside the run that computed them:
+
+- in the obligation report (§17);
+- in the diff document (§14);
+- in the conformance records a repository commits (Part IV), where a fact states what a piece of code was checked to provide.
+
+A conformance record may be written by one build and read by another months later. So a fact has a durable form, held to the same standard as the spec files themselves.
+
+### Shape
+
+Every fact kind has a fixed list of fields (the catalogue below). A fact is a map tagged by `kind`, its fields in canonical DSL form:
+
+- ids as strings;
+- field paths as component lists;
+- value references and object selectors in their canonical tagged form (§1.4 of the semantics contract);
+- enums in snake case;
+- sets as sorted lists.
+
+No shorthand is written, and a reader accepts only the canonical form, so one fact has exactly one spelling. Unknown kinds and unknown fields are refused, as every other Conseqa format refuses them.
+
+### Identity
+
+A fact's identity is its canonical form: two facts are the same fact exactly when their canonical forms are equal. A record may also store a digest of the form, to index by. The digest is derived and never authoritative, and a reader recomputes it rather than trusting it.
+
+This is deliberately unlike `SemanticHash`. That hash is runtime metadata, and a serialization change may legitimately move it; a fact's identity must not move.
+
+### Versioning
+
+`FACT_FORMAT` (in `src/analyzer/basis.rs`) counts the fact vocabulary, starting at 1. Any change to the vocabulary bumps it: a kind added, removed, or renamed, or a field added, removed, renamed, or retyped.
+
+A `dsl` bump forces a `FACT_FORMAT` bump, since facts are stated in the DSL's vocabulary. A `FACT_FORMAT` bump never forces a `dsl` bump.
+
+Every durable record that carries facts records both its `dsl` and its `fact_format`. A reader refuses any other pair by name, with one exception. A fact format listed in `FACT_READS` is one the current format extends without changing anything it said (a kind added, say), and it is read as the current format. This mirrors the DSL's `DSL_READS` rule. At this revision, `FACT_READS` is `[1]`.
+
+### Anchors and the durable declaration key
+
+Anchors (§10.2) take no part in a fact's identity. They are stored with it wherever a basis is stored, as durable declaration keys.
+
+A declaration key has two durable forms:
+
+- **Structured:** the `kind` / `value` map of §14.
+- **Textual:** used wherever a person writes a key by hand, as Part IV's code markers do. It is the member kind of §7.2, a space, and the declaration's ids, with the ids of a contained declaration separated by `/`:
+
+```text
+transaction operation.apply_payment/tx.apply_payment
+data_object data.orders/object.order
+subscription_runtime operation.ship/input.ship.paid
+schema schema.OrderRecord
+```
+
+Each id is written as the store writes it in a file name (`PROJECT_STATE.md`): letters, digits, `_`, `-`, and `.` (not leading) as themselves, and every other byte as `%XX`. So neither `/` nor a space ever appears inside an id, and any declaration has exactly one textual key. A `requirement` declaration has no textual form, since no one writes one by hand.
+
+### Stability guard
+
+Every fact kind has a golden serialization under `tests/golden/facts/`, which records the `FACT_FORMAT` it was written at. A change that alters any golden file while `FACT_FORMAT` stays the same fails the test suite. Durability does not depend on someone noticing a serde change.
+
+### What durability does not change
+
+Verdicts are still never compared across runs, and §6.5 stands: the diff recomputes both sides with one build and never reads an archived report as a side. The two differ in what they are. A fact is a statement in the model's vocabulary, which is stable within a fact format. A verdict is one build's judgment, which is not.
+
+### Catalogue of fields
+
+| Kind | Fields |
+|---|---|
+| `isolation` | `operation`, `transaction`, `level` |
+| `lock` | `operation`, `transaction`, `data_model`, `object`, `selector`, `mode` |
+| `guarded_mutation` | `operation`, `transaction`, `data_model`, `object`, `mechanism`, `coverage`, `compared_fields` |
+| `cursor` | `data_model`, `object`, `field`, `rule` |
+| `fence` | `data_model`, `object`, `field` |
+| `conflict_closure` | `root` (an operation and a transaction), `key`, `members` (operation–transaction pairs) |
+| `cyclic_components` | `root`, `key`, `components` (sets of operation–transaction pairs) |
+| `no_deleters` | `data_model`, `object` |
+| `admits_no_messages` | `operation`, `input` |
+| `no_admitted_paths` | `operation`, `input` |
+| `returns_no_result` | `operation`, `input` |
+| `terminal` | `operation`, `input` |
+| `stable_root` | `operation`, `rule`, `root` (a value reference) |
+| `delivery` | `operation`, `input`, `semantics` |
+| `message_identity` | `channel` (a topic, or a data model's outbox), `schema`, `fields` |
+| `deduplicated_by` | `operation`, `transaction`, `key` |
+| `naturally_replayable` | `operation`, `transaction` |
+| `artifact_route` | `operation`, `transaction`, `artifact`, `route` |
+| `outbox_redrive` | `operation`, `input`, `data_model`, `outbox` |
+| `retry_may_repeat` | `site`: an effect site (`operation`, `effect`) or a transition effect (`machine`, `transition`, `effect`) |
+| `external_guarantee` | `operation`, `effect`, `guarantee` (`idempotent`, `side_effect_free`), `identity` |
+| `propagation` | `producer` (an effect site or a transition effect), `schema`, `channel` |
+| `relies_on` | `obligation`, an obligation key (§9.2) |
+
+`coverage` is a tagged map, one of:
+
+- `atomic`;
+- `held_protection`;
+- `observed_state { read }`;
+- `observed_version { read, version_field }`;
+- `locked_reader { selector, mode }`.
+
+It names reads by their binding ids and never by step (§10.3). `selector` is the canonical object selector of the step the fact describes, so two locks one transaction takes on two instances of one object are two facts.
 
 ---
 
@@ -516,6 +617,7 @@ Every fact carries its layer. Introduced L1 reliance is infrastructure-facing (t
 {
   "format": 1,
   "dsl": 6,
+  "fact_format": 1,
   "base": { "source": { "commit": "00c029f6…", "ref": "origin/master" }, "empty": false },
   "head": { "source": { "working_tree": true }, "empty": false },
 
@@ -661,7 +763,7 @@ The head side is the project's current files, which the engine adopts as its hea
 
 # 17. Obligation report format 10
 
-`ProverReport.format` becomes 10. `Obligation` gains:
+`ProverReport.format` becomes 10. `ProverReport` gains `fact_format`, the `FACT_FORMAT` its facts are written in (§10.9), beside its existing `dsl`. `Obligation` gains:
 
 | Field | Present | Meaning |
 |---|---|---|
@@ -681,7 +783,7 @@ Factor `load_workspace` over a file source with two implementations: the directo
 
 ## 18.2 `src/analyzer/basis.rs` (new)
 
-Defines `ObligationKey`, `BasisFact`, `Fact`, the query facts, and the exhaustive extraction from `VerificationReport` (§10.5, §10.8). It lives in the core library, not behind the `design` feature, because the report needs it.
+Defines `ObligationKey`, `BasisFact`, `Fact`, the query facts, and the exhaustive extraction from `VerificationReport` (§10.5, §10.8). Also defines the durable form (§10.9): `FACT_FORMAT`, `FACT_READS`, the canonical serialization and its two-phase probe of `dsl` and `fact_format`, and the textual declaration key with its parser. It lives in the core library, not behind the `design` feature, because the report needs it.
 
 ## 18.3 `src/analyzer/report.rs`
 
@@ -774,6 +876,13 @@ The same two trees produce byte-identical documents across two runs.
 
 A proven obligation carries a non-empty basis, and an unproven one a non-empty blocked-on set. Every key round-trips. The viz loads a format 10 report.
 
+## 19.14 Durable facts
+
+- Every fact kind has a golden serialization, and the test fails when one changes without a `FACT_FORMAT` bump (§10.9).
+- Every fact extracted from every fixture round-trips through its canonical form unchanged.
+- A shorthand spelling, an unknown kind, an unknown field, and a record of another `dsl` or `fact_format` are each refused by name.
+- Every textual declaration key round-trips through its parser, including ids that need `%XX` escapes.
+
 ---
 
 # 20. Acceptance criteria
@@ -789,6 +898,7 @@ A proven obligation carries a non-empty basis, and an unproven one a non-empty b
 9. Obligation report format 10 carries `key`, `basis`, and `blocked_on`. Positional ids are unchanged.
 10. `diff_spec` serves the same document to every design MCP role.
 11. No verdict of any fixture changes.
+12. Facts have one canonical durable form per kind, versioned by `FACT_FORMAT` and guarded by golden tests. Declaration keys have one textual form.
 
 ---
 
