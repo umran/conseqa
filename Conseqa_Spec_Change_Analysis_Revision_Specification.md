@@ -3,7 +3,7 @@
 ## 1. Status
 
 **Status:** Proposed  
-**Part:** I of V: semantic diff and obligation diff. Parts II–V are outlined in §21 and are not normative.  
+**Part:** I of VI: semantic diff and obligation diff. Parts II, III and V are outlined in §21 and are not normative. Part IV (conformance) and Part VI (realization profiles) are specified in their own documents.  
 **Target DSL version:** 6 (unchanged)  
 **Project store format:** 10 (unchanged)  
 **Obligation report format:** 9 → 10  
@@ -497,6 +497,9 @@ Verdicts are still never compared across runs, and §6.5 stands: the diff recomp
 | `external_guarantee` | `operation`, `effect`, `guarantee` (`idempotent`, `side_effect_free`), `identity` |
 | `propagation` | `producer` (an effect site or a transition effect), `schema`, `channel` |
 | `relies_on` | `obligation`, an obligation key (§9.2) |
+| `realization` | `declaration` (the textual key the requirement applies to), `entry` (`id@version` of the chosen catalogue entry), `realizes` (the textual key of the declaration that entry realizes), `requirement` (the requirement's id) |
+
+`realization` was added by Part VI (`Conseqa_Realization_Profiles_Revision_Specification.md` §12) before format 1 shipped. It states a configuration requirement of a chosen realization, not a proof fact. No basis contains one, and Part IV attests it as a required fact.
 
 `coverage` is a tagged map, one of:
 
@@ -607,6 +610,17 @@ Facts relied on by both sides, with different counts, are listed only in the per
 
 Every fact carries its layer. Introduced L1 reliance is infrastructure-facing (today, delivery facts feeding `completion: guaranteed`), and Part IV binds it to infrastructure definitions.
 
+## 13.4 Realization changes
+
+When either side has a stack profile (Part VI §9), the diff reads `.conseqa/realization/` on both sides, through the same loader rules as the spec (§6.2). It reports:
+
+- changes to the stack;
+- per realizable declaration, changes to its derived needs (Part VI §6.3), and to its chosen realization's entry, version, options, or state (`chosen`, `automatic`, `ambiguous`, `invalid_choice`, `infeasible`);
+- every declaration whose state on head is `ambiguous`, `invalid_choice` or `infeasible`, with its infeasibility report (Part VI §10.4);
+- added and withdrawn `realization` facts (§10.9). This is the realization half of the reliance delta: configuration the code and infrastructure must now provide, or no longer need to.
+
+A spec change that adds a need the chosen realization does not provide is reported here, at the spec gate, rather than discovered by an implementing agent.
+
 ---
 
 # 14. The diff document
@@ -672,11 +686,30 @@ Every fact carries its layer. Introduced L1 reliance is infrastructure-facing (t
   "reliance": {
     "introduced": [ { "fact": { "...": "..." }, "layer": "l0", "relied_on_by": 2 } ],
     "withdrawn":  [ { "fact": { "...": "..." }, "layer": "l0" } ]
+  },
+
+  "realization": {
+    "stack": { "added": ["kafka@3.7"], "removed": [] },
+    "declarations": [
+      {
+        "declaration": "topic_runtime topic.payment_captured",
+        "needs": { "added": [{ "ordering": "within_group" }], "removed": [] },
+        "base": null,
+        "head": { "state": "automatic", "entry": "kafka.keyed-topic@1", "options": [] }
+      }
+    ],
+    "unrealizable": [],
+    "requirements": {
+      "introduced": [ { "fact": { "kind": "realization", "...": "..." } } ],
+      "withdrawn": []
+    }
   }
 }
 ```
 
 When the obligation diff is unavailable, `obligations` is `{ "status": "unavailable", "side": "base", "reason": "…", "other_side": { "proven": 11, "unknown": 2, "disproven": 0 } }`, and `impact` and `reliance` are absent.
+
+`realization` (§13.4) is present when either side has a stack profile, and absent otherwise. It does not depend on the obligation diff being available, since needs and choices are derived from the spec and the realization files alone.
 
 `base_id` and `head_id` link each entry to the side's obligation report, which uses the positional id as its address.
 
@@ -737,6 +770,8 @@ Removed obligations and unexplained entries, when there are any, are printed in 
 | `added-unproven` | any added obligation is not proven |
 | `rebased` | any obligation was rebased |
 | `unexplained` | any entry is unexplained |
+| `infeasible` | any declaration on head is `infeasible`, or has an `invalid_choice` (§13.4) |
+| `ambiguous` | any declaration on head is `ambiguous` (§13.4) |
 
 | Exit | Meaning |
 |---|---|
@@ -883,6 +918,16 @@ A proven obligation carries a non-empty basis, and an unproven one a non-empty b
 - A shorthand spelling, an unknown kind, an unknown field, and a record of another `dsl` or `fact_format` are each refused by name.
 - Every textual declaration key round-trips through its parser, including ids that need `%XX` escapes.
 
+## 19.15 Realization changes
+
+With a stack profile on both sides, each of the following is reported in the realization section, and fails the named gate:
+
+- adding a lock step to a transaction on a DynamoDB-realized data model makes it `infeasible` (`infeasible`);
+- adding SQS to a Kafka-only stack makes every topic runtime `ambiguous` (`ambiguous`);
+- choosing `kafka.keyed-topic@1` introduces its `record-key` facts on every producing effect site, as introduced realization requirements.
+
+A side without a stack profile produces no realization section, and neither gate fails.
+
 ---
 
 # 20. Acceptance criteria
@@ -899,6 +944,7 @@ A proven obligation carries a non-empty basis, and an unproven one a non-empty b
 10. `diff_spec` serves the same document to every design MCP role.
 11. No verdict of any fixture changes.
 12. Facts have one canonical durable form per kind, versioned by `FACT_FORMAT` and guarded by golden tests. Declaration keys have one textual form.
+13. With a stack profile, the diff reports realization changes and unrealizable declarations, and the `infeasible` and `ambiguous` gates fail on them (§13.4).
 
 ---
 
@@ -945,6 +991,18 @@ Drafted in full, ahead of Parts II and III, as `Conseqa_Conformance_and_Implemen
   - Reshaping a `deduplicated_by` key makes it stop matching A's records.
 - **The transition model.** Both versions' operations over the expanded data model, verified by the existing verifiers, with rollback as the same check reversed. A change whose transition model fails is split into intermediate specs, each of which passes.
 - **Semantics.** This is new proof territory, and needs a semantics revision and a §27 entry.
+
+## Part VI: Realization profiles
+
+Specified in `Conseqa_Realization_Profiles_Revision_Specification.md`. It covers:
+
+- a capability vocabulary derived from the spec;
+- a catalogue of technologies stating what each provides and requires;
+- a per-project stack profile;
+- a chosen realization per declaration, with feasibility checked at the spec gate (§13.4);
+- realization requirements attested under Part IV.
+
+The DSL is unchanged.
 
 ---
 
