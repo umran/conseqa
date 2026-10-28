@@ -601,7 +601,7 @@ Facts relied on by both sides, with different counts, are listed only in the per
 §1.3 makes every proof conditional on the implementation conforming to the declarations it consumed. The reliance delta therefore states, model-wide, the change in what the implementation must guarantee for the head side's proofs to hold of it:
 
 - an introduced fact is a guarantee the implementation must now provide, or must now be known to provide;
-- a withdrawn fact is one no proof needs any longer. That is not a statement that the implementation may stop providing it. The fact may still be declared, may still matter to the external analysis (§10.9), and may still matter to readers. The diff says "no longer relied on", never "safe to remove".
+- a withdrawn fact is one no proof needs any longer. That is not a statement that the implementation may stop providing it. The fact may still be declared, may still matter to the external analysis (§10.9 of the semantics contract), and may still matter to readers. The diff says "no longer relied on", never "safe to remove".
 
 ## 13.3 Layers
 
@@ -929,11 +929,13 @@ A proven obligation carries a non-empty basis, and an unproven one a non-empty b
 
 ## Part IV: Realization bindings
 
-- **Code markers.** Markers in code bind declarations (operations, transactions, effect sites, inputs, data objects, state machines) to implementation regions.
-- **Infrastructure tags.** A `conseqa_id` tag on infrastructure resources binds L1 declarations; L1 stays qualitative (§10.9), and the numbers stay in the infrastructure definitions.
-- **Attestations.** An attestation records a declaration's residual, a bound region's content hash, and that they were checked together. Either side drifting marks the binding stale.
-- **Conformance work list.** The reliance delta (§13), intersected with the bindings, becomes the work list for implementation and infrastructure changes.
-- **Reverse direction.** An infrastructure change that falsifies a relied-on L1 fact (a queue losing its redrive policy, which falsifies `at_least_once`) is traced back to the proofs that rest on it.
+Drafted in full, ahead of Parts II and III, as `Conseqa_Conformance_and_Implementation_Guidance_Revision_Specification.md`, which supersedes this outline. In brief:
+
+- **Markers.** Comment markers in any text file (code, SQL, configuration, Terraform) bind regions to declarations.
+- **Records.** Per-declaration conformance records store the residual the code was checked against, the region digests, and the attested facts with their evidence. Re-checked completeness claims cover the model-wide facts.
+- **Guidance.** A derived work list and work items guide implementing agents. Each item names the load-bearing facts, what each one's withdrawal would cost, and the project's own precedents.
+- **Conformance.** Every proven obligation is reported as conformant in the code or not.
+- **Part II.** The deployment baseline becomes the records at the deployed commit.
 
 ## Part V: Mixed-version verification
 
