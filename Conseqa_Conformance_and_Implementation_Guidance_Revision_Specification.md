@@ -5,6 +5,7 @@
 **Status:** Proposed  
 **Part:** IV of the spec-versioning programme: realization bindings. It is drafted ahead of Parts II and III, because Part II's deployment baseline is defined in terms of the records this part introduces (§16).  
 **Depends on:** Part I, `Conseqa_Spec_Change_Analysis_Revision_Specification.md`. It uses Part I's declaration partition (§7), obligation keys (§9), the basis and the durable form of facts (§10, §10.9), and the reliance delta (§13).  
+**Amended by:** Part VI, `Conseqa_Realization_Profiles_Revision_Specification.md` (§7.1–§7.3, §8.2, §10.1, §12.1, §12.2, §14.3, §14.4, §19, §21). Realization requirements become required facts, a stack profile brings realized declarations under binding, and catalogue checkers record reviews.  
 **Target DSL version:** 6 (unchanged)  
 **Project store format:** 10 (unchanged). Conformance records live in `.conseqa/` but outside what the store loads and scans (§8.1).  
 **Conformance format:** 1 (new)  
@@ -211,7 +212,7 @@ Every fact kind of Part I §10.9 belongs to exactly one conformance class:
 
 | Class | How the code provides it | Kinds |
 |---|---|---|
-| **attestable** | A region of an implementer provides it, and a record attests it with evidence. | `isolation`, `lock`, `guarded_mutation`, `cursor`, `fence`, `deduplicated_by`, `delivery`, `message_identity`, `outbox_redrive`, `retry_may_repeat`, `external_guarantee`, `propagation` |
+| **attestable** | A region of an implementer provides it, and a record attests it with evidence. | `isolation`, `lock`, `guarded_mutation`, `cursor`, `fence`, `deduplicated_by`, `delivery`, `message_identity`, `outbox_redrive`, `retry_may_repeat`, `external_guarantee`, `propagation`, `realization` |
 | **structural** | It follows from the declaration's content, so it holds of the code when the anchor's structural conformance holds. | `naturally_replayable`, `artifact_route`, `admits_no_messages`, `no_admitted_paths`, `returns_no_result`, `terminal`, `stable_root` |
 | **model-wide** | It depends on code the model does not declare doing nothing to the objects involved, so it holds only under completeness claims (§9). | `conflict_closure`, `cyclic_components`, `no_deleters` |
 | **internal** | It holds when the obligation it relies on is conformant (§10.2). | `relies_on` |
@@ -230,12 +231,20 @@ Every fact kind of Part I §10.9 belongs to exactly one conformance class:
 | `retry_may_repeat` | the caller's `effect_site`, or the `transition` |
 | `external_guarantee` | the `effect_site` |
 | `propagation` | the producer's `effect_site`, or the `transition` |
+| `realization` | the declaration named in its `declaration` field (Part VI §11.3) |
 
 A fact with several implementers is required of each of them, and each one's record attests it for its own regions.
 
 ## 7.3 Required facts
 
-A declaration's **required facts** are the attestable facts in the current spec's reliance (Part I §13.1) whose implementers include it. They are what the current proofs need its code to provide. A record attests only required facts (§14.2). A record is about what the proofs need, and the structural claim covers the rest of the declaration's content.
+A declaration's **required facts** come from two sources:
+
+- the attestable facts in the current spec's reliance (Part I §13.1) whose implementers include it. These are what the current proofs need its code to provide;
+- when the project has a stack profile, every `realization` fact applying to it (Part VI §11). These are the configuration its chosen realizations demand of it, whether or not a proof relies on them.
+
+A record attests only required facts (§14.2). The structural claim covers the rest of the declaration's content.
+
+A declaration that a catalogue entry realizes has its chosen entry recorded in its record (§8.2). When the chosen entry, its version, or its options change, the record is `stale` (§10.1): the claims it was checked against are no longer the ones in force.
 
 ## 7.4 Evidence
 
@@ -283,6 +292,9 @@ regions:                  # computed by the tool (§14.2)
 
 structural: true          # §7.1
 
+# realization: { entry: kafka.keyed-topic@1, options: [] }
+#   present only on records of declarations a catalogue entry realizes (Part VI §10)
+
 facts:
   - fact:
       kind: guarded_mutation
@@ -295,6 +307,14 @@ facts:
       compared_fields: [[version]]
     evidence:
       - { path: src/payments/apply.rs, lines: [47, 51] }
+  - fact:                 # a realization requirement of the data model's PostgreSQL entry (Part VI §11)
+      kind: realization
+      declaration: transaction operation.apply_payment/tx.apply_payment
+      entry: postgres.database@1
+      realizes: data_model data.orders
+      requirement: conditional-update
+    evidence:
+      - { path: src/payments/apply.rs, lines: [47, 53] }
 
 completeness: []          # data_object, topic, and outbox records only (§9)
 
@@ -379,13 +399,14 @@ Each bindable declaration has a set of conditions, possibly empty:
 | `unbound` | The declaration has no region, and its kind is one the policy requires bound (§14.4). |
 | `orphaned` | A region's key names no declaration of the current spec. Reported against the key. |
 | `unattested` | The declaration is bound, but no readable record exists (§8.6). |
-| `stale` | The record's residual differs from the current residual. |
+| `stale` | The record's residual differs from the current residual, or, for a realized declaration, its `realization` differs from the chosen one (§7.3). |
 | `drifted` | The record's regions differ from the current regions: a digest, or the set of regions. |
 | `missing_facts` | A required fact is not attested in the record. |
 | `incomplete` | A required completeness claim is absent, or does not hold (§9.3). |
 | `surplus` | The record attests a fact that is no longer required. |
 | `unreviewed` | The policy requires a review of something the record carries, and no review by another party confirms it at the current digests. |
 | `disputed` | A review at the current digests disputes something the record carries. |
+| `unrealizable` | With a stack profile, the declaration is `ambiguous`, has an `invalid_choice`, or is `infeasible` (Part VI §10.3). Its work item is parked: the remedy is a decision about the spec or the stack, not code. |
 
 A declaration with no conditions is **current**.
 
@@ -468,6 +489,7 @@ The packet for one item holds everything an agent needs to do it, and nothing it
 | **Required facts** | Each fact's canonical form and a one-line rendering. Also the obligations whose basis contains the fact, by display name, with each obligation's summary line, and the load-bearing check (§12.2). |
 | **Completeness** | The required claims, their current matches outside declared regions, and the declared writers or publishers. |
 | **Code** | The item's regions (path and line range). The regions of its neighbours one hop away in the design graph: callers and callees, readers and writers of the objects it touches, publishers and consumers of its channels. Paths and ranges only, since the agent reads the files itself. |
+| **Realization** | With a stack profile (Part VI):<ul><li>the chosen catalogue entry, and why: automatic, or the architect's recorded reason;</li><li>each realization requirement on this declaration, with its statement and evidence shape;</li><li>the requirements this declaration's realization places on its neighbours, so a topic's implementer knows that producers must set the record key;</li><li>the idiom entries matching the project's frameworks for the primitives the declaration uses.</li></ul>This is the guidance an agent needs before any precedent exists. |
 | **Precedents** | For each required fact kind, how this project already implements it (§12.3). |
 | **Semantics** | For each primitive the declaration uses, the guide topic that defines it, by the name the design MCP `dsl_guide` tool resolves (for example `Atomic conditional mutations`, `Locks`, `Outbox write effect`). |
 | **Done when** | The checklist: regions bound with markers; structural conformance; each required fact evidenced; each required claim holding; then `attest`; then, where the policy requires it, a review. |
@@ -496,7 +518,7 @@ The withdrawals at this revision:
 | `retry_may_repeat` | set the retry to `unspecified` |
 | `message_identity` | set the identity to `unspecified` |
 
-A kind without a withdrawal falls back to listing the obligations that rely on the fact. Models are small and verification is fast, so the check runs on every packet. This is the sentence that stops an agent from deleting the `version = $2`: not a rule that it should be careful, but the named properties it would break.
+A kind without a withdrawal falls back to listing the obligations that rely on the fact. A `realization` fact has no proof cost, so the packet states instead the capability its requirement secures: "without it, `topic_runtime topic.payment_captured` no longer provides `ordering: within_group` as the spec declares". Models are small and verification is fast, so the check runs on every packet. This is the sentence that stops an agent from deleting the `version = $2`: not a rule that it should be careful, but the named properties it would break.
 
 ## 12.3 Precedents
 
@@ -570,6 +592,8 @@ A review is a second party's check of a record against the code. It gives a verd
 
 `conseqa conform review [<key>…] --backend claude|codex` runs one fresh-context worker per record, through the harness backends `conseqa design` already uses, with their scratch configuration outside the repository. A worker receives the record, the item's packet, and read access to the files, but not the attester's reasoning. It reports through the review operation. Done this way, a review is an independent read, not the attester's argument repeated back.
 
+**Checker reviews.** A catalogue entry's deterministic checkers (Part VI §13) run on every derivation, over the regions bound to the declaration their requirement applies to. Each result is recorded as a review, `by: { kind: checker, name: <entry id>/<checker id>@<entry version> }`, at the digests it read. Like any review, it lapses when they change.
+
 ## 14.4 Policy
 
 ```yaml
@@ -581,9 +605,15 @@ review:
   relied_on_facts: required     # required | optional
   completeness: required
   structural: optional
+  realization: required
+  checker_satisfies: [realization]   # fact kinds a confirming checker review satisfies
 ```
 
-When the file is absent, these values are the defaults. A fact or claim that no proof relies on never needs a review.
+When the file is absent, these values are the defaults. A fact or claim that no proof relies on needs a review only when it is a `realization` fact.
+
+When the project has a stack profile, every declaration with a chosen realization must also be bound, whatever `require_binding` lists. This is what brings routers, execution pools, storage layouts and topic runtimes under conformance: the spec's topology is held to what it declares, even where no proof relies on it.
+
+A confirming checker review satisfies the required review of exactly the requirements its checker covers. At this revision `checker_satisfies` may list only `realization`, because no catalogue checker covers a proof fact. A checker can confirm that a Terraform topic exists; it cannot confirm that a conditional update guards what a proof needs.
 
 ## 14.5 Provenance
 
@@ -783,6 +813,15 @@ The same inputs produce byte-identical status, plan, and packet JSON.
 
 Each exit code and gate of §15.3.
 
+## 18.12 Realization requirements
+
+With a stack profile, covered in detail by Part VI §20:
+
+- realization facts appear as required facts on their declarations;
+- a changed chosen entry makes its records `stale`;
+- an unrealizable declaration's item is parked;
+- checker reviews satisfy only the requirements their checkers cover.
+
 ---
 
 # 19. Acceptance criteria
@@ -797,6 +836,7 @@ Each exit code and gate of §15.3.
 8. Every packet names its load-bearing facts with the obligations each one carries, the withdrawal's cost where catalogued, and reviewed precedents.
 9. Reviews run in fresh context through the existing backends, are bound to digests, and never count when given by the attester.
 10. The MCP tools and the CLI serve the same derivation, and the store format, the DSL, and every verdict are unchanged.
+11. With a stack profile, realization requirements are required facts, every realized declaration is bound, and catalogue checkers record reviews that satisfy only what they cover.
 
 ---
 
@@ -815,7 +855,7 @@ Each exit code and gate of §15.3.
 # 21. Open questions
 
 - **Readers completeness.** A `writers` claim does not cover unmodeled readers. An unbound read-only path can still observe a non-serializable state. Whether read-side completeness is worth its cost is undecided.
-- **Deterministic checkers.** Some fact kinds have recognizable shapes: an `UPDATE … WHERE <version> = ?` for an observed-version guard, an isolation level in a `BEGIN`, a redrive policy in a queue resource. A checker per kind and language could confirm evidence mechanically, or flag its disappearance. The record format admits a `by: { kind: checker }` review today.
+- **Deterministic checkers.** Partly resolved by Part VI §13. Catalogue entries ship checkers for realization requirements with a known shape: a Terraform resource, an Envoy cluster field, a DDL clause. Checkers for proof facts in application code remain open: an `UPDATE … WHERE <version> = ?` for an observed-version guard, or an isolation level in a `BEGIN`.
 - **Generated code.** Markers in generated files vanish on regeneration. The working rule is to bind the generator's input, such as the migration source or the ORM schema. Whether the tool should know about generators is open.
 - **Several repositories.** A spec in one repository implemented in others is out of scope. Markers and records live in the project's repository.
 - **Precedent quality over time.** Precedents are only as good as the reviews behind them. Whether precedents should also prefer recent records is open.
