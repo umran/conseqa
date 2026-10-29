@@ -1,0 +1,23 @@
+{
+  "fact_format": 1,
+  "facts": [
+    {
+      "data_model": "data.orders",
+      "field": [
+        "last_applied_sequence"
+      ],
+      "kind": "cursor",
+      "object": "object.order",
+      "rule": "successor"
+    },
+    {
+      "data_model": "data.orders",
+      "field": [
+        "last_applied_sequence"
+      ],
+      "kind": "cursor",
+      "object": "object.order",
+      "rule": "monotonic_after"
+    }
+  ]
+}

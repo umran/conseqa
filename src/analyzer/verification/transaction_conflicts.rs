@@ -1032,7 +1032,13 @@ impl<'a> ConflictIndex<'a> {
                         // instance's write protection, which the
                         // writer's own held write withholds until it
                         // terminates: what it reads has committed.
-                        guard_evidence(target, guard, coverage, BTreeSet::new(), Some(held))
+                        guard_evidence(
+                            target,
+                            guard,
+                            coverage,
+                            BTreeSet::new(),
+                            Some(Box::new(held)),
+                        )
                     } else {
                         gaps.push(DependencyGap::IsolationUnspecified {
                             transaction: target.reference.clone(),
@@ -1070,10 +1076,10 @@ impl<'a> ConflictIndex<'a> {
                             guard,
                             coverage,
                             BTreeSet::new(),
-                            Some(HeldWrite::Isolation {
+                            Some(Box::new(HeldWrite::Isolation {
                                 transaction: source.reference.clone(),
                                 isolation: source_isolation,
-                            }),
+                            })),
                         )
                     } else {
                         for (template, isolation) in
@@ -1275,6 +1281,11 @@ impl<'a> ConflictIndex<'a> {
                 object: guard.target.object.clone(),
                 mechanism: guard.mechanism,
                 guard: coverage,
+                compared_fields: guard
+                    .comparisons
+                    .iter()
+                    .map(|comparison| comparison.field.clone())
+                    .collect(),
             })
     }
 
@@ -1767,7 +1778,7 @@ fn guard_evidence(
     guard: &ConditionalMutation,
     coverage: GuardCoverage,
     compared: BTreeSet<FieldPath>,
-    held_write: Option<HeldWrite>,
+    held_write: Option<Box<HeldWrite>>,
 ) -> CommitOrderEvidence {
     CommitOrderEvidence::AtomicConditionalMutation {
         guarded_by: template.reference.clone(),
@@ -2135,7 +2146,7 @@ pub enum CommitOrderEvidence {
         /// the earlier writer of a write-write dependency whose later
         /// writer holds it. Absent where the guard alone suffices.
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        held_write: Option<HeldWrite>,
+        held_write: Option<Box<HeldWrite>>,
     },
 
     /// The reader only reads, and observes committed state at one
@@ -2217,6 +2228,9 @@ pub enum HeldWrite {
         object: Id,
         mechanism: ConditionalMutationKind,
         guard: GuardCoverage,
+
+        #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+        compared_fields: BTreeSet<FieldPath>,
     },
 }
 
