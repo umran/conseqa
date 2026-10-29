@@ -1026,13 +1026,13 @@ impl<'a> ConflictIndex<'a> {
                             isolation: target.transaction.isolation,
                         }
                     } else if let Some((guard, coverage)) = self.protection(target, b)
-                        && self.holds_write(source, a)
+                        && let Some(held) = self.held_write(source, a)
                     {
                         // The reader observes at or after acquiring the
                         // instance's write protection, which the
                         // writer's own held write withholds until it
                         // terminates: what it reads has committed.
-                        guard_evidence(target, guard, coverage, BTreeSet::new())
+                        guard_evidence(target, guard, coverage, BTreeSet::new(), Some(held))
                     } else {
                         gaps.push(DependencyGap::IsolationUnspecified {
                             transaction: target.reference.clone(),
@@ -1057,7 +1057,7 @@ impl<'a> ConflictIndex<'a> {
                         // The earlier writer holds the instance's write
                         // protection from its guard to commit, so no
                         // later conflicting write commits before it.
-                        guard_evidence(source, guard, coverage, BTreeSet::new())
+                        guard_evidence(source, guard, coverage, BTreeSet::new(), None)
                     } else if let Some((guard, coverage)) = self.protection(target, b)
                         && source_isolation != TransactionIsolation::Unspecified
                     {
@@ -1065,7 +1065,16 @@ impl<'a> ConflictIndex<'a> {
                         // write protection only once the earlier one,
                         // which holds its write under declared
                         // isolation, has terminated.
-                        guard_evidence(target, guard, coverage, BTreeSet::new())
+                        guard_evidence(
+                            target,
+                            guard,
+                            coverage,
+                            BTreeSet::new(),
+                            Some(HeldWrite::Isolation {
+                                transaction: source.reference.clone(),
+                                isolation: source_isolation,
+                            }),
+                        )
                     } else {
                         for (template, isolation) in
                             [(source, source_isolation), (target, target_isolation)]
@@ -1117,6 +1126,7 @@ impl<'a> ConflictIndex<'a> {
                                             reader_lock: lock.clone(),
                                         },
                                         BTreeSet::new(),
+                                        None,
                                     )
                                 } else {
                                     if let Err(gap) = reader_lock {
@@ -1243,11 +1253,29 @@ impl<'a> ConflictIndex<'a> {
         }
     }
 
-    /// Whether the template holds its write until it terminates: under
-    /// declared isolation, or under a guarded mutation's protection.
-    fn holds_write(&self, template: &TransactionTemplate<'_>, access: &TransactionAccess) -> bool {
-        template.transaction.isolation != TransactionIsolation::Unspecified
-            || self.protection(template, access).is_some()
+    /// How the template holds its write until it terminates, if it
+    /// does: under declared isolation, or under a guarded mutation's
+    /// protection.
+    fn held_write(
+        &self,
+        template: &TransactionTemplate<'_>,
+        access: &TransactionAccess,
+    ) -> Option<HeldWrite> {
+        if template.transaction.isolation != TransactionIsolation::Unspecified {
+            return Some(HeldWrite::Isolation {
+                transaction: template.reference.clone(),
+                isolation: template.transaction.isolation,
+            });
+        }
+
+        self.protection(template, access)
+            .map(|(guard, coverage)| HeldWrite::GuardedMutation {
+                guarded_by: template.reference.clone(),
+                step: guard.step,
+                object: guard.target.object.clone(),
+                mechanism: guard.mechanism,
+                guard: coverage,
+            })
     }
 
     /// Why the reader's observation `a` cannot go stale under the
@@ -1273,7 +1301,13 @@ impl<'a> ConflictIndex<'a> {
         b: &TransactionAccess,
     ) -> Result<CommitOrderEvidence, DependencyGap> {
         if let Some((guard, coverage)) = self.protection(reader, a) {
-            return Ok(guard_evidence(reader, guard, coverage, BTreeSet::new()));
+            return Ok(guard_evidence(
+                reader,
+                guard,
+                coverage,
+                BTreeSet::new(),
+                None,
+            ));
         }
 
         if !self.identifies_instance(&a.selector) {
@@ -1309,9 +1343,9 @@ impl<'a> ConflictIndex<'a> {
                 // An insertion after a deletion establishes its token
                 // afresh and may repeat the one observed, so where the
                 // object is ever deleted the token covers no insertion.
-                let repeats = matches!(b.mode, AccessMode::Insert | AccessMode::UpsertReadWrite)
-                    .then(|| self.deleter(&a.object))
-                    .flatten();
+                let insertion = matches!(b.mode, AccessMode::Insert | AccessMode::UpsertReadWrite);
+
+                let repeats = insertion.then(|| self.deleter(&a.object)).flatten();
 
                 match repeats {
                     None => {
@@ -1322,8 +1356,10 @@ impl<'a> ConflictIndex<'a> {
                                 read: observed.read.clone(),
                                 read_step: observed.step,
                                 version_field: version.clone(),
+                                no_deleters: insertion,
                             },
                             BTreeSet::from([version.clone()]),
+                            None,
                         ));
                     }
 
@@ -1370,6 +1406,7 @@ impl<'a> ConflictIndex<'a> {
                             read_step: a.step,
                         },
                         compared,
+                        None,
                     ));
                 }
 
@@ -1465,36 +1502,14 @@ impl<'a> ConflictIndex<'a> {
         closure: &[usize],
         dependencies: &[DependencyEvidence],
     ) -> Vec<UnconstrainedCycle> {
-        let position = |reference: &TransactionRef| {
-            closure
-                .iter()
-                .position(|&index| self.templates[index].reference == *reference)
-        };
-
-        let edges: Vec<(usize, usize)> = dependencies
+        let references: Vec<TransactionRef> = closure
             .iter()
-            .filter_map(|dependency| {
-                Some((position(&dependency.source)?, position(&dependency.target)?))
-            })
+            .map(|&index| self.templates[index].reference.clone())
             .collect();
 
         let mut cycles = Vec::new();
 
-        for component in strongly_connected_components(closure.len(), &edges) {
-            let cyclic = component.len() > 1
-                || edges
-                    .iter()
-                    .any(|(from, to)| from == to && component.contains(from));
-
-            if !cyclic {
-                continue;
-            }
-
-            let members: Vec<TransactionRef> = component
-                .iter()
-                .map(|&local| self.templates[closure[local]].reference.clone())
-                .collect();
-
+        for members in cyclic_components(&references, dependencies) {
             let unconstrained: Vec<DependencyEvidence> = dependencies
                 .iter()
                 .filter(|dependency| {
@@ -1745,12 +1760,14 @@ pub fn observation(
         })
 }
 
-/// The evidence a guarded mutation of `template` supplies.
+/// The evidence a guarded mutation of `template` supplies, with the
+/// other side's held write where the credit rests on it too.
 fn guard_evidence(
     template: &TransactionTemplate<'_>,
     guard: &ConditionalMutation,
     coverage: GuardCoverage,
     compared: BTreeSet<FieldPath>,
+    held_write: Option<HeldWrite>,
 ) -> CommitOrderEvidence {
     CommitOrderEvidence::AtomicConditionalMutation {
         guarded_by: template.reference.clone(),
@@ -1767,6 +1784,7 @@ fn guard_evidence(
         } else {
             compared
         },
+        held_write,
     }
 }
 
@@ -1876,6 +1894,44 @@ pub fn field_overlap(a: &AccessFields, b: &AccessFields) -> FieldOverlap {
             }
         }
     }
+}
+
+/// The cyclic strongly connected components of the dependency graph
+/// over a closure's members, each in the members' order: those of more
+/// than one member, and those of one member with a dependency on
+/// itself. A dependency inside one needs commit-order evidence for the
+/// graph route to hold; a dependency between components closes no
+/// cycle and needs none, which is why a proof's basis cites only the
+/// evidence inside these (§10.5 of the spec change analysis revision).
+pub fn cyclic_components(
+    members: &[TransactionRef],
+    dependencies: &[DependencyEvidence],
+) -> Vec<Vec<TransactionRef>> {
+    let position =
+        |reference: &TransactionRef| members.iter().position(|member| member == reference);
+
+    let edges: Vec<(usize, usize)> = dependencies
+        .iter()
+        .filter_map(|dependency| {
+            Some((position(&dependency.source)?, position(&dependency.target)?))
+        })
+        .collect();
+
+    strongly_connected_components(members.len(), &edges)
+        .into_iter()
+        .filter(|component| {
+            component.len() > 1
+                || edges
+                    .iter()
+                    .any(|(from, to)| from == to && component.contains(from))
+        })
+        .map(|component| {
+            component
+                .iter()
+                .map(|&local| members[local].clone())
+                .collect()
+        })
+        .collect()
 }
 
 /// Tarjan's algorithm over `count` nodes: the strongly connected
@@ -2072,6 +2128,14 @@ pub enum CommitOrderEvidence {
 
         #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
         compared_fields: BTreeSet<FieldPath>,
+
+        /// What holds the other transaction's write until it
+        /// terminates, where the credit rests on that too: the writer
+        /// of a write-read dependency whose reader holds the guard, and
+        /// the earlier writer of a write-write dependency whose later
+        /// writer holds it. Absent where the guard alone suffices.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        held_write: Option<HeldWrite>,
     },
 
     /// The reader only reads, and observes committed state at one
@@ -2118,6 +2182,14 @@ pub enum GuardCoverage {
         read: Id,
         read_step: usize,
         version_field: FieldPath,
+
+        /// Set when the covered write is an insertion. An instance
+        /// inserted after a deletion establishes its token afresh, so
+        /// the token covers an insertion only because no transaction of
+        /// the model deletes the object: the argument rests on that
+        /// absence (§18.4 of the spec change analysis revision).
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        no_deleters: bool,
     },
 
     /// The reader holds a lock on the instance from before its
@@ -2125,6 +2197,27 @@ pub enum GuardCoverage {
     /// acquire the instance's write protection, which that lock
     /// withholds until the reader terminates.
     LockedReader { reader_lock: LockRef },
+}
+
+/// How a transaction holds its write until it terminates.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum HeldWrite {
+    /// Under its declared isolation.
+    Isolation {
+        transaction: TransactionRef,
+        isolation: TransactionIsolation,
+    },
+
+    /// Under the write protection of its own guarded mutation of the
+    /// instance, held from the guard to commit.
+    GuardedMutation {
+        guarded_by: TransactionRef,
+        step: usize,
+        object: Id,
+        mechanism: ConditionalMutationKind,
+        guard: GuardCoverage,
+    },
 }
 
 /// A missing premise of commit-order evidence.

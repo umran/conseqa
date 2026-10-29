@@ -947,7 +947,7 @@ fn idempotency_assumptions(proof: &IdempotencyProof) -> Vec<String> {
                             root_labels(key)
                         ),
 
-                        RetryRoute::NaturalReplay => format!(
+                        RetryRoute::NaturalReplay { .. } => format!(
                             "{prefix}{} is naturally replayable: re-execution \
                              reproduces the same logical state",
                             transaction.transaction
@@ -1211,7 +1211,7 @@ fn resumption_assumptions(paths: &[verification::PathResumption]) -> Vec<String>
                     root_labels(key)
                 ),
 
-                Resolution::NaturalReplay => format!(
+                Resolution::NaturalReplay { .. } => format!(
                     "{prefix}{} re-executes safely by natural replay",
                     transaction.transaction
                 ),

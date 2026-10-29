@@ -1167,59 +1167,21 @@ fn from_yaml<T: DeserializeOwned>(text: &str, path: &Path) -> Result<T, StoreErr
 // File names
 // ---------------------------------------------------------------------
 
-/// An id's file name. Letters, digits, `_`, `-`, and `.` (not leading)
-/// are kept; every other byte is `%XX`, so any id is a file name and
-/// the common ones read as themselves.
+/// An id's file name: its escaped spelling (`Id::encoded`), so any id
+/// is a file name and the common ones read as themselves.
 fn file_name(id: &Id) -> Result<String, StoreError> {
     if id.0.is_empty() {
         return Err(StoreError::EmptyId);
     }
 
-    Ok(format!("{}.yaml", encode(&id.0)))
-}
-
-fn encode(id: &str) -> String {
-    let mut encoded = String::with_capacity(id.len());
-
-    for (index, byte) in id.bytes().enumerate() {
-        let kept = byte.is_ascii_alphanumeric()
-            || byte == b'_'
-            || byte == b'-'
-            || (byte == b'.' && index > 0);
-
-        if kept {
-            encoded.push(byte as char);
-        } else {
-            encoded.push_str(&format!("%{byte:02X}"));
-        }
-    }
-
-    encoded
+    Ok(format!("{}.yaml", id.encoded()))
 }
 
 /// The id a file stem names, if the stem is an id's canonical encoding.
 /// A non-canonical spelling is refused, so two files can never name
 /// the same id.
 fn decode_file_stem(stem: &str) -> Option<String> {
-    let bytes = stem.as_bytes();
-    let mut decoded = Vec::with_capacity(bytes.len());
-    let mut index = 0;
-
-    while index < bytes.len() {
-        if bytes[index] == b'%' {
-            let hex = stem.get(index + 1..index + 3)?;
-
-            decoded.push(u8::from_str_radix(hex, 16).ok()?);
-            index += 3;
-        } else {
-            decoded.push(bytes[index]);
-            index += 1;
-        }
-    }
-
-    let id = String::from_utf8(decoded).ok()?;
-
-    (!id.is_empty() && encode(&id) == stem).then_some(id)
+    Id::decode(stem).map(|id| id.0)
 }
 
 // ---------------------------------------------------------------------

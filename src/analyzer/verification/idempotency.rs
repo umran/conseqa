@@ -333,8 +333,12 @@ pub enum RetryRoute {
     /// At most one commit per class; re-encounters resolve it.
     KeyedCommit { key: Vec<StableRoot> },
 
-    /// Re-execution reproduces the same logical state.
-    NaturalReplay,
+    /// Re-execution reproduces the same logical state, resting on the
+    /// stable roots of the body's update targets and derivations.
+    NaturalReplay {
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        body: Vec<StableRoot>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1157,9 +1161,9 @@ fn analyze_path(
                         route: RetryRoute::KeyedCommit { key: key.clone() },
                     }),
 
-                    (Err(_), Ok(())) => transactions.push(TransactionRetrySafety {
+                    (Err(_), Ok(body)) => transactions.push(TransactionRetrySafety {
                         transaction: transaction.id.clone(),
-                        route: RetryRoute::NaturalReplay,
+                        route: RetryRoute::NaturalReplay { body: body.clone() },
                     }),
 
                     (Err(recovery), Err(reconstruction)) => {
