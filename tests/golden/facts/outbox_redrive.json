@@ -1,0 +1,12 @@
+{
+  "fact_format": 1,
+  "facts": [
+    {
+      "data_model": "data.orders",
+      "input": "input.relay.outbox",
+      "kind": "outbox_redrive",
+      "operation": "operation.relay",
+      "outbox": "outbox.order_events"
+    }
+  ]
+}

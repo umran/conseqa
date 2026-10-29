@@ -249,7 +249,7 @@ Update this table in every milestone PR.
 
 | Milestone | State | Branch | PR |
 |---|---|---|---|
-| M1 Durable facts, keys, basis | not started | | |
+| M1 Durable facts, keys, basis | in review | `spec-versioning-m1` | #43 |
 | M2 Two trees, partition | not started | | |
 | M3 Obligation diff, `conseqa diff` | not started | | |
 | M4 Markers, regions, records | not started | | |

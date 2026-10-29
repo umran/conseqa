@@ -1,0 +1,17 @@
+{
+  "fact_format": 1,
+  "facts": [
+    {
+      "input": "input.ship.paid",
+      "kind": "delivery",
+      "operation": "operation.ship",
+      "semantics": "at_least_once"
+    },
+    {
+      "input": "input.ship.paid",
+      "kind": "delivery",
+      "operation": "operation.ship",
+      "semantics": "at_most_once"
+    }
+  ]
+}

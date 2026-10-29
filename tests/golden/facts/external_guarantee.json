@@ -1,0 +1,58 @@
+{
+  "fact_format": 1,
+  "facts": [
+    {
+      "effect": "effect.charge.card",
+      "guarantee": "idempotent",
+      "identity": {
+        "key": {
+          "components": [
+            {
+              "path": [
+                "payment_id"
+              ],
+              "source": {
+                "id": "input.charge.request",
+                "kind": "input"
+              }
+            }
+          ]
+        },
+        "kind": "keyed"
+      },
+      "kind": "external_guarantee",
+      "operation": "operation.charge"
+    },
+    {
+      "effect": "effect.charge.quote",
+      "guarantee": "side_effect_free",
+      "identity": {
+        "kind": "unspecified"
+      },
+      "kind": "external_guarantee",
+      "operation": "operation.charge"
+    },
+    {
+      "effect": "effect.charge.card",
+      "guarantee": "replay_stable",
+      "identity": {
+        "key": {
+          "components": [
+            {
+              "path": [
+                "payment_id"
+              ],
+              "source": {
+                "id": "input.charge.request",
+                "kind": "input"
+              }
+            }
+          ]
+        },
+        "kind": "keyed"
+      },
+      "kind": "external_guarantee",
+      "operation": "operation.charge"
+    }
+  ]
+}

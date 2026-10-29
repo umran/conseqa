@@ -1,0 +1,33 @@
+{
+  "fact_format": 1,
+  "facts": [
+    {
+      "components": [
+        [
+          {
+            "operation": "operation.apply_payment",
+            "transaction": "tx.apply_payment"
+          },
+          {
+            "operation": "operation.cancel_order",
+            "transaction": "tx.cancel_order"
+          }
+        ]
+      ],
+      "key": {
+        "path": [
+          "order_id"
+        ],
+        "source": {
+          "id": "input.apply_payment.request",
+          "kind": "input"
+        }
+      },
+      "kind": "cyclic_components",
+      "root": {
+        "operation": "operation.apply_payment",
+        "transaction": "tx.apply_payment"
+      }
+    }
+  ]
+}

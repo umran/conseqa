@@ -1,0 +1,75 @@
+{
+  "fact_format": 1,
+  "facts": [
+    {
+      "kind": "stable_root",
+      "operation": "operation.apply_payment",
+      "root": {
+        "path": [
+          "event_id"
+        ],
+        "source": {
+          "id": "input.apply_payment.request",
+          "kind": "input"
+        }
+      },
+      "rule": "key_component"
+    },
+    {
+      "kind": "stable_root",
+      "operation": "operation.apply_payment",
+      "root": {
+        "path": [
+          "event_id"
+        ],
+        "source": {
+          "id": "input.apply_payment.request",
+          "kind": "input"
+        }
+      },
+      "rule": "identified_payload"
+    },
+    {
+      "kind": "stable_root",
+      "operation": "operation.apply_payment",
+      "root": {
+        "path": [
+          "event_id"
+        ],
+        "source": {
+          "id": "input.apply_payment.request",
+          "kind": "input"
+        }
+      },
+      "rule": "recovered_artifact"
+    },
+    {
+      "kind": "stable_root",
+      "operation": "operation.apply_payment",
+      "root": {
+        "path": [
+          "event_id"
+        ],
+        "source": {
+          "id": "input.apply_payment.request",
+          "kind": "input"
+        }
+      },
+      "rule": "reconstructed_artifact"
+    },
+    {
+      "kind": "stable_root",
+      "operation": "operation.apply_payment",
+      "root": {
+        "path": [
+          "event_id"
+        ],
+        "source": {
+          "id": "input.apply_payment.request",
+          "kind": "input"
+        }
+      },
+      "rule": "replay_stable_external_result"
+    }
+  ]
+}

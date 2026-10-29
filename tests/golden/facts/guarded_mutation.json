@@ -1,0 +1,128 @@
+{
+  "fact_format": 1,
+  "facts": [
+    {
+      "compared_fields": [
+        [
+          "version"
+        ]
+      ],
+      "coverage": {
+        "kind": "atomic"
+      },
+      "data_model": "data.orders",
+      "kind": "guarded_mutation",
+      "mechanism": "compare_and_set",
+      "object": "object.order",
+      "operation": "operation.apply_payment",
+      "transaction": "tx.apply_payment"
+    },
+    {
+      "compared_fields": [
+        [
+          "version"
+        ]
+      ],
+      "coverage": {
+        "kind": "held_protection"
+      },
+      "data_model": "data.orders",
+      "kind": "guarded_mutation",
+      "mechanism": "transition",
+      "object": "object.order",
+      "operation": "operation.apply_payment",
+      "transaction": "tx.apply_payment"
+    },
+    {
+      "compared_fields": [
+        [
+          "version"
+        ]
+      ],
+      "coverage": {
+        "kind": "observed_state",
+        "read": "read.apply_payment.order"
+      },
+      "data_model": "data.orders",
+      "kind": "guarded_mutation",
+      "mechanism": "advance_cursor",
+      "object": "object.order",
+      "operation": "operation.apply_payment",
+      "transaction": "tx.apply_payment"
+    },
+    {
+      "compared_fields": [
+        [
+          "version"
+        ]
+      ],
+      "coverage": {
+        "kind": "observed_version",
+        "read": "read.apply_payment.order",
+        "version_field": [
+          "version"
+        ]
+      },
+      "data_model": "data.orders",
+      "kind": "guarded_mutation",
+      "mechanism": "compare_and_set",
+      "object": "object.order",
+      "operation": "operation.apply_payment",
+      "transaction": "tx.apply_payment"
+    },
+    {
+      "compared_fields": [
+        [
+          "version"
+        ]
+      ],
+      "coverage": {
+        "kind": "locked_reader",
+        "mode": "shared",
+        "selector": {
+          "object": "object.order",
+          "predicate": {
+            "field": [
+              "order_id"
+            ],
+            "kind": "eq",
+            "value": {
+              "kind": "value",
+              "value": {
+                "path": [
+                  "order_id"
+                ],
+                "source": {
+                  "id": "input.apply_payment.request",
+                  "kind": "input"
+                }
+              }
+            }
+          }
+        }
+      },
+      "data_model": "data.orders",
+      "kind": "guarded_mutation",
+      "mechanism": "upsert",
+      "object": "object.order",
+      "operation": "operation.apply_payment",
+      "transaction": "tx.apply_payment"
+    },
+    {
+      "compared_fields": [
+        [
+          "version"
+        ]
+      ],
+      "coverage": {
+        "kind": "atomic"
+      },
+      "data_model": "data.orders",
+      "kind": "guarded_mutation",
+      "mechanism": "fence",
+      "object": "object.order",
+      "operation": "operation.apply_payment",
+      "transaction": "tx.apply_payment"
+    }
+  ]
+}

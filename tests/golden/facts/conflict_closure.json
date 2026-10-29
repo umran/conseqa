@@ -1,0 +1,31 @@
+{
+  "fact_format": 1,
+  "facts": [
+    {
+      "key": {
+        "path": [
+          "order_id"
+        ],
+        "source": {
+          "id": "input.apply_payment.request",
+          "kind": "input"
+        }
+      },
+      "kind": "conflict_closure",
+      "members": [
+        {
+          "operation": "operation.apply_payment",
+          "transaction": "tx.apply_payment"
+        },
+        {
+          "operation": "operation.cancel_order",
+          "transaction": "tx.cancel_order"
+        }
+      ],
+      "root": {
+        "operation": "operation.apply_payment",
+        "transaction": "tx.apply_payment"
+      }
+    }
+  ]
+}

@@ -385,7 +385,7 @@ transitions in the machine view inherit theirs.
 ## The obligation report
 
 The report format is `conseqa::analyzer::report` (`ProverReport`,
-`format: 9`): one obligation per declared requirement — transaction
+`format: 10`): one obligation per declared requirement — transaction
 serializability and transaction ordering (anchored to the transaction
 that declares them, with the operation whose program carries it),
 idempotency, result replay (the result half of an idempotency
@@ -406,7 +406,11 @@ format 8 judged request results per variant and carried the `abandon`
 terminal; format 9 (dsl 6) replaced version validation with atomic
 conditional-mutation evidence — a compare-and-set, transition, or
 cursor advance comparing the observed version or fields — and the
-read-only observation.
+read-only observation; format 10 gave every obligation its
+position-free `key`, a proven one its `basis` and an unproven one its
+`blocked_on` set, written in the durable fact vocabulary the report's
+`fact_format` names (`src/analyzer/basis/`). The viz accepts these
+fields and does not read them yet.
 Unknown is epistemic: the checker could not establish the property,
 typically because a required fact is `unspecified` or no V1 verifier
 attempts that family. It is never evidence of a violation.

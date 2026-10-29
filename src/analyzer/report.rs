@@ -16,6 +16,9 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::analyzer::basis::{
+    self, BasisFact, BlockedOn, Extractor, FactFormat, Grounds, ObligationKey, ObligationProperty,
+};
 use crate::analyzer::verification::{
     self, ArtifactReplay, CommitArtifact, CommitOrderEvidence, ConsumerCollapse, DecisionReplay,
     DecisionRule, EffectSafety, IdempotencyProof, IdempotencyVerdict, InstanceStability,
@@ -40,6 +43,10 @@ pub struct ProverReport {
     /// so an archived report without it is ambiguous.
     #[serde(default)]
     pub dsl: Option<crate::spec::DslVersion>,
+
+    /// The fact vocabulary the bases and blocked-on sets are written in
+    /// (§10.9 of the spec change analysis revision).
+    pub fact_format: FactFormat,
 
     /// Revision of the model the report was produced against.
     ///
@@ -88,14 +95,25 @@ pub struct ProverReport {
 /// `compare_write`, `upsert_read_write`, `version_publish`), and the
 /// natural-replay gap `contains_version_bump` becomes
 /// `publishes_version` beside `contains_compare_and_set`,
-/// `contains_fence_comparison`, and `contains_upsert`.
-pub const FORMAT: u32 = 9;
+/// `contains_fence_comparison`, and `contains_upsert`. Format 10 is
+/// the spec change analysis revision: every obligation carries its
+/// position-free `key`, a proven one its `basis` and an unproven one
+/// its `blocked_on` set, in the durable fact vocabulary the report's
+/// `fact_format` names.
+pub const FORMAT: u32 = 10;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Obligation {
-    /// Stable identity of the obligation within the report.
+    /// Stable identity of the obligation within the report: its
+    /// address, positional, and what the viz, the harness, and the
+    /// engine refer to it by.
     pub id: String,
+
+    /// The obligation's identity across reports: its subject, property,
+    /// and requirement key, which reordering requirements leaves
+    /// unchanged (§9 of the spec change analysis revision).
+    pub key: ObligationKey,
 
     pub property: Property,
     pub subject: Subject,
@@ -127,6 +145,18 @@ pub struct Obligation {
     /// Model facts explaining how the verdict was reached.
     #[serde(default)]
     pub evidence: Vec<EvidenceItem>,
+
+    /// The facts a proof consumed, each with the declarations it was
+    /// read from: the structured form of `assumptions`. Present only
+    /// when `status` is `proven`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub basis: Option<Vec<BasisFact>>,
+
+    /// What an unproven verdict is blocked on: facts found present but
+    /// insufficient, facts found missing, and the declarations its
+    /// obstacles read. Present only when the obligation is not proven.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocked_on: Option<BlockedOn>,
 
     /// Present only when `status` is `disproven`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -237,10 +267,12 @@ pub fn scaffold(model: &Model) -> ProverReport {
         op_id: &Id,
         property: Property,
         index: usize,
+        key: ObligationKey,
         summary: String,
     ) -> Obligation {
         Obligation {
             id: format!("oblig.{}.{}.{}", op_id, property_slug(&property), index),
+            key,
             property,
             subject: Subject::Operation {
                 operation: op_id.clone(),
@@ -252,6 +284,8 @@ pub fn scaffold(model: &Model) -> ProverReport {
             remedy: None,
             assumptions: Vec::new(),
             evidence: Vec::new(),
+            basis: None,
+            blocked_on: None,
             counterexample: None,
         }
     }
@@ -261,10 +295,12 @@ pub fn scaffold(model: &Model) -> ProverReport {
         transaction: &Id,
         property: Property,
         index: usize,
+        key: ObligationKey,
         summary: String,
     ) -> Obligation {
         Obligation {
             id: transaction_obligation_id(op_id, transaction, property_slug(&property), index),
+            key,
             property,
             subject: Subject::Transaction {
                 operation: op_id.clone(),
@@ -277,6 +313,8 @@ pub fn scaffold(model: &Model) -> ProverReport {
             remedy: None,
             assumptions: Vec::new(),
             evidence: Vec::new(),
+            basis: None,
+            blocked_on: None,
             counterexample: None,
         }
     }
@@ -286,12 +324,31 @@ pub fn scaffold(model: &Model) -> ProverReport {
         // properties of committed state, which is what the operation's
         // own obligations build on.
         for (_, transaction) in op.program.transactions() {
-            for (i, r) in transaction.requirements.serializability.iter().enumerate() {
+            let serializability_keys = basis::transaction_keys(
+                op_id,
+                transaction,
+                ObligationProperty::TransactionSerializability,
+            );
+
+            let ordering_keys = basis::transaction_keys(
+                op_id,
+                transaction,
+                ObligationProperty::TransactionOrdering,
+            );
+
+            for ((i, r), key) in transaction
+                .requirements
+                .serializability
+                .iter()
+                .enumerate()
+                .zip(serializability_keys)
+            {
                 obligations.push(transaction_obligation(
                     op_id,
                     &transaction.id,
                     Property::TransactionSerializability,
                     i,
+                    key,
                     format!(
                         "Executions of {} sharing key {} commit in a history equivalent \
                          to some serial order, together with every transaction they may \
@@ -302,12 +359,19 @@ pub fn scaffold(model: &Model) -> ProverReport {
                 ));
             }
 
-            for (i, r) in transaction.requirements.ordering.iter().enumerate() {
+            for ((i, r), key) in transaction
+                .requirements
+                .ordering
+                .iter()
+                .enumerate()
+                .zip(ordering_keys)
+            {
                 obligations.push(transaction_obligation(
                     op_id,
                     &transaction.id,
                     Property::TransactionOrdering,
                     i,
+                    key,
                     format!(
                         "Executions of {} sharing key {} take effect in the order of {}.",
                         transaction.id,
@@ -321,15 +385,28 @@ pub fn scaffold(model: &Model) -> ProverReport {
         let push = |obligations: &mut Vec<Obligation>,
                     property: Property,
                     index: usize,
+                    key: ObligationKey,
                     summary: String| {
-            obligations.push(requirement_obligation(op_id, property, index, summary));
+            obligations.push(requirement_obligation(op_id, property, index, key, summary));
         };
 
-        for (i, r) in op.requirements.idempotency.iter().enumerate() {
+        let idempotency_keys = basis::idempotency_keys(op_id, op, ObligationProperty::Idempotency);
+        let result_replay_keys =
+            basis::idempotency_keys(op_id, op, ObligationProperty::ResultReplay);
+
+        for (((i, r), key), result_key) in op
+            .requirements
+            .idempotency
+            .iter()
+            .enumerate()
+            .zip(idempotency_keys)
+            .zip(result_replay_keys)
+        {
             push(
                 &mut obligations,
                 Property::Idempotency,
                 i,
+                key,
                 format!(
                     "Repeated attempts at {op_id} sharing the declared key \
                      produce the effects of a single invocation.",
@@ -339,6 +416,7 @@ pub fn scaffold(model: &Model) -> ProverReport {
             if r.result == ResultReplayRequirement::ReplayConsistent {
                 obligations.push(Obligation {
                     id: format!("oblig.{op_id}.result_replay.{i}"),
+                    key: result_key,
                     property: Property::ResultReplay,
                     subject: Subject::Operation {
                         operation: op_id.clone(),
@@ -353,16 +431,25 @@ pub fn scaffold(model: &Model) -> ProverReport {
                     remedy: None,
                     assumptions: Vec::new(),
                     evidence: Vec::new(),
+                    basis: None,
+                    blocked_on: None,
                     counterexample: None,
                 });
             }
         }
 
-        for (i, r) in op.requirements.recoverability.iter().enumerate() {
+        for ((i, r), key) in op
+            .requirements
+            .recoverability
+            .iter()
+            .enumerate()
+            .zip(basis::recoverability_keys(op_id, op))
+        {
             push(
                 &mut obligations,
                 Property::Recoverability,
                 i,
+                key,
                 format!(
                     "An interrupted invocation of {op_id} {} a terminal of \
                      its program.",
@@ -378,6 +465,7 @@ pub fn scaffold(model: &Model) -> ProverReport {
     ProverReport {
         format: FORMAT,
         dsl: Some(crate::spec::DSL_VERSION),
+        fact_format: basis::FACT_FORMAT,
         model_revision: Some(model.revision.0),
         obligations,
         notes: Vec::new(),
@@ -387,9 +475,13 @@ pub fn scaffold(model: &Model) -> ProverReport {
 /// Builds the obligation report from real verification results.
 ///
 /// Every declared obligation appears, carrying its verdict — proofs
-/// rendered as assumptions, obstacles as evidence.
+/// rendered as assumptions, obstacles as evidence — and what the verdict
+/// rests on: a proven obligation's basis, an unproven one's blocked-on
+/// set, both extracted from the structured verdicts rather than the
+/// prose.
 pub fn obligations(model: &Model, verification: &VerificationReport) -> ProverReport {
     let mut report = scaffold(model);
+    let extractor = Extractor::new(model, verification);
 
     for check in &verification.transaction_serializability {
         let id = transaction_obligation_id(
@@ -411,6 +503,11 @@ pub fn obligations(model: &Model, verification: &VerificationReport) -> ProverRe
         });
 
         set_remedy(&mut report, &id, check.remedy());
+        set_grounds(
+            &mut report,
+            &id,
+            extractor.transaction_serializability(check),
+        );
     }
 
     for check in &verification.transaction_ordering {
@@ -433,6 +530,7 @@ pub fn obligations(model: &Model, verification: &VerificationReport) -> ProverRe
         });
 
         set_remedy(&mut report, &id, check.remedy());
+        set_grounds(&mut report, &id, extractor.transaction_ordering(check));
     }
 
     for check in &verification.idempotency {
@@ -444,6 +542,8 @@ pub fn obligations(model: &Model, verification: &VerificationReport) -> ProverRe
             }
             IdempotencyVerdict::Unproven { .. } => Err(check.diagnostic()),
         });
+
+        set_grounds(&mut report, &id, extractor.idempotency(check));
 
         if let Some(obligation) = report
             .obligations
@@ -579,6 +679,8 @@ pub fn obligations(model: &Model, verification: &VerificationReport) -> ProverRe
             ResultReplayVerdict::Unproven { .. } => Err(check.diagnostic()),
         });
 
+        set_grounds(&mut report, &id, extractor.result_replay(check));
+
         if check.coinductive
             && let Some(obligation) = report
                 .obligations
@@ -600,6 +702,8 @@ pub fn obligations(model: &Model, verification: &VerificationReport) -> ProverRe
             }
             RecoverabilityVerdict::Unproven { .. } => Err(check.diagnostic()),
         });
+
+        set_grounds(&mut report, &id, extractor.recoverability(check));
 
         // Notes ride along as evidence: facts a reader wants next to
         // the verdict, which they do not change.
@@ -664,6 +768,31 @@ fn set_remedy(report: &mut ProverReport, id: &str, remedy: Option<RemedyLayer>) 
         .find(|obligation| obligation.id == id)
     {
         obligation.remedy = remedy;
+    }
+}
+
+/// Records what one check's verdict rests on: a proven obligation's
+/// basis, or an unproven one's blocked-on set (§10, §17 of the spec
+/// change analysis revision).
+fn set_grounds(report: &mut ProverReport, id: &str, grounds: Grounds) {
+    let Some(obligation) = report
+        .obligations
+        .iter_mut()
+        .find(|obligation| obligation.id == id)
+    else {
+        return;
+    };
+
+    match grounds {
+        Grounds::Basis(basis) => {
+            obligation.basis = Some(basis);
+            obligation.blocked_on = None;
+        }
+
+        Grounds::BlockedOn(blocked_on) => {
+            obligation.basis = None;
+            obligation.blocked_on = Some(blocked_on);
+        }
     }
 }
 
@@ -947,7 +1076,7 @@ fn idempotency_assumptions(proof: &IdempotencyProof) -> Vec<String> {
                             root_labels(key)
                         ),
 
-                        RetryRoute::NaturalReplay => format!(
+                        RetryRoute::NaturalReplay { .. } => format!(
                             "{prefix}{} is naturally replayable: re-execution \
                              reproduces the same logical state",
                             transaction.transaction
@@ -1211,7 +1340,7 @@ fn resumption_assumptions(paths: &[verification::PathResumption]) -> Vec<String>
                     root_labels(key)
                 ),
 
-                Resolution::NaturalReplay => format!(
+                Resolution::NaturalReplay { .. } => format!(
                     "{prefix}{} re-executes safely by natural replay",
                     transaction.transaction
                 ),
