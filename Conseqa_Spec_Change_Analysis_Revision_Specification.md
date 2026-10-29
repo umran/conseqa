@@ -9,7 +9,8 @@
 **Obligation report format:** 9 → 10  
 **Fact format:** 1 (new, §10.9)  
 **Baseline:** Conseqa `master`, commit `00c029f64738157c33e65d8e1cb41121c38ca831`  
-**Primary affected subsystems:** the obligation report, the project store reader, the `conseqa` CLI, the design MCP server
+**Primary affected subsystems:** the obligation report, the project store reader, the `conseqa` CLI, the design MCP server  
+**Amended in implementation (M1, 2026-10-29):** §9.2, §10.5, §10.7, §10.9, §17, §18.2, and §18.4, with the maintainer's approval. The catalogue now covers every proof structure, the blocked-on set has a shape and a catalogue of its own, and the reliance the proofs used without stating it is exposed in their structures.
 
 This revision makes a **change to a Conseqa spec** a first-class object. Given two spec trees, typically two git revisions of one repository's `.conseqa/`, Conseqa SHALL report:
 
@@ -296,6 +297,8 @@ A result replay obligation is the result half of an idempotency requirement. Its
 
 The key holds canonical value references, not a hash. It stays meaningful outside one run, and it changes only when the DSL's canonical serialization does, which happens only across a contract bump (§6.5).
 
+`property` is one of the five properties a declared requirement produces, written as a plain name, as §14 writes it. The report's `Property` also admits a custom property, which no declared requirement produces, so a key carries the closed set.
+
 ## 9.3 Terms
 
 A requirement's **terms** are the parts that do not identify it:
@@ -366,35 +369,67 @@ A basis fact SHALL NOT carry a step index, a `StepLocation`, a `read_step`, or a
 
 ## 10.5 Catalogue
 
-The basis is extracted from the structured proofs, never from the rendered report. At the baseline the proof structures map to facts as follows. The catalogue is normative for the baseline and grows with the proof routes. The table writes each fact in a functional shorthand named after its durable kind. The kinds and their fields are §10.9.
+The basis is extracted from the structured proofs, never from the rendered report. The proof structures map to facts as follows. The catalogue is normative and grows with the proof routes. The table writes each fact in a functional shorthand named after its durable kind. The kinds and their fields are §10.9.
 
 | Proof structure (`src/analyzer/verification/`) | Basis facts | Anchors |
 |---|---|---|
-| `TransactionSerializabilityProof::SerializableIsolationClosure` | `conflict_closure(root, key) = {members}` (query); `isolation(t) = serializable` for each member | the members; each member's `transaction` |
-| `TransactionSerializabilityProof::ConflictGraph` | the closure query; `cyclic_components(closure)` (query); one fact per constraining `CommitOrderEvidence` below | as below |
-| `CommitOrderEvidence::IntrinsicCommittedRead`, `ReadOnlyObservation` | `isolation(t) = level` | `transaction` |
+| `TransactionSerializabilityProof::SerializableIsolationClosure` | `conflict_closure(root, key) = {members}` (query); `isolation(t) = serializable` for each member | each member's `transaction` |
+| `TransactionSerializabilityProof::ConflictGraph` | the closure query; `cyclic_components(closure)` (query); the facts of the `CommitOrderEvidence` of every dependency inside a cyclic component. A dependency between components closes no cycle, so its evidence is not relied on and is not cited. | each member's `transaction`; as below |
+| `CommitOrderEvidence::IntrinsicCommittedRead`, `ReadOnlyObservation` | `isolation(t) = level` of the reader | `transaction` |
 | `CommitOrderEvidence::AtomicWriteOrder` | `isolation` of both sides | both `transaction`s |
 | `CommitOrderEvidence::StrictLock` | `lock(t, object, selector, mode)` per side | `transaction`, `data_object` |
-| `CommitOrderEvidence::AtomicConditionalMutation` | `guarded_mutation(t, object, mechanism, coverage, compared_fields)`, where `coverage` is the `GuardCoverage` kind with its read binding id and version field, and without steps | `transaction`, `data_object` |
-| the observed-version leg's "no transaction deletes the object" | `no_deleters(object)` (query) | `data_object` |
-| `CommitOrderEvidence::OrderedCursor` | `cursor(object, field, rule)` | `data_object` |
-| `TransactionOrderingProof::Cursor`, `::Fence` | `cursor(...)` or `fence(object, field)`; and the basis of the serializability argument ordering invokes for its closure | `data_object`, the transactions advancing it |
+| `CommitOrderEvidence::AtomicConditionalMutation` | `guarded_mutation(t, object, mechanism, coverage, compared_fields)`, where `coverage` is the `GuardCoverage` kind with its read binding id and version field, and without steps. Where the credit also rests on the other side holding its write (`held_write`: the writer of a `wr` dependency whose reader holds the guard, the earlier writer of a `ww` dependency whose later writer holds it), that side's `isolation` or `guarded_mutation`. A `locked_reader` coverage also cites the reader's `lock`. | `transaction`, `data_object`; the other side's `transaction` |
+| `GuardCoverage::ObservedVersion` covering an insertion (`no_deleters`) | `no_deleters(object)` (query) | `data_object` |
+| `CommitOrderEvidence::OrderedCursor` | `cursor(object, field, rule)` | `data_object`, both `transaction`s |
+| `TransactionOrderingProof::Cursor`, `::Fence` | `cursor(...)` or `fence(object, field)`; and the basis of the serializability argument ordering invokes for its closure | `data_object`, every `transaction` advancing or fencing the field |
 | `ResultReplayProof::NoAdmittedInvocations`, `IdempotencyProof::NoAdmittedInvocations`, `RecoverabilityProof::NoAdmittedInvocations` | `admits_no_messages(input)` | `input`, `topic` or `outbox` |
 | `IdempotencyProof::NoAdmittedPaths` | `no_admitted_paths(operation, input)` | `program`, `input` |
+| `IdempotencyProof::SingleDelivery` | `delivery(input) = at_most_once` (L1); `message_identity(topic, schema)` per admitted schema | `subscription_runtime`, `topic` |
+| `IdempotencyProof::RetrySafePaths` | each path's decisions, transaction routes, and effect safety, below | as below |
 | `ResultReplayProof::NoReturnedResult` | `returns_no_result(operation, input)` | `program` |
-| `ResultReplayProof::ClassFixedResult` | one `stable_root(operation, rule, root)` per `StabilityRule` and `ResultStabilityRule` cited (requirement key component, identified payload, recovered artifact, reconstructed artifact, replay-stable external result); `relies_on` for a replay-consistent target result (§10.6) | the requirement; the `topic` or `outbox` with its `schema`; the `transaction`; the target's `requirement`; the `effect_site` |
-| `IdempotencyProof::SingleDelivery` | `delivery(input) = at_most_once` (L1); `message_identity(topic)` | `subscription_runtime`, `topic` |
-| `EffectSafety::*` | per variant: `external_guarantee` for external idempotency and external side-effect freedom; `message_identity` for the same logical message, on a topic or an outbox; `relies_on` for target deduplication (§10.6); `deduplicated_by` for transaction deduplication | `effect_site`; `topic`/`outbox`; the target's `requirement`; `transaction` |
-| `RetryRoute::KeyedCommit`, `Resolution::KeyedCommit` | `deduplicated_by(t, key)` | `transaction` |
-| `RetryRoute::NaturalReplay`, `Resolution::NaturalReplay` | `naturally_replayable(t)` | `transaction` |
+| `ResultReplayProof::ClassFixedResult` | each returning path's decisions and derivation roots, below. A return of a retryable error class is exempt by the contract and contributes nothing. | as below |
+| `RetryRoute::KeyedCommit`, `Resolution::KeyedCommit`, `DecisionRule::ResolvedCommit` | `deduplicated_by(t, key)`; the key's roots | `transaction` |
+| `RetryRoute::NaturalReplay`, `Resolution::NaturalReplay` | `naturally_replayable(t)`; the stable roots of its update targets and derivations | `transaction` |
 | `Resolution::TerminalStep` | `terminal(operation, input)` | `program` |
-| `ArtifactReplay::Recovered`, `::Reconstructed` | `artifact_route(t, artifact, route)` | `transaction` |
+| `ArtifactReplay::Recovered` | `artifact_route(t, artifact, recovered)`; `deduplicated_by(t, key)` and the key's roots | `transaction` |
+| `ArtifactReplay::Reconstructed` | `artifact_route(t, artifact, reconstructed)`; `naturally_replayable(t)` with its roots; the derivation's roots | `transaction` |
+| `InstanceStability::ReplayDeterministic` | its roots | as below |
+| `InstanceStability::EstablishedIntent` | the intent's artifact route | `transaction` |
+| `EffectSafety::ExternallyIdempotent` | `external_guarantee(effect, idempotent, identity)`; the identity key's roots | `effect_site` |
+| `EffectSafety::ExternallySideEffectFree` | `external_guarantee(effect, side_effect_free, identity)` | `effect_site` |
+| `EffectSafety::SameLogicalMessage`, `::SameLogicalOutboxMessage` | `message_identity(channel, schema)`; the instance; each consumer, below | `effect_site`; `topic` or `outbox` |
+| `EffectSafety::DeduplicatedByTarget` | `relies_on` the target's idempotency (§10.6); the instance | the target's `requirement`; `effect_site` |
+| `EffectSafety::TransactionDeduplicated` | `deduplicated_by(t, key)`; the key's roots | `transaction` |
+| `ConsumerCollapse::ProvenRequirement` | `relies_on` the consumer's idempotency | the consumer's `requirement` |
+| `ConsumerCollapse::SingleDelivery` | `delivery(input) = at_most_once` (L1) | `subscription_runtime` |
+| `DecisionRule::StableResult` | its `ResultStabilityRule`, below | `effect_site` |
+| `DecisionRule::StableCondition` | its roots | as below |
+| `DecisionRule::IdempotencyInertContinuation`, `::OutcomeDivergenceAddsNoWork` | nothing: derived from program structure, never an implementation assumption, and lapsing by itself when the continuation gains work | |
+| `ResultStabilityRule::ReplayConsistentTarget` | `relies_on` the target's result replay obligation; the instance | the target's `requirement`; `effect_site` |
+| `ResultStabilityRule::ExternalTerminalResult` | `external_guarantee(effect, replay_stable, identity)`; the identity key's roots | `effect_site` |
 | `RetryDriver::AtLeastOnceDelivery` | `delivery(input) = at_least_once` (L1) | `subscription_runtime` |
 | `RetryDriver::IntrinsicOutboxRedrive` | `outbox_redrive(input)` | `input`, `outbox` |
 | `RetryDriver::InboundRepeatableRequest`, `::InboundRepeatableTransitionEffect` | `retry_may_repeat(effect)` | the caller's `effect_site` or `transition` |
-| `LineageFact::Propagated` | `propagation(producer, schema, source)` | the producer's `effect_site` or `transition` |
+| `LineageFact::Propagated`, on a proven idempotency obligation | `propagation(producer, schema, channel)` | the producer's `effect_site` or `transition` |
+| `LineageFact::Undeclared`, commit artifacts, notes, a dependency's recorded fence, an abandoning path | nothing | |
+
+**Roots.** Every `StableRoot` a proof cites contributes `stable_root(operation, rule, root)`, and the declared fact its rule rests on:
+
+| Rule | Also | Anchors |
+|---|---|---|
+| `key_component` | nothing | the `requirement` |
+| `identified_payload` | `message_identity` of the input's channel for each schema it admits; a request input's identity has no fact kind | the `requirement`; the `input`, with its `topic` or `outbox` |
+| `recovered_artifact` | `deduplicated_by(t, key)`, as the transaction declares it | `transaction` |
+| `reconstructed_artifact` | `naturally_replayable(t)` | `transaction` |
+| `replay_stable_external_result` | `external_guarantee(effect, replay_stable, identity)` | `effect_site` |
+
+A root into a request effect's replay-consistent result is not a `stable_root`: it relies on the target's result replay obligation (§10.6).
+
+**Relied-on obligations.** The verifier judges a request target or a message consumer by operation and input: any proven idempotency requirement of the operation keyed from the input collapses the duplicates. So `relies_on` cites every proven idempotency obligation of that operation keyed from that input.
 
 A fact whose truth was read from a schema field (its type, its optionality) also anchors that `schema`. The general rule is that a fact anchors **every declaration whose content its truth was read from**.
+
+A proof that rests on program structure alone (no transaction, effect, decision, or stable root on any path) has an empty basis. No fixture has one, and none is given an invented fact.
 
 ## 10.6 Proofs that rest on other obligations
 
@@ -402,7 +437,46 @@ Some proofs rest on another obligation: idempotency through a target's proven re
 
 ## 10.7 The blocked-on set
 
-An unproven verdict has no basis. It has a **blocked-on set**: the basis facts its obstacles found present but insufficient, the facts they found missing (stated as the fact that would be needed, such as `lock(t, object, exclusive)` missing), and their anchors. The blocked-on set is what lets a regression be explained from the head side and an improvement from the base side.
+An unproven verdict has no basis. It has a **blocked-on set**: the basis facts its obstacles found present but insufficient, the facts they found missing, and the declarations they read. The blocked-on set is what lets a regression be explained from the head side and an improvement from the base side.
+
+```rust
+pub struct BlockedOn {
+    /// Facts the obstacles found present but insufficient.
+    pub present: Vec<BasisFact>,
+
+    /// Facts the obstacles found missing, stated as the fact that
+    /// would be needed.
+    pub missing: Vec<BasisFact>,
+
+    /// Every declaration the obstacles read.
+    pub anchors: BTreeSet<DeclarationKey>,
+}
+```
+
+A missing fact is stated only where a gap names the premise its route lacks exactly: a `lock` over the access's own selector, an at-least-once `delivery`, `no_deleters`, a `naturally_replayable` body. Elsewhere the remedy is a choice the gap does not make, such as which guarded mutation would cover an observation, and the obstacle contributes its anchors alone.
+
+| Obstacle or gap | Present | Missing | Anchors |
+|---|---|---|---|
+| `SerializableClosureContainsWeakerIsolation` | `isolation(t) = level` of each member it lists | | |
+| `TransactionSerializabilityUnconstrainedCycle` | | | each member's `transaction` |
+| `…UnprotectedReadWriteDependency`, `…UnconstrainedDependency` | per gap, below | | both `transaction`s, `data_object` |
+| `LockCoverageMissing` | | `lock(t, object, selector, mode)` over the access's selector, `shared` for a reader and `exclusive` for a writer; an insert names no selector, so none is stated | `transaction`, `data_object` |
+| `LockAcquiredAfterProtectedAccess` | the late `lock` | | `transaction` |
+| `ObservedStateGuardMissing`, `…DoesNotCoverConflict`, `ObservedStateNotIdentified` | | | `transaction`, `data_object` |
+| `ObservedVersionMayRepeat` | | `no_deleters(object)` | `data_object`, the deleting `transaction`, the reader's `transaction` |
+| `IsolationUnspecified` | `isolation(t) = unspecified` | | |
+| `…UnknownSelectorOverlap`, `…UnknownFieldOverlap` | | | `data_object` |
+| `OrderingMissingSerializability` | its serializability obstacles' | | |
+| `OrderingMissingCursorOrFence` | | | `transaction` |
+| `OrderingPositionMismatch`, `OrderingKeyDomainMismatch` | the step's `cursor` or `fence` | | `transaction`, `data_object` |
+| `OrderingUncontrolledManagedFieldWriter` | | | the requiring and the writing `transaction`, `data_object` |
+| `TransactionNotRetrySafe`, `TransactionNotResolvable` | | `naturally_replayable(t)` | `transaction`, and each replay gap's |
+| `ReplayGap::CommitKeyRootUnstable` | `deduplicated_by(t, key)` as declared | | its stability gap's |
+| every other `ReplayGap` | | | `transaction`, and a root's stability gap's |
+| `…RequirementUnproven` (a target or consumer), `ResultGap::TargetResultUnproven` | `relies_on` the unproven obligation | | `effect_site`; `topic` or `outbox`; `input` |
+| `NoModeledRetryDriver` on a subscription | `delivery(input) = declared` (L1) | `delivery(input) = at_least_once` (L1) | `subscription_runtime` |
+| `NoModeledRetryDriver` on a request input | | | `input` |
+| every other obstacle and gap | | | the declarations it names or reads: `program`, `input`, `effect_site`, `topic`, `outbox`, `schema`, `state_machine`, `transaction`, the `requirement` |
 
 ## 10.8 Exhaustiveness
 
@@ -434,6 +508,10 @@ No shorthand is written, and a reader accepts only the canonical form, so one fa
 
 A fact's identity is its canonical form: two facts are the same fact exactly when their canonical forms are equal. A record may also store a digest of the form, to index by. The digest is derived and never authoritative, and a reader recomputes it rather than trusting it.
 
+The canonical form's text is compact JSON with every map's keys sorted, so it depends on the form alone and never on the order fields are declared in an implementation. Facts in a basis, and in each list of a blocked-on set, are ordered by that text. Anchors are ordered by member kind, in §7.2's order, then by ids.
+
+A reader parses a value, serializes what it parsed, and refuses the value unless the two are equal, naming the first path where they differ. A shorthand, an unsorted or repeated set member, an omitted field, and an unknown field each fail there; an unknown kind fails to parse, by name.
+
 This is deliberately unlike `SemanticHash`. That hash is runtime metadata, and a serialization change may legitimately move it; a fact's identity must not move.
 
 ### Versioning
@@ -464,7 +542,7 @@ Each id is written as the store writes it in a file name (`PROJECT_STATE.md`): l
 
 ### Stability guard
 
-Every fact kind has a golden serialization under `tests/golden/facts/`, which records the `FACT_FORMAT` it was written at. A change that alters any golden file while `FACT_FORMAT` stays the same fails the test suite. Durability does not depend on someone noticing a serde change.
+Every fact kind has a golden serialization under `tests/golden/facts/<kind>.json`, which records the `FACT_FORMAT` it was written at and samples covering every value of the kind's nested vocabularies. A change that alters any golden sample while `FACT_FORMAT` stays the same fails the test suite, and re-blessing the goldens refuses to rewrite it until the format is bumped. Durability does not depend on someone noticing a serde change.
 
 ### What durability does not change
 
@@ -494,7 +572,7 @@ Verdicts are still never compared across runs, and §6.5 stands: the diff recomp
 | `artifact_route` | `operation`, `transaction`, `artifact`, `route` |
 | `outbox_redrive` | `operation`, `input`, `data_model`, `outbox` |
 | `retry_may_repeat` | `site`: an effect site (`operation`, `effect`) or a transition effect (`machine`, `transition`, `effect`) |
-| `external_guarantee` | `operation`, `effect`, `guarantee` (`idempotent`, `side_effect_free`), `identity` |
+| `external_guarantee` | `operation`, `effect`, `guarantee` (`idempotent`, `side_effect_free`, `replay_stable`), `identity` (the effect's declared external identity) |
 | `propagation` | `producer` (an effect site or a transition effect), `schema`, `channel` |
 | `relies_on` | `obligation`, an obligation key (§9.2) |
 | `realization` | `declaration` (the textual key the requirement applies to), `entry` (`id@version` of the chosen catalogue entry), `realizes` (the textual key of the declaration that entry realizes), `requirement` (the requirement's id) |
@@ -510,6 +588,20 @@ Verdicts are still never compared across runs, and §6.5 stands: the diff recomp
 - `locked_reader { selector, mode }`.
 
 It names reads by their binding ids and never by step (§10.3). `selector` is the canonical object selector of the step the fact describes, so two locks one transaction takes on two instances of one object are two facts.
+
+The other enumerated fields take these values:
+
+| Field | Values |
+|---|---|
+| `mechanism` | the DSL step: `compare_and_set`, `transition`, `advance_cursor`, `fence`, `upsert` |
+| `stable_root.rule` | `key_component`, `identified_payload`, `recovered_artifact`, `reconstructed_artifact`, `replay_stable_external_result` |
+| `artifact_route.route` | `recovered`, `reconstructed` |
+| `channel` | `{ kind: topic, topic }` or `{ kind: outbox, data_model, outbox }` |
+| `site`, `producer` | `{ kind: effect_site, operation, effect }` or `{ kind: transition_effect, machine, transition, effect }` |
+| `deduplicated_by.key` | the declared key's components, a list of value references |
+| `realization.entry` | `id@version`, the version in canonical decimal |
+
+A fact's vocabulary is its own: no fact field takes an analyzer type, so the analyzer may rename its structures without moving a fact.
 
 ---
 
@@ -806,7 +898,7 @@ The head side is the project's current files, which the engine adopts as its hea
 | `basis` | proven only | The basis (§10). |
 | `blocked_on` | unproven only | The blocked-on set (§10.7). |
 
-`id`, `assumptions`, and `evidence` are unchanged. The `FORMAT` doc comment gains its format 10 line. The viz's report types (`viz/src/types/report.ts`) accept the new fields; nothing in the viz is required to read them in this revision. `conseqa check --report` thereby carries the basis, so a single report already answers "which proofs rest on this declaration" without a diff.
+`blocked_on` is the `{ present, missing, anchors }` map of §10.7, and `fact_format` is always written. `id`, `assumptions`, and `evidence` are unchanged. The `FORMAT` doc comment gains its format 10 line. The viz's report types (`viz/src/types/report.ts`) accept the new fields; nothing in the viz is required to read them in this revision. `conseqa check --report` thereby carries the basis, so a single report already answers "which proofs rest on this declaration" without a diff.
 
 ---
 
@@ -820,6 +912,15 @@ Factor `load_workspace` over a file source with two implementations: the directo
 
 Defines `ObligationKey`, `BasisFact`, `Fact`, the query facts, and the exhaustive extraction from `VerificationReport` (§10.5, §10.8). Also defines the durable form (§10.9): `FACT_FORMAT`, `FACT_READS`, the canonical serialization and its two-phase probe of `dsl` and `fact_format`, and the textual declaration key with its parser. It lives in the core library, not behind the `design` feature, because the report needs it.
 
+It is a directory module, `src/analyzer/basis/`:
+
+- `mod.rs`: the vocabulary;
+- `declaration.rs`: declaration keys and their textual form;
+- `durable.rs`: the strict reader and the version probe;
+- `extract.rs`: the extraction.
+
+The store's id escaping moves to `Id::encoded` and `Id::decode` in `src/spec/id.rs`, so a textual key and a file name escape an id the same way.
+
 ## 18.3 `src/analyzer/report.rs`
 
 Compute `key` for every obligation in `scaffold`, and fill `basis` and `blocked_on` in `obligations`. Bump `FORMAT` to 10.
@@ -827,6 +928,15 @@ Compute `key` for every obligation in `scaffold`, and fill `basis` and `blocked_
 ## 18.4 `src/analyzer/verification/`
 
 Wherever an argument rests on an absence that the structured proof does not yet state (the observed-version leg's "no transaction deletes the object" is the known case), expose it in the proof or check structure so that extraction can turn it into a query fact. No verdict changes.
+
+Four arguments rested on facts their structures did not record:
+
+- `GuardCoverage::ObservedVersion` gains `no_deleters`, set when the covered write is an insertion: only then does the token's coverage rest on no transaction deleting the object.
+- `CommitOrderEvidence::AtomicConditionalMutation` gains `held_write`. A guard credited on a write-read dependency, or on a write-write one whose later writer holds it, rests on the other side holding its write until it terminates: under its declared isolation, or under its own guard.
+- `RetryRoute::NaturalReplay`, `Resolution::NaturalReplay`, and `ArtifactReplay::Reconstructed` gain `body`, the stable roots of the transaction's update targets and derivations. Natural replay rests on them, and a root's rule can rest on a channel's message identity or on another obligation.
+- `cyclic_components` becomes a shared function, so the prover and the extraction read one definition of which dependencies need evidence.
+
+A `locked_reader` coverage needed no new field: its lock step names the reader's `lock`.
 
 ## 18.5 `src/design/change/` (new, `design` feature)
 
