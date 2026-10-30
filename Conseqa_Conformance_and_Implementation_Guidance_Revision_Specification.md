@@ -11,7 +11,11 @@
 **Conformance format:** 1 (new)  
 **Baseline:** Conseqa `master`, commit `8883890` (PR #38 merged)  
 **Primary affected subsystems:** a new conformance module, the `conseqa` CLI, the design MCP server, the harness backends  
-**Amended in implementation (Part I's M3, 2026-10-30):** §12.2's `guarded_mutation` withdrawal applies to a `compare_and_set` only, with the maintainer's approval, as Part I's mutation catalogue implements it.
+**Amended in implementation (Part I's M3, 2026-10-30):** §12.2's `guarded_mutation` withdrawal applies to a `compare_and_set` only, with the maintainer's approval, as Part I's mutation catalogue implements it.  
+**Amended in implementation (M4, 2026-10-30):** with the maintainer's approval:
+- §6.1–§6.3 and §6.5: the marker grammar and pairing, region residuals, and the scan's root and what it skips;
+- §8.1, §8.2, §8.4 and §8.6: refusals fail the read, the record's format rules, the write lock and digest, and missing version fields;
+- §14.3, §14.4, §15.3 and §17.1: review lapse, the policy's defaults, exit 1, and the module table.
 
 This revision connects a spec to the code that implements it, and turns the spec's changes into guided implementation work for LLM agents. It introduces:
 
@@ -129,14 +133,20 @@ This revision does not:
 ## 6.1 Syntax
 
 ```text
-<anything> conseqa:begin <declaration key> [<anything>]
+<anything> conseqa:begin <declaration key> [<closer>]
 …
-<anything> conseqa:end <declaration key> [<anything>]
+<anything> conseqa:end <declaration key> [<closer>]
 ```
 
-A marker is recognized wherever `conseqa:begin` or `conseqa:end` appears on a line. Whatever precedes it is the comment leader, and is ignored: `//`, `#`, `--`, `;`, `/*`, `<!--`. After the key, whitespace and a trailing comment closer (`*/`, `-->`) are ignored. Anything else after the key is malformed.
+A marker is recognized wherever `conseqa:begin` or `conseqa:end` appears on a line, so prose or a string literal that mentions a keyword is a malformed marker. Whatever precedes the keyword is the comment leader, and is ignored: `//`, `#`, `--`, `;`, `/*`, `<!--`. Then come:
 
-The key is Part I's textual declaration key (§10.9): the member kind, a space, and the escaped ids joined by `/`. The end marker repeats the key, so a mismatched pair is caught instead of silently closing the wrong region.
+1. whitespace;
+2. the key;
+3. optionally, whitespace and one comment closer (`*/`, `-->`). The closer may touch the key, as in `…/tx.reserve*/`.
+
+Anything else after the key is malformed.
+
+The key is Part I's textual declaration key (§10.9): the member kind, exactly one space, and the escaped ids joined by `/`. The end marker repeats the key, so a mismatched pair is caught instead of silently closing the wrong region.
 
 ```rust
 // conseqa:begin transaction operation.apply_payment/tx.apply_payment
@@ -170,9 +180,22 @@ A region is the lines strictly between a begin marker and its matching end marke
 - A declaration may have any number of regions, in any number of files. A transaction is often a repository function, a SQL file, and a migration.
 - Each region binds exactly one declaration.
 
+Markers pair as brackets do:
+
+- An end marker closes the innermost open region when its key is that region's.
+- If its key names an outer open region instead, the two regions overlap.
+- If its key names no open region, it is an end whose key differs from its begin's, and it closes the innermost region.
+
+A marker whose key does not parse still pairs by its text. A bad key is therefore reported at each marker carrying it, and raises no pairing error. A region may contain another region of its own declaration.
+
 ## 6.3 Region digest
 
-A region's digest is the BLAKE3 hash of its **region residual**: the region's text with line endings normalized to `\n`, and each nested region replaced by one line holding its key. The digest therefore mirrors Part I's partition. Editing a transaction's region drifts the transaction and not the program around it, and editing the program around the transaction drifts only the program.
+A region's digest is the BLAKE3 hash of its **region residual**:
+
+- the region's text, with line endings normalized to `\n`. Only `\n` and `\r\n` end a line;
+- each directly nested region, markers included, replaced by one line holding exactly its textual key, with no comment leader or indentation.
+
+The digest therefore mirrors Part I's partition. Editing a transaction's region drifts the transaction and not the program around it, and editing the program around the transaction drifts only the program. Re-indenting or re-commenting the transaction's markers drifts neither.
 
 ## 6.4 Bindable declarations
 
@@ -189,6 +212,13 @@ The scan reads:
 - the untracked files git does not ignore (`git ls-files --others --exclude-standard`).
 
 `.conseqa/` itself is never scanned, and neither is a file that is not valid UTF-8. Outside a git repository, the scan walks the project root, skipping `.conseqa/` and dot-directories. A scan reads only, and writes nothing.
+
+The scan covers the project directory, the one holding `.conseqa/`, since that is where the code a project describes lives. In git, it lists the files below that directory. It names each file relative to the project directory, with `/` separators. It never reads:
+
+- a symbolic link, which would read another file's lines under a second name;
+- a submodule, which is another repository;
+- a tracked file missing from the working tree;
+- a path that is not UTF-8, which no record could name.
 
 ## 6.6 Diagnostics
 
@@ -268,6 +298,8 @@ The path is the declaration's textual key: the kind as a directory, then each es
 
 The conformance reader follows the store's strictness rules. A directory that is not a bindable kind is refused by name, and so are a file name that is not an id's canonical encoding and any stray entry. Dotfiles pass.
 
+A refusal fails the read and names the entry, as a spec file that does not load fails the store's. So does a record that does not parse or breaks a rule of its format (§8.2). Only a record of another version is set aside instead (§8.6).
+
 The store loads `project.yaml`, `spec/`, and `intent/`, and its change detection scans only those (`src/design/store.rs`). Records therefore sit outside the spec in three ways. Writing one never adopts a spec revision, never invalidates a design task, and never needs the spec writer lock. Older builds ignore the directory.
 
 ## 8.2 Content
@@ -285,7 +317,7 @@ residual:                 # the declaration's residual (Part I §7.2) when check
 
 regions:                  # computed by the tool (§14.2)
   - path: src/payments/apply.rs
-    lines: [42, 71]       # presentation
+    lines: [42, 71]       # its begin and end markers' lines: presentation
     digest: 9f2c…         # §6.3
   - path: migrations/0007_orders_version.sql
     lines: [1, 12]
@@ -329,7 +361,16 @@ reviews:
     verdict: confirmed    # confirmed | disputed
     items:                # optional per-fact or per-claim verdicts
       - { fact: 0, verdict: confirmed, note: "WHERE version = $2 at 50" }
+      - { structural: true, verdict: confirmed }
 ```
+
+The format's rules beyond its shape:
+
+- `by.kind` is `agent`, `person`, or `checker`. `attested.commit` is optional, and absent outside git.
+- Each attested fact is in its canonical durable form, appears once, and cites at least one evidence span.
+- A `writers` claim belongs on a `data_object` record, and a `publishers` claim on a `topic` or `outbox` record. Each claim names at least one pattern.
+- A review item names exactly one target: `fact: <index>`, `completeness: <index>`, or `structural: true`. Each index lies within the record.
+- Every path is relative to the project directory, as the scan names files.
 
 ## 8.3 Why a snapshot, not a hash
 
@@ -337,7 +378,7 @@ A record stores the declaration's residual itself, not its digest. "What changed
 
 ## 8.4 Writing
 
-Records are written by the attest and review operations (§14). Each write is atomic: a temporary sibling, renamed into place. Each write also names the digest of the record it replaces, or its absence, and is refused if the file changed in the meantime. This is the same optimistic rule the commit gate applies to stale work. Hand edits are allowed and are authoritative on read, since the files are, as in the spec. A hand-written record with wrong digests simply reads as `drifted`.
+Records are written by the attest and review operations (§14). Each write is atomic: a temporary sibling, renamed into place. Each write also names the digest of the record it replaces, or its absence, and is refused if the file changed in the meantime. That digest is the BLAKE3 hash of the record file's bytes. This is the same optimistic rule the commit gate applies to stale work. A short advisory lock on `.conseqa/local/conformance.lock` makes the comparison and the rename one step across processes. That file is machine-local and outside version control, and the lock is never the spec writer lock. Hand edits are allowed and are authoritative on read, since the files are, as in the spec. A hand-written record with wrong digests simply reads as `drifted`.
 
 ## 8.5 Merging
 
@@ -345,7 +386,7 @@ One file per declaration means two branches conflict only when both checked the 
 
 ## 8.6 Version axes
 
-A record of another `format`, `dsl`, or `fact_format`, other than one `FACT_READS` admits, is not read as evidence. Its declaration reads as `unattested`, with the reason naming the record and both versions. A DSL bump therefore leaves every declaration unattested instead of failing the whole derivation. That is the honest outcome: the declarations' meaning changed, so every check is owed again.
+A record of another `format`, `dsl`, or `fact_format`, other than one `FACT_READS` admits, is not read as evidence. Its declaration reads as `unattested`, with the reason naming the record and both versions. A DSL bump therefore leaves every declaration unattested instead of failing the whole derivation. That is the honest outcome: the declarations' meaning changed, so every check is owed again. A record missing `format`, `dsl`, or `fact_format` is not of another version but malformed, and is refused (§8.1).
 
 ---
 
@@ -589,7 +630,7 @@ Partial attestation is allowed. Attesting two of three required facts leaves `mi
 
 ## 14.3 Reviews
 
-A review is a second party's check of a record against the code. It gives a verdict, `confirmed` or `disputed`, for the record as a whole and optionally per fact and per claim, with notes. It records the digests it saw and lapses when they change.
+A review is a second party's check of a record against the code. It gives a verdict, `confirmed` or `disputed`, for the record as a whole and optionally per fact and per claim, with notes. It records the digests it saw. It applies while they are the record's region digests, counted as a multiset, so it lapses when a region is edited, added, or removed.
 
 `conseqa conform review [<key>…] --backend claude|codex` runs one fresh-context worker per record, through the harness backends `conseqa design` already uses, with their scratch configuration outside the repository. A worker receives the record, the item's packet, and read access to the files, but not the attester's reasoning. It reports through the review operation. Done this way, a review is an independent read, not the attester's argument repeated back.
 
@@ -610,7 +651,7 @@ review:
   checker_satisfies: [realization]   # fact kinds a confirming checker review satisfies
 ```
 
-When the file is absent, these values are the defaults. A fact or claim that no proof relies on needs a review only when it is a `realization` fact.
+When the file is absent, these values are the defaults. When it is present, `format` is required, and any other field it omits takes its default. A kind in `require_binding` that is not bindable is refused, and so is any kind but `realization` in `checker_satisfies`. A fact or claim that no proof relies on needs a review only when it is a `realization` fact.
 
 When the project has a stack profile, every declaration with a chosen realization must also be bound, whatever `require_binding` lists. This is what brings routers, execution pools, storage layouts and topic runtimes under conformance: the spec's topology is held to what it declares, even where no proof relies on it.
 
@@ -666,7 +707,7 @@ A feature branch might gate on scan errors alone, letting the spec lead.
 | Exit | Meaning |
 |---|---|
 | 0 | Derived, and no gate failed. |
-| 1 | Could not derive: the spec did not load, a policy file did not load, or git failed. |
+| 1 | Could not derive: the spec, the records, or the policy file did not load (§8.1), or git failed. |
 | 2 | A gate failed, or there is a scan error. |
 
 ---
@@ -694,6 +735,7 @@ A feature branch might gate on scan errors alone, letting the spec lead.
 
 | Module | Holds |
 |---|---|
+| `mod.rs` | The conformance format, digests, the bindable kinds, and the errors the modules share. |
 | `markers.rs` | The scan, marker parsing, regions, region residuals and digests, and diagnostics (§6). |
 | `record.rs` | The record format, the strict reader, atomic and optimistic writes, and the version axes (§8). |
 | `policy.rs` | The policy file and its defaults (§14.4). |
