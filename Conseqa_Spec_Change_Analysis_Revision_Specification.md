@@ -10,7 +10,8 @@
 **Fact format:** 1 (new, §10.9)  
 **Baseline:** Conseqa `master`, commit `00c029f64738157c33e65d8e1cb41121c38ca831`  
 **Primary affected subsystems:** the obligation report, the project store reader, the `conseqa` CLI, the design MCP server  
-**Amended in implementation (M1, 2026-10-29):** §9.2, §10.5, §10.7, §10.9, §17, §18.2, and §18.4, with the maintainer's approval. The catalogue now covers every proof structure, the blocked-on set has a shape and a catalogue of its own, and the reliance the proofs used without stating it is exposed in their structures.
+**Amended in implementation (M1, 2026-10-29):** §9.2, §10.5, §10.7, §10.9, §17, §18.2, and §18.4, with the maintainer's approval. The catalogue now covers every proof structure, the blocked-on set has a shape and a catalogue of its own, and the reliance the proofs used without stating it is exposed in their structures.  
+**Amended in implementation (M2, 2026-10-29):** §7.2, §7.3, §7.4, §8.2, §18.1, and §18.5, with the maintainer's approval. The partition names who owns a requirement's `result` and the effect contracts inside a transaction; the invariant states the rename case; the authoring items and the delta's notation are fixed; and the module layout is recorded.
 
 This revision makes a **change to a Conseqa spec** a first-class object. Given two spec trees, typically two git revisions of one repository's `.conseqa/`, Conseqa SHALL report:
 
@@ -208,9 +209,9 @@ It is wrong for attribution. One edited lock step would be reported as a change 
 | L0 | `operation` | The operation's `service`. |
 | L0 | `input` (operation, input) | The input. |
 | L0 | `program` (operation) | The program's control structure. Each inline transaction is replaced by its id and each effect contract by its effect id. Blocks reached from a transaction step, its rejected arm included, are control structure and belong here. |
-| L0 | `transaction` (operation, transaction) | The transaction declaration minus its requirements. |
+| L0 | `transaction` (operation, transaction) | The transaction declaration minus its id and its requirements. Each effect contract of its steps (an `establish_effect_intent`, a `write_outbox`) is replaced by its effect id, as in the program. |
 | L0 | `effect_site` (operation, effect) | The effect contract at the site, outbox writes included. |
-| L0 | `requirement` (requirement identity, §9.2) | The requirement's terms (§9.3). |
+| L0 | `requirement` (requirement identity, §9.2) | Everything of the requirement but the key that identifies it: its terms (§9.3) and, for idempotency, `result`. A change of `result` modifies the requirement and restates nothing, since the terms are unchanged; it adds or removes the result replay obligation (§9.3). |
 | L1 | `topic_runtime`, `subscription_runtime`, `outbox_runtime`, `execution_pool`, `router`, `storage_layout` | The declaration. |
 | intent | `prompt_obligation` | The prompt obligation. |
 
@@ -225,11 +226,29 @@ The following content is classified **authoring**. It is reported in its own sec
 - `intent/proposals.yaml`, the provenance of requirements;
 - `project.yaml` settings other than `format` and `dsl` (the project name, the run policy).
 
+Each is reported as one **authoring item**, present on a side only when that side has it, so a first sketch is an added item:
+
+| Item | Content |
+|---|---|
+| `operation_sketch` (operation) | the sketch |
+| `operation_stage` (operation) | the stage |
+| `operation_description` (operation) | the description |
+| `schema_description` (schema) | the description |
+| `requirement_proposals` | all of `intent/proposals.yaml` |
+| `project_settings` | the name and the run policy |
+
 An authoring change still appears in the diff, because a reviewer may care about it. It never contributes to a semantic change count or a gate (§15.3).
 
 ## 7.4 The partition invariant
 
 Every leaf of a workspace's canonical serialization SHALL be owned by exactly one partition member or classified as authoring. This is enforced by a property test (§19.1): perturbing any leaf of any fixture's canonical form, wherever the result still loads, changes exactly one member's residual or exactly one authoring item.
+
+A leaf that spells an identity is the exception, and its rule is exact. Such leaves are an inline transaction's `id`, an effect site's `effect_id`, and the components of a requirement's key. Perturbing one renames something, which §8.3 reports as a removal and an addition:
+
+- the members whose identity contains the leaf are removed, and re-added under the new spelling (a transaction's requirements, for instance, rename with it);
+- at most one other member changes its residual: the one that names the renamed member by id, such as the program holding a transaction.
+
+The property test checks exactly this pattern by respelling the removed members.
 
 ---
 
@@ -245,8 +264,9 @@ Each modified declaration carries a **structural delta**, a readable account of 
 
 - Maps align by key.
 - Lists of elements that carry an `id` align by id.
-- Every other list aligns by the longest common subsequence of its elements' canonical forms, recursing into aligned elements. This keeps an inserted transaction step from reporting every later step as changed.
-- Paths are printed as on the side they name: `steps[3].compare[0].field`, with base and head indexes both given where they differ.
+- Every other list aligns by the longest common subsequence of its elements' canonical forms. This keeps an inserted transaction step from reporting every later step as changed. Between two aligned elements, the remaining elements of each side pair up by position. A pair of the same `kind` is compared field by field. A pair of different kinds is one replacement, as an `update` turned `compare_and_set` is (§14). What is left over is added or removed.
+- Paths are printed as on the side they name: `steps[3].compare[0].field`. Where an element's index differs between the sides, both are given, base then head: `steps[2→3]`.
+- Each entry is `{ path, base, head }`, with `base` absent for an addition and `head` absent for a removal.
 
 ## 8.3 Ids are identity
 
@@ -908,6 +928,15 @@ The head side is the project's current files, which the engine adopts as its hea
 
 Factor `load_workspace` over a file source with two implementations: the directory (today's behavior) and a git tree read through `git rev-parse`, `git ls-tree -r -z`, and `git cat-file --batch`. Every refusal goes through the same code for both. Add the empty-project reading of §6.4.
 
+The trait is `FileSource`, with two implementations:
+
+- `ProjectDirectory`: the project's own `.conseqa/`, read without the writer lock;
+- `FileTree`: files held in memory.
+
+`read_commit` reads a commit's `.conseqa/` at the project's path into a `FileTree`, skipping `local/`, or returns none when the commit holds no `project.yaml` there. `load_source` loads any source, giving none for a source with no project. Git runs with `GIT_OPTIONAL_LOCKS=0`, so no command refreshes the index.
+
+A git tree records a symbolic link or a submodule as itself, not as the file it points to. Under `spec/` or `intent/` either is refused as an unexpected entry, by name.
+
 ## 18.2 `src/analyzer/basis.rs` (new)
 
 Defines `ObligationKey`, `BasisFact`, `Fact`, the query facts, and the exhaustive extraction from `VerificationReport` (§10.5, §10.8). Also defines the durable form (§10.9): `FACT_FORMAT`, `FACT_READS`, the canonical serialization and its two-phase probe of `dsl` and `fact_format`, and the textual declaration key with its parser. It lives in the core library, not behind the `design` feature, because the report needs it.
@@ -940,6 +969,7 @@ A `locked_reader` coverage needed no new field: its lock step names the reader's
 
 ## 18.5 `src/design/change/` (new, `design` feature)
 
+- `side.rs`: reading a side from a commit or the working tree, the empty project, the merge base, and refusals that name the side (§6).
 - `partition.rs`: the declaration partition, residual projection, and authoring classification (§7).
 - `delta.rs`: structural deltas (§8.2).
 - `diff.rs`: declaration changes, the obligation diff, explanation, impact, reliance, and the document (§8, §11–§14).

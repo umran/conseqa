@@ -115,6 +115,10 @@ name = "design_analysis"
 required-features = ["design"]
 
 [[test]]
+name = "spec_change"
+required-features = ["design"]
+
+[[test]]
 name = "harness_backends"
 required-features = ["design"]
 
