@@ -2,7 +2,7 @@
 
 ## 1. Status
 
-**Status:** Proposed  
+**Status:** Implemented, except the realization changes of §13.4, their two gates, and §19.15, which arrive with Part VI. Historical design record: the current behavior is described in `docs/live/SPEC_CHANGE_ANALYSIS.md`.  
 **Part:** I of VI: semantic diff and obligation diff. Parts II, III and V are outlined in §21 and are not normative. Part IV (conformance) and Part VI (realization profiles) are specified in their own documents.  
 **Target DSL version:** 6 (unchanged)  
 **Project store format:** 10 (unchanged)  
@@ -11,7 +11,8 @@
 **Baseline:** Conseqa `master`, commit `00c029f64738157c33e65d8e1cb41121c38ca831`  
 **Primary affected subsystems:** the obligation report, the project store reader, the `conseqa` CLI, the design MCP server  
 **Amended in implementation (M1, 2026-10-29):** §9.2, §10.5, §10.7, §10.9, §17, §18.2, and §18.4, with the maintainer's approval. The catalogue now covers every proof structure, the blocked-on set has a shape and a catalogue of its own, and the reliance the proofs used without stating it is exposed in their structures.  
-**Amended in implementation (M2, 2026-10-29):** §7.2, §7.3, §7.4, §8.2, §18.1, and §18.5, with the maintainer's approval. The partition names who owns a requirement's `result` and the effect contracts inside a transaction; the invariant states the rename case; the authoring items and the delta's notation are fixed; and the module layout is recorded.
+**Amended in implementation (M2, 2026-10-29):** §7.2, §7.3, §7.4, §8.2, §18.1, and §18.5, with the maintainer's approval. The partition names who owns a requirement's `result` and the effect contracts inside a transaction; the invariant states the rename case; the authoring items and the delta's notation are fixed; and the module layout is recorded.  
+**Amended in implementation (M3, 2026-10-30):** §10.1, §10.5, §10.6, §10.7, §10.9, §11.4, §12.1, §12.2, §12.3, §14, §15.3, §16, §18.5, and §19.2, with the maintainer's approval. The document's entries, counts, and removed section are specified; a modified requirement explains the obligations its change adds or removes; a change is explained through the relied-on obligations whose own change is explained; a requirement's absence is a query fact, `keyed_requirement`, and absence queries are read on both sides; and the mutation catalogue is library code.
 
 This revision makes a **change to a Conseqa spec** a first-class object. Given two spec trees, typically two git revisions of one repository's `.conseqa/`, Conseqa SHALL report:
 
@@ -353,7 +354,7 @@ A key that names an input or a binding by id inherits §8.3. Renaming the input 
 The **basis** of a proven verdict is the set of basis facts its proof consumed. A basis fact is one of:
 
 - a **declared fact**: one declaration's statement that the proof relied on, such as an isolation level, a lock, a guarded mutation, a delivery fact, a message identity, a commit-deduplication key, or an external boundary guarantee;
-- a **query fact**: a model-wide result the proof relied on, such as the members of a conflict closure, or the absence of any transaction deleting a versioned object.
+- a **query fact**: a model-wide result the proof relied on, such as the members of a conflict closure, the absence of any transaction deleting a versioned object, or whether a consumer declares a requirement keyed from its input.
 
 A basis is a proof's read set. It mirrors the design engine's `TaskReadSet` (`src/design/read_set.rs`), which records the symbols a task observed and the queries whose results it relied on. A proof depends on what is present and on what is absent in exactly the same way.
 
@@ -430,7 +431,7 @@ The basis is extracted from the structured proofs, never from the rendered repor
 | `RetryDriver::AtLeastOnceDelivery` | `delivery(input) = at_least_once` (L1) | `subscription_runtime` |
 | `RetryDriver::IntrinsicOutboxRedrive` | `outbox_redrive(input)` | `input`, `outbox` |
 | `RetryDriver::InboundRepeatableRequest`, `::InboundRepeatableTransitionEffect` | `retry_may_repeat(effect)` | the caller's `effect_site` or `transition` |
-| `LineageFact::Propagated`, on a proven idempotency obligation | `propagation(producer, schema, channel)` | the producer's `effect_site` or `transition` |
+| `LineageFact::Propagated`, on a proven idempotency obligation | `propagation(producer, schema, channel)` | the producer's `effect_site` or `transition`; the channel's `topic` or `outbox`, whose message identity the propagation's targets must cover |
 | `LineageFact::Undeclared`, commit artifacts, notes, a dependency's recorded fence, an abandoning path | nothing | |
 
 **Roots.** Every `StableRoot` a proof cites contributes `stable_root(operation, rule, root)`, and the declared fact its rule rests on:
@@ -453,7 +454,7 @@ A proof that rests on program structure alone (no transaction, effect, decision,
 
 ## 10.6 Proofs that rest on other obligations
 
-Some proofs rest on another obligation: idempotency through a target's proven requirement (`IdempotencyProof::dependencies`), replay through a request target's replay-consistent result, and coinductive cycles. Such a proof's basis carries `relies_on(obligation key)`, anchored to that obligation's `requirement` declaration. It does not inline the other obligation's basis. A change to the other obligation is explained there, and the dependent obligation's entry names it.
+Some proofs rest on another obligation: idempotency through a target's proven requirement (`IdempotencyProof::dependencies`), replay through a request target's replay-consistent result, and coinductive cycles. Such a proof's basis carries `relies_on(obligation key)`, anchored to that obligation's `requirement` declaration. It does not inline the other obligation's basis. A change to the other obligation is explained there, and the dependent obligation's entry names it under `explained_through` (§12.1).
 
 ## 10.7 The blocked-on set
 
@@ -473,7 +474,7 @@ pub struct BlockedOn {
 }
 ```
 
-A missing fact is stated only where a gap names the premise its route lacks exactly: a `lock` over the access's own selector, an at-least-once `delivery`, `no_deleters`, a `naturally_replayable` body. Elsewhere the remedy is a choice the gap does not make, such as which guarded mutation would cover an observation, and the obstacle contributes its anchors alone.
+A missing fact is stated only where a gap names the premise its route lacks exactly: a `lock` over the access's own selector, an at-least-once `delivery`, `no_deleters`, a `naturally_replayable` body, a requirement keyed from a consumer's or target's input (`keyed_requirement`). Elsewhere the remedy is a choice the gap does not make, such as which guarded mutation would cover an observation, and the obstacle contributes its anchors alone.
 
 | Obstacle or gap | Present | Missing | Anchors |
 |---|---|---|---|
@@ -494,6 +495,8 @@ A missing fact is stated only where a gap names the premise its route lacks exac
 | `ReplayGap::CommitKeyRootUnstable` | `deduplicated_by(t, key)` as declared | | its stability gap's |
 | every other `ReplayGap` | | | `transaction`, and a root's stability gap's |
 | `…RequirementUnproven` (a target or consumer), `ResultGap::TargetResultUnproven` | `relies_on` the unproven obligation | | `effect_site`; `topic` or `outbox`; `input` |
+| `PublicationConsumerNotKeyed`, `OutboxConsumerNotKeyed`, `RequestTargetHasNoKeyedRequirement` | | `keyed_requirement(operation, input, idempotency)` | `effect_site`; `topic` or `outbox`; the fact's `input` |
+| `ResultGap::TargetResultNotDeclared` | | `keyed_requirement(operation, input, result_replay)` | the fact's `input` |
 | `NoModeledRetryDriver` on a subscription | `delivery(input) = declared` (L1) | `delivery(input) = at_least_once` (L1) | `subscription_runtime` |
 | `NoModeledRetryDriver` on a request input | | | `input` |
 | every other obstacle and gap | | | the declarations it names or reads: `program`, `input`, `effect_site`, `topic`, `outbox`, `schema`, `state_machine`, `transaction`, the `requirement` |
@@ -580,6 +583,7 @@ Verdicts are still never compared across runs, and §6.5 stands: the diff recomp
 | `conflict_closure` | `root` (an operation and a transaction), `key`, `members` (operation–transaction pairs) |
 | `cyclic_components` | `root`, `key`, `components` (sets of operation–transaction pairs) |
 | `no_deleters` | `data_model`, `object` |
+| `keyed_requirement` | `operation`, `input`, `property` (`idempotency`, or `result_replay` for a requirement whose result is `replay_consistent`) |
 | `admits_no_messages` | `operation`, `input` |
 | `no_admitted_paths` | `operation`, `input` |
 | `returns_no_result` | `operation`, `input` |
@@ -596,6 +600,8 @@ Verdicts are still never compared across runs, and §6.5 stands: the diff recomp
 | `propagation` | `producer` (an effect site or a transition effect), `schema`, `channel` |
 | `relies_on` | `obligation`, an obligation key (§9.2) |
 | `realization` | `declaration` (the textual key the requirement applies to), `entry` (`id@version` of the chosen catalogue entry), `realizes` (the textual key of the declaration that entry realizes), `requirement` (the requirement's id) |
+
+`keyed_requirement` is a query fact: the operation declares a requirement of the property keyed from the input (its key's first component reads the input). It was added in implementation (M3) before format 1 shipped, because a consumer or target that declares no such requirement is blocked on an absence that no declaration on its own side can anchor. Stating it as missing lets the requirement's addition or removal explain the change from either side (§12.1).
 
 `realization` was added by Part VI (`Conseqa_Realization_Profiles_Revision_Specification.md` §12) before format 1 shipped. It states a configuration requirement of a chosen realization, not a proof fact. No basis contains one, and Part IV attests it as a required fact.
 
@@ -656,7 +662,7 @@ Two flags apply to any matched obligation:
 
 ## 11.4 Removed obligations are never silent
 
-Every removed obligation is listed in its own section of every output, grouped by the removed declaration that took it: a removed requirement, transaction, or operation. Removing a requirement is a legitimate design decision, and this revision does not forbid it. It makes it visible, and gateable (§15.3).
+Every removed obligation is listed in its own section of every output (the document's `obligations.removed`), grouped by the declaration that took it: the outermost of its operation, its transaction, and its requirement that was removed, or else the requirement whose change dropped it, as a `result` no longer `replay_consistent` drops a result replay obligation. Removing a requirement is a legitimate design decision, and this revision does not forbid it. It makes it visible, and gateable (§15.3).
 
 ## 11.5 Rebased obligations
 
@@ -684,19 +690,23 @@ For every matched obligation that is not `held` with untouched anchors, the **ex
 
 - the anchors of base's basis or blocked-on set;
 - the anchors of head's basis or blocked-on set;
-- the members appearing in either side's results of the query facts those sets contain.
+- the members of the results of the query facts those sets contain. A conflict closure or a set of cyclic components records its members on its side. An absence query is read on both sides, since what falsifies it on one side is what the other side declares: the transactions deleting the object, for `no_deleters`; the requirements of the property keyed from the input, for `keyed_requirement`.
 
-For an added or removed obligation, the explaining declarations are the added or removed `requirement` declaration that produced it, and the subject declarations that were added or removed with it.
+For an added or removed obligation, the explaining declarations are the `requirement` declaration that produced it, when it was added, removed, or modified, and the subject declarations that were added or removed with it. A modified requirement explains, for instance, the result replay obligation that turning its `result` to `replay_consistent` adds.
+
+An entry also names, under `explained_through`, the obligations it relies on (the `relies_on` facts of either side's basis or blocked-on set) whose own entries changed: added, removed, or changed in status, basis, or blocked-on set. Each is explained at its own entry (§10.6).
 
 ## 12.2 The explanation invariant
 
-Every `regressed`, `improved`, or `rebased` obligation, and every `unproven` obligation whose blocked-on set changed, SHALL have at least one explaining declaration.
+Every `regressed`, `improved`, or `rebased` obligation, and every `unproven` obligation whose blocked-on set changed, SHALL be explained: by at least one explaining declaration, or through a relied-on obligation whose own change is explained. An added or removed obligation counts as explained by its requirement. Explanation is well-founded: obligations that changed only through one another, with no changed declaration under any of them, are not explained.
+
+Two blocked-on sets differ when their present facts, their missing facts (each compared by canonical form), or their anchors differ.
 
 Verdicts are a deterministic function of the model, and one build analyzes both sides (§6.5). A verdict that changed while none of the declarations it read from changed therefore means the extraction failed to anchor something the verifier read. Such an entry is listed under `unexplained`, with both sides' bases and blocked-on sets, as an analyzer defect. It is never dropped and never assigned a guessed explanation. The test corpus (§19.2) SHALL hold no unexplained entries, and an anchoring gap it finds is fixed in the catalogue (§10.5).
 
 ## 12.3 Per-declaration view
 
-The impact section also inverts the relation. For every changed declaration it lists the obligations of either side whose basis or blocked-on set anchors it, with each one's class. This is the view a reviewer of one changed file wants: "this transaction carries these proofs, and this is what happened to each".
+The impact section also inverts the relation. For every changed declaration it lists the obligations of either side whose basis or blocked-on set anchors it, with each one's class; a changed declaration no obligation anchors is listed with none. This is the view a reviewer of one changed file wants: "this transaction carries these proofs, and this is what happened to each".
 
 ---
 
@@ -770,6 +780,8 @@ A spec change that adds a need the chosen realization does not provide is report
 
   "obligations": {
     "status": "available",
+    "counts": { "added": 0, "removed": 0, "regressed": 0, "improved": 0,
+                "held": 10, "rebased": 1, "unproven": 0 },
     "entries": [
       {
         "key": {
@@ -784,12 +796,15 @@ A spec change that adds a need the chosen realization does not provide is report
         "base_id": "oblig.operation.apply_payment.tx.apply_payment.transaction_serializability.0",
         "head_id": "oblig.operation.apply_payment.tx.apply_payment.transaction_serializability.0",
         "class": "rebased",
+        "base_status": "proven",
+        "head_status": "proven",
         "restated": false,
         "withdrawn": [ { "fact": { "kind": "isolation", "...": "..." }, "anchors": ["..."] } ],
         "introduced": [ { "fact": { "kind": "guarded_mutation", "...": "..." }, "anchors": ["..."] } ],
         "explained_by": [ { "kind": "transaction", "value": { "...": "..." } } ]
       }
     ],
+    "removed": [],
     "unexplained": []
   },
 
@@ -824,6 +839,17 @@ When the obligation diff is unavailable, `obligations` is `{ "status": "unavaila
 `realization` (§13.4) is present when either side has a stack profile, and absent otherwise. It does not depend on the obligation diff being available, since needs and choices are derived from the spec and the realization files alone.
 
 `base_id` and `head_id` link each entry to the side's obligation report, which uses the positional id as its address.
+
+**Counts and entries.** `obligations.counts` gives the number of obligations in each class, quiet ones included. `obligations.entries` lists, in key order, every obligation that changed or that a changed declaration touches. A `held` obligation, or an `unproven` one whose blocked-on set is unchanged, is quiet and left out when it is not restated, its scope did not move, and no changed declaration explains or touches it. An entry carries:
+
+- `key`, `class`, and `base_id`, `head_id`, `base_status`, and `head_status`, each present when the obligation exists on that side;
+- on a matched obligation, `restated`; on a proven one whose scope moved, `scope` as `{ base, head, through }`, where `through` names the relied-on obligations whose own scope moved; on an `unproven` one, `blocked_on_changed`;
+- on a `rebased` one, `withdrawn` and `introduced` (§11.5);
+- `explained_by`, which for a `held` entry lists the changed declarations its basis anchors (§11.6), and `explained_through` (§12.1).
+
+`obligations.removed` groups the removed obligations by the declaration that took them (§11.4). An unexplained entry stays in `entries`, and `unexplained` repeats its key and class with both sides' `basis` or `blocked_on`.
+
+**Sources.** A side read through `--merge-base` records the commit read, the expression given as its `ref`, and `merge_base: true`. When neither side analyzes, the unavailable record names the base and has no `other_side`.
 
 ---
 
@@ -885,6 +911,8 @@ Removed obligations and unexplained entries, when there are any, are printed in 
 | `infeasible` | any declaration on head is `infeasible`, or has an `invalid_choice` (§13.4) |
 | `ambiguous` | any declaration on head is `ambiguous` (§13.4) |
 
+`infeasible` and `ambiguous` arrive with Part VI's realization section (§13.4). Until then `conseqa diff` does not accept them.
+
 | Exit | Meaning |
 |---|---|
 | 0 | The diff was produced, and no named gate failed. |
@@ -904,7 +932,7 @@ The design MCP server gains `diff_spec`:
 | `base` | A git commit expression. Default `HEAD`. |
 | `merge_base` | As `--merge-base`. Default `false`. |
 
-The head side is the project's current files, which the engine adopts as its head before every tool call (`PROJECT_STATE.md`). The result is the diff document with a short text summary in front. The tool is read-only, takes no part in the commit gate, and is a shared tool, served to every role as `requirement_report` is. A design agent finishing a task can ask what its work changed relative to the branch it started from, and see a regression before a reviewer does.
+The head side is the project's current files, which the engine adopts as its head before every tool call (`PROJECT_STATE.md`); the tool reads that head, so it never sees a file half-written by another call. The result is two text blocks: a short summary (the counts, and every regressed, removed, and unexplained obligation), then the diff document as compact JSON. A base that cannot be read is an in-band error naming it. The tool is read-only, takes no part in the commit gate, and is a shared tool, served to every role as `requirement_report` is. A design agent finishing a task can ask what its work changed relative to the branch it started from, and see a regression before a reviewer does.
 
 ---
 
@@ -972,7 +1000,11 @@ A `locked_reader` coverage needed no new field: its lock step names the reader's
 - `side.rs`: reading a side from a commit or the working tree, the empty project, the merge base, and refusals that name the side (§6).
 - `partition.rs`: the declaration partition, residual projection, and authoring classification (§7).
 - `delta.rs`: structural deltas (§8.2).
-- `diff.rs`: declaration changes, the obligation diff, explanation, impact, reliance, and the document (§8, §11–§14).
+- `diff.rs`: declaration changes, the obligation diff, explanation, impact, reliance, the document, and the gates (§8, §11–§14, §15.3).
+- `render.rs`: the human output, and the summary `diff_spec` puts in front of the document (§15.2, §16).
+- `mutation.rs`: the mutation catalogue of §19.2 and the fact withdrawals of Part IV §12.2, as library code both read.
+
+`mod.rs` reads both sides of a project and diffs them, for `conseqa diff`.
 
 ## 18.6 `src/main.rs`
 
@@ -997,6 +1029,8 @@ For every fixture under `tests/fixtures/`, perturb each leaf of the workspace's 
 ## 19.2 Explanation corpus
 
 For every fixture, apply each mutation of a fixed catalogue: remove a lock step; drop or weaken isolation; replace a `compare_and_set` with an `update`; add a transaction deleting a versioned object; change a subscription's delivery; remove a `deduplicated_by`; change an external effect's idempotency; widen a selector; remove a requirement. Diff the fixture against the mutation. Assert that the expected obligations change class and that no entry is unexplained (§12.2).
+
+The catalogue is library code (`src/design/change/mutation.rs`), shared with Part IV's load-bearing check, and the corpus also applies that check's remaining withdrawals: an external effect's result replay, a request's retry, and a channel's message identity. Each mutation applies at every site it fits. Removing a lock removes every lock step of the transaction with that selector and mode, which is what withdrawing one `lock` fact means. Weakening moves isolation one level down. Delivery and external idempotency change to each of their other values. Widening sets the selector of a read, update, delete, or lock to `all`. The added deleter is a new transaction right after one that selects the object by values still in scope after it commits, and it deletes by that selector. A mutant that does not validate has no obligation diff and is skipped, but every mutation kind must verify somewhere in the corpus. The expected change: every obligation whose basis held a fact the mutation falsifies is not `held` on head, and a removed requirement's obligations are `removed`.
 
 ## 19.3 Reordering is not a change
 

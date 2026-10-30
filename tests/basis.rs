@@ -457,6 +457,7 @@ fn kind(fact: &Fact) -> &'static str {
         Fact::ConflictClosure { .. } => "conflict_closure",
         Fact::CyclicComponents { .. } => "cyclic_components",
         Fact::NoDeleters { .. } => "no_deleters",
+        Fact::KeyedRequirement { .. } => "keyed_requirement",
         Fact::AdmitsNoMessages { .. } => "admits_no_messages",
         Fact::NoAdmittedPaths { .. } => "no_admitted_paths",
         Fact::ReturnsNoResult { .. } => "returns_no_result",
@@ -476,7 +477,7 @@ fn kind(fact: &Fact) -> &'static str {
     }
 }
 
-const KINDS: [&str; 24] = [
+const KINDS: [&str; 25] = [
     "isolation",
     "lock",
     "guarded_mutation",
@@ -485,6 +486,7 @@ const KINDS: [&str; 24] = [
     "conflict_closure",
     "cyclic_components",
     "no_deleters",
+    "keyed_requirement",
     "admits_no_messages",
     "no_admitted_paths",
     "returns_no_result",
@@ -628,6 +630,16 @@ fn samples() -> Vec<Fact> {
         Fact::NoDeleters {
             data_model: id("data.orders"),
             object: id("object.order"),
+        },
+        Fact::KeyedRequirement {
+            operation: id("operation.ship"),
+            input: id("input.ship.paid"),
+            property: ObligationProperty::Idempotency,
+        },
+        Fact::KeyedRequirement {
+            operation: id("operation.quote"),
+            input: id("input.quote.request"),
+            property: ObligationProperty::ResultReplay,
         },
         Fact::AdmitsNoMessages {
             operation: id("operation.ship"),

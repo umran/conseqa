@@ -1,11 +1,12 @@
 //! Reading the two sides of a change (§6 of the spec change analysis
-//! revision; its tests §19.10), in temporary git repositories.
+//! revision), and `conseqa diff` over them (§15): its tests §19.10–§19.12,
+//! in temporary git repositories.
 
 use std::{
     collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Output},
 };
 
 use conseqa::{
@@ -13,7 +14,7 @@ use conseqa::{
     design::{
         ProjectStore, RunId, RunMetadata, StoreError, WorkspaceState,
         change::{
-            diff::{Change, declaration_changes},
+            diff::{Change, DiffDocument, declaration_changes},
             partition::Partition,
             side::{self, SideErrorReason, SideName, Source},
         },
@@ -433,4 +434,264 @@ fn a_committed_symbolic_link_is_refused_by_name() {
         &error.reason,
         SideErrorReason::Store(StoreError::Unexpected { path, .. }) if path.ends_with("operation.alias.yaml")
     ));
+}
+
+// ---------------------------------------------------------------------
+// `conseqa diff` (§15; its tests §19.10–§19.12)
+// ---------------------------------------------------------------------
+
+fn conseqa(dir: &Path, args: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_conseqa"))
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .expect("conseqa runs")
+}
+
+fn exit_code(output: &Output) -> i32 {
+    output.status.code().expect("conseqa exits")
+}
+
+fn stdout(output: &Output) -> String {
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+fn stderr(output: &Output) -> String {
+    String::from_utf8_lossy(&output.stderr).into_owned()
+}
+
+const EVERY_GATE: &str = "regressed,removed,added-unproven,rebased,unexplained";
+
+/// No change passes every gate; a rebased proof fails `rebased` alone.
+#[test]
+fn conseqa_diff_exits_by_its_gates() {
+    let (_, project) = repository("cli-gates", "");
+
+    let output = conseqa(&project, &["diff", "--fail-on", EVERY_GATE]);
+
+    assert_eq!(exit_code(&output), 0, "{}", stderr(&output));
+    assert!(
+        stdout(&output).contains("no semantic change"),
+        "{}",
+        stdout(&output)
+    );
+
+    strengthen_isolation(&project);
+
+    let output = conseqa(
+        &project,
+        &["diff", "--fail-on", "regressed,removed,unexplained"],
+    );
+
+    assert_eq!(exit_code(&output), 0, "{}", stderr(&output));
+    assert!(stdout(&output).contains("~ rebased"), "{}", stdout(&output));
+
+    let output = conseqa(&project, &["diff", "--fail-on", EVERY_GATE]);
+
+    assert_eq!(exit_code(&output), 2, "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("gate failed: rebased"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(!stderr(&output).contains("gate failed: regressed"));
+}
+
+/// The report is the diff document, byte-identical across runs.
+#[test]
+fn conseqa_diff_writes_a_deterministic_report() {
+    let (_, project) = repository("cli-report", "");
+    let out = temp_dir("cli-report-out");
+
+    strengthen_isolation(&project);
+
+    let first = out.join("first.json");
+    let second = out.join("second.json");
+
+    for path in [&first, &second] {
+        let output = conseqa(&project, &["diff", "--report", path.to_str().unwrap()]);
+
+        assert_eq!(exit_code(&output), 0, "{}", stderr(&output));
+    }
+
+    let (first, second) = (fs::read(&first).unwrap(), fs::read(&second).unwrap());
+
+    assert_eq!(first, second, "two runs wrote different documents");
+
+    let document: DiffDocument = serde_json::from_slice(&first).expect("the document reads back");
+
+    assert_eq!(document.format, 1);
+    assert!(document.head.source.working_tree);
+    assert_eq!(document.base.source.reference.as_deref(), Some("HEAD"));
+    assert_eq!(document.declarations.changes.len(), 1);
+}
+
+/// A side that cannot be read exits 1, naming it.
+#[test]
+fn conseqa_diff_exits_1_when_a_side_cannot_be_read() {
+    let (root, project) = repository("cli-refusals", "");
+
+    let output = conseqa(&project, &["diff", "no-such-branch"]);
+
+    assert_eq!(exit_code(&output), 1);
+    assert!(
+        stderr(&output).contains("`no-such-branch` names no commit"),
+        "{}",
+        stderr(&output)
+    );
+
+    let file = operation_file(&project, "operation.apply_payment");
+    let text = fs::read_to_string(&file).unwrap();
+
+    fs::write(&file, "service: [unclosed\n").unwrap();
+
+    let output = conseqa(&project, &["diff"]);
+
+    assert_eq!(exit_code(&output), 1);
+    assert!(
+        stderr(&output).contains("head (working tree)"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(
+        stderr(&output).contains("operation.apply_payment.yaml"),
+        "{}",
+        stderr(&output)
+    );
+
+    fs::write(&file, text).unwrap();
+
+    let manifest = project.join(".conseqa/project.yaml");
+    let manifest_text = fs::read_to_string(&manifest).unwrap();
+
+    fs::write(&manifest, manifest_text.replacen("dsl: 6", "dsl: 5", 1)).unwrap();
+    commit(&root, "an older dsl");
+    fs::write(&manifest, &manifest_text).unwrap();
+
+    let output = conseqa(&project, &["diff"]);
+
+    assert_eq!(exit_code(&output), 1);
+    assert!(
+        stderr(&output).contains("base (HEAD)"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(stderr(&output).contains("dsl 5"), "{}", stderr(&output));
+
+    let outside = temp_dir("cli-no-repository");
+
+    drop(ProjectStore::create(&outside, &workspace()).unwrap());
+
+    let output = conseqa(&outside, &["diff"]);
+
+    assert_eq!(exit_code(&output), 1);
+    assert!(
+        stderr(&output).contains("no git repository"),
+        "{}",
+        stderr(&output)
+    );
+}
+
+/// A gate that cannot be evaluated fails: with an operation left
+/// without a program, the obligation diff is unavailable.
+#[test]
+fn a_gate_on_an_unavailable_obligation_diff_exits_2() {
+    let (_, project) = repository("cli-unavailable", "");
+    let file = operation_file(&project, "operation.apply_payment");
+    let text = fs::read_to_string(&file).unwrap();
+
+    let start = text.find("program:").unwrap();
+    let end = text[start..].find("\nrequirements:").unwrap() + start + 1;
+
+    fs::write(
+        &file,
+        format!("{}{}", &text[..start], &text[end..])
+            .replace("stage: ready_for_assembly", "stage: planned"),
+    )
+    .unwrap();
+
+    let output = conseqa(&project, &["diff"]);
+
+    assert_eq!(exit_code(&output), 0, "{}", stderr(&output));
+    assert!(
+        stdout(&output).contains("unavailable: head"),
+        "{}",
+        stdout(&output)
+    );
+
+    let output = conseqa(&project, &["diff", "--fail-on", "removed"]);
+
+    assert_eq!(exit_code(&output), 2, "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("gate failed: removed"),
+        "{}",
+        stderr(&output)
+    );
+}
+
+/// `--merge-base` reports what the branch changed, not what master did
+/// since the branch point; reading writes nothing and takes no lock.
+#[test]
+fn conseqa_diff_from_the_merge_base_reads_only() {
+    let (root, project) = repository("cli-merge-base", "");
+
+    git(&root, &["checkout", "-q", "-b", "feature"]);
+    strengthen_isolation(&project);
+    commit(&root, "strengthen on the branch");
+
+    git(&root, &["checkout", "-q", "master"]);
+
+    let subscriptions =
+        project.join(".conseqa/spec/runtime/subscriptions/operation.apply_payment.yaml");
+    let text = fs::read_to_string(&subscriptions).unwrap();
+
+    fs::write(
+        &subscriptions,
+        text.replacen("delivery: at_least_once", "delivery: unspecified", 1),
+    )
+    .unwrap();
+    commit(&root, "weaken delivery on master");
+
+    git(&root, &["checkout", "-q", "feature"]);
+
+    let out = temp_dir("cli-merge-base-out");
+    let report = out.join("diff.json");
+
+    let (_held, _) = ProjectStore::open(&project).expect("the project opens for writing");
+    let before = snapshot(&root);
+
+    let output = conseqa(
+        &project,
+        &[
+            "diff",
+            "master",
+            "HEAD",
+            "--merge-base",
+            "--report",
+            report.to_str().unwrap(),
+        ],
+    );
+
+    assert_eq!(exit_code(&output), 0, "{}", stderr(&output));
+    assert_eq!(snapshot(&root), before, "diffing changed a file");
+
+    let document: DiffDocument = serde_json::from_slice(&fs::read(&report).unwrap()).unwrap();
+
+    assert!(document.base.source.merge_base);
+    assert_eq!(document.base.source.reference.as_deref(), Some("master"));
+
+    let changed: Vec<&str> = document
+        .declarations
+        .changes
+        .iter()
+        .map(|change| change.declaration.kind())
+        .collect();
+
+    // The branch's isolation change, and not master's delivery change.
+    assert_eq!(changed, vec!["transaction"], "{changed:?}");
+    assert!(
+        stdout(&output).contains("merge base of master"),
+        "{}",
+        stdout(&output)
+    );
 }

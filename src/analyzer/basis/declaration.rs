@@ -142,7 +142,7 @@ impl DeclarationKey {
 
     /// The declaration's ids in textual order, the containing
     /// declaration's first, or `None` for a requirement.
-    fn ids(&self) -> Option<Vec<&Id>> {
+    pub fn ids(&self) -> Option<Vec<&Id>> {
         Some(match self {
             Self::Service(id)
             | Self::Schema(id)
