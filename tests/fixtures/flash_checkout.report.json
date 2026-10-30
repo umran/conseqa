@@ -1101,6 +1101,10 @@
           },
           "anchors": [
             {
+              "kind": "topic",
+              "value": "topic.order_events"
+            },
+            {
               "kind": "effect_site",
               "value": {
                 "operation": "operation.charge_payment",

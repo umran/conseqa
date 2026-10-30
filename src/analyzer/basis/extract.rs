@@ -1227,14 +1227,26 @@ impl<'a> Collector<'a> {
                     ),
                 };
 
+                // The propagation counts only where its targets cover
+                // the channel's identity fields, so its truth is read
+                // from the channel's message identity too.
                 if let Some(channel) = channel {
+                    let declared = match &channel {
+                        Channel::Topic { topic } => DeclarationKey::Topic(topic.clone()),
+
+                        Channel::Outbox { data_model, outbox } => DeclarationKey::Outbox {
+                            data_model: data_model.clone(),
+                            outbox: outbox.clone(),
+                        },
+                    };
+
                     self.fact(
                         Fact::Propagation {
                             producer: site,
                             schema: schema.clone(),
                             channel,
                         },
-                        [anchor],
+                        [anchor, declared],
                     );
                 }
             }
@@ -1309,7 +1321,7 @@ impl<'a> Collector<'a> {
             } => {
                 self.anchor(self.effect_anchor(self.operation, effect));
                 self.anchor(DeclarationKey::Topic(topic.clone()));
-                self.anchor(input_key(operation, input));
+                self.keyed_requirement_missing(operation, input, ObligationProperty::Idempotency);
             }
 
             // Present, and insufficient: the consumer's requirement is
@@ -1355,7 +1367,7 @@ impl<'a> Collector<'a> {
                 input,
             } => {
                 self.anchor(self.effect_anchor(self.operation, effect));
-                self.anchor(input_key(operation, input));
+                self.keyed_requirement_missing(operation, input, ObligationProperty::Idempotency);
 
                 if let Some(anchor) = self.outbox_anchor(outbox) {
                     self.anchor(anchor);
@@ -1415,7 +1427,7 @@ impl<'a> Collector<'a> {
                 input,
             } => {
                 self.anchor(self.effect_anchor(self.operation, effect));
-                self.anchor(input_key(operation, input));
+                self.keyed_requirement_missing(operation, input, ObligationProperty::Idempotency);
             }
 
             // Present, and insufficient: the target's requirement is
@@ -1781,6 +1793,25 @@ impl<'a> Collector<'a> {
                 identity,
             },
             [self.effect_anchor(self.operation, effect)],
+        );
+    }
+
+    /// A consumer or request target declares no requirement of
+    /// `property` keyed from its input: the query fact it fails, read
+    /// from the input its requirements would be keyed from.
+    fn keyed_requirement_missing(
+        &mut self,
+        operation: &Id,
+        input: &Id,
+        property: ObligationProperty,
+    ) {
+        self.missing_fact(
+            Fact::KeyedRequirement {
+                operation: operation.clone(),
+                input: input.clone(),
+                property,
+            },
+            [input_key(operation, input)],
         );
     }
 
@@ -2216,8 +2247,11 @@ impl<'a> Collector<'a> {
                 self.anchor(DeclarationKey::Schema(actual.clone()));
             }
 
-            ResultGap::TargetResultNotDeclared { operation, input }
-            | ResultGap::TargetErrorRetryable {
+            ResultGap::TargetResultNotDeclared { operation, input } => {
+                self.keyed_requirement_missing(operation, input, ObligationProperty::ResultReplay);
+            }
+
+            ResultGap::TargetErrorRetryable {
                 operation,
                 input,
                 error: _,

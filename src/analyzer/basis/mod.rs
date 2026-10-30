@@ -36,8 +36,8 @@ use std::fmt;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::spec::{
-    CursorAdvanceRule, DeliverySemantics, ExternalIdentity, FieldPath, Id, LockMode,
-    ObjectSelector, TransactionIsolation, ValueRef,
+    CursorAdvanceRule, DeliverySemantics, ExternalIdentity, FieldPath, Id, Literal, LockMode,
+    ObjectSelector, SelectorPredicate, SelectorValue, TransactionIsolation, ValueRef,
 };
 
 pub use declaration::{DeclarationKey, TextualKey, TextualKeyError};
@@ -207,6 +207,17 @@ pub enum RequirementFamily {
     Recoverability,
 }
 
+impl fmt::Display for RequirementFamily {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::TransactionSerializability => "SerializableBy",
+            Self::TransactionOrdering => "OrderedBy",
+            Self::Idempotency => "Idempotency",
+            Self::Recoverability => "Recoverability",
+        })
+    }
+}
+
 /// The identity of one declared requirement: the obligation key of
 /// what it produces, with the property replaced by its family (§9.2).
 /// It names the `requirement` member of the declaration partition.
@@ -217,6 +228,24 @@ pub struct RequirementIdentity {
     pub family: RequirementFamily,
     pub requirement_key: Vec<ValueRef>,
     pub occurrence: u32,
+}
+
+impl fmt::Display for RequirementIdentity {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{}({}) on {}",
+            self.family,
+            list(self.requirement_key.iter().map(value)),
+            self.subject
+        )?;
+
+        if self.occurrence > 0 {
+            write!(f, " #{}", self.occurrence)?;
+        }
+
+        Ok(())
+    }
 }
 
 /// The keys of a list of requirements on one subject, in declaration
@@ -415,6 +444,18 @@ pub enum Fact {
     /// whose truth an added deleter falsifies.
     NoDeleters { data_model: Id, object: Id },
 
+    /// The operation declares a requirement of `property` keyed from
+    /// `input`: a query over its requirements. A consumer or request
+    /// target that declares none fails it, and the obstacle states it
+    /// as missing, so that a requirement added or removed on either
+    /// side explains the change (§12.1). `property` is `idempotency` or
+    /// `result_replay`.
+    KeyedRequirement {
+        operation: Id,
+        input: Id,
+        property: ObligationProperty,
+    },
+
     /// The triggering input admits no message schema.
     AdmitsNoMessages { operation: Id, input: Id },
 
@@ -525,6 +566,7 @@ impl Fact {
             | Self::ConflictClosure { .. }
             | Self::CyclicComponents { .. }
             | Self::NoDeleters { .. }
+            | Self::KeyedRequirement { .. }
             | Self::AdmitsNoMessages { .. }
             | Self::NoAdmittedPaths { .. }
             | Self::ReturnsNoResult { .. }
@@ -552,6 +594,258 @@ impl Fact {
         // Every field is a string, an integer, a sequence, or a
         // string-keyed map, so serialization cannot fail.
         durable::canonical_text(&serde_json::to_value(self).expect("a fact serializes"))
+    }
+}
+
+/// The fact in one line, in the functional shorthand the specs write
+/// it in: `isolation(tx.apply_payment) = serializable`. Presentation
+/// only, for a diff's human output and a work item's packet; the
+/// canonical form is the fact's identity. A transaction is written by
+/// its id alone, as a reader names it.
+impl fmt::Display for Fact {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Isolation {
+                transaction, level, ..
+            } => write!(f, "isolation({transaction}) = {}", snake(level)),
+
+            Self::Lock {
+                transaction,
+                object,
+                selector,
+                mode,
+                ..
+            } => write!(
+                f,
+                "lock({transaction}, {object} where {}, {})",
+                predicate(&selector.predicate),
+                snake(mode)
+            ),
+
+            Self::GuardedMutation {
+                transaction,
+                object,
+                mechanism,
+                coverage,
+                compared_fields,
+                ..
+            } => {
+                write!(
+                    f,
+                    "guarded_mutation({transaction}, {object}, {}, {coverage}",
+                    snake(mechanism)
+                )?;
+
+                if !compared_fields.is_empty() {
+                    write!(f, ", comparing {}", list(compared_fields))?;
+                }
+
+                f.write_str(")")
+            }
+
+            Self::Cursor {
+                object,
+                field,
+                rule,
+                ..
+            } => write!(f, "cursor({object}.{field}) = {rule}"),
+
+            Self::Fence { object, field, .. } => write!(f, "fence({object}.{field})"),
+
+            Self::ConflictClosure { root, key, members } => write!(
+                f,
+                "conflict_closure({}, {}) = {{{}}}",
+                root.transaction,
+                value(key),
+                list(members.iter().map(|member| &member.transaction))
+            ),
+
+            Self::CyclicComponents {
+                root,
+                key,
+                components,
+            } => write!(
+                f,
+                "cyclic_components({}, {}) = {{{}}}",
+                root.transaction,
+                value(key),
+                list(components.iter().map(|component| format!(
+                    "{{{}}}",
+                    list(component.iter().map(|member| &member.transaction))
+                )))
+            ),
+
+            Self::NoDeleters { object, .. } => write!(f, "no_deleters({object})"),
+
+            Self::KeyedRequirement {
+                operation,
+                input,
+                property,
+            } => write!(
+                f,
+                "keyed_requirement({operation}, {input}, {})",
+                snake(property)
+            ),
+            Self::AdmitsNoMessages { input, .. } => write!(f, "admits_no_messages({input})"),
+            Self::NoAdmittedPaths { input, .. } => write!(f, "no_admitted_paths({input})"),
+            Self::ReturnsNoResult { input, .. } => write!(f, "returns_no_result({input})"),
+            Self::Terminal { input, .. } => write!(f, "terminal({input})"),
+
+            Self::StableRoot { rule, root, .. } => {
+                write!(f, "stable_root({}) by {}", value(root), snake(rule))
+            }
+
+            Self::Delivery {
+                input, semantics, ..
+            } => write!(f, "delivery({input}) = {}", snake(semantics)),
+
+            Self::MessageIdentity {
+                channel,
+                schema,
+                fields,
+            } => write!(
+                f,
+                "message_identity({channel}, {schema}) = ({})",
+                list(fields)
+            ),
+
+            Self::DeduplicatedBy {
+                transaction, key, ..
+            } => write!(
+                f,
+                "deduplicated_by({transaction}) = ({})",
+                list(key.iter().map(value))
+            ),
+
+            Self::NaturallyReplayable { transaction, .. } => {
+                write!(f, "naturally_replayable({transaction})")
+            }
+
+            Self::ArtifactRoute {
+                transaction,
+                artifact,
+                route,
+                ..
+            } => write!(
+                f,
+                "artifact_route({transaction}, {artifact}) = {}",
+                snake(route)
+            ),
+
+            Self::OutboxRedrive { input, outbox, .. } => {
+                write!(f, "outbox_redrive({input}, {outbox})")
+            }
+
+            Self::RetryMayRepeat { site } => write!(f, "retry_may_repeat({site})"),
+
+            Self::ExternalGuarantee {
+                effect, guarantee, ..
+            } => write!(f, "external_guarantee({effect}) = {}", snake(guarantee)),
+
+            Self::Propagation {
+                producer,
+                schema,
+                channel,
+            } => write!(f, "propagation({producer}, {schema}, {channel})"),
+
+            Self::ReliesOn { obligation } => write!(f, "relies_on({obligation})"),
+
+            Self::Realization {
+                declaration,
+                entry,
+                requirement,
+                ..
+            } => write!(f, "realization({declaration}, {entry}, {requirement})"),
+        }
+    }
+}
+
+impl fmt::Display for Coverage {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Atomic => f.write_str("atomic"),
+            Self::HeldProtection => f.write_str("held_protection"),
+            Self::ObservedState { read } => write!(f, "observed_state({read})"),
+
+            Self::ObservedVersion {
+                read,
+                version_field,
+            } => write!(f, "observed_version({read}, {version_field})"),
+
+            Self::LockedReader { selector, mode } => write!(
+                f,
+                "locked_reader({} where {}, {})",
+                selector.object,
+                predicate(&selector.predicate),
+                snake(mode)
+            ),
+        }
+    }
+}
+
+impl fmt::Display for Channel {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Topic { topic } => write!(f, "{topic}"),
+            Self::Outbox { outbox, .. } => write!(f, "{outbox}"),
+        }
+    }
+}
+
+impl fmt::Display for Site {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::EffectSite { effect, .. } => write!(f, "{effect}"),
+
+            Self::TransitionEffect {
+                transition, effect, ..
+            } => write!(f, "{transition}.{effect}"),
+        }
+    }
+}
+
+/// A unit enum value as its durable spelling.
+fn snake<T: Serialize>(value: &T) -> String {
+    match serde_json::to_value(value) {
+        Ok(serde_json::Value::String(text)) => text,
+        _ => String::new(),
+    }
+}
+
+fn value(value: &ValueRef) -> String {
+    format!("{}.{}", value.source.id(), value.path)
+}
+
+fn list<T: fmt::Display>(items: impl IntoIterator<Item = T>) -> String {
+    items
+        .into_iter()
+        .map(|item| item.to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn predicate(selected: &SelectorPredicate) -> String {
+    match selected {
+        SelectorPredicate::All => "all".to_string(),
+
+        SelectorPredicate::Eq { field, value: to } => match to {
+            SelectorValue::Value(root) => format!("{field} = {}", value(root)),
+            SelectorValue::Literal(literal) => format!("{field} = {}", snake_literal(literal)),
+        },
+
+        SelectorPredicate::And { predicates } => predicates
+            .iter()
+            .map(predicate)
+            .collect::<Vec<_>>()
+            .join(" and "),
+    }
+}
+
+fn snake_literal(literal: &Literal) -> String {
+    match literal {
+        Literal::String(text) => text.clone(),
+        Literal::Bool(flag) => flag.to_string(),
+        Literal::Int(number) => number.to_string(),
     }
 }
 
