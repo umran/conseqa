@@ -113,6 +113,14 @@ const TEXTUAL_KINDS: [(&str, usize); 20] = [
 ];
 
 impl DeclarationKey {
+    /// The member kinds with a textual form, in §7.2's order, each with
+    /// how many ids its key names: the shape of a conformance record's
+    /// path, whose directories are a kind and then its ids (Part IV
+    /// §8.1).
+    pub fn textual_kinds() -> &'static [(&'static str, usize)] {
+        &TEXTUAL_KINDS
+    }
+
     /// The member kind, spelled as both forms spell it.
     pub fn kind(&self) -> &'static str {
         match self {

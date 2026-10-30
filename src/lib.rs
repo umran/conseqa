@@ -1,5 +1,7 @@
 pub mod analyzer;
 #[cfg(feature = "design")]
+pub mod conformance;
+#[cfg(feature = "design")]
 pub mod design;
 #[cfg(feature = "design")]
 pub mod harness;
