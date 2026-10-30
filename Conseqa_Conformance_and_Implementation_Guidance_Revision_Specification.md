@@ -10,7 +10,8 @@
 **Project store format:** 10 (unchanged). Conformance records live in `.conseqa/` but outside what the store loads and scans (§8.1).  
 **Conformance format:** 1 (new)  
 **Baseline:** Conseqa `master`, commit `8883890` (PR #38 merged)  
-**Primary affected subsystems:** a new conformance module, the `conseqa` CLI, the design MCP server, the harness backends
+**Primary affected subsystems:** a new conformance module, the `conseqa` CLI, the design MCP server, the harness backends  
+**Amended in implementation (Part I's M3, 2026-10-30):** §12.2's `guarded_mutation` withdrawal applies to a `compare_and_set` only, with the maintainer's approval, as Part I's mutation catalogue implements it.
 
 This revision connects a spec to the code that implements it, and turns the spec's changes into guided implementation work for LLM agents. It introduces:
 
@@ -511,7 +512,7 @@ The withdrawals at this revision:
 |---|---|
 | `isolation` | set to `unspecified` |
 | `lock` | remove the lock step |
-| `guarded_mutation` | drop the comparison; a `compare_and_set` becomes an `update` |
+| `guarded_mutation` | drop the comparison: a `compare_and_set` becomes an `update`. A transition, cursor advance, fence, or upsert has no comparison whose removal withdraws the fact, so it falls back as a kind without a withdrawal does. |
 | `deduplicated_by` | remove it |
 | `delivery` | set to `unspecified` |
 | `external_guarantee` | set the guarantee to `unspecified` |
