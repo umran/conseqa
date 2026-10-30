@@ -123,6 +123,10 @@ name = "obligation_diff"
 required-features = ["design"]
 
 [[test]]
+name = "conformance"
+required-features = ["design"]
+
+[[test]]
 name = "harness_backends"
 required-features = ["design"]
 
