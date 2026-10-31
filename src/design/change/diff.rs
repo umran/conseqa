@@ -35,6 +35,7 @@ use crate::analyzer::basis::{
 use crate::analyzer::report::{self, Obligation, Status};
 use crate::analyzer::verification::ProofScope;
 use crate::analyzer::{self, Diagnostic};
+use crate::design::workspace::WorkspaceState;
 use crate::spec::{DSL_VERSION, DslVersion, ValueSource};
 
 use super::delta::{DeltaEntry, delta};
@@ -692,6 +693,21 @@ fn analyze(side: &Side) -> Result<Analysis, String> {
         return Ok(Analysis::default());
     };
 
+    let report = verified(workspace)?;
+
+    Ok(Analysis {
+        obligations: report
+            .obligations
+            .into_iter()
+            .map(|obligation| (obligation.key.clone(), obligation))
+            .collect(),
+    })
+}
+
+/// A workspace's obligation report, under `conseqa check`'s
+/// preconditions: it must assemble into a model, and the model must
+/// validate. The reason says which failed, and how.
+pub(crate) fn verified(workspace: &WorkspaceState) -> Result<report::ProverReport, String> {
     let model = workspace
         .assemble_model()
         .map_err(|error| error.to_string())?;
@@ -716,15 +732,8 @@ fn analyze(side: &Side) -> Result<Analysis, String> {
     }
 
     let verification = analyzer::verification::verify(&model);
-    let report = report::obligations(&model, &verification);
 
-    Ok(Analysis {
-        obligations: report
-            .obligations
-            .into_iter()
-            .map(|obligation| (obligation.key.clone(), obligation))
-            .collect(),
-    })
+    Ok(report::obligations(&model, &verification))
 }
 
 /// Both sides, analyzed, with what changed between them.
