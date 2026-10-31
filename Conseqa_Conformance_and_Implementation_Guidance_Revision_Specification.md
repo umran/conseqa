@@ -23,6 +23,12 @@
 - §10.1 and §10.2: every condition's exact rule, records naming no declaration, conditions without a record, and when each class of fact holds of the code;
 - §14.3, §14.4, §15.3 and §17.2: review verdicts, what needs a review, an unverifiable spec, and the basis's implementer rule.
 
+**Amended in implementation (M6, 2026-10-31):** with the maintainer's approval, taking the delivery loop orchestrator's tooling asks T2, T3, T5, T6, and T7:
+- §11.1–§11.5: what an item states, including `depends_on` and `files`; priority by blocking, then by the most urgent condition; where the unlisted kinds fall in dependency order, and call order; scoping by a spec range, and by added and removed obligations;
+- §12.1–§12.3: packets for every bindable declaration and orphaned key, open disputes and the last refusal, neighbours, semantics topics, the checklist, what the load-bearing check lists, and precedents;
+- §8.4, §13.1, §13.2, §14.1, §14.2, and §14.5: the read set's members, the last refusal kept per machine, `by` stamped by the surface, an identical attest replayed as a no-op, the refusals by name, what attest writes, and when reviews survive;
+- §15.1–§15.3, §17.1, and §18.5–§18.8.
+
 This revision connects a spec to the code that implements it, and turns the spec's changes into guided implementation work for LLM agents. It introduces:
 
 - **binding markers**: comment pairs, in any text file of the repository, that bind a region of the file to a declaration;
@@ -390,6 +396,8 @@ A record stores the declaration's residual itself, not its digest. "What changed
 
 Records are written by the attest and review operations (§14). Each write is atomic: a temporary sibling, renamed into place. Each write also names the digest of the record it replaces, or its absence, and is refused if the file changed in the meantime. That digest is the BLAKE3 hash of the record file's bytes. This is the same optimistic rule the commit gate applies to stale work. A short advisory lock on `.conseqa/local/conformance.lock` makes the comparison and the rename one step across processes. That file is machine-local and outside version control, and the lock is never the spec writer lock. Hand edits are allowed and are authoritative on read, since the files are, as in the spec. A hand-written record with wrong digests simply reads as `drifted`.
 
+An attest that would write exactly the record already on disk, its `attested.commit` aside, writes nothing and succeeds, whatever record its caller read (§14.2). A retry after a crash replays a call, and the record the replay names is the one the first call replaced, so the optimistic rule alone would refuse it.
+
 ## 8.5 Merging
 
 One file per declaration means two branches conflict only when both checked the same declaration, which is a real conflict. A merged tree's state is derived like any other (§13.1).
@@ -513,32 +521,48 @@ obligations    14 proven: 9 conformant, 5 not conformant
 
 There is one work item per declaration that has conditions, and one per orphaned key. An item carries all of its declaration's conditions, because an agent changing a declaration's code should handle everything wrong with it at once.
 
+Beside its key and priority, an item states:
+
+- its conditions, by name;
+- the proven obligations it blocks;
+- `depends_on`: the items of the declarations its own declaration references in the design graph, an operation it calls standing for that operation's transactions and effect sites. Only those before it in dependency order (§11.4) count, so the relation has no cycle;
+- `files`: the paths of its regions, of its record's regions, and of its claims' matches outside them (§9.3), and, while it has no region, those of its container's regions. A transaction's or effect site's container is its program, a program's or input's is its operation, a data object's or outbox's is its data model, and a transition's is its state machine.
+
+With these, a scheduler can run items side by side, in waves whose items neither depend on one another nor touch the same files.
+
 ## 11.2 Identity
 
 An item's id is its declaration's textual key. The same item has the same id on every derivation until its conditions clear, on every machine and every branch.
 
 ## 11.3 Priority
 
-1. **Correctness.** The item blocks the conformance of a proven obligation: one of its conditions involves a fact or claim in that obligation's basis.
+1. **Correctness.** The item blocks the conformance of a proven obligation: its declaration is one of the obligation's blockers (§10.2), so one of its conditions involves a fact or claim in that obligation's basis.
 2. **Structure.** Items for `unbound`, `unattested`, `stale`, or `drifted` declarations that block no proven obligation.
 3. **Review.** Items whose only conditions are `unreviewed` or `disputed`.
 4. **Cleanup.** `orphaned` keys and `surplus` facts. This is optional work. A surplus fact is one no proof needs any longer, which is not the same as one the code may stop providing (Part I §13.2).
+
+An item that blocks no proven obligation takes the priority of its most urgent condition: `unbound`, `unattested`, `stale`, and `drifted` are structure, `unreviewed` and `disputed` are review, and `surplus` is cleanup. `missing_facts` and `incomplete` always block what relies on them.
 
 ## 11.4 Order within a priority
 
 Items follow dependency order:
 
-1. `schema`, `data_model`, `data_object`, `outbox`, `topic`;
-2. `transaction`, `effect_site`;
-3. `program`, `input`;
+1. `schema`, `data_model`, `data_object`, `outbox`, `topic`, `state_machine`;
+2. `transaction`, `effect_site`, `transition`;
+3. `program`, `input`, `operation`;
 4. the L1 kinds;
-5. otherwise by key.
+5. any other kind, `service` among them.
 
-Within the second group, callees come before callers (`GraphQuery::Callees`). Implementing a caller before the callee it relies on produces code that has nothing correct to call.
+Within a group, items come by key, except that within the second group callees come before callers. An operation calls the operations its effect sites request (`GraphQuery::Callees`) and the transitions its transactions apply, and a transition calls the operations its side effects request. A transaction or an effect site takes its operation's place in that order. Operations and transitions that call one another in a cycle come after the callees outside the cycle, in key order. Implementing a caller before the callee it relies on produces code that has nothing correct to call.
 
 ## 11.5 Scoping
 
-`implementation_plan --base <ref>` (and `conseqa conform plan <base>`) keeps only the items whose declarations Part I's diff from `<base>` reports as changed, plus the items anchoring a fact of an obligation the diff reports as `regressed`, `improved`, or `rebased`. This is the view for a pull request that changes spec and code together: the code work that this branch's spec changes owe.
+A Part I diff scopes the work list to the code work its spec changes owe. The diff is one of two:
+
+- from a base to the working tree: `implementation_plan` with `base` (and `merge_base`), or `conseqa conform plan <base>`. This is the view for a pull request that changes spec and code together;
+- across a spec range of two commits: `implementation_plan` with `spec_range`, or `conseqa conform plan --spec-range <a>..<b>`. On a trunk that carries other changes' leading specs, it scopes one change's work to that change's own spec commits, so the change's gate never fails on another change's work.
+
+An item is in scope when the diff reports its declaration as changed, a removed declaration's leftover regions or record being its orphaned key. It is also in scope when it anchors, implements, or carries a claim for a fact of the basis, on either side, of an obligation the diff reports as `added`, `removed`, `regressed`, `improved`, or `rebased`. Adding a requirement changes only the requirement, so the code its new proof needs is in scope through the obligation it adds. When a side does not assemble and validate, there are no verdicts to compare, and only the changed declarations scope the list. An item's dependencies on items out of scope are left out. `conseqa conform check` takes the same two forms (§15.3).
 
 ## 11.6 The spec may lead the code
 
@@ -550,24 +574,26 @@ A non-empty work list is a normal state. A spec change can land first, and its i
 
 ## 12.1 Contents
 
-The packet for one item holds everything an agent needs to do it, and nothing it can fetch for itself.
+The packet for one item holds everything an agent needs to do it, and nothing it can fetch for itself. There is a packet for every bindable declaration of the spec, current or not, and for every orphaned key. A current declaration's packet has no conditions: it tells an agent what is load-bearing before it edits code that conforms.
 
 | Section | Contents |
 |---|---|
 | **Declaration** | The textual key and the current residual (canonical YAML). When a record exists, the structural delta from the recorded residual to the current one (Part I §8.2). |
-| **Conditions** | Each condition, stated in a sentence. |
+| **Conditions** | Each condition, stated in a sentence, with what it found. |
+| **Disputes** | The reviews at the current digests that dispute the record, or items of it, with their notes. |
+| **Last refusal** | Why the last attest of the declaration was refused, while its record is still the one that attest saw (§13.1). |
 | **Required facts** | Each fact's canonical form and a one-line rendering. Also the obligations whose basis contains the fact, by display name, with each obligation's summary line, and the load-bearing check (§12.2). |
 | **Completeness** | The required claims, their current matches outside declared regions, and the declared writers or publishers. |
-| **Code** | The item's regions (path and line range). The regions of its neighbours one hop away in the design graph: callers and callees, readers and writers of the objects it touches, publishers and consumers of its channels. Paths and ranges only, since the agent reads the files itself. |
+| **Code** | The item's regions (path and line range). The regions of its neighbours one hop away in the design graph: the effect sites calling its operation and the inputs its operation calls; the transactions reading or writing an object it touches; the effect sites, transitions, and inputs publishing to, writing into, or consuming a channel it uses. A data object touches itself, and a program or an operation touches what its transactions touch. A topic or an outbox is its own channel, an effect site uses the one it publishes to or writes into, and an input the one it consumes. Paths and ranges only, since the agent reads the files itself. |
 | **Realization** | With a stack profile (Part VI):<ul><li>the chosen catalogue entry, and why: automatic, or the architect's recorded reason;</li><li>each realization requirement on this declaration, with its statement and evidence shape;</li><li>the requirements this declaration's realization places on its neighbours, so a topic's implementer knows that producers must set the record key;</li><li>the idiom entries matching the project's frameworks for the primitives the declaration uses.</li></ul>This is the guidance an agent needs before any precedent exists. |
 | **Precedents** | For each required fact kind, how this project already implements it (§12.3). |
-| **Semantics** | For each primitive the declaration uses, the guide topic that defines it, by the name the design MCP `dsl_guide` tool resolves (for example `Atomic conditional mutations`, `Locks`, `Outbox write effect`). |
-| **Done when** | The checklist: regions bound with markers; structural conformance; each required fact evidenced; each required claim holding; then `attest`; then, where the policy requires it, a review. |
-| **Read set** | The declarations and graph queries the packet was built from, with their digests (§13.2). |
+| **Semantics** | For each primitive the declaration uses, the guide topic that defines it, by a name the design MCP `dsl_guide` tool resolves to exactly one section (for example `Atomic conditional mutations`, `Locks`, `Outbox write effect`). The topics come from a fixed table: one for the declaration's kind, one for each construct its content uses (transaction steps, isolation, idempotency, effect and input kinds), and one for each fact and claim required of it. |
+| **Done when** | The checklist: regions bound with markers; structural conformance, claimed when a relied-on structural fact rests on the declaration; each required fact evidenced; each required claim holding; then `attest`; then, where the policy requires it, a review. Each step says whether it is done. |
+| **Read set** | The declarations and graph queries the packet was built from, with their digests, and the record it read (§13.2). |
 
 ## 12.2 The load-bearing check
 
-For every required fact whose kind has a withdrawal mutation in Part I's mutation catalogue (§19.2), the packet says what the withdrawal costs. It applies that mutation to the current model, verifies the result, and lists the obligations that regress:
+For every required fact whose kind has a withdrawal mutation in Part I's mutation catalogue (§19.2), the packet says what the withdrawal costs. It applies that mutation to the current model, verifies the result, and lists the obligations that regress: every obligation proven now that is not proven once the fact is withdrawn, with both statuses. A withdrawal that leaves a model that does not validate says so, with the reason.
 
 ```text
 guarded_mutation(object.order, compare_and_set, observed_version)
@@ -588,11 +614,11 @@ The withdrawals at this revision:
 | `retry_may_repeat` | set the retry to `unspecified` |
 | `message_identity` | set the identity to `unspecified` |
 
-A kind without a withdrawal falls back to listing the obligations that rely on the fact. A `realization` fact has no proof cost, so the packet states instead the capability its requirement secures: "without it, `topic_runtime topic.payment_captured` no longer provides `ordering: within_group` as the spec declares". Models are small and verification is fast, so the check runs on every packet. This is the sentence that stops an agent from deleting the `version = $2`: not a rule that it should be careful, but the named properties it would break.
+A kind without a withdrawal, structural facts among them, falls back to listing the obligations that rely on the fact. A `realization` fact has no proof cost, so the packet states instead the capability its requirement secures: "without it, `topic_runtime topic.payment_captured` no longer provides `ordering: within_group` as the spec declares". Models are small and verification is fast, so the check runs on every packet. This is the sentence that stops an agent from deleting the `version = $2`: not a rule that it should be careful, but the named properties it would break.
 
 ## 12.3 Precedents
 
-For each required fact kind, the packet cites up to three evidence spans from other records that are current, have no conditions, and are confirmed by a review. Records about the same object, then the same data model, come first. A new transaction's packet can then say: this project implements an observed-version `compare_and_set` like `src/orders/repo.rs:88–95`. Unreviewed evidence is never a precedent, because an unchecked idiom spreading through the codebase is worse than none.
+For each kind of attestable fact required of the declaration, the packet cites up to three precedents, from distinct records of other declarations that are current, with no conditions. Each precedent is a fact of the kind, with its evidence spans, that a review by another party than the attester confirms at the current digests. Records whose declarations touch an object this declaration touches come first, then those of its data model, then the rest, by key. A new transaction's packet can then say: this project implements an observed-version `compare_and_set` like `src/orders/repo.rs:88–95`. Unreviewed evidence is never a precedent, because an unchecked idiom spreading through the codebase is worse than none.
 
 ## 12.4 Size and format
 
@@ -613,11 +639,13 @@ Every condition, item, and packet is derived from four inputs read at one moment
 
 Nothing is derived from history, and nothing persists between derivations. The answer for a branch is the answer for its files.
 
+The one exception is guidance, not state. When an attest is refused, the machine that ran it keeps the refusal below `.conseqa/local/`, outside version control, so that the declaration's next packet can say why the last attempt failed (§12.1). A packet shows it while the record is still the one the refused attest saw, and the next attest of the declaration that succeeds clears it. No condition, item, or gate reads it.
+
 ## 13.2 Work in flight
 
-An agent works an item over many steps, and the spec can move meanwhile: another agent's design commit, a `git pull`, a teammate's merge. Each packet carries its read set: the residual digests of the declarations it was built from, and the result digests of the graph queries it used. This mirrors the design engine's `TaskReadSet`.
+An agent works an item over many steps, and the spec can move meanwhile: another agent's design commit, a `git pull`, a teammate's merge. Each packet carries its read set: the residual digests of the declarations it was built from, and the result digests of the graph queries it used. This mirrors the design engine's `TaskReadSet`. The declarations are the item's own and the anchors of the facts required of it. The queries are those the packet ran: its neighbours, and its claims' declared writers and publishers. The read set also names the digest of the record the packet read, or its absence, which is the record an attest sending it replaces (§8.4).
 
-`attest` takes the packet's read set and re-derives. If a member changed, attest is refused as stale, naming the changes, by the same rule `stale_causes` applies to design tasks (`src/design/invalidation.rs`). The agent fetches a fresh packet, sees the delta, and adjusts. Work done against a spec that has since moved is never recorded as conforming to it.
+`attest` takes the packet's read set and re-derives. If a member changed, attest is refused as stale, naming the changes, by the same rule `stale_causes` applies to design tasks (`src/design/invalidation.rs`). Without a read set, attest replaces the record it read when it began. The agent fetches a fresh packet, sees the delta, and adjusts. Work done against a spec that has since moved is never recorded as conforming to it.
 
 ## 13.3 Relation to Part I's diff
 
@@ -635,24 +663,27 @@ The caller supplies:
 - the facts it attests, each with evidence spans;
 - `structural: true` or `false`;
 - any completeness claims;
-- `by`;
 - the packet's read set (optional, but always sent by the MCP tool's documented flow).
 
-The caller never supplies regions, digests, or the residual.
+The caller never supplies regions, digests, the residual, or `by`. The surface stamps `by` from the credential the call came with (§14.5).
 
 ## 14.2 Validation
 
 Attest refuses, by name, unless all of the following hold:
 
-1. no file holding the declaration's regions or the evidence has a scan error;
-2. the declaration exists, is bindable, and is bound;
-3. every fact is currently required (§7.3), with this declaration among its implementers;
-4. every evidence span lies in a region bound to the implementer or to one of the fact's anchors (§7.4);
-5. every completeness pattern compiles, and the claim holds now (§9.3);
-6. the read set, if given, is not stale (§13.2);
-7. the record being replaced is the one the caller read (§8.4).
+1. no file holding the declaration's regions or the evidence has a scan error (`scan_error`). A file holds the declaration's regions when one of its markers names the declaration, since a file with a scan error contributes no regions;
+2. the declaration exists, is bindable, and is bound (`unknown_declaration`, `not_bindable`, `unbound`);
+3. every fact is currently required (§7.3), with this declaration among its implementers (`not_required`, `not_implementer`). A structural, model-wide, or internal fact is never attested: the structural claim and completeness claims provide those (`not_attestable`);
+4. every evidence span lies in a region bound to the implementer or to one of the fact's anchors (§7.4), every line of it strictly between the region's markers (`evidence_outside`);
+5. every completeness pattern compiles, and every claim the attest carries holds now (§9.3), whether or not a proof requires it (`claim_unheld`);
+6. the read set, if given, is not stale (§13.2) (`stale`);
+7. the record being replaced is the one the caller read (§8.4) (`record_changed`).
 
-The tool then computes the regions and digests from the current files, snapshots the current residual, and writes the record. Reviews whose digests no longer match are dropped. A review covers the code it saw, not code written since.
+An input that breaks a rule of the record format (§8.2), such as a fact attested twice or a pattern that does not compile, is refused as `malformed`.
+
+The tool then computes the regions and digests from the current files, snapshots the current residual, takes `attested.commit` from git's `HEAD`, and writes the record, its facts in canonical order and each fact's spans sorted, each once. A review covers the code it saw, not code written since, and the record it read. It survives an attest only when the new record attests exactly what the old one did, at the same digests: the residual, the structural claim, the facts, and the claims. Otherwise every review is dropped, since an overall verdict would confirm facts it never saw, and items name facts by index.
+
+An attest that would write the record already on disk, `attested.commit` aside, writes nothing and succeeds, whatever record the caller read (§8.4). A successful attest returns the record's path, its digest, whether it wrote, and how many reviews it dropped.
 
 Partial attestation is allowed. Attesting two of three required facts leaves `missing_facts` for the third.
 
@@ -697,7 +728,7 @@ A confirming checker review satisfies the required review of exactly the require
 
 ## 14.5 Provenance
 
-`by` is a claim. Conseqa records it and cannot authenticate it: the pull request that commits a record is the trust boundary, as it is for the spec itself. Two rules keep the claim honest within the tool:
+`by` is a claim. Conseqa records it and cannot authenticate it: the pull request that commits a record is the trust boundary, as it is for the spec itself. The surface stamps it from the credential a call came with, and neither an attest's input nor a review's names it, so an agent cannot declare itself someone else. Two rules keep the claim honest within the tool:
 
 - a review whose `by` equals the record's `attested.by` does not satisfy a required review;
 - the tool computes everything it can, so a record can be wrong only in its judgments, never in what code it describes.
@@ -711,8 +742,8 @@ A confirming checker review satisfies the required review of exactly the require
 | Tool | Served to | Does |
 |---|---|---|
 | `conformance_status` | every role | The summary of §10.3, with each declaration's conditions and each proven obligation's conformance. |
-| `implementation_plan` | every role | The ordered work list. `base` and `merge_base` scope it as in §11.5. |
-| `work_item` | every role | The packet for one item, by key. |
+| `implementation_plan` | every role | The ordered work list. `base` and `merge_base`, or `spec_range`, scope it as in §11.5. |
+| `work_item` | every role | The packet for one item, by key: any bindable declaration of the spec, or an orphaned key. |
 | `attest` | the coordinator | §14.1–§14.2. |
 | `record_review` | the coordinator | Records one review of one record. |
 
@@ -722,12 +753,13 @@ The read tools join the shared router. The write tools join the coordinator rout
 
 ```text
 conseqa conform status [--json] [--report <path>]
-conseqa conform plan [<base>] [--merge-base] [--json]
+conseqa conform plan [<base>] [--merge-base] [--spec-range <a>..<b>] [--json]
 conseqa conform item <declaration key> [--json]
 conseqa conform attest --input <path>
 conseqa conform review [<declaration key>…] --backend claude|codex
 conseqa conform scan
-conseqa conform check [--fail-on <condition>[,<condition>…]] [--report <path>]
+conseqa conform check [<base>] [--merge-base] [--spec-range <a>..<b>]
+                      [--fail-on <condition>[,<condition>…]] [--report <path>]
 ```
 
 `attest --input` takes the same JSON the MCP tool takes. Like every `conseqa` subcommand, `conform` discovers the project from the working directory. It takes no spec writer lock, so it runs beside an open design MCP server, and §8.4's optimistic replace keeps two writers from losing each other's records.
@@ -740,7 +772,7 @@ conseqa conform check [--fail-on <condition>[,<condition>…]] [--report <path>]
 conseqa conform check --fail-on not_conformant,disputed
 ```
 
-A feature branch might gate on scan errors alone, letting the spec lead.
+A feature branch might gate on scan errors alone, letting the spec lead. Given a base or a spec range, `check` gates only on what that diff scopes (§11.5): the conditions of the items in scope, and the conformance of the obligations it moved.
 
 | Exit | Meaning |
 |---|---|
@@ -779,9 +811,9 @@ A feature branch might gate on scan errors alone, letting the spec lead.
 | `policy.rs` | The policy file and its defaults (§14.4). |
 | `completeness.rs` | Claims and their re-check (§9). |
 | `state.rs` | Required facts, conditions, obligation conformance, and the summary (§7.3, §10). |
-| `plan.rs` | The work list, priorities, order, and scoping (§11). |
-| `packet.rs` | Work items, the load-bearing check, and precedents (§12). |
-| `attest.rs` | Validation and writing (§14.1–§14.2). |
+| `plan.rs` | The work list, priorities, order, dependencies and files, and scoping (§11). |
+| `packet.rs` | Work items, the load-bearing check, precedents, and read sets (§12, §13.2). |
+| `attest.rs` | Validation and writing, and the last refusal this machine keeps (§13.1, §14.1–§14.2). |
 
 ## 17.2 `src/analyzer/basis.rs` (Part I)
 
@@ -859,6 +891,8 @@ Each clause of §14.2 refused by name:
 - a scan error in a file involved;
 - a replaced record that changed.
 
+An identical attest replayed succeeds without writing.
+
 ## 18.6 Completeness
 
 `no_deleters` with `writers` patterns:
@@ -874,11 +908,11 @@ On the fixtures, check:
 - priorities and dependency order;
 - callees before callers;
 - ids stable across derivations;
-- `--base` scoping equal to Part I's changed declarations plus the anchors of affected obligations.
+- scoping by a diff, from a base or across a spec range, equal to Part I's changed declarations plus the anchors of the obligations it moved, an added requirement's included.
 
 ## 18.8 Packets
 
-A packet contains the delta from the recorded residual, the required facts with their relying obligations, and the load-bearing check for each catalogued kind, matching an independent verification of the withdrawn model. Its precedents come only from current, reviewed records. Every semantics topic resolves through the `dsl_guide` lookup.
+A packet contains the delta from the recorded residual, the required facts with their relying obligations, and the load-bearing check for each catalogued kind, matching an independent verification of the withdrawn model. Its precedents come only from current, reviewed records. Every semantics topic resolves through the `dsl_guide` lookup to exactly one section. It carries the open disputes and the last refusal, which a successful attest clears.
 
 ## 18.9 Reviews
 
