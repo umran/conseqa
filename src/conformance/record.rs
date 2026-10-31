@@ -380,7 +380,7 @@ impl Record {
     }
 
     /// The format's rules beyond its shape.
-    fn check(&self) -> Result<(), String> {
+    pub(crate) fn check(&self) -> Result<(), String> {
         let declaration = self.declaration.key();
         let kind = declaration.kind();
 

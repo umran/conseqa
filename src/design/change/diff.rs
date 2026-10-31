@@ -594,6 +594,13 @@ impl DiffDocument {
 
 /// The diff of two sides (§6–§14).
 pub fn diff(base: &Side, head: &Side) -> DiffDocument {
+    analyzed(base, head).0
+}
+
+/// The diff of two sides, with each side's obligations by key when both
+/// were analyzed: what a work list scoped by the diff reads the bases of
+/// the obligations it moved from (Part IV §11.5).
+pub(crate) fn analyzed(base: &Side, head: &Side) -> (DiffDocument, Option<[Obligations; 2]>) {
     let base_partition = base
         .workspace
         .as_ref()
@@ -608,7 +615,7 @@ pub fn diff(base: &Side, head: &Side) -> DiffDocument {
 
     let declarations = declaration_changes(&base_partition, &head_partition);
 
-    let (obligations, impact, reliance) = match (analyze(base), analyze(head)) {
+    let (obligations, impact, reliance, analyses) = match (analyze(base), analyze(head)) {
         (Ok(base_analysis), Ok(head_analysis)) => {
             let sides = Sides {
                 base: &base_analysis,
@@ -626,7 +633,12 @@ pub fn diff(base: &Side, head: &Side) -> DiffDocument {
             let impact = sides.impact(&declarations, &classes);
             let reliance = sides.reliance();
 
-            (obligations, Some(impact), Some(reliance))
+            (
+                obligations,
+                Some(impact),
+                Some(reliance),
+                Some([base_analysis.obligations, head_analysis.obligations]),
+            )
         }
 
         (Err(reason), other) => (
@@ -635,6 +647,7 @@ pub fn diff(base: &Side, head: &Side) -> DiffDocument {
                 reason,
                 other_side: other.ok().map(|analysis| analysis.counts()),
             },
+            None,
             None,
             None,
         ),
@@ -647,10 +660,11 @@ pub fn diff(base: &Side, head: &Side) -> DiffDocument {
             },
             None,
             None,
+            None,
         ),
     };
 
-    DiffDocument {
+    let document = DiffDocument {
         format: FORMAT,
         dsl: DSL_VERSION,
         fact_format: FACT_FORMAT,
@@ -660,13 +674,18 @@ pub fn diff(base: &Side, head: &Side) -> DiffDocument {
         obligations,
         impact,
         reliance,
-    }
+    };
+
+    (document, analyses)
 }
+
+/// A side's obligations, by key.
+pub(crate) type Obligations = BTreeMap<ObligationKey, Obligation>;
 
 /// One side's obligations, by key.
 #[derive(Debug, Default)]
 struct Analysis {
-    obligations: BTreeMap<ObligationKey, Obligation>,
+    obligations: Obligations,
 }
 
 impl Analysis {

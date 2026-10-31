@@ -133,6 +133,10 @@ name = "conformance_state"
 required-features = ["design"]
 
 [[test]]
+name = "conformance_work"
+required-features = ["design"]
+
+[[test]]
 name = "harness_backends"
 required-features = ["design"]
 

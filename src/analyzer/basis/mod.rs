@@ -601,6 +601,38 @@ impl Fact {
         durable::canonical_text(&serde_json::to_value(self).expect("a fact serializes"))
     }
 
+    /// The fact's kind, as its durable form names it: what a work item
+    /// groups precedents by (§12.3 of the conformance revision).
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Isolation { .. } => "isolation",
+            Self::Lock { .. } => "lock",
+            Self::GuardedMutation { .. } => "guarded_mutation",
+            Self::Cursor { .. } => "cursor",
+            Self::Fence { .. } => "fence",
+            Self::DeduplicatedBy { .. } => "deduplicated_by",
+            Self::Delivery { .. } => "delivery",
+            Self::MessageIdentity { .. } => "message_identity",
+            Self::OutboxRedrive { .. } => "outbox_redrive",
+            Self::RetryMayRepeat { .. } => "retry_may_repeat",
+            Self::ExternalGuarantee { .. } => "external_guarantee",
+            Self::Propagation { .. } => "propagation",
+            Self::Realization { .. } => "realization",
+            Self::NaturallyReplayable { .. } => "naturally_replayable",
+            Self::ArtifactRoute { .. } => "artifact_route",
+            Self::AdmitsNoMessages { .. } => "admits_no_messages",
+            Self::NoAdmittedPaths { .. } => "no_admitted_paths",
+            Self::ReturnsNoResult { .. } => "returns_no_result",
+            Self::Terminal { .. } => "terminal",
+            Self::StableRoot { .. } => "stable_root",
+            Self::ConflictClosure { .. } => "conflict_closure",
+            Self::CyclicComponents { .. } => "cyclic_components",
+            Self::NoDeleters { .. } => "no_deleters",
+            Self::ReliesOn { .. } => "relies_on",
+            Self::KeyedRequirement { .. } => "keyed_requirement",
+        }
+    }
+
     /// How the code provides the fact (§7.1 of the conformance
     /// revision).
     pub fn conformance_class(&self) -> ConformanceClass {

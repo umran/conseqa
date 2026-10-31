@@ -139,7 +139,7 @@ pub fn scopes(fact: &Fact, workspace: &WorkspaceState) -> Vec<(TextualKey, Claim
 
 /// The objects the transactions read, write, or lock, as `data_object`
 /// declarations.
-fn accessed<'a>(
+pub(crate) fn accessed<'a>(
     workspace: &WorkspaceState,
     members: impl Iterator<Item = &'a TransactionId>,
 ) -> Vec<DeclarationKey> {
@@ -217,7 +217,31 @@ pub fn declared(
     workspace: &WorkspaceState,
     graph: &SymbolGraph,
 ) -> BTreeSet<DeclarationKey> {
-    let query = match (scope, carrier) {
+    let Some(query) = declared_query(scope, carrier) else {
+        return BTreeSet::new();
+    };
+
+    graph_query::run(workspace, graph, &query)
+        .rows
+        .into_iter()
+        .filter_map(|row| match row {
+            QueryRow::Access(access) => Some(DeclarationKey::Transaction {
+                operation: access.transaction.operation,
+                transaction: access.transaction.transaction,
+            }),
+
+            QueryRow::Publisher(publisher) => Some(site_declaration(publisher.site)),
+
+            _ => None,
+        })
+        .collect()
+}
+
+/// The design graph query naming the declarations a claim of `scope` on
+/// `carrier` accepts matches in: what a work item's read set records of
+/// its claims (§13.2).
+pub fn declared_query(scope: ClaimScope, carrier: &DeclarationKey) -> Option<GraphQuery> {
+    Some(match (scope, carrier) {
         (ClaimScope::Writers, DeclarationKey::DataObject { data_model, object }) => {
             GraphQuery::Writers {
                 data_model: data_model.clone(),
@@ -239,23 +263,8 @@ pub fn declared(
         },
 
         // The record format puts no other claim on any other kind.
-        _ => return BTreeSet::new(),
-    };
-
-    graph_query::run(workspace, graph, &query)
-        .rows
-        .into_iter()
-        .filter_map(|row| match row {
-            QueryRow::Access(access) => Some(DeclarationKey::Transaction {
-                operation: access.transaction.operation,
-                transaction: access.transaction.transaction,
-            }),
-
-            QueryRow::Publisher(publisher) => Some(site_declaration(publisher.site)),
-
-            _ => None,
-        })
-        .collect()
+        _ => return None,
+    })
 }
 
 /// The declaration owning an effect site of the design graph: the

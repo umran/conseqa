@@ -19,7 +19,14 @@
 //!   what a model-wide fact depends on (§9);
 //! - [`state`] derives each declaration's conditions and each proven
 //!   obligation's conformance, from the spec, the files, the records,
-//!   and the policy read at one moment (§10).
+//!   and the policy read at one moment (§10);
+//! - [`plan`] orders the work the code owes the spec into items, and
+//!   scopes them by a Part I diff (§11);
+//! - [`packet`] builds the work item for one declaration: everything an
+//!   agent needs to do it, and what each load-bearing fact would cost
+//!   (§12);
+//! - [`attest`] records what a declaration's regions were checked to
+//!   provide, computing everything but the judgments itself (§14).
 //!
 //! Records and the policy live in `.conseqa/conformance/`, beside the
 //! spec but outside what the store loads and scans (§8.1). Writing a
@@ -34,8 +41,11 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::analyzer::basis::DeclarationKey;
 
+pub mod attest;
 pub mod completeness;
 pub mod markers;
+pub mod packet;
+pub mod plan;
 pub mod policy;
 pub mod record;
 pub mod state;
