@@ -166,7 +166,7 @@ pub struct CompletenessClaim {
     pub exceptions: Vec<Exception>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ClaimScope {
     /// The object's writers: a `data_object` record's claim.
@@ -258,7 +258,8 @@ pub struct ReviewItem {
 
 /// What a review item is about: an attested fact or a completeness
 /// claim, by its index in the record, or the structural claim.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ReviewTarget {
     Fact(usize),
     Completeness(usize),
@@ -454,6 +455,16 @@ impl Record {
                 return Err(format!("completeness[{index}] names no pattern"));
             }
 
+            for (pattern_index, pattern) in claim.patterns.iter().enumerate() {
+                if let Err(error) = regex::Regex::new(pattern) {
+                    return Err(format!(
+                        "completeness[{index}].patterns[{pattern_index}] is not a regular \
+                         expression: {}",
+                        pattern_error(&error)
+                    ));
+                }
+            }
+
             for (exception_index, exception) in claim.exceptions.iter().enumerate() {
                 check_path(
                     &exception.path,
@@ -507,6 +518,24 @@ fn check_path(path: &str, at: &str) -> Result<(), String> {
             "{at}: `{path}` is not a path relative to the project directory"
         ))
     }
+}
+
+/// Why a pattern does not compile, in one line: a syntax error's last
+/// line names the problem, after the pattern and a caret pointing at it.
+pub(crate) fn pattern_error(error: &regex::Error) -> String {
+    let text = error.to_string();
+
+    let problem = text
+        .lines()
+        .rev()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or_default()
+        .trim();
+
+    problem
+        .strip_prefix("error: ")
+        .unwrap_or(problem)
+        .to_string()
 }
 
 fn check_party(party: &Party, at: &str) -> Result<(), String> {

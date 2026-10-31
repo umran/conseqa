@@ -34,6 +34,8 @@ use std::fmt;
 use std::fs;
 use std::path::Path;
 
+use serde::ser::{Serialize, SerializeStruct, Serializer};
+
 use crate::analyzer::basis::{DeclarationKey, TextualKey, TextualKeyError};
 use crate::design::change::partition::Partition;
 use crate::design::change::side::Repository;
@@ -122,6 +124,20 @@ pub struct ScanError {
 impl fmt::Display for ScanError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}:{}: {}", self.path, self.line, self.kind)
+    }
+}
+
+/// A scan error as a status reports it: where it is, and what is wrong
+/// there, in words.
+impl Serialize for ScanError {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut error = serializer.serialize_struct("ScanError", 3)?;
+
+        error.serialize_field("path", &self.path)?;
+        error.serialize_field("line", &self.line)?;
+        error.serialize_field("message", &self.kind.to_string())?;
+
+        error.end()
     }
 }
 
@@ -241,6 +257,16 @@ impl fmt::Display for ScanErrorKind {
 /// or path that is not UTF-8. Paths are relative to the project
 /// directory, which is where the code a project describes lives.
 pub fn scan(project_dir: &Path) -> Result<Scan, ConformanceError> {
+    scan_with(project_dir, |_, _| {})
+}
+
+/// Scans as [`scan`] does, showing `visit` each file's path and text as
+/// it is read. The text is what completeness claims are matched against
+/// (§9.3), so one read of each file serves both, at one moment.
+pub fn scan_with(
+    project_dir: &Path,
+    mut visit: impl FnMut(&str, &str),
+) -> Result<Scan, ConformanceError> {
     let paths = match Repository::of(project_dir) {
         Some(_) => listed(project_dir)?,
         None => walked(project_dir)?,
@@ -252,6 +278,8 @@ pub fn scan(project_dir: &Path) -> Result<Scan, ConformanceError> {
         let Some(text) = read_text(&project_dir.join(&path))? else {
             continue;
         };
+
+        visit(&path, &text);
 
         let (regions, errors) = scan_file(&path, &text);
 
