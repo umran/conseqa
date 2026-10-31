@@ -17,6 +17,12 @@
 - §8.1, §8.2, §8.4 and §8.6: refusals fail the read, the record's format rules, the write lock and digest, and missing version fields;
 - §14.3, §14.4, §15.3 and §17.1: review lapse, the policy's defaults, exit 1, and the module table.
 
+**Amended in implementation (M5, 2026-10-31):** with the maintainer's approval:
+- §7.1–§7.3: `keyed_requirement`'s class, structural facts required of their bindable anchors, and the implementers of a message identity, a cursor, and a fence;
+- §8.2 and §9.2–§9.4: patterns compile as regular expressions, how a match is placed, exceptions, the objects a closure accesses, and when a required scope holds;
+- §10.1 and §10.2: every condition's exact rule, records naming no declaration, conditions without a record, and when each class of fact holds of the code;
+- §14.3, §14.4, §15.3 and §17.2: review verdicts, what needs a review, an unverifiable spec, and the basis's implementer rule.
+
 This revision connects a spec to the code that implements it, and turns the spec's changes into guided implementation work for LLM agents. It introduces:
 
 - **binding markers**: comment pairs, in any text file of the repository, that bind a region of the file to a declaration;
@@ -244,27 +250,29 @@ Every fact kind of Part I §10.9 belongs to exactly one conformance class:
 | Class | How the code provides it | Kinds |
 |---|---|---|
 | **attestable** | A region of an implementer provides it, and a record attests it with evidence. | `isolation`, `lock`, `guarded_mutation`, `cursor`, `fence`, `deduplicated_by`, `delivery`, `message_identity`, `outbox_redrive`, `retry_may_repeat`, `external_guarantee`, `propagation`, `realization` |
-| **structural** | It follows from the declaration's content, so it holds of the code when the anchor's structural conformance holds. | `naturally_replayable`, `artifact_route`, `admits_no_messages`, `no_admitted_paths`, `returns_no_result`, `terminal`, `stable_root` |
+| **structural** | It follows from its anchors' content, so it holds of the code when each anchor that can be bound conforms structurally. | `naturally_replayable`, `artifact_route`, `admits_no_messages`, `no_admitted_paths`, `returns_no_result`, `terminal`, `stable_root` |
 | **model-wide** | It depends on code the model does not declare doing nothing to the objects involved, so it holds only under completeness claims (§9). | `conflict_closure`, `cyclic_components`, `no_deleters` |
-| **internal** | It holds when the obligation it relies on is conformant (§10.2). | `relies_on` |
+| **internal** | A statement about the spec, which no code provides. A relied-on obligation holds when it is conformant itself (§10.2). A requirement declared is only ever stated missing, in a blocked-on set, and no basis holds one. | `relies_on`, `keyed_requirement` |
 
 **Structural conformance** is the claim that a declaration's regions implement its residual and perform no modeled work beyond it: no read, mutation, lock, effect, publication, or outbox write the residual does not declare. The "beyond it" half is what makes a structural fact hold of the code. A transaction is naturally replayable because of what it does not do, so an extra `INSERT` in its code falsifies the fact, though every declared step is present.
+
+A structural fact's anchors are the declarations whose content its truth was read from (Part I §10.5), so it holds of the code when each of them that can be bound conforms structurally. A `requirement` anchor has no code: a root stable because it is a key component asks nothing of any region.
 
 ## 7.2 Implementers
 
 | Kind | Implementers |
 |---|---|
 | `isolation`, `lock`, `guarded_mutation`, `deduplicated_by` | the `transaction` |
-| `cursor`, `fence` | every `transaction` whose steps advance or guard the field |
+| `cursor`, `fence` | every `transaction` with a step on the field: an `advance_cursor` step for a cursor, a `fence` step for a fence |
 | `delivery` | the `subscription_runtime` |
-| `message_identity` | every `effect_site` publishing or writing that schema to the channel |
+| `message_identity` | every `effect_site` publishing or writing that schema to the channel, and every `transition` whose side effect publishes it there |
 | `outbox_redrive` | the `outbox`: whatever relays it must durably re-drive |
 | `retry_may_repeat` | the caller's `effect_site`, or the `transition` |
 | `external_guarantee` | the `effect_site` |
 | `propagation` | the producer's `effect_site`, or the `transition` |
 | `realization` | the declaration named in its `declaration` field (Part VI §11.3) |
 
-A fact with several implementers is required of each of them, and each one's record attests it for its own regions.
+A fact with several implementers is required of each of them, and each one's record attests it for its own regions. A fact with none in the model, such as the identity of a message no modeled site publishes, asks nothing of implementers, though the claims it requires still apply (§9.4).
 
 ## 7.3 Required facts
 
@@ -274,6 +282,8 @@ A declaration's **required facts** come from two sources:
 - when the project has a stack profile, every `realization` fact applying to it (Part VI §11). These are the configuration its chosen realizations demand of it, whether or not a proof relies on them.
 
 A record attests only required facts (§14.2). The structural claim covers the rest of the declaration's content.
+
+A structural fact in the current reliance is required of each of its anchors that can be bound (§7.1). Such a declaration provides it with its structural claim, `structural: true`, rather than by attesting it. Without the claim, it has the condition `missing_facts` (§10.1).
 
 A declaration that a catalogue entry realizes has its chosen entry recorded in its record (§8.2). When the chosen entry, its version, or its options change, the record is `stale` (§10.1): the claims it was checked against are no longer the ones in force.
 
@@ -368,7 +378,7 @@ The format's rules beyond its shape:
 
 - `by.kind` is `agent`, `person`, or `checker`. `attested.commit` is optional, and absent outside git.
 - Each attested fact is in its canonical durable form, appears once, and cites at least one evidence span.
-- A `writers` claim belongs on a `data_object` record, and a `publishers` claim on a `topic` or `outbox` record. Each claim names at least one pattern.
+- A `writers` claim belongs on a `data_object` record, and a `publishers` claim on a `topic` or `outbox` record. Each claim names at least one pattern, and each pattern compiles as a regular expression (§9.2).
 - A review item names exactly one target: `fact: <index>`, `completeness: <index>`, or `structural: true`. Each index lies within the record.
 - Every path is relative to the project directory, as the scan names files.
 
@@ -411,11 +421,21 @@ completeness:
         reason: one-off backfill, not deployed
 ```
 
-The claim reads: every match of these patterns, in the scanned files (§6.5), lies in a region bound to a transaction the model declares as writing this object, or in an excepted path. For `publishers`, the regions are those of the effect sites the model declares as publishing to, or writing into, the channel. The declared writers and publishers come from the design graph (`GraphQuery::Writers`, `GraphQuery::Publishers`).
+The claim reads: every match of these patterns, in the scanned files (§6.5), lies in a region bound to a transaction the model declares as writing this object, or in an excepted path. For `publishers`, the regions are those of the effect sites the model declares as publishing to, or writing into, the channel, and of the transitions whose side effects publish to it. The declared writers and publishers come from the design graph (`GraphQuery::Writers`, `GraphQuery::Publishers`).
+
+Patterns are regular expressions in the syntax of Rust's `regex` crate. A record whose pattern does not compile is refused (§8.1). An exception names one file, exactly as the scan names it.
 
 ## 9.3 Checking
 
 The claim is re-checked on every derivation, not trusted from the time it was written. A new match outside declared regions and exceptions turns the condition `incomplete`, and the work item lists the matches. A claim is not sound: patterns can miss. But it is recorded, reviewable, and continuously re-checked, which is the most a language-agnostic tool can offer. Reviews (§14.3) are where the patterns themselves get scrutinized.
+
+How a match is placed:
+
+- Each pattern runs over a scanned file's whole text, as written, so a match may span lines, as a SQL statement often does.
+- A match of no text touches no line, and is passed over.
+- A match lies in a region when every line it touches is strictly between the region's markers. A marker line is text like any other, and is not inside its own region.
+- A file with a scan error contributes no regions (§6.6), so its matches lie outside.
+- A status lists the first 20 matches outside each claim, and counts the rest.
 
 ## 9.4 When a claim is required
 
@@ -424,9 +444,11 @@ A model-wide fact in the current reliance requires these claims:
 | Fact | Requires |
 |---|---|
 | `no_deleters` | `writers` completeness of its object |
-| `conflict_closure`, `cyclic_components` | `writers` completeness of every object the closure's transactions access |
+| `conflict_closure`, `cyclic_components` | `writers` completeness of every object the closure's transactions read, write, or lock |
 
 `message_identity` facts also require `publishers` completeness of their channel. An unbound publisher could put a second message with an existing identity on the channel.
+
+A required scope holds when the carrier's readable record carries at least one claim of that scope and every one of them holds. With no readable record, the claim is absent. A claim no proof requires is neither checked nor reported.
 
 ---
 
@@ -439,29 +461,35 @@ Each bindable declaration has a set of conditions, possibly empty:
 | Condition | Holds when |
 |---|---|
 | `unbound` | The declaration has no region, and its kind is one the policy requires bound (§14.4). |
-| `orphaned` | A region's key names no declaration of the current spec. Reported against the key. |
-| `unattested` | The declaration is bound, but no readable record exists (§8.6). |
+| `orphaned` | A region's key, or a record, names no declaration of the current spec. Reported against the key. |
+| `unattested` | The declaration is bound, but no readable record exists (§8.6). A record set aside is named, with its reason. |
 | `stale` | The record's residual differs from the current residual, or, for a realized declaration, its `realization` differs from the chosen one (§7.3). |
-| `drifted` | The record's regions differ from the current regions: a digest, or the set of regions. |
-| `missing_facts` | A required fact is not attested in the record. |
-| `incomplete` | A required completeness claim is absent, or does not hold (§9.3). |
+| `drifted` | The record's regions differ from the current regions, compared as a multiset of digests. Editing, adding, or removing a region drifts the record. Paths and lines are presentation, so moving a region unchanged does not. |
+| `missing_facts` | A required attestable fact is not attested in the record, or a required structural fact (§7.3) lacks the record's `structural: true`. With no readable record, nothing is attested. |
+| `incomplete` | A required completeness claim is absent, or does not hold (§9.3, §9.4). With no readable record, every required claim is absent. |
 | `surplus` | The record attests a fact that is no longer required. |
-| `unreviewed` | The policy requires a review of something the record carries, and no review by another party confirms it at the current digests. |
-| `disputed` | A review at the current digests disputes something the record carries. |
+| `unreviewed` | The policy requires a review of something the record carries (§14.4), and no review by another party confirms it at the current digests (§14.3). |
+| `disputed` | A review at the current digests disputes something the record carries: the record as a whole, or one of its items. A review by anyone counts, the attester included. |
 | `unrealizable` | With a stack profile, the declaration is `ambiguous`, has an `invalid_choice`, or is `infeasible` (Part VI §10.3). Its work item is parked: the remedy is a decision about the spec or the stack, not code. |
 
 A declaration with no conditions is **current**.
+
+`missing_facts` and `incomplete` hold whatever the policy requires bound. A declaration that owes a fact, such as a `transition` implementing `retry_may_repeat`, therefore always has a condition saying so.
 
 ## 10.2 Obligation conformance
 
 A proven obligation is **conformant** when every fact of its basis holds of the code:
 
-- every attestable fact is attested, at current digests, by every implementer;
-- every structural fact's anchor is current, with `structural: true`;
+- every attestable fact is attested, at current digests, by every implementer: each implementer's readable record lists it and is not `drifted`;
+- every structural fact's bindable anchors claim it: each one's readable record has `structural: true` and is neither `stale` nor `drifted`;
 - every model-wide fact's required claims hold;
 - every `relies_on` obligation is itself conformant.
 
 An obligation can therefore be proven in the model and not conformant in the code, which is the distinction this revision exists to draw. `conseqa conform status` reports, for every proven obligation, whether it is conformant, and if not, which declarations block it.
+
+Reviews and disputes are not part of conformance. They say who else checked a record, not what it records, and they are gated apart, as `--fail-on not_conformant,disputed` does (§15.3).
+
+A non-conformant obligation names its own blockers: each declaration whose condition keeps a fact of its own basis from holding, with the condition and the facts. Under `through`, it names the obligations it relies on that are not conformant. Relied-on obligations are read as proofs read them, coinductively: obligations relying on each other in a cycle are conformant unless something in the cycle fails.
 
 ## 10.3 Summary
 
@@ -632,6 +660,8 @@ Partial attestation is allowed. Attesting two of three required facts leaves `mi
 
 A review is a second party's check of a record against the code. It gives a verdict, `confirmed` or `disputed`, for the record as a whole and optionally per fact and per claim, with notes. It records the digests it saw. It applies while they are the record's region digests, counted as a multiset, so it lapses when a region is edited, added, or removed.
 
+An item's verdict overrides the review's verdict on the record as a whole, for the item's target. A review confirms one thing the record carries when it saw the current digests, is by another party than `attested.by` (§14.5), and its verdict on that thing is `confirmed`. A checker review satisfies only the realization requirements its checker covers (below), so until catalogue checkers exist (Part VI §13) it satisfies no required review.
+
 `conseqa conform review [<key>…] --backend claude|codex` runs one fresh-context worker per record, through the harness backends `conseqa design` already uses, with their scratch configuration outside the repository. A worker receives the record, the item's packet, and read access to the files, but not the attester's reasoning. It reports through the review operation. Done this way, a review is an independent read, not the attester's argument repeated back.
 
 **Checker reviews.** A catalogue entry's deterministic checkers (Part VI §13) run on every derivation, over the regions bound to the declaration their requirement applies to. Each result is recorded as a review, `by: { kind: checker, name: <entry id>/<checker id>@<entry version> }`, at the digests it read. Like any review, it lapses when they change.
@@ -652,6 +682,14 @@ review:
 ```
 
 When the file is absent, these values are the defaults. When it is present, `format` is required, and any other field it omits takes its default. A kind in `require_binding` that is not bindable is refused, and so is any kind but `realization` in `checker_satisfies`. A fact or claim that no proof relies on needs a review only when it is a `realization` fact.
+
+What needs a review, then, is what proofs rely on:
+
+- each fact the record attests that is required of it (`relied_on_facts`);
+- each claim of a scope the reliance requires of it (`completeness`);
+- its structural claim, when a relied-on structural fact rests on it (`structural`).
+
+A surplus fact, or a claim no proof needs, needs none.
 
 When the project has a stack profile, every declaration with a chosen realization must also be bound, whatever `require_binding` lists. This is what brings routers, execution pools, storage layouts and topic runtimes under conformance: the spec's topology is held to what it declares, even where no proof relies on it.
 
@@ -707,7 +745,7 @@ A feature branch might gate on scan errors alone, letting the spec lead.
 | Exit | Meaning |
 |---|---|
 | 0 | Derived, and no gate failed. |
-| 1 | Could not derive: the spec, the records, or the policy file did not load (§8.1), or git failed. |
+| 1 | Could not derive: the spec, the records, or the policy file did not load (§8.1), the spec does not assemble and validate (it then has no proofs, and nothing is required of its code), or git failed. |
 | 2 | A gate failed, or there is a scan error. |
 
 ---
@@ -740,14 +778,14 @@ A feature branch might gate on scan errors alone, letting the spec lead.
 | `record.rs` | The record format, the strict reader, atomic and optimistic writes, and the version axes (§8). |
 | `policy.rs` | The policy file and its defaults (§14.4). |
 | `completeness.rs` | Claims and their re-check (§9). |
-| `state.rs` | Conditions and obligation conformance (§10). |
+| `state.rs` | Required facts, conditions, obligation conformance, and the summary (§7.3, §10). |
 | `plan.rs` | The work list, priorities, order, and scoping (§11). |
 | `packet.rs` | Work items, the load-bearing check, and precedents (§12). |
 | `attest.rs` | Validation and writing (§14.1–§14.2). |
 
 ## 17.2 `src/analyzer/basis.rs` (Part I)
 
-Each fact kind gains its conformance class and its implementers (§7.1, §7.2).
+Each fact kind gains its conformance class and the rule naming its implementers (§7.1, §7.2). Most facts name their implementer in their own fields. A cursor's, a fence's, and a message identity's implementers are every transaction or producer the model declares doing the work, so the conformance module resolves those rules against the design graph and the workspace.
 
 ## 17.3 `src/design/mcp.rs`
 
