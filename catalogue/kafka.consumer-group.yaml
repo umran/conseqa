@@ -1,0 +1,79 @@
+format: 1
+id: kafka.consumer-group
+version: 1
+technology: { name: kafka, versions: ">=2.8" }
+realizes:
+  kind: subscription_runtime
+provides:
+  - capability: { delivery: at_least_once }
+    with: { option: commit_after_processing }
+    cite: [https://kafka.apache.org/44/design/design/#message-delivery-semantics]
+  - capability: { delivery: at_most_once }
+    with: { option: commit_before_processing }
+    cite: [https://kafka.apache.org/44/design/design/#message-delivery-semantics]
+  # The semantics contract's consistent_hash (§10.6) holds equal routing
+  # domains on one pool member during a stable ownership epoch. A
+  # consumer group gives each partition to exactly one member per
+  # rebalance generation, and equal record keys share a partition, so
+  # equal grouping keys reach one member for a generation.
+  - capability: { assignment: consistent_hash }
+    cite:
+      - https://kafka.apache.org/44/design/design/#consumer-position
+      - https://kafka.apache.org/44/getting-started/introduction#main-concepts-and-terminology
+cannot_provide:
+  - capability: { assignment: round_robin }
+    reason: >-
+      A consumer group assigns whole partitions to members, and never rotates the records of
+      one partition across members.
+    cite: [https://kafka.apache.org/44/design/design/#consumer-position]
+options:
+  commit_after_processing:
+    description: >-
+      Offsets are committed only after a record is processed, so a failure before the commit
+      redelivers it.
+    excludes: [commit_before_processing]
+  commit_before_processing:
+    description: >-
+      Offsets are committed before a record is processed, so a failure after the commit
+      loses it.
+    excludes: [commit_after_processing]
+requirements:
+  - id: consumer-group
+    of: self
+    statement: >-
+      The subscription's consumers are members of one consumer group of its own, never a
+      share group (which hands one partition's records to several consumers), and they run
+      on the dispatch pool's members, processing what they are assigned where they receive
+      it.
+    cite:
+      - https://kafka.apache.org/44/design/design/#consumer-position
+      - https://kafka.apache.org/44/design/design/#the-share-consumer
+  - id: keyed-records
+    of: self
+    statement: >-
+      The topic this subscription reads keys every record by the grouping key its dispatch
+      routes on, so equal keys share a partition, and so a member.
+    cite: [https://kafka.apache.org/44/getting-started/introduction#main-concepts-and-terminology]
+  - id: commit-after-processing
+    of: self
+    with: { option: commit_after_processing }
+    statement: >-
+      Each consumer commits a record's offset only after the invocation it starts has
+      completed.
+    cite: [https://kafka.apache.org/44/design/design/#message-delivery-semantics]
+  - id: commit-before-processing
+    of: self
+    with: { option: commit_before_processing }
+    statement: >-
+      Each consumer commits a record's offset before it starts the invocation.
+    cite: [https://kafka.apache.org/44/design/design/#message-delivery-semantics]
+evidence:
+  consumer-group: { look_for: "the consumer's group.id, and where its poll loop runs" }
+  keyed-records: { look_for: "the record key the topic's producers set" }
+  commit-after-processing: { look_for: "the offset commit after processing, and enable.auto.commit" }
+  commit-before-processing: { look_for: "the offset commit before processing, and enable.auto.commit" }
+citations:
+  - https://kafka.apache.org/44/design/design/#message-delivery-semantics
+  - https://kafka.apache.org/44/design/design/#consumer-position
+  - https://kafka.apache.org/44/design/design/#the-share-consumer
+  - https://kafka.apache.org/44/getting-started/introduction#main-concepts-and-terminology

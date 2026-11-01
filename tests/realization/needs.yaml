@@ -1,0 +1,106 @@
+# What each fixture's realizable declarations need (§20.1 of the
+# realization profiles revision), written by hand from the fixtures'
+# transactions and runtime declarations, never from the derivation's
+# output. Capabilities are listed in the vocabulary's order (§6.2).
+#
+# Two readings to check against: an insert counts as an instance of its
+# own, since its derivation names no identity, so video_streaming's
+# claim (insert, then transition) writes several instances; and
+# reading a binding into a transaction output is a decision resting on
+# a read, so shop's inspections are interactive.
+
+flash_checkout.yaml:
+  data_model data.checkout: ["durability: committed", "isolation: read_committed", "transaction: interactive", "mutation: conditional", "uniqueness: identity"]
+  data_model data.inventory: ["durability: committed", "isolation: read_committed", "transaction: interactive", "transaction: multi_instance", "lock: exclusive"]
+  topic topic.order_events: ["channel: fanout"]
+  topic_runtime topic.order_events: ["grouping: keyed", "ordering: within_group"]
+  subscription_runtime operation.apply_payment/input.apply_payment.captured: ["delivery: at_least_once", "assignment: consistent_hash"]
+  subscription_runtime operation.charge_payment/input.charge_payment.reserved: ["delivery: at_least_once", "assignment: consistent_hash"]
+  subscription_runtime operation.reserve_inventory/input.reserve_inventory.created: ["delivery: at_least_once", "assignment: consistent_hash"]
+  execution_pool pool.checkout_api: []
+  execution_pool pool.inventory_api: []
+  execution_pool pool.order_workers: ["concurrency: bounded"]
+  execution_pool pool.payment_workers: ["concurrency: bounded"]
+  router router.cancel_order: []
+  router router.create_order: ["assignment: consistent_hash"]
+  router router.transfer_stock: []
+  storage_layout layout.order: ["partitioning: keyed"]
+  storage_layout layout.stock: ["partitioning: composite"]
+
+hedged_read.yaml:
+  topic topic.reads: ["channel: fanout"]
+
+keyed_topic.yaml:
+  topic order_events: ["channel: fanout"]
+  topic_runtime order_events: ["grouping: keyed", "ordering: within_group"]
+
+minimal.yaml:
+  topic order_events: ["channel: fanout"]
+  topic_runtime order_events: []
+
+payment_capture.yaml:
+  data_model data.ledger: ["durability: committed", "isolation: read_committed", "uniqueness: identity"]
+  data_model data.payments: ["durability: committed", "isolation: read_committed", "transaction: multi_instance", "uniqueness: identity", "outbox: atomic"]
+  outbox data.payments/outbox.payment_events: ["redrive: durable"]
+  topic topic.payment_events: ["channel: fanout"]
+  subscription_runtime operation.post_ledger_entry/input.post_ledger_entry.captured: ["delivery: at_least_once"]
+  outbox_runtime operation.publish_payment_event/input.publish_payment_event.outbox: ["grouping: keyed", "ordering: within_group", "assignment: consistent_hash"]
+  execution_pool pool.ledger_workers: ["concurrency: bounded"]
+  execution_pool pool.relay_workers: ["concurrency: bounded"]
+
+shop.yaml:
+  data_model data.shop: ["durability: committed", "isolation: read_committed", "transaction: interactive", "transaction: multi_instance", "lock: exclusive", "mutation: conditional", "uniqueness: identity"]
+  execution_pool pool.shop_api: []
+  router router.cancel_order: []
+  router router.pay_order: []
+  router router.place_order: []
+  router router.restock: []
+  router router.ship_order: []
+  storage_layout layout.order: ["partitioning: keyed"]
+  storage_layout layout.payment: ["partitioning: keyed"]
+  storage_layout layout.product: ["partitioning: keyed"]
+  storage_layout layout.restock_receipt: ["partitioning: keyed"]
+
+tenant_ledger.yaml:
+  data_model data.accounts: ["durability: committed", "isolation: read_committed", "transaction: interactive", "transaction: multi_instance", "lock: exclusive", "uniqueness: identity", "outbox: atomic"]
+  data_model data.ledger: ["durability: committed", "isolation: read_committed", "transaction: interactive", "mutation: conditional"]
+  outbox data.accounts/outbox.tenant_events: ["redrive: durable"]
+  topic topic.tenant_events: ["channel: fanout"]
+  topic_runtime topic.tenant_events: ["grouping: keyed", "ordering: within_group"]
+  subscription_runtime operation.apply_entry/input.apply_entry.posted: ["delivery: at_least_once", "assignment: consistent_hash"]
+  subscription_runtime operation.notify_entry/input.notify_entry.posted: ["delivery: at_least_once"]
+  outbox_runtime operation.relay_tenant_event/input.relay_tenant_event.outbox: ["grouping: keyed", "ordering: within_group", "assignment: consistent_hash"]
+  execution_pool pool.accounts_api: []
+  execution_pool pool.ledger_workers: ["concurrency: bounded"]
+  execution_pool pool.notifier_workers: ["concurrency: bounded"]
+  execution_pool pool.relay_workers: ["concurrency: bounded"]
+  router router.post_entry: ["assignment: consistent_hash"]
+  storage_layout layout.entry: ["partitioning: keyed"]
+  storage_layout layout.tenant: ["partitioning: keyed"]
+  storage_layout layout.tenant_ledger: ["partitioning: keyed"]
+
+transactional_outbox.yaml:
+  data_model data.analytics: ["durability: committed", "isolation: read_committed", "uniqueness: identity"]
+  data_model data.orders: ["durability: committed", "isolation: read_committed", "transaction: multi_instance", "uniqueness: identity", "outbox: atomic"]
+  outbox data.orders/outbox.order_events: ["redrive: durable"]
+  topic topic.order_events: ["channel: fanout"]
+  outbox_runtime operation.publish_order_event/input.publish_order_event.outbox: ["grouping: keyed", "ordering: within_group", "assignment: consistent_hash"]
+  execution_pool pool.outbox_workers: ["concurrency: bounded"]
+
+video_streaming.yaml:
+  data_model data.transcoder: ["durability: committed", "isolation: serializable", "transaction: multi_instance", "mutation: conditional", "uniqueness: identity"]
+  data_model data.videos: ["durability: committed", "isolation: serializable", "transaction: interactive", "mutation: conditional", "uniqueness: identity"]
+  topic topic.video_events: ["channel: fanout"]
+  topic_runtime topic.video_events: ["grouping: keyed", "ordering: within_group"]
+  subscription_runtime operation.notify_published/input.notify_published.published: ["delivery: at_least_once", "assignment: consistent_hash"]
+  subscription_runtime operation.publish_video/input.publish_video.completed: ["delivery: at_least_once", "assignment: consistent_hash"]
+  subscription_runtime operation.transcode_video/input.transcode_video.uploaded: ["delivery: at_least_once", "assignment: consistent_hash"]
+  execution_pool pool.catalog_workers: ["concurrency: bounded"]
+  execution_pool pool.ingest_api: []
+  execution_pool pool.notifier_workers: ["concurrency: bounded"]
+  execution_pool pool.playback_readers: ["concurrency: bounded"]
+  execution_pool pool.transcode_workers: ["concurrency: bounded"]
+  router router.complete_upload: []
+  router router.get_playback: ["assignment: consistent_hash"]
+  storage_layout layout.transcode_job: ["partitioning: keyed"]
+  storage_layout layout.video: ["partitioning: keyed"]

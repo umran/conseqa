@@ -6,6 +6,8 @@ pub mod design;
 #[cfg(feature = "design")]
 pub mod harness;
 pub mod parser;
+#[cfg(feature = "design")]
+pub mod realization;
 pub mod spec;
 #[cfg(feature = "system-one")]
 pub mod system_one;

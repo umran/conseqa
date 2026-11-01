@@ -1,0 +1,51 @@
+format: 1
+id: debezium.outbox-relay
+version: 1
+technology: { name: debezium, versions: ">=2.0" }
+realizes:
+  kind: outbox
+provides:
+  - capability: { redrive: durable }
+    cite:
+      - https://debezium.io/documentation/reference/stable/transformations/outbox-event-router.html
+      - https://debezium.io/documentation/reference/stable/connectors/postgresql.html#postgresql-overview
+      - https://debezium.io/documentation/faq/#why_must_consuming_applications_expect_duplicate_events
+requirements:
+  - id: event-router
+    of: self
+    statement: >-
+      The connector capturing the outbox's table applies the outbox event router
+      transformation, publishing each committed row as one event to the topic the outbox's
+      consumer reads.
+    cite: [https://debezium.io/documentation/reference/stable/transformations/outbox-event-router.html]
+  - id: durable-offsets
+    of: self
+    statement: >-
+      The connector records its log position in durable offset storage, so after a restart
+      it resumes where it left off and skips no committed row.
+    cite:
+      - https://debezium.io/documentation/reference/stable/connectors/postgresql.html#postgresql-overview
+      - https://debezium.io/documentation/faq/#why_must_consuming_applications_expect_duplicate_events
+  - id: retention
+    of: self
+    statement: >-
+      The topic the events are routed to retains each event until the outbox's consumer has
+      processed it.
+    cite: [https://kafka.apache.org/44/configuration/topic-configs/#topicconfigs_retention.ms]
+  - id: commit-after-processing
+    of: self
+    statement: >-
+      The outbox's consumer commits an event's offset only after the invocation it starts has
+      completed, so an event is re-driven until it is consumed.
+    cite: [https://kafka.apache.org/44/design/design/#message-delivery-semantics]
+evidence:
+  event-router: { look_for: "the connector configuration's transforms" }
+  durable-offsets: { look_for: "the Kafka Connect worker's offset storage configuration" }
+  retention: { look_for: "the routed topic's infrastructure definition, and its retention settings" }
+  commit-after-processing: { look_for: "the consumer's offset commit, and enable.auto.commit" }
+citations:
+  - https://debezium.io/documentation/reference/stable/transformations/outbox-event-router.html
+  - https://debezium.io/documentation/reference/stable/connectors/postgresql.html#postgresql-overview
+  - https://debezium.io/documentation/faq/#why_must_consuming_applications_expect_duplicate_events
+  - https://kafka.apache.org/44/configuration/topic-configs/#topicconfigs_retention.ms
+  - https://kafka.apache.org/44/design/design/#message-delivery-semantics

@@ -1,0 +1,45 @@
+format: 1
+id: envoy.ring-hash
+version: 1
+technology: { name: envoy, versions: ">=1.18" }
+realizes:
+  kind: router
+provides:
+  - capability: { assignment: consistent_hash }
+    cite:
+      - https://www.envoyproxy.io/docs/envoy/latest/intro/arch_overview/upstream/load_balancing/load_balancers#ring-hash
+      - https://www.envoyproxy.io/docs/envoy/latest/intro/arch_overview/upstream/load_balancing/load_balancers#maglev
+cannot_provide:
+  - capability: { assignment: round_robin }
+    reason: >-
+      Ring hash and Maglev send each hash key to one host; rotation is another load
+      balancing policy, which envoy.round-robin describes.
+    cite: [https://www.envoyproxy.io/docs/envoy/latest/intro/arch_overview/upstream/load_balancing/load_balancers#ring-hash]
+requirements:
+  - id: lb-policy
+    of: self
+    statement: >-
+      The router's cluster sets lb_policy to RING_HASH or MAGLEV.
+    cite: [https://www.envoyproxy.io/docs/envoy/latest/api-v3/config/cluster/v3/cluster.proto#envoy-v3-api-enum-config-cluster-v3-cluster-lbpolicy]
+  - id: hash-policy
+    of: self
+    statement: >-
+      The route to the cluster has a hash_policy that hashes the one request header carrying
+      the routing key.
+    cite: [https://www.envoyproxy.io/docs/envoy/latest/api-v3/config/route/v3/route_components.proto#envoy-v3-api-msg-config-route-v3-routeaction-hashpolicy]
+  - id: routing-header
+    of: callers
+    statement: >-
+      Every caller through the router's boundary sets the hashed header from the request's
+      routing key, serialized the same way by every caller. A request without it produces no
+      hash, and is sent to a random host.
+    cite: [https://www.envoyproxy.io/docs/envoy/latest/api-v3/config/route/v3/route_components.proto#envoy-v3-api-msg-config-route-v3-routeaction-hashpolicy]
+evidence:
+  lb-policy: { look_for: "the cluster's lb_policy in the Envoy configuration" }
+  hash-policy: { look_for: "the route's hash_policy in the Envoy configuration" }
+  routing-header: { look_for: "the request construction that sets the hashed header" }
+citations:
+  - https://www.envoyproxy.io/docs/envoy/latest/intro/arch_overview/upstream/load_balancing/load_balancers#ring-hash
+  - https://www.envoyproxy.io/docs/envoy/latest/intro/arch_overview/upstream/load_balancing/load_balancers#maglev
+  - https://www.envoyproxy.io/docs/envoy/latest/api-v3/config/cluster/v3/cluster.proto#envoy-v3-api-enum-config-cluster-v3-cluster-lbpolicy
+  - https://www.envoyproxy.io/docs/envoy/latest/api-v3/config/route/v3/route_components.proto#envoy-v3-api-msg-config-route-v3-routeaction-hashpolicy

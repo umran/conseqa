@@ -1,0 +1,30 @@
+format: 1
+id: kafka.topic
+version: 1
+technology: { name: kafka, versions: ">=2.8" }
+realizes:
+  kind: topic
+provides:
+  - capability: { channel: fanout }
+    cite:
+      - https://kafka.apache.org/44/getting-started/introduction#main-concepts-and-terminology
+      - https://kafka.apache.org/44/design/design/#consumer-position
+requirements:
+  - id: group-per-subscription
+    of: consumers
+    statement: >-
+      Each subscription reads the topic through a consumer group of its own, which it shares
+      with no other subscription, so every subscription receives every record.
+    cite: [https://kafka.apache.org/44/design/design/#consumer-position]
+  - id: retention
+    of: self
+    statement: >-
+      The topic retains each record until every subscription has consumed it.
+    cite: [https://kafka.apache.org/44/configuration/topic-configs/#topicconfigs_retention.ms]
+evidence:
+  group-per-subscription: { look_for: "the group.id each subscription's consumers set" }
+  retention: { look_for: "the topic's infrastructure definition, and its retention settings" }
+citations:
+  - https://kafka.apache.org/44/getting-started/introduction#main-concepts-and-terminology
+  - https://kafka.apache.org/44/design/design/#consumer-position
+  - https://kafka.apache.org/44/configuration/topic-configs/#topicconfigs_retention.ms

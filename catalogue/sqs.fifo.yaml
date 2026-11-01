@@ -1,0 +1,59 @@
+format: 1
+id: sqs.fifo
+version: 1
+# SQS has no product versions; a stack names it at its API version, as
+# sqs@2012.11.05.
+technology: { name: sqs, versions: ">=2012.11.5" }
+realizes:
+  kind: topic_runtime
+provides:
+  - capability: { grouping: keyed }
+    cite:
+      - https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/using-messagegroupid-property.html
+      - https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/FIFO-queues-understanding-logic.html#FIFO-sending-messages
+  - capability: { ordering: within_group }
+    cite: [https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/FIFO-queues-understanding-logic.html#FIFO-sending-messages]
+  - capability: { ordering: global }
+    with: { option: single_group }
+    cite: [https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/FIFO-queues-understanding-logic.html#FIFO-sending-messages]
+cannot_provide:
+  - capability: { ordering: global }
+    unless: { option: single_group }
+    reason: >-
+      A FIFO queue orders messages within a message group only; messages of different groups
+      may arrive out of order relative to one another.
+    cite: [https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/FIFO-queues-understanding-logic.html#FIFO-sending-messages]
+options:
+  single_group:
+    description: >-
+      Every message carries the same message group ID, which gives one order over every
+      message at the cost of all parallelism.
+requirements:
+  - id: message-group-id
+    of: producers
+    statement: >-
+      Every message is sent with its MessageGroupId set to the message's grouping key,
+      serialized the same way by every producer.
+    cite:
+      - https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/using-messagegroupid-property.html
+      - https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/FIFO-queues-understanding-logic.html#FIFO-sending-messages
+  - id: deduplication-id
+    of: producers
+    statement: >-
+      Every send carries a MessageDeduplicationId, or the queue enables content-based
+      deduplication, so a retried send neither duplicates nor reorders a message.
+    cite: [https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/FIFO-queues-understanding-logic.html#FIFO-retrying-multiple-times]
+  - id: single-group
+    of: producers
+    with: { option: single_group }
+    statement: >-
+      Every message is sent with the same MessageGroupId.
+    cite: [https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/FIFO-queues-understanding-logic.html#FIFO-sending-messages]
+evidence:
+  message-group-id: { look_for: "the SendMessage call that sets MessageGroupId" }
+  deduplication-id: { look_for: "the MessageDeduplicationId, or the queue's ContentBasedDeduplication attribute" }
+  single-group: { look_for: "the MessageGroupId every producer sets" }
+citations:
+  - https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/using-messagegroupid-property.html
+  - https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/FIFO-queues-understanding-logic.html#FIFO-sending-messages
+  - https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/FIFO-queues-understanding-logic.html#FIFO-retrying-multiple-times

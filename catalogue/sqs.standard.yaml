@@ -1,0 +1,22 @@
+format: 1
+id: sqs.standard
+version: 1
+# SQS has no product versions; a stack names it at its API version, as
+# sqs@2012.11.05.
+technology: { name: sqs, versions: ">=2012.11.5" }
+realizes:
+  kind: topic_runtime
+provides: []
+cannot_provide:
+  - capability: { ordering: within_group }
+    reason: >-
+      A standard queue makes only a best-effort attempt to keep the order messages are sent
+      in, and messages may arrive out of order.
+    cite: [https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/standard-queues.html]
+  - capability: { ordering: global }
+    reason: >-
+      A standard queue makes only a best-effort attempt to keep the order messages are sent
+      in, and messages may arrive out of order.
+    cite: [https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/standard-queues.html]
+citations:
+  - https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/standard-queues.html
