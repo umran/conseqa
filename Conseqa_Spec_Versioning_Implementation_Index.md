@@ -193,7 +193,7 @@ M8 needs only M1 and M2, so a second agent can run it beside M4–M7. M9 needs e
   - the stack profile, candidates, validity, choice and infeasibility reports;
   - `conseqa realize` and `check --require-realizable`;
   - the three MCP tools.
-- **Catalogue content:** start with the entries whose claims you can cite from vendor documentation: `postgres.database`, `kafka.keyed-topic`, `sqs.fifo`, `sqs.standard`, `envoy.ring-hash`. The entries in VI §7 are illustrative. Every capability, exclusion and requirement must carry a citation (VI §8.3). **Do not ship `kafka.consumer-group`** until VI §21's question is answered.
+- **Catalogue content:** start with the entries whose claims you can cite from vendor documentation: `postgres.database`, `kafka.keyed-topic`, `sqs.fifo`, `sqs.standard`, `envoy.ring-hash`. The entries in VI §7 are illustrative. Every capability, exclusion and requirement must carry a citation (VI §8.3). **Do not ship `kafka.consumer-group`** until VI §21's question is answered. M8 answered it (§6).
 - **Tests:** VI §20.1–§20.3 and §20.7.
 
 ### M9: Realization requirements, checkers, and integration
@@ -231,14 +231,14 @@ T1–T7 come from the orchestrator design's §12. Each is a small amendment to P
 
 | Decision | Needed by |
 |---|---|
-| T1: documented, versioned JSON output for every `conform` and `realize` command | M7: accepted, with a conformance document format of its own (#49); M8 follows it for `realize` |
+| T1: documented, versioned JSON output for every `conform` and `realize` command | M7: accepted, with a conformance document format of its own (#49); M8 follows it for `realize`, with a realization document format of its own (#50) |
 | T2: `--spec-range` scoping for `conform plan` and `conform check` | M6: accepted, with added and removed obligations scoping too (#48) |
 | T3: plan items carry `depends_on` and `files` | M6: accepted (#48) |
 | T4: implementer and reviewer roles on the design MCP server | M7: accepted, tokens minted on the admin surface; the coordinator and the CLI stamp git's `user.name` (#49) |
 | T5: `by` stamped from the credential, not supplied by the agent | M6: accepted; the MCP tool stamps it in M7 (#48) |
 | T6: replaying an identical attest or review is a no-op success | M6: accepted for attest; reviews follow in M7 (#48) |
 | T7: packets carry open disputes and the last refusal reason | M6: accepted, the refusal kept per machine (#48) |
-| The `kafka.consumer-group` entry's reading of `consistent_hash` (VI §21). Recommendation: confirm it against §10.6 of the semantics contract, or ship the entry without the `assignment` claim. | M8 |
+| The `kafka.consumer-group` entry's reading of `consistent_hash` (VI §21). Recommendation: confirm it against §10.6 of the semantics contract, or ship the entry without the `assignment` claim. | M8: confirmed against §10.6 and shipped with the claim, its conditions stated as requirements (#50) |
 | Anything a spec leaves undecided. Ask; never pick silently (house rule 11). | when found |
 
 ---
@@ -256,7 +256,7 @@ Update this table in every milestone PR.
 | M5 Required facts, state | in review | `spec-versioning-m5` | #47 (stacked on #46) |
 | M6 Work list, items, attest | in review | `spec-versioning-m6` | #48 (stacked on #47) |
 | M7 Reviews, surfaces | in review | `spec-versioning-m7` | #49 (stacked on #48) |
-| M8 Capabilities, catalogue, choice | not started | | |
+| M8 Capabilities, catalogue, choice | in review | `spec-versioning-m8` | #50 (stacked on #49) |
 | M9 Realization integration | not started | | |
 
 ---
