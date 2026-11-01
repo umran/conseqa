@@ -22,16 +22,19 @@
 //! non-empty list is a normal state: the spec may lead the code (§11.6).
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Write as _;
+use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
 use crate::analyzer::basis::{BasisFact, DeclarationKey, ObligationKey, TextualKey};
 use crate::design::change::diff::{
-    self, DiffDocument, ObligationClass, ObligationDiff, Obligations,
+    self, DiffDocument, ObligationClass, ObligationDiff, Obligations, SideRecord,
 };
-use crate::design::change::side::Side;
+use crate::design::change::side::{self, Side, SideName, Source};
 use crate::design::graph::EdgeKind;
 use crate::design::symbol::SymbolKey;
+use crate::design::workspace::WorkspaceState;
 
 use super::completeness;
 use super::state::{
@@ -94,6 +97,40 @@ pub enum Priority {
 }
 
 impl Plan {
+    /// The work list in text: each item's priority, key, and
+    /// conditions, then what it depends on.
+    pub fn render(&self) -> String {
+        let mut out = String::new();
+
+        if self.items.is_empty() {
+            out.push_str("no work: every declaration is current\n");
+        }
+
+        for item in &self.items {
+            let priority = serde_json::to_value(item.priority)
+                .ok()
+                .and_then(|name| name.as_str().map(str::to_string))
+                .unwrap_or_default();
+
+            let _ = writeln!(
+                out,
+                "{priority:<12} {}  {}",
+                item.key,
+                item.conditions
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+
+            for dependency in &item.depends_on {
+                let _ = writeln!(out, "{:13}after {dependency}", "");
+            }
+        }
+
+        out
+    }
+
     /// One item, by its id.
     pub fn item(&self, key: &TextualKey) -> Option<&Item> {
         self.items.iter().find(|item| &item.key == key)
@@ -628,8 +665,12 @@ fn components(
 }
 
 /// What a Part I diff scopes the work list to (§11.5).
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Scope {
+    /// Where the diff's sides were read from.
+    pub base: SideRecord,
+    pub head: SideRecord,
+
     /// The declarations the diff changed: added, removed, or modified.
     pub changed: BTreeSet<DeclarationKey>,
 
@@ -642,6 +683,7 @@ pub struct Scope {
     /// The facts of the moved obligations' bases, on either side, each
     /// with its anchors there: head's for an added obligation, base's
     /// for a removed one.
+    #[serde(skip)]
     pub facts: Vec<BasisFact>,
 }
 
@@ -655,6 +697,65 @@ impl Scope {
         let (document, sides) = diff::analyzed(base, head);
 
         Self::of(&document, sides.as_ref())
+    }
+
+    /// The scope of the change from a base commit to the working tree,
+    /// whose spec is `head`: the view of a pull request that changes
+    /// spec and code together. With `merge_base`, the base is read at
+    /// its merge base with the working tree, so what the base's branch
+    /// changed since is left out.
+    pub fn since(
+        project_dir: &Path,
+        base: &str,
+        merge_base: bool,
+        head: &WorkspaceState,
+    ) -> Result<Self, String> {
+        let head = Side {
+            name: SideName::Head,
+            source: Source::WorkingTree,
+            commit: None,
+            merge_base: false,
+            workspace: Some(head.clone()),
+        };
+
+        let base = if merge_base {
+            side::read_merge_base(project_dir, base, &Source::WorkingTree)
+        } else {
+            side::read(
+                project_dir,
+                SideName::Base,
+                &Source::Commit(base.to_string()),
+            )
+        }
+        .map_err(|error| error.to_string())?;
+
+        Ok(Self::between(&base, &head))
+    }
+
+    /// The scope of a spec range `<a>..<b>`, both ends commits: on a
+    /// trunk that carries other changes' leading specs, what one
+    /// change's own spec commits owe.
+    pub fn range(project_dir: &Path, range: &str) -> Result<Self, String> {
+        let (base, head) = range
+            .split_once("..")
+            .filter(|(base, head)| !base.is_empty() && !head.is_empty() && !head.starts_with('.'))
+            .ok_or_else(|| format!("`{range}` is not a spec range `<a>..<b>`"))?;
+
+        let base = side::read(
+            project_dir,
+            SideName::Base,
+            &Source::Commit(base.to_string()),
+        )
+        .map_err(|error| error.to_string())?;
+
+        let head = side::read(
+            project_dir,
+            SideName::Head,
+            &Source::Commit(head.to_string()),
+        )
+        .map_err(|error| error.to_string())?;
+
+        Ok(Self::between(&base, &head))
     }
 
     fn of(document: &DiffDocument, sides: Option<&[Obligations; 2]>) -> Self {
@@ -692,6 +793,8 @@ impl Scope {
             .collect();
 
         Self {
+            base: document.base.clone(),
+            head: document.head.clone(),
             changed,
             moved,
             facts,

@@ -19,14 +19,24 @@ use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
+use conseqa::analyzer::basis::TextualKey;
 use conseqa::analyzer::report::{self, ProverReport, Status};
 use conseqa::analyzer::{self, Diagnostic, Severity};
+use conseqa::conformance::{
+    self,
+    attest::{AttestError, AttestInput},
+    document::ReviewResult,
+    plan::Scope,
+    record::Party,
+    state::Derivation,
+};
 use conseqa::design::change::{self, diff::Gate, render, side::Source};
 use conseqa::design::export::write_artifacts;
 use conseqa::design::{
     DesignEngine, PROJECT_DIR, ProjectRead, ProjectStore, mcp, new_project_workspace,
 };
 use conseqa::harness::backends::{ClaudeCliBackend, CodexCliBackend};
+use conseqa::harness::review::{ReviewBackend, ReviewRun, Reviewer};
 use conseqa::harness::{
     AgentBackend, RunStatus, Scheduler, SchedulerPolicy, Supervisor, Workflow, WorkflowConfig,
 };
@@ -35,7 +45,8 @@ use conseqa::spec::Model;
 #[derive(Parser)]
 #[command(
     name = "conseqa",
-    about = "Initialize, inspect, check, diff, export, visualize, and design a Conseqa project"
+    about = "Initialize, inspect, check, diff, export, visualize, and design a Conseqa project, \
+             and hold its code to it"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -129,6 +140,145 @@ enum Command {
     /// decompose the prompt, synthesize every operation, discover and
     /// repair requirements. Exits 2 when the run ends incomplete.
     Design(Box<DesignArgs>),
+
+    /// Hold the project's code to its spec: each declaration's
+    /// conformance, the work the code owes, attests, reviews, the
+    /// binding markers, and CI gates. `--json` prints each command's
+    /// conformance document.
+    #[command(subcommand)]
+    Conform(ConformCommand),
+}
+
+#[derive(Subcommand)]
+enum ConformCommand {
+    /// Each bindable declaration's conditions, and whether each proven
+    /// obligation's code conforms. Exits 1 when the state cannot be
+    /// derived.
+    Status {
+        /// Print the status document instead of the summary.
+        #[arg(long)]
+        json: bool,
+
+        /// Write the status document here.
+        #[arg(long)]
+        report: Option<PathBuf>,
+    },
+
+    /// The ordered work list: what the code owes the spec, item by item.
+    Plan {
+        #[command(flatten)]
+        scope: ScopeArgs,
+
+        /// Print the plan document instead of the list.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// The work item for one declaration, or an orphaned key: everything
+    /// an agent needs to make its code conform. Exits 1 when the key has
+    /// none.
+    Item {
+        /// The declaration's textual key, e.g.
+        /// "transaction operation.apply_payment/tx.apply_payment".
+        key: String,
+
+        /// Print the item document instead of the markdown.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Record what a declaration's code was checked to provide, from an
+    /// attest's JSON, as the MCP tool takes it, stamped with git's
+    /// `user.name`. Exits 2 when refused.
+    Attest {
+        /// The attest's JSON; `-` reads it from stdin.
+        #[arg(long)]
+        input: PathBuf,
+
+        /// Print the attest document.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Review records with fresh-context agents, one per record: the
+    /// named declarations', or every record with items the policy
+    /// requires reviewed that no review confirms. Exits 2 when any is
+    /// left unreviewed.
+    Review(Box<ConformReviewArgs>),
+
+    /// The binding markers in the project's files: every region and
+    /// every scan error, read without the spec. Exits 2 on a scan
+    /// error.
+    Scan {
+        /// Print the scan document instead of the list.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Gate CI: fails on every scan error, and on the conditions
+    /// `--fail-on` names. Given a base or a spec range, gates only on
+    /// what that change owes. Exits 2 when a gate fails.
+    Check {
+        #[command(flatten)]
+        scope: ScopeArgs,
+
+        /// Also fail on these: conditions by name (unbound, orphaned,
+        /// unattested, stale, drifted, missing_facts, incomplete,
+        /// surplus, unreviewed, disputed), or not_conformant.
+        #[arg(long, value_delimiter = ',')]
+        fail_on: Vec<String>,
+
+        /// Write the check document here.
+        #[arg(long)]
+        report: Option<PathBuf>,
+
+        /// Print the check document instead of the outcome.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+/// What scopes the work list or a check to a spec change.
+#[derive(Args)]
+struct ScopeArgs {
+    /// Scope to what the spec's changes since this commit owe, from it
+    /// to the working tree.
+    base: Option<String>,
+
+    /// Read the base at its merge base with the working tree.
+    #[arg(long, requires = "base")]
+    merge_base: bool,
+
+    /// Scope to what a range of spec commits owes, `<a>..<b>`, instead.
+    #[arg(long, conflicts_with = "base")]
+    spec_range: Option<String>,
+}
+
+#[derive(Args)]
+struct ConformReviewArgs {
+    /// The declarations whose records to review; every record with
+    /// unreviewed items when omitted.
+    keys: Vec<String>,
+
+    /// Coding-agent backend.
+    #[arg(long, value_enum)]
+    backend: Backend,
+
+    /// Path to the backend executable (for a non-default install).
+    #[arg(long)]
+    backend_program: Option<String>,
+
+    /// The model the agents run on, recorded with their reviews.
+    #[arg(long)]
+    model: Option<String>,
+
+    /// Maximum agents reviewing at once.
+    #[arg(long, default_value_t = 4)]
+    max_agents: usize,
+
+    /// Print the review document instead of the outcomes.
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Args)]
@@ -239,6 +389,7 @@ fn main() -> ExitCode {
             .build()
             .map_err(|error| format!("cannot start the runtime: {error}"))
             .and_then(|runtime| runtime.block_on(design(*args))),
+        Command::Conform(command) => conform(command),
     };
 
     match outcome {
@@ -400,6 +551,351 @@ fn diff(
     }
 
     Ok(if failed.is_empty() {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(2)
+    })
+}
+
+fn conform(command: ConformCommand) -> Result<ExitCode, String> {
+    match command {
+        ConformCommand::Status { json, report } => conform_status(json, report),
+        ConformCommand::Plan { scope, json } => conform_plan(&scope, json),
+        ConformCommand::Item { key, json } => conform_item(&key, json),
+        ConformCommand::Attest { input, json } => conform_attest(&input, json),
+        ConformCommand::Review(args) => tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| format!("cannot start the runtime: {error}"))
+            .and_then(|runtime| runtime.block_on(conform_review(*args))),
+        ConformCommand::Scan { json } => conform_scan(json),
+        ConformCommand::Check {
+            scope,
+            fail_on,
+            report,
+            json,
+        } => conform_check(&scope, &fail_on, report, json),
+    }
+}
+
+fn conform_status(json: bool, report: Option<PathBuf>) -> Result<ExitCode, String> {
+    let (project, read) = read_project()?;
+    let derivation =
+        Derivation::of(&project, &read.workspace).map_err(|error| error.to_string())?;
+    let document = conformance::document::status(&derivation.state);
+
+    if json {
+        println!("{}", document.to_pretty_json());
+    } else {
+        print!("{}", derivation.state.summary());
+    }
+
+    if let Some(path) = report {
+        write_file(&path, &format!("{}\n", document.to_pretty_json()))?;
+    }
+
+    Ok(ExitCode::SUCCESS)
+}
+
+/// The scope a base or a spec range names, if one does.
+fn conform_scope(
+    project: &Path,
+    workspace: &conseqa::design::WorkspaceState,
+    scope: &ScopeArgs,
+) -> Result<Option<Scope>, String> {
+    match (&scope.base, &scope.spec_range) {
+        (Some(base), _) => Scope::since(project, base, scope.merge_base, workspace).map(Some),
+        (None, Some(range)) => Scope::range(project, range).map(Some),
+        (None, None) => Ok(None),
+    }
+}
+
+fn conform_plan(scope: &ScopeArgs, json: bool) -> Result<ExitCode, String> {
+    let (project, read) = read_project()?;
+    let derivation =
+        Derivation::of(&project, &read.workspace).map_err(|error| error.to_string())?;
+    let scope = conform_scope(&project, &read.workspace, scope)?;
+
+    let work = conformance::plan::plan(&derivation);
+
+    let work = match &scope {
+        Some(scope) => work.scoped(scope, &derivation),
+        None => work,
+    };
+
+    if json {
+        println!(
+            "{}",
+            conformance::document::plan(&work.items, scope.as_ref()).to_pretty_json()
+        );
+    } else {
+        print!("{}", work.render());
+    }
+
+    Ok(ExitCode::SUCCESS)
+}
+
+fn conform_item(key: &str, json: bool) -> Result<ExitCode, String> {
+    let key: TextualKey = key
+        .parse()
+        .map_err(|error| format!("`{key}` is not a textual key: {error}"))?;
+
+    let (project, read) = read_project()?;
+    let derivation =
+        Derivation::of(&project, &read.workspace).map_err(|error| error.to_string())?;
+
+    let packet = conformance::packet::packet(&derivation, &key).ok_or_else(|| {
+        format!(
+            "`{key}` has no work item: it is neither a bindable declaration of the spec nor an \
+             orphaned key"
+        )
+    })?;
+
+    if json {
+        println!("{}", conformance::document::item(&packet).to_pretty_json());
+    } else {
+        print!("{}", packet.render());
+    }
+
+    Ok(ExitCode::SUCCESS)
+}
+
+fn conform_attest(input: &Path, json: bool) -> Result<ExitCode, String> {
+    let text = if input == Path::new("-") {
+        std::io::read_to_string(std::io::stdin())
+            .map_err(|error| format!("cannot read the attest from stdin: {error}"))?
+    } else {
+        std::fs::read_to_string(input)
+            .map_err(|error| format!("cannot read {}: {error}", input.display()))?
+    };
+
+    let input: AttestInput = serde_json::from_str(&text)
+        .map_err(|error| format!("the attest does not parse: {error}"))?;
+
+    let (project, read) = read_project()?;
+    let by = Party::person(&project).map_err(|error| error.to_string())?;
+
+    let outcome = match conformance::attest::attest(&project, &read.workspace, &input, by) {
+        Ok(attested) => Ok(attested),
+        Err(AttestError::Refused(refusal)) => Err(refusal),
+        Err(AttestError::Failed(error)) => return Err(error.to_string()),
+    };
+
+    let document = conformance::document::attest(conformance::document::AttestOutcome::of(
+        outcome.as_ref().map_err(|refusal| refusal.as_ref()),
+    ));
+
+    if json {
+        println!("{}", document.to_pretty_json());
+    }
+
+    match outcome {
+        Ok(attested) => {
+            if !json {
+                println!(
+                    "{} {}",
+                    if attested.written {
+                        "wrote"
+                    } else {
+                        "unchanged"
+                    },
+                    attested.record
+                );
+            }
+
+            Ok(ExitCode::SUCCESS)
+        }
+
+        Err(refusal) => {
+            eprintln!("attest refused: {refusal}");
+
+            Ok(ExitCode::from(2))
+        }
+    }
+}
+
+async fn conform_review(args: ConformReviewArgs) -> Result<ExitCode, String> {
+    let ConformReviewArgs {
+        keys,
+        backend,
+        backend_program,
+        model,
+        max_agents,
+        json,
+    } = args;
+
+    let keys = keys
+        .iter()
+        .map(|key| {
+            key.parse::<TextualKey>()
+                .map_err(|error| format!("`{key}` is not a textual key: {error}"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let project = project_dir()?;
+
+    let (provider, backend) = match backend {
+        Backend::Claude => {
+            let mut claude = ClaudeCliBackend::new();
+
+            if let Some(program) = &backend_program {
+                claude = claude.with_program(program);
+            }
+
+            if let Some(model) = &model {
+                claude = claude.with_model(model);
+            }
+
+            ("claude", ReviewBackend::Claude(claude))
+        }
+
+        Backend::Codex => {
+            let mut codex = CodexCliBackend::new();
+
+            if let Some(program) = &backend_program {
+                codex = codex.with_program(program);
+            }
+
+            if let Some(model) = &model {
+                codex = codex.with_model(model);
+            }
+
+            ("codex", ReviewBackend::Codex(codex))
+        }
+    };
+
+    let reviewer = Reviewer {
+        backend,
+        name: match &model {
+            Some(model) => format!("{provider}/{model}"),
+            None => provider.to_string(),
+        },
+    };
+
+    let outcomes = conseqa::harness::review::review(
+        &project,
+        &reviewer,
+        &ReviewRun {
+            keys,
+            max_agents,
+            budget: conseqa::harness::InvocationBudget::default(),
+        },
+    )
+    .await?;
+
+    let unreviewed = outcomes
+        .iter()
+        .filter(|outcome| {
+            !matches!(
+                outcome.result,
+                ReviewResult::Recorded { .. } | ReviewResult::Unchanged { .. }
+            )
+        })
+        .count();
+
+    if json {
+        println!(
+            "{}",
+            conformance::document::review(outcomes).to_pretty_json()
+        );
+    } else if outcomes.is_empty() {
+        println!("nothing to review: every record's required reviews are confirmed");
+    } else {
+        for outcome in &outcomes {
+            let what = match &outcome.result {
+                ReviewResult::Recorded { .. } => "recorded".to_string(),
+                ReviewResult::Unchanged { .. } => "unchanged".to_string(),
+                ReviewResult::Refused { message, .. } => format!("refused: {message}"),
+                ReviewResult::NotReported { message } => format!("not reported: {message}"),
+            };
+
+            let by = outcome
+                .by
+                .as_ref()
+                .map(|by| format!(" by {}", by.name))
+                .unwrap_or_default();
+
+            println!("{}{by}: {what}", outcome.declaration);
+        }
+    }
+
+    Ok(if unreviewed == 0 {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(2)
+    })
+}
+
+fn conform_scan(json: bool) -> Result<ExitCode, String> {
+    let project = project_dir()?;
+    let scan = conformance::markers::scan(&project).map_err(|error| error.to_string())?;
+
+    if json {
+        println!(
+            "{}",
+            conformance::document::scan(scan.files.len(), &scan.regions, &scan.errors)
+                .to_pretty_json()
+        );
+    } else {
+        for region in &scan.regions {
+            println!(
+                "{}:{}-{}  {}",
+                region.path, region.lines[0], region.lines[1], region.key
+            );
+        }
+
+        for error in &scan.errors {
+            println!("scan error  {error}");
+        }
+
+        println!(
+            "{} file{} read: {} region{}, {} scan error{}",
+            scan.files.len(),
+            if scan.files.len() == 1 { "" } else { "s" },
+            scan.regions.len(),
+            if scan.regions.len() == 1 { "" } else { "s" },
+            scan.errors.len(),
+            if scan.errors.len() == 1 { "" } else { "s" },
+        );
+    }
+
+    Ok(if scan.errors.is_empty() {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(2)
+    })
+}
+
+fn conform_check(
+    scope: &ScopeArgs,
+    fail_on: &[String],
+    report: Option<PathBuf>,
+    json: bool,
+) -> Result<ExitCode, String> {
+    let gates = fail_on
+        .iter()
+        .map(|name| name.parse::<conformance::check::Gate>())
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let (project, read) = read_project()?;
+    let derivation =
+        Derivation::of(&project, &read.workspace).map_err(|error| error.to_string())?;
+    let scope = conform_scope(&project, &read.workspace, scope)?;
+
+    let check = conformance::check::check(&derivation, scope.as_ref(), &gates);
+    let document = conformance::document::check(&check, scope.as_ref());
+
+    if json {
+        println!("{}", document.to_pretty_json());
+    } else {
+        print!("{}", check.render());
+    }
+
+    if let Some(path) = report {
+        write_file(&path, &format!("{}\n", document.to_pretty_json()))?;
+    }
+
+    Ok(if check.passed {
         ExitCode::SUCCESS
     } else {
         ExitCode::from(2)

@@ -1,6 +1,6 @@
-//! The work list, work items, and attest (§11–§14.2 of the conformance
-//! and implementation guidance revision; its tests §18.5, §18.7, and
-//! §18.8).
+//! The work list, work items, attest, reviews, gates, and documents
+//! (§11–§15 of the conformance and implementation guidance revision;
+//! its tests §18.5 and §18.7–§18.10).
 
 use std::{
     collections::BTreeSet,
@@ -16,14 +16,17 @@ use conseqa::{
         report,
     },
     conformance::{
+        ConformanceError,
         attest::{self, AttestError, AttestInput, Attested, Refusal},
-        markers,
+        check::{self, Gate},
+        document, markers,
         packet::{self, LoadBearing, Packet, ReadSetChange},
         plan::{self, Item, Plan, Priority, Scope},
         record::{
             AttestedFact, ClaimScope, CompletenessClaim, Party, PartyKind, Record, RecordedRegion,
             Records, Review, ReviewItem, ReviewTarget, Span, Verdict,
         },
+        review::{self as reviews, ReviewError, ReviewInput, ReviewRefusal, Reviewed},
         state::{self, ConditionKind, Derivation, State},
     },
     design::{
@@ -70,6 +73,7 @@ fn party(kind: PartyKind, name: &str) -> Party {
     Party {
         kind,
         name: name.to_string(),
+        job: None,
     }
 }
 
@@ -1574,4 +1578,470 @@ fn a_packets_read_set_round_trips_into_an_attest() {
             .unwrap()
             .written
     );
+}
+
+// ---------------------------------------------------------------------
+// §14.3, §18.9 Reviews
+// ---------------------------------------------------------------------
+
+fn review_of(text: &str, verdict: Verdict, items: Vec<ReviewItem>) -> ReviewInput {
+    ReviewInput {
+        declaration: key(text),
+        verdict,
+        items,
+        record: None,
+    }
+}
+
+fn record_review(
+    dir: &Path,
+    workspace: &WorkspaceState,
+    input: &ReviewInput,
+    by: Party,
+) -> Result<Reviewed, ReviewError> {
+    reviews::record_review(dir, workspace, input, by)
+}
+
+fn review_refusal(result: Result<Reviewed, ReviewError>) -> String {
+    match result {
+        Err(ReviewError::Refused(refusal)) => serde_json::to_value(&*refusal).unwrap()["refusal"]
+            .as_str()
+            .unwrap()
+            .to_string(),
+        Err(ReviewError::Failed(error)) => panic!("the review failed: {error}"),
+        Ok(reviewed) => panic!("the review was not refused: {reviewed:?}"),
+    }
+}
+
+/// Attests the debit's required facts, unreviewed.
+fn attest_debit_alone(dir: &Path, workspace: &WorkspaceState) {
+    let state = state::derive(dir, workspace).unwrap();
+    let facts = required(&state, DEBIT, ConformanceClass::Attestable);
+
+    attest_as(dir, workspace, &input(dir, DEBIT, &facts), attester()).unwrap();
+}
+
+fn edit_the_debit(dir: &Path) {
+    let path = dir.join("src/wallet.rs");
+    let code = fs::read_to_string(&path).unwrap();
+
+    fs::write(
+        &path,
+        code.replace("account.balance - amount", "account.balance - amount - 0"),
+    )
+    .unwrap();
+}
+
+#[test]
+fn a_review_confirms_only_from_another_party_and_lapses_with_the_code() {
+    let dir = temp_dir("reviews");
+    wallet_code(&dir);
+
+    let workspace = wallet("read_committed");
+    attest_debit_alone(&dir, &workspace);
+
+    let unreviewed = || kinds(&state::derive(&dir, &workspace).unwrap(), DEBIT);
+
+    assert!(unreviewed().contains(&ConditionKind::Unreviewed));
+
+    // The attester reviewing its own record satisfies nothing, from
+    // another job as from its own.
+    let mut itself = attester();
+    itself.job = Some("job-2".to_string());
+
+    let recorded = record_review(
+        &dir,
+        &workspace,
+        &review_of(DEBIT, Verdict::Confirmed, Vec::new()),
+        itself.clone(),
+    )
+    .unwrap();
+
+    assert!(recorded.written);
+    assert_eq!(record_of(&dir, DEBIT).reviews[0].by, itself);
+    assert!(unreviewed().contains(&ConditionKind::Unreviewed));
+
+    // Another party's confirmation does, at the digests the tool read.
+    record_review(
+        &dir,
+        &workspace,
+        &review_of(DEBIT, Verdict::Confirmed, Vec::new()),
+        reviewer(),
+    )
+    .unwrap();
+
+    let record = record_of(&dir, DEBIT);
+
+    assert_eq!(record.reviews.len(), 2);
+    assert_eq!(record.reviews[1].digests, record.digests());
+    assert!(!unreviewed().contains(&ConditionKind::Unreviewed));
+
+    // An edit lapses it: the record drifts from the code the review saw,
+    // and the drifted record cannot be reviewed until attested again.
+    edit_the_debit(&dir);
+
+    assert!(unreviewed().contains(&ConditionKind::Drifted));
+    assert_eq!(
+        review_refusal(record_review(
+            &dir,
+            &workspace,
+            &review_of(DEBIT, Verdict::Confirmed, Vec::new()),
+            reviewer(),
+        )),
+        "drifted"
+    );
+
+    // Attested again, the record drops the review of other code.
+    attest_debit_alone(&dir, &workspace);
+
+    assert_eq!(record_of(&dir, DEBIT).reviews, []);
+    assert!(unreviewed().contains(&ConditionKind::Unreviewed));
+}
+
+#[test]
+fn a_disputed_review_raises_disputed_whoever_gives_it() {
+    let dir = temp_dir("disputed");
+    wallet_code(&dir);
+
+    let workspace = wallet("read_committed");
+    attest_debit_alone(&dir, &workspace);
+
+    // The attester's own dispute counts.
+    record_review(
+        &dir,
+        &workspace,
+        &review_of(
+            DEBIT,
+            Verdict::Confirmed,
+            vec![ReviewItem {
+                target: ReviewTarget::Fact(1),
+                verdict: Verdict::Disputed,
+                note: Some("the version is compared after the write".to_string()),
+            }],
+        ),
+        attester(),
+    )
+    .unwrap();
+
+    assert!(
+        kinds(&state::derive(&dir, &workspace).unwrap(), DEBIT).contains(&ConditionKind::Disputed)
+    );
+}
+
+#[test]
+fn a_review_is_refused_by_name_when_the_record_cannot_be_reviewed() {
+    let dir = temp_dir("review-refusals");
+    wallet_code(&dir);
+
+    let workspace = wallet("read_committed");
+
+    let refused = |text: &str| {
+        review_refusal(record_review(
+            &dir,
+            &workspace,
+            &review_of(text, Verdict::Confirmed, Vec::new()),
+            reviewer(),
+        ))
+    };
+
+    assert_eq!(
+        refused("transaction operation.nope/tx.nope"),
+        "unknown_declaration"
+    );
+    assert_eq!(refused(DEBIT), "no_record");
+
+    attest_debit_alone(&dir, &workspace);
+
+    // An item naming a fact the record does not hold.
+    assert_eq!(
+        review_refusal(record_review(
+            &dir,
+            &workspace,
+            &review_of(
+                DEBIT,
+                Verdict::Confirmed,
+                vec![ReviewItem {
+                    target: ReviewTarget::Fact(9),
+                    verdict: Verdict::Confirmed,
+                    note: None,
+                }],
+            ),
+            reviewer(),
+        )),
+        "malformed"
+    );
+
+    // A record that changed since the reviewer read it.
+    let mut stale_read = review_of(DEBIT, Verdict::Confirmed, Vec::new());
+    stale_read.record = Some(conseqa::conformance::Digest::of(b"another record"));
+
+    let Err(ReviewError::Refused(refusal)) =
+        record_review(&dir, &workspace, &stale_read, reviewer())
+    else {
+        panic!("the record changed since it was read");
+    };
+
+    assert!(matches!(*refusal, ReviewRefusal::RecordChanged { .. }));
+
+    // A record the spec has moved past.
+    assert_eq!(
+        review_refusal(record_review(
+            &dir,
+            &wallet("serializable"),
+            &review_of(DEBIT, Verdict::Confirmed, Vec::new()),
+            reviewer(),
+        )),
+        "stale"
+    );
+}
+
+#[test]
+fn a_party_keeps_one_review_per_digests_and_a_replay_writes_nothing() {
+    let dir = temp_dir("review-replay");
+    wallet_code(&dir);
+
+    let workspace = wallet("read_committed");
+    attest_debit_alone(&dir, &workspace);
+
+    let read = Records::of_project(&dir)
+        .read(&key(DEBIT))
+        .unwrap()
+        .unwrap()
+        .digest;
+
+    let mut confirmed = review_of(DEBIT, Verdict::Confirmed, Vec::new());
+    confirmed.record = Some(read);
+
+    let first = record_review(&dir, &workspace, &confirmed, reviewer()).unwrap();
+
+    assert!(first.written);
+    assert!(!first.replaced);
+
+    // Replayed, though the record it names is gone: nothing to write.
+    let replay = record_review(&dir, &workspace, &confirmed, reviewer()).unwrap();
+
+    assert!(!replay.written);
+    assert_eq!(replay.digest, first.digest);
+
+    // A new verdict by the same party replaces its review, from any job.
+    let mut later = reviewer();
+    later.job = Some("job-9".to_string());
+
+    let disputed = record_review(
+        &dir,
+        &workspace,
+        &review_of(DEBIT, Verdict::Disputed, Vec::new()),
+        later.clone(),
+    )
+    .unwrap();
+
+    assert!(disputed.written);
+    assert!(disputed.replaced);
+
+    let record = record_of(&dir, DEBIT);
+
+    assert_eq!(record.reviews.len(), 1);
+    assert_eq!(record.reviews[0].by, later);
+    assert_eq!(record.reviews[0].verdict, Verdict::Disputed);
+}
+
+// ---------------------------------------------------------------------
+// §15.3 Gates
+// ---------------------------------------------------------------------
+
+#[test]
+fn a_check_fails_on_scan_errors_and_on_the_gates_named_within_its_scope() {
+    let dir = temp_dir("gates");
+    wallet_code(&dir);
+
+    let committed = wallet("read_committed");
+    attest_debit(&dir, &committed);
+
+    let derivation = derive(&dir, &committed);
+
+    // The charge owes its facts. Each closure holds the other's
+    // transaction, so that blocks both proofs, though the debit itself
+    // is current. With no gate, nothing fails.
+    assert!(check::check(&derivation, None, &[]).passed);
+
+    let failing = check::check(
+        &derivation,
+        None,
+        &[
+            Gate::NotConformant,
+            Gate::Condition(ConditionKind::MissingFacts),
+            Gate::Condition(ConditionKind::Disputed),
+        ],
+    );
+
+    assert!(!failing.passed);
+    assert_eq!(
+        failing
+            .failed
+            .iter()
+            .map(|failure| failure.gate)
+            .collect::<Vec<_>>(),
+        [
+            Gate::NotConformant,
+            Gate::Condition(ConditionKind::MissingFacts)
+        ]
+    );
+    assert_eq!(
+        texts(&failing.failed[0].obligations),
+        [CHARGE_SERIALIZABLE, DEBIT_SERIALIZABLE]
+    );
+    assert_eq!(texts(&failing.failed[1].items), [CHARGE]);
+
+    // Scoped to a change of the debit's isolation, what the change owes
+    // is in scope, the charge included, since the debit's moved proof
+    // rests on the charge's guarded mutations too. The programs' missing
+    // markers are no part of it.
+    let serializable = wallet("serializable");
+    let head = derive(&dir, &serializable);
+
+    let scope = Scope::between(
+        &side(SideName::Base, committed.clone()),
+        &side(SideName::Head, serializable.clone()),
+    );
+
+    let unbound = [Gate::Condition(ConditionKind::Unbound)];
+
+    assert!(!check::check(&head, None, &unbound).passed);
+    assert!(check::check(&head, Some(&scope), &unbound).passed);
+
+    let scoped = check::check(
+        &head,
+        Some(&scope),
+        &[Gate::Condition(ConditionKind::MissingFacts)],
+    );
+
+    assert_eq!(texts(&scoped.failed[0].items), [CHARGE, DEBIT]);
+
+    // A scan error fails every check.
+    put(
+        &dir,
+        "src/broken.rs",
+        "// conseqa:begin transaction operation.debit/tx.debit\n",
+    );
+
+    let broken = check::check(&derive(&dir, &committed), None, &[]);
+
+    assert!(!broken.passed);
+    assert_eq!(broken.scan_errors.len(), 1);
+
+    // Gates are named as conditions are.
+    assert_eq!(
+        "missing_facts".parse::<Gate>(),
+        Ok(Gate::Condition(ConditionKind::MissingFacts))
+    );
+    assert_eq!("not_conformant".parse::<Gate>(), Ok(Gate::NotConformant));
+    assert!("conformant".parse::<Gate>().is_err());
+}
+
+// ---------------------------------------------------------------------
+// T1, §18.10 Documents
+// ---------------------------------------------------------------------
+
+#[test]
+fn documents_name_their_format_and_kind_and_are_byte_identical() {
+    let dir = temp_dir("documents");
+    wallet_code(&dir);
+
+    let workspace = wallet("read_committed");
+    attest_debit(&dir, &workspace);
+
+    let render = || {
+        let derivation = derive(&dir, &workspace);
+        let work = plan::plan(&derivation);
+
+        [
+            document::status(&derivation.state).to_json(),
+            document::plan(&work.items, None).to_json(),
+            document::item(&packet_of(&derivation, CHARGE)).to_json(),
+            document::check(&check::check(&derivation, None, &[]), None).to_json(),
+        ]
+    };
+
+    let first = render();
+
+    assert_eq!(first, render());
+
+    for (json, kind) in first.iter().zip(["status", "plan", "item", "check"]) {
+        let document: Value = serde_json::from_str(json).unwrap();
+
+        assert_eq!(document["format"], json!(document::FORMAT), "{kind}");
+        assert_eq!(document["document"], json!(kind));
+        assert_eq!(document["dsl"], json!(6));
+        assert_eq!(document["fact_format"], json!(1));
+    }
+
+    // An attest's outcome, written or refused, by name.
+    let state = state::derive(&dir, &workspace).unwrap();
+    let facts = required(&state, CHARGE, ConformanceClass::Attestable);
+    let attested = attest_as(&dir, &workspace, &input(&dir, CHARGE, &facts), attester()).unwrap();
+
+    let written: Value = serde_json::from_str(
+        &document::attest(document::AttestOutcome::of(Ok(&attested))).to_json(),
+    )
+    .unwrap();
+
+    assert_eq!(written["document"], json!("attest"));
+    assert_eq!(written["outcome"], json!("written"));
+    assert_eq!(written["record"], json!(attested.record));
+
+    let refused = refusal(attest_as(
+        &dir,
+        &workspace,
+        &input(&dir, DEBIT, &facts),
+        attester(),
+    ));
+
+    let refused: Value = serde_json::from_str(
+        &document::attest(document::AttestOutcome::of(Err(&refused))).to_json(),
+    )
+    .unwrap();
+
+    assert_eq!(refused["outcome"], json!("refused"));
+    assert_eq!(refused["refusal"], json!("not_implementer"));
+    assert!(refused["message"].as_str().unwrap().contains("required of"));
+}
+
+// ---------------------------------------------------------------------
+// §14.5 Provenance
+// ---------------------------------------------------------------------
+
+#[test]
+fn the_person_running_a_checkout_is_its_git_user_name() {
+    let dir = temp_dir("person");
+
+    let git = |args: &[&str]| {
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&dir)
+            .args(args)
+            .status()
+            .unwrap();
+
+        assert!(status.success(), "git {args:?}");
+    };
+
+    git(&["init", "-q"]);
+    git(&["config", "user.name", "Ana Tester"]);
+
+    assert_eq!(
+        Party::person(&dir).unwrap(),
+        party(PartyKind::Person, "Ana Tester")
+    );
+
+    // The rule that a reviewer is another party ignores jobs.
+    let mut first = party(PartyKind::Agent, "claude/claude-opus-5-5");
+    let mut second = first.clone();
+
+    first.job = Some("job-1".to_string());
+    second.job = Some("job-2".to_string());
+
+    assert!(first.same_as(&second));
+    assert!(!first.same_as(&party(PartyKind::Agent, "codex")));
+
+    let _ = ConformanceError::NoPerson { path: dir };
 }

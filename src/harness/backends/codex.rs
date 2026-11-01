@@ -17,7 +17,7 @@ use async_trait::async_trait;
 use crate::design::AgentBackendMetadata;
 use crate::harness::backend::{
     AgentBackend, AgentBackendError, AgentEvent, AgentEventSink, AgentExit, AgentHandle,
-    AgentInvocation, AgentUsage,
+    AgentInvocation, AgentUsage, SessionLaunch,
 };
 
 use super::process::{LineParser, supervise};
@@ -62,7 +62,7 @@ impl CodexCliBackend {
         self
     }
 
-    fn build_args(&self, invocation: &AgentInvocation) -> Vec<String> {
+    fn build_args(&self, launch: &SessionLaunch) -> Vec<String> {
         let mut args = vec![
             "exec".to_string(),
             "--json".to_string(),
@@ -72,7 +72,7 @@ impl CodexCliBackend {
             "--sandbox".to_string(),
             "read-only".to_string(),
             "-c".to_string(),
-            format!("mcp_servers.conseqa.url=\"{}\"", invocation.mcp_url),
+            format!("mcp_servers.conseqa.url=\"{}\"", launch.mcp_url),
             "-c".to_string(),
             format!("mcp_servers.conseqa.bearer_token_env_var=\"{TOKEN_ENV_VAR}\""),
             "-c".to_string(),
@@ -87,7 +87,7 @@ impl CodexCliBackend {
         args.extend(self.extra_args.iter().cloned());
 
         // The prompt is the trailing positional argument.
-        args.push(invocation.prompt.clone());
+        args.push(launch.prompt.clone());
 
         args
     }
@@ -105,19 +105,32 @@ impl AgentBackend for CodexCliBackend {
         handle: AgentHandle,
         events: AgentEventSink,
     ) -> Result<AgentExit, AgentBackendError> {
-        let args = self.build_args(&invocation);
-        let env = vec![(TOKEN_ENV_VAR.to_string(), invocation.task_token.clone())];
+        self.launch(SessionLaunch::from(&invocation), &handle, &events)
+            .await
+    }
+}
+
+impl CodexCliBackend {
+    /// Runs one session to completion, or until `handle` cancels it.
+    pub async fn launch(
+        &self,
+        launch: SessionLaunch,
+        handle: &AgentHandle,
+        events: &AgentEventSink,
+    ) -> Result<AgentExit, AgentBackendError> {
+        let args = self.build_args(&launch);
+        let env = vec![(TOKEN_ENV_VAR.to_string(), launch.token.clone())];
 
         let outcome = supervise(
             &self.program,
             &args,
             &env,
-            invocation.repo.as_ref(),
+            launch.repo.as_ref(),
             None,
             Box::new(CodexStreamParser::default()),
-            &handle,
-            &events,
-            invocation.budget.max_wall_time_secs,
+            handle,
+            events,
+            launch.budget.max_wall_time_secs,
         )
         .await?;
 

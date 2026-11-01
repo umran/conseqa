@@ -687,6 +687,7 @@ fn party(kind: PartyKind, name: &str) -> Party {
     Party {
         kind,
         name: name.to_string(),
+        job: None,
     }
 }
 

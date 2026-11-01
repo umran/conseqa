@@ -42,12 +42,15 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use crate::analyzer::basis::DeclarationKey;
 
 pub mod attest;
+pub mod check;
 pub mod completeness;
+pub mod document;
 pub mod markers;
 pub mod packet;
 pub mod plan;
 pub mod policy;
 pub mod record;
+pub mod review;
 pub mod state;
 
 /// The conformance format, of records and of the policy file alike
@@ -217,6 +220,15 @@ pub enum ConformanceError {
     /// code.
     #[error("the spec cannot be verified: {reason}")]
     Unverifiable { reason: String },
+
+    /// The CLI or a coordinator's surface stamps who attests or reviews
+    /// with the person running it, and git names no one (§14.5).
+    #[error(
+        "git has no `user.name` for {}, so there is no one to record as attesting or \
+         reviewing; set it with `git config user.name <name>`",
+        .path.display()
+    )]
+    NoPerson { path: PathBuf },
 
     /// The record a write meant to replace is not the one on disk
     /// (§8.4): someone wrote it in the meantime.

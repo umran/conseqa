@@ -44,6 +44,46 @@ pub struct AgentInvocation {
     pub budget: InvocationBudget,
 }
 
+/// What one agent session needs, whatever it was launched for: a design
+/// task's invocation, or a conformance review's (§14.3 of the
+/// conformance revision), which is no design task.
+#[derive(Debug, Clone)]
+pub struct SessionLaunch {
+    /// Names the session's generated files in the work directory.
+    pub name: String,
+
+    pub prompt: String,
+
+    /// The MCP endpoint the session reaches.
+    pub mcp_url: String,
+
+    /// The session's bearer credential, injected through the
+    /// environment, never the prompt (§57.1).
+    pub token: String,
+
+    /// The directory the agent works in, read-only.
+    pub repo: Option<PathBuf>,
+
+    /// A scratch directory for generated configuration.
+    pub work_dir: PathBuf,
+
+    pub budget: InvocationBudget,
+}
+
+impl From<&AgentInvocation> for SessionLaunch {
+    fn from(invocation: &AgentInvocation) -> Self {
+        Self {
+            name: invocation.task.0.to_string(),
+            prompt: invocation.prompt.clone(),
+            mcp_url: invocation.mcp_url.clone(),
+            token: invocation.task_token.clone(),
+            repo: invocation.repo.clone(),
+            work_dir: invocation.work_dir.clone(),
+            budget: invocation.budget,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 pub struct InvocationBudget {
     pub max_wall_time_secs: Option<u64>,
