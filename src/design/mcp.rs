@@ -19,6 +19,11 @@
 //! agents `conseqa conform review` starts. The conformance tools are in
 //! [`conformance`].
 //!
+//! Every role reads what the project's stack can realize, and the
+//! coordinator chooses which catalogue entry realizes a declaration
+//! (§15.2 of the realization profiles revision). The realization tools
+//! are in [`realization`].
+//!
 //! DSL payloads — symbol keys, graph queries, patches — travel in
 //! their canonical serialized JSON forms; `dsl_guide` documents the
 //! shapes under its `JSON shapes` topics.
@@ -61,6 +66,7 @@ use super::workspace::EvidenceRef;
 use super::workspace_manager::WorkspaceManager;
 
 mod conformance;
+mod realization;
 
 pub use conformance::{Credential, CredentialRole, Credentials};
 
@@ -79,7 +85,9 @@ Conseqa shared architecture state. Invariants:
 9. Finish by committing one patch, filing a dependency request, or \
 reporting unresolved.
 Call dsl_guide for the DSL's semantics by topic, and for the JSON \
-shapes of symbols, queries, and patches under its `JSON shapes` topics.";
+shapes of symbols, queries, and patches under its `JSON shapes` topics. \
+Where the project has a stack profile, realization_status and \
+explain_realization say what its technologies can realize.";
 
 /// The brief served to an implementer (T4 of the delivery loop
 /// orchestrator design): one work item's loop, from packet to attest.
@@ -170,7 +178,10 @@ operation's open obligations in full. Fix what they name narrowly, \
 yourself, and build again. Before you finish, diff_spec shows what your \
 work changed relative to a commit (`merge_base` for the branch it \
 began from): every obligation it regressed, removed, or rebased, and \
-the declarations that explain each.
+the declarations that explain each. Where the project has a stack \
+profile, realization_status shows whether its technologies can realize \
+each declaration, explain_realization names what each candidate lacks, \
+and choose_realization records the entry you choose where several fit.
 
 An unproven transaction serializability or ordering obligation \
 carries `remedy: application`, always: the fix is in the L0 model. \
@@ -554,8 +565,12 @@ struct Routers {
 }
 
 static ROUTERS: LazyLock<Routers> = LazyLock::new(|| {
-    let reads =
-        || ConseqaMcp::shared_tools() + ConseqaMcp::guide_tools() + ConseqaMcp::conformance_reads();
+    let reads = || {
+        ConseqaMcp::shared_tools()
+            + ConseqaMcp::guide_tools()
+            + ConseqaMcp::conformance_reads()
+            + ConseqaMcp::realization_reads()
+    };
 
     Routers {
         worker: reads() + ConseqaMcp::patch_tools() + ConseqaMcp::worker_tools(),
@@ -564,16 +579,19 @@ static ROUTERS: LazyLock<Routers> = LazyLock::new(|| {
             + ConseqaMcp::coordinator_tools()
             + ConseqaMcp::project_tools()
             + ConseqaMcp::attest_tools()
-            + ConseqaMcp::review_tools(),
+            + ConseqaMcp::review_tools()
+            + ConseqaMcp::realization_writes(),
         session: reads()
             + ConseqaMcp::patch_tools()
             + ConseqaMcp::coordinator_tools()
             + ConseqaMcp::attest_tools()
-            + ConseqaMcp::review_tools(),
+            + ConseqaMcp::review_tools()
+            + ConseqaMcp::realization_writes(),
         implementer: reads() + ConseqaMcp::attest_tools(),
         reviewer: reads() + ConseqaMcp::review_tools(),
         review_server: ConseqaMcp::guide_tools()
             + ConseqaMcp::conformance_reads()
+            + ConseqaMcp::realization_reads()
             + ConseqaMcp::review_tools(),
         all: reads()
             + ConseqaMcp::patch_tools()
@@ -581,7 +599,8 @@ static ROUTERS: LazyLock<Routers> = LazyLock::new(|| {
             + ConseqaMcp::coordinator_tools()
             + ConseqaMcp::project_tools()
             + ConseqaMcp::attest_tools()
-            + ConseqaMcp::review_tools(),
+            + ConseqaMcp::review_tools()
+            + ConseqaMcp::realization_writes(),
     }
 });
 
