@@ -3078,6 +3078,8 @@ It should **not** be read as:
 
 Conseqa proves selected application-level properties over a declared abstraction. Its strength comes from making the abstraction explicit and forcing correctness arguments to state which facts they depend on.
 
+That conformance assumption is checkable per obligation: `conseqa conform` reports every proven obligation as conformant in the code or not, with the declarations whose code keeps it from conforming (`CONFORMANCE.md`). "Proven" and "conformant" are distinct, reported states.
+
 ### 25.1 Proof scope
 
 Every successful proof records the semantic layers its argument consumed:

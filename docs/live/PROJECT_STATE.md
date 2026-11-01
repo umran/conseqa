@@ -26,6 +26,9 @@ Implementation: [`src/design/store.rs`](../../src/design/store.rs).
   intent/
     obligations.yaml              the prompt's correctness obligations
     proposals.yaml                requirement proposals and their provenance
+  conformance/
+    policy.yaml                   what must be bound and reviewed (optional)
+    <kind>/<id>[/<id>].yaml       one conformance record per declaration
   .gitignore                      ignores local/
   local/                          this machine's engine state (not committed)
 ```
@@ -33,6 +36,8 @@ Implementation: [`src/design/store.rs`](../../src/design/store.rs).
 Everything except `local/` is committed. The committed state is the authoring workspace (`WorkspaceState`), not the assembled `Model`: an operation may be planned with no program yet, and the correctness obligations a design run extracted from its prompt, and the provenance of each requirement, are part of the design record. The prompt itself is not: what to design is an input to each design run (`conseqa design --prompt`, the `prompt` of the MCP `build_design` tool), seen by every task of that run and recorded nowhere. What lasts of it is `intent/obligations.yaml`, which quotes the spans that matter, and a later run without a prompt works from the skeleton and those obligations. `conseqa export`, like the design MCP server's `export_spec` tool, assembles the canonical single-file `conseqa.yaml` when every operation has a program.
 
 Empty collections have no directory and no file. `intent/` files exist only when they hold something.
+
+`conformance/` holds what the code was checked to provide (`CONFORMANCE.md`). The store neither loads nor scans it: writing a record never adopts a spec revision, invalidates a task, or takes the writer lock, and its strict reader is the conformance module's own.
 
 ## File format
 
@@ -66,6 +71,8 @@ Empty collections have no directory and no file. `intent/` files exist only when
 | `tasks.jsonl` | Task records and state changes. Tasks still active when a process ended are invalidated on the next open (§84). |
 | `dependency_requests.json` | Dependency requests filed by tasks, with their resolutions. |
 | `design/` | The last design run's finalized `conseqa.yaml`, verification report, and manifest. |
+| `conformance.lock` | The short lock a conformance record's write holds while it compares and renames. |
+| `conformance/refusals/` | The last refused attest of each declaration, which its work item shows until an attest succeeds. |
 
 All of it can be deleted while no engine has the project open; nothing in it is part of the design.
 
@@ -86,14 +93,15 @@ All of it can be deleted while no engine has the project open; nothing in it is 
 | `conseqa diff [<base>] [<head>]` | Compares two versions of the project's spec, each read through the store's own loader without the writer lock: `<base>` is a commit (default `HEAD`), `<head>` a commit or, by default, the working tree. Prints the declarations added, removed, and modified, every obligation that changed with the declarations explaining it, and the change in what the proofs rely on. `--merge-base` reads the base at its merge base with the head; `--report` writes the diff document; `--fail-on` exits 2 on the classes it names. Exits 1 when a side cannot be read. For CI, beside `check`; see `SPEC_CHANGE_ANALYSIS.md`. |
 | `conseqa export <dir>` | Writes `conseqa.yaml`, `verification-report.json` (when the model is valid), and `spec.html` (unless `--no-render`) into `<dir>`, through the same writer as `export_spec`. |
 | `conseqa viz` | Renders `spec.html`, with the verdicts overlaid when the model is valid, into `.conseqa/local/` or `--out`; `--json` writes the page data instead. |
+| `conseqa conform` | Holds the code to the spec, reading the project's files without the writer lock: `status`, `plan`, `item`, `attest`, `review`, `scan`, and `check`, each with `--json` for its conformance document. `check --fail-on` is the CI gate. See `CONFORMANCE.md`. |
 | `conseqa design` | Runs the design workflow on the project with coding agents (`--backend claude|codex`; a System One decider and the `--system-one-kinds` whose builders go in front of the agents), writing its run artifacts into `.conseqa/local/design`. `--prompt` or `--prompt-file` says what to build, for this run only; a project with no operations needs one. Exits 2 when the run ends incomplete. |
-| `conseqa-design-mcp serve` | `--project`, default `.`. Opens that project for the design MCP and admin surfaces; its existing server options may initialize a workspace when one is absent. |
+| `conseqa-design-mcp serve` | `--project`, default `.`. Opens that project for the design MCP and admin surfaces; its existing server options may initialize a workspace when one is absent. Its localhost admin surface mints task, session, and implementer and reviewer tokens (`POST /admin/credentials`). |
 
-The repository builds two binaries: `conseqa`, the project CLI, and `conseqa-design-mcp`, the design MCP server. The `conseqa` CLI has no project path flag: after initialization, its context is the `.conseqa/` directory discovered from the working directory. Its subcommands give a pipeline with no MCP client — CI, a script — what the design MCP server gives an agent: checking, exporting, visualizing, and designing the committed model.
+The repository builds two binaries: `conseqa`, the project CLI, and `conseqa-design-mcp`, the design MCP server. The `conseqa` CLI has no project path flag: after initialization, its context is the `.conseqa/` directory discovered from the working directory. Its subcommands give a pipeline with no MCP client — CI, a script — what the design MCP server gives an agent: checking, exporting, visualizing, and designing the committed model, and holding the code to it.
 
 Discovery never looks at or above the home directory: its `.conseqa/` is the machine's configuration (below), so a project there would claim every directory of the user's as its own.
 
-A server hosts any number of projects at once, keyed by directory. Worker agents of a design run keep their scratch configuration in the system temporary directory, outside every repository, so that no worker picks up a repository's own agent settings.
+A server hosts any number of projects at once, keyed by directory. Worker agents of a design run, like the review agents of `conseqa conform review`, keep their scratch configuration in the system temporary directory, outside every repository, so that no agent picks up a repository's own agent settings.
 
 ## Machine configuration
 
