@@ -13,7 +13,12 @@ Both are amended by this revision (§17, §18).
 **Project store format:** 10 (unchanged). The realization files live in `.conseqa/` outside what the store loads and scans (§10.1).  
 **Realization format:** 1 (new)  
 **Fact format:** amended before format 1 ships, adding the `realization` kind (§12.2)  
-**Baseline:** Conseqa `master`, commit `f184f34`
+**Baseline:** Conseqa `master`, commit `f184f34`  
+**Amended in implementation (M8, 2026-10-31):** with the maintainer's approval:
+- §6.2 and §6.3: coverage is exact, and which steps read, write several instances, and guard;
+- §7.1, §7.2, §8.1–§8.3, and §9: entries carry `format`, realize one kind, cite each claim, give options their own requirements and exclusions; the standard catalogue's first entries; the stack pins the standard catalogue; versions and ranges;
+- §10.1, §10.3, §10.4, §13.1, §14, and §15: a choice file's fields, the `unneeded` state, the infeasibility report, checker assertions' shapes, the realization documents, each subcommand's output and exit codes, and where the tools read;
+- §20.7 and §21: the record-staleness test moves with the record's `realization` field; Kafka's consumer-group assignment is settled, and compatibility between neighbouring realizations is a new open question.
 
 This revision connects a spec to the concrete technologies that can realize it. It introduces:
 
@@ -161,23 +166,27 @@ A capability is an `axis: value` pair. Every value means exactly what the semant
 
 The vocabulary is closed and versioned by `REALIZATION_FORMAT` (§14). A `dsl` bump forces a `REALIZATION_FORMAT` bump, because capabilities are stated in the DSL's terms.
 
+No value implies another. A candidate covers a need only by listing that very capability, so an entry that provides serializable isolation lists snapshot isolation too, if it provides it. Coverage is then a membership test a reviewer can check by reading the entry.
+
 ## 6.3 Deriving needs
 
 Needs are computed from the spec, with no declaration of their own:
 
 | Declaration | Needs |
 |---|---|
-| `data_model` | `durability: committed`. Then, for every transaction declaring this data model: <ul><li>its `isolation`, unless `unspecified`;</li><li>`transaction: interactive` if a step's values or decision derive from a read in the same transaction;</li><li>`transaction: multi_instance` if it mutates more than one identified instance, or writes an outbox alongside an object;</li><li>`lock: <mode>` per lock step;</li><li>`mutation: conditional` per `compare_and_set` or guarded `transition`, `advance_cursor` or `fence`;</li><li>`mutation: upsert` per `upsert`;</li><li>`uniqueness: identity` per `insert` or `upsert`;</li><li>`outbox: atomic` per outbox write.</li></ul> |
+| `data_model` | `durability: committed`. Then, for every transaction declaring this data model: <ul><li>its `isolation`, unless `unspecified`;</li><li>`transaction: interactive` if a step's value, comparison or selector uses a `transaction_read` or `state_machine_subject` reference: persistent state the transaction observed before it commits;</li><li>`transaction: multi_instance` if it writes more than one instance. An instance a selector identifies, pinning its object's whole identity, counts once however often it is written; a selector pinning less counts as several; each insert and each outbox write counts as one, since an insert's derivation names no identity;</li><li>`lock: <mode>` per lock step;</li><li>`mutation: conditional` per guarded mutation: `compare_and_set`, `transition`, `advance_cursor`, or `fence` (§20 of the semantics contract);</li><li>`mutation: upsert` per `upsert`;</li><li>`uniqueness: identity` per `insert` or `upsert`;</li><li>`outbox: atomic` per outbox write, a transition's admissions included.</li></ul> |
 | `topic` | `channel: fanout` |
 | `outbox` | `redrive: durable` |
 | `topic_runtime` | `grouping: keyed` when `grouping` is declared, and `ordering: <value>` when it is `within_group` or `global` |
 | `subscription_runtime` | `delivery: <value>` unless `unspecified`. `grouping` and `ordering` as for a topic runtime, when subscription-scoped. `assignment: <kind>` when `dispatch.routing` is declared. |
-| `outbox_runtime` | `grouping: keyed` when `partitioning` is declared, `ordering` as declared, `assignment` when `dispatch.routing` is declared |
+| `outbox_runtime` | `grouping: keyed` when `partitioning` is keyed; `ordering: within_group` when `ordering` is `partition`, since a partition is the runtime's grouping domain, and `ordering: global` when it is `global`; `assignment` when `dispatch.routing` is declared |
 | `router` | `assignment: <kind>` when `routing` is declared; nothing otherwise |
 | `execution_pool` | `concurrency: bounded` when `member_concurrency` is `bounded` |
 | `storage_layout` | `partitioning: keyed` for a one-field key, `partitioning: composite` for more |
 
 Needs are recomputed on every derivation, like everything else. When a spec change adds a need the chosen realization does not provide, the declaration becomes infeasible (§10.4) at the spec gate.
+
+Each need records where the spec asks for it: the transaction and the step, or the declaration and the field it declares. The infeasibility report and `explain` name them.
 
 ---
 
@@ -186,6 +195,7 @@ Needs are recomputed on every derivation, like everything else. When a spec chan
 ## 7.1 Platform entries
 
 ```yaml
+format: 1
 id: kafka.keyed-topic
 version: 1
 technology: { name: kafka, versions: ">=2.8" }
@@ -233,31 +243,37 @@ citations:
 
 | Field | Meaning |
 |---|---|
-| `id`, `version` | Identity. A record names the entry it was checked against as `id@version` (§17). |
-| `technology` | The product, and the versions the entry is true for. A stack whose version is outside the range makes the entry no candidate. |
-| `realizes.kind` | One realizable kind (§6.1). |
-| `provides` | Capabilities, each optionally conditional `with` an option. |
-| `cannot_provide` | Capabilities the technology does not provide, with the reason. This turns "not listed" into an explanation in `realize explain` (§15). |
-| `options` | Named configuration choices that extend `provides`. Choosing an option adds its requirements. |
-| `requirements` | Realization requirements (§11), each `of: self` or of a neighbour relation (§11.2), stated in a sentence an agent and a reviewer can both check. |
+| `format` | The realization format (§14). |
+| `id`, `version` | Identity. A record names the entry it was checked against as `id@version` (§17). An id is plain names joined by `.`; a version counts from 1. |
+| `technology` | The product, and the versions the entry is true for (§9). A stack whose version is outside the range makes the entry no candidate. |
+| `realizes.kind` | One realizable kind (§6.1). An entry realizes exactly one: a technology that realizes several kinds has an entry for each, since what it provides and requires differs by kind. |
+| `provides` | Capabilities, each optionally conditional `with` an option. A provision is written bare, `- grouping: keyed`, or long, with `capability:` and then `with:` or `cite:`. |
+| `cannot_provide` | Capabilities the technology does not provide, with the reason, optionally `unless` an option provides it. This turns "not listed" into an explanation in `realize explain` (§15). |
+| `options` | Named configuration choices that extend `provides`, at most sixteen per entry. An option may list the options it `excludes`, and a set holding both is never valid. Choosing an option adds its requirements. |
+| `requirements` | Realization requirements (§11), each `of: self` or of a neighbour relation (§11.2) the entry's kind has, stated in a sentence an agent and a reviewer can both check. A requirement marked `with` an option is that option's. |
 | `evidence` | Where, in a region, the evidence for each requirement is found. |
 | `checkers` | Deterministic checks of some requirements (§13). |
-| `citations` | The vendor documentation the entry's claims rest on. |
+| `cite` | On any provision, exclusion or requirement: the vendor documentation that claim rests on. |
+| `citations` | The vendor documentation the entry's claims rest on, together. |
 
 ## 7.2 More platform entries, in brief
 
 | Entry | Realizes | Provides | Cannot provide | Requires |
 |---|---|---|---|---|
-| `postgres.database@1` (PostgreSQL ≥ 9.1) | `data_model` | `durability: committed`; `isolation`: `read_committed`, `snapshot` (`REPEATABLE READ`), `serializable` (`SERIALIZABLE`); `transaction`: `interactive`, `multi_instance`; `lock`: `shared` (`FOR SHARE`), `exclusive` (`FOR UPDATE`); `mutation`: `conditional`, `upsert` (`ON CONFLICT DO UPDATE`); `uniqueness: identity`; `outbox: atomic` | nothing on these axes | serializable transactions retried from their first statement on SQLSTATE `40001`; a guarded update is one `UPDATE` carrying every comparison, with a check that exactly one row changed; version publication by trigger (option `version_trigger`) or by every writer |
+| `postgres.database@1` (PostgreSQL ≥ 9.5) | `data_model` | `durability: committed`; `isolation`: `read_committed`, `snapshot` (`REPEATABLE READ`), `serializable` (`SERIALIZABLE`); `transaction`: `interactive`, `multi_instance`; `lock`: `shared` (`FOR SHARE`), `exclusive` (`FOR UPDATE`); `mutation`: `conditional`, `upsert` (`ON CONFLICT DO UPDATE`); `uniqueness: identity`; `outbox: atomic` | nothing on these axes | serializable transactions retried from their first statement on SQLSTATE `40001`; a guarded update is one `UPDATE` carrying every comparison, with a check that exactly one row changed; version publication by trigger (option `version_trigger`) or by every writer |
 | `dynamodb.table@1` | `data_model` | `durability: committed`; `transaction: multi_instance` (`TransactWriteItems`); `mutation`: `conditional` (`ConditionExpression`), `upsert`; `uniqueness: identity` (`attribute_not_exists`); `outbox: atomic` | `transaction: interactive`, since no transaction spans a read, a decision and a write; `lock` | every decision a transaction makes is expressed as a condition on its writes |
 | `oracle.database@1` | `data_model` | `isolation: read_committed`; `snapshot` (`SERIALIZABLE`); `transaction`: `interactive`, `multi_instance`; `lock: exclusive`; `mutation: conditional` | `isolation: serializable`: Oracle's `SERIALIZABLE` is snapshot isolation and admits write skew | none beyond the usual |
-| `sqs.fifo@1` | `topic_runtime`, `subscription_runtime` | `grouping: keyed` (`MessageGroupId`); `ordering: within_group`; `delivery: at_least_once` | `ordering: global` | producers set `MessageGroupId` from the grouping key |
-| `sqs.standard@1` | `topic_runtime`, `subscription_runtime` | `delivery: at_least_once` | `grouping`, `ordering` | a redrive policy, so that failed messages are retried |
-| `kafka.consumer-group@1` | `subscription_runtime` | `delivery: at_least_once` (option `commit_after_processing`), `at_most_once` (option `commit_before_processing`); `assignment: consistent_hash`, reviewed as partition affinity within one rebalance generation (§21) | none | the consumer commits offsets as its option says |
+| `sqs.fifo@1` | `topic_runtime` | `grouping: keyed` (`MessageGroupId`); `ordering: within_group`; `delivery: at_least_once` | `ordering: global` | producers set `MessageGroupId` from the grouping key |
+| `sqs.standard@1` | `topic_runtime` | `delivery: at_least_once` | `grouping`, `ordering` | a redrive policy, so that failed messages are retried |
+| `kafka.topic@1` | `topic` | `channel: fanout` | none on this axis | each subscription reads through a consumer group of its own |
+| `kafka.consumer-group@1` | `subscription_runtime` | `delivery: at_least_once` (option `commit_after_processing`), `at_most_once` (option `commit_before_processing`, which excludes the other); `assignment: consistent_hash`, as partition affinity within one rebalance generation (§21) | `assignment: round_robin`: a group assigns whole partitions, never rotating one's records across members | the consumers form one consumer group, never a share group, running on the pool's members; the topic's records are keyed by the grouping key the dispatch routes on; offsets are committed as the option says |
 | `envoy.ring-hash@1` | `router` | `assignment: consistent_hash` (`RING_HASH` or `MAGLEV`) | `assignment: round_robin` (a separate entry, `envoy.round-robin@1`) | the cluster's `hash_policy` hashes a named header; every caller through the router's boundary sets that header from the routing key |
 | `debezium.outbox-relay@1` | `outbox` | `redrive: durable` | none | the outbox table's connector is configured with the outbox event router |
+| `postgres.partitioned-table@1` (PostgreSQL ≥ 10) | `storage_layout` | `partitioning`: `keyed`, `composite` (`PARTITION BY`) | none | the object's table is partitioned by exactly the layout's key |
 
-The table is illustrative: the standard catalogue's entries are authored with their citations under §8.3. The PostgreSQL, Oracle and DynamoDB rows are the cases §2.1 needs, and the version bound on PostgreSQL is part of the entry, not a footnote.
+The table is illustrative: the standard catalogue's entries are authored with their citations under §8.3. The PostgreSQL, Oracle and DynamoDB rows are the cases §2.1 needs, and the version bound on PostgreSQL is part of the entry, not a footnote: PostgreSQL's `SERIALIZABLE` is serializable from 9.1, and `ON CONFLICT DO UPDATE` arrived in 9.5.
+
+The standard catalogue `conseqa-standard@1` ships `postgres.database`, `postgres.partitioned-table`, `oracle.database`, `dynamodb.table`, `kafka.topic`, `kafka.keyed-topic`, `kafka.consumer-group`, `sqs.fifo`, `sqs.standard`, `envoy.ring-hash`, `envoy.round-robin`, and `debezium.outbox-relay`, at version 1. Their checkers arrive with the checkers themselves.
 
 ## 7.3 Requirements of the declaration's own regions
 
@@ -307,15 +323,26 @@ When a project's stack names a framework, the packet of every item using a primi
 
 An entry id is unique across both sources, and a project entry with a standard entry's id is refused by name. A project that disagrees with a standard entry copies it under its own id and says why. It never silently overrides.
 
+A stack names the standard catalogue it was judged against (§9), and a build shipping another refuses that stack by name. Adopting a new standard catalogue is then a reviewed change to the stack, like any other.
+
 ## 8.2 Strictness
 
-The catalogue reader refuses unknown fields, unknown capability axes or values, a `kind` that is not realizable, an option referenced but not defined, and a requirement whose `of` names no neighbour relation (§11.2). It uses the same strictness rule as the store and the conformance reader.
+The catalogue reader refuses unknown fields, unknown capability axes or values, a `kind` that is not realizable, an option referenced but not defined, and a requirement whose `of` names no neighbour relation (§11.2) of the entry's kind. It also refuses:
+
+- an entry that is neither a platform entry (with `realizes`) nor an idiom entry (with `primitive`), and an entry whose id is not its file's name;
+- an entry of more than sixteen options, an option excluding itself or an undefined one, and duplicate requirement or checker ids;
+- evidence, or a checker's `covers`, naming no requirement of the entry;
+- an idiom's `platforms` naming no platform entry;
+- a capability both provided and excluded, unless the exclusion is lifted by the option that provides it;
+- a checker assertion outside its kind's shape (§13.1).
+
+It uses the same strictness rule as the store and the conformance reader.
 
 ## 8.3 Trust
 
 A catalogue entry is trusted the way a proof's assumptions are: a wrong entry misleads every project that uses it. The standard catalogue's rules:
 
-- every capability, every exclusion, and every requirement cites vendor documentation;
+- every capability, every exclusion, and every requirement cites vendor documentation in its own `cite:`, each URL listed in the entry's `citations`, and a test holds the standard catalogue to it;
 - every entry is reviewed by someone other than its author before release;
 - an entry with a version-dependent claim states the version range, as PostgreSQL's does;
 - where feasible, an entry ships a reproduction under `tests/realization/<id>/`: for example, a container test showing a Kafka topic with keyed records keeping per-key order across a producer retry.
@@ -342,7 +369,8 @@ technologies:
 The stack is a project-wide architectural decision, made by the architect and changed through the spec pull request like any other.
 
 - Without a stack profile, nothing in this revision applies, and Parts I and IV behave as written.
-- A technology must be named with a version, so that version-dependent entries can be judged (PostgreSQL before 9.1 is no candidate for `isolation: serializable`).
+- A technology must be named with a version, so that version-dependent entries can be judged (PostgreSQL before 9.1 is no candidate for `isolation: serializable`). A version is dotted numbers, compared part by part with missing parts read as zero, so `9.1` is `9.1.0`. An entry's range is one or more comparisons (`>=`, `>`, `<=`, `<`, `=`), comma-separated, all of which must hold: `>=9.1, <13`. A managed service without product versions is named at its API version, as `dynamodb@2012.08.10`.
+- The stack names each technology once, and names the standard catalogue it was judged against (§8.1).
 - A technology no entry describes is allowed: it simply provides nothing, until a project entry describes it.
 
 ---
@@ -371,6 +399,8 @@ options: [commit_after_processing]
 reason: Shipping must not drop captured payments under load.
 ```
 
+The `declaration` is the one the file's path names. `options` lists each chosen option once, written sorted, and is omitted when none is chosen; `reason` is optional.
+
 ## 10.2 Candidates and validity
 
 A realizable declaration's **candidates** are the platform entries that realize its kind, and whose technology the stack names at a version inside the entry's range. A candidate, with a set of options, is **valid** when its provisions under those options cover the declaration's needs.
@@ -381,11 +411,14 @@ A realizable declaration's **candidates** are the platform entries that realize 
 |---|---|
 | A choice file exists, and its entry and options are valid | that choice |
 | A choice file exists, and its entry is no longer valid (needs grew, the stack changed, the entry changed) | **invalid choice**: infeasible until re-chosen |
+| No choice file, and the declaration needs nothing | **unneeded**: nothing is chosen, nothing fails, and nothing is bound |
 | No choice file, exactly one valid candidate with exactly one minimal option set | that candidate, **automatically** |
 | No choice file, several valid candidates or option sets | **ambiguous**: a choice is needed |
 | No valid candidate | **infeasible** |
 
 A minimal option set is one from which no option can be dropped while staying valid. Automatic choice never picks an option the declaration does not need, so a Kafka topic that does not need global order is never made single-partition by default.
+
+A declaration needs nothing when it declares nothing a technology must provide: a router without routing, a pool whose concurrency is unbounded or unspecified, a topic runtime declaring neither grouping nor ordering. It is unneeded whatever the stack offers. A choice file may still choose an entry for it, which is then judged like any other choice.
 
 ## 10.4 Infeasibility
 
@@ -396,12 +429,12 @@ An infeasible declaration is reported with:
 - its `cannot_provide` reasons for those needs.
 
 ```text
-infeasible  data_model data.orders
-  needs     transaction: interactive    (tx.apply_payment reads object.order, then decides)
-  dynamodb.table@1  cannot provide transaction: interactive
-                    no transaction spans a read, a decision and a write; express the
-                    decision as conditions on the writes
+infeasible     data_model data.orders
+  needs transaction: interactive    transaction operation.pay/tx.apply_payment: step 2 (update object.order) uses `transaction_read:read.order`, read in the same transaction
+  dynamodb.table@1  cannot provide transaction: interactive: A DynamoDB transaction is one TransactWriteItems call, [...] Express the decision as conditions on the writes.
 ```
+
+A candidate that provides every need only with options that exclude one another says so. With no candidate at all, the report says that no entry in the stack realizes the kind.
 
 The report is the architect's choice of remedies:
 
@@ -474,6 +507,18 @@ Conseqa ships a closed set of checker kinds. Entries configure them; they never 
 
 A checker reads only regions bound to the declaration its requirement applies to. It never searches the repository.
 
+Each kind's `assert` has one shape, and asserts exactly one thing:
+
+| Kind | `assert` |
+|---|---|
+| `hcl` | `{ resource, present: true }`, or `{ resource, attribute, equals: <value> }`, or `{ resource, attribute, contains: <value> }` |
+| `yaml_path` | `{ path, exists: true }`, or `{ path, equals: <value> }`, or `{ path, one_of: [<value>, ...] }` |
+| `properties` | `{ key, equals: <value> }` |
+| `sql_ddl` | `{ table }` with one of `primary_key: [<column>, ...]`, `unique: [<column>, ...]`, `partition_by: [<column>, ...]`, or `trigger: true` |
+| `pattern` | `{ regex }`, which must compile |
+
+A value is a string, a boolean, or an integer, compared as it is written. An idiom entry's checker has no `covers`, since an idiom states no requirements: it checks the idiom's evidence shape.
+
 ## 13.2 Results are reviews
 
 A checker run yields `confirmed`, `disputed`, or `not_applicable` for each requirement it covers. It is recorded as a Part IV review, `by: { kind: checker, name: <entry id>/<checker id>@<entry version> }`, at the digests it read. Its review lapses when those digests change, like any other.
@@ -490,7 +535,8 @@ Part IV's policy decides whether a confirming checker satisfies a required revie
 
 - A `dsl` bump forces a `REALIZATION_FORMAT` bump, never the reverse.
 - Every realization file records its `format`. A reader refuses any other format by name.
-- A record names the entry it was checked against as `id@version`. A new entry version makes every record naming the old one stale (§18, item 2), because the claims it was checked against may have changed.
+- A record names the entry it was checked against as `id@version`. A new entry version makes every record naming the old one stale (§18, item 2), because the claims it was checked against may have changed. A choice naming the old version is likewise an invalid choice (§10.3).
+- The realization documents (§15.1) count a `format` of their own, starting at 1, since a document and a profile file change for different reasons.
 
 ---
 
@@ -499,28 +545,35 @@ Part IV's policy decides whether a confirming checker satisfies a required revie
 ## 15.1 CLI
 
 ```text
-conseqa realize status [--json]                    per declaration: needs, chosen entry, state
-conseqa realize explain <declaration key> [--json] every candidate: provides, missing needs, exclusions
-conseqa realize choose <declaration key> <entry>[@<version>] [--option <name>]… [--reason <text>]
-conseqa realize catalogue [list | show <entry>]
+conseqa realize status [--require-realizable] [--json]  per declaration: needs, chosen entry, state
+conseqa realize explain <declaration key> [--json]      every candidate: provides, missing needs, exclusions
+conseqa realize choose <declaration key> <entry>[@<version>] [--option <name>]… [--reason <text>] [--json]
+conseqa realize catalogue [list [--json] | show <entry>[@<version>] [--json]]
 ```
 
-`status` reports every realizable declaration as `chosen`, `automatic`, `ambiguous`, `invalid_choice` or `infeasible`. `choose` writes a choice file, and refuses an invalid entry by naming what it lacks.
+- `status` reports every realizable declaration as `chosen`, `automatic`, `ambiguous`, `invalid_choice`, `infeasible` or `unneeded`, with its needs and where each comes from. It lists apart the orphaned choices, whose declaration the spec no longer has, and they fail nothing. Without a stack profile it says so, and `--require-realizable` passes, since nothing applies (§9).
+- `explain` lists every candidate with what it provides, the needs it misses and why, and the option sets it is valid with. It also lists the kind's entries outside the stack, each with why: not in the stack, or the stack's version outside its range. That gives "change the stack" something to name.
+- `choose` writes a choice file. An entry named without a version takes the catalogue's current one. It refuses by name an unknown declaration, a kind that is not realizable (a data object names its data model), an unknown entry or version, an entry realizing another kind, a technology outside the stack, an unknown option or two that exclude each other, and needs left uncovered. A choice replaces the declaration's last one, and an identical choice writes nothing.
+- `catalogue` lists every entry the project can choose from, or shows one in full. It runs outside a project too, on the standard catalogue alone.
 
 Exit codes follow the project CLI:
 - **0:** the command ran;
-- **1:** the spec, the stack, or the catalogue did not load;
-- **2:** `status --require-realizable` found an ambiguous, invalid or infeasible declaration.
+- **1:** the spec, the stack, or the catalogue did not load; `explain` also exits 1 for a declaration that is not realizable or a project without a stack, and `catalogue show` for an entry no catalogue holds;
+- **2:** `status --require-realizable` found an ambiguous, invalid or infeasible declaration, or `choose` was refused, as `conform attest` exits when refused.
 
 `conseqa check` gains `--require-realizable`, with the same meaning, so a single CI step can demand both proof and feasibility.
+
+Each subcommand's `--json` prints one document (T1 of the orchestrator design): `format`, a counter of its own (§14); `document`, one of `realization_status`, `realization_explain`, `realization_choice`, `catalogue`, and `catalogue_entry`; `dsl`; and `realization_format`; then the payload. The same inputs give a byte-identical document.
 
 ## 15.2 Design MCP tools
 
 | Tool | Served to | Does |
 |---|---|---|
-| `realization_status` | every role | §15.1's `status` |
-| `explain_realization` | every role | §15.1's `explain` |
+| `realization_status` | every role, and a review server's agents | §15.1's `status` |
+| `explain_realization` | every role, and a review server's agents | §15.1's `explain` |
 | `choose_realization` | the coordinator | §15.1's `choose`, through the server's write path |
+
+The tools read the spec where the caller reads it: a design task's worker at the head its task pinned, every other role at the engine's head, and a review server's agents from the project's files. Each returns §15.1's document, after a text rendering for the status and the explanation. `choose_realization` writes the choice file under a lock of its own, outside the spec's commit gate, as an attest writes a record.
 
 Design agents can then keep a design feasible while designing it, which is the cheapest place to steer technology: a design agent asks `explain_realization` before it reaches for interactive transactions on a DynamoDB stack.
 
@@ -585,11 +638,11 @@ Part IV (`Conseqa_Conformance_and_Implementation_Guidance_Revision_Specification
 
 | Module | Changes |
 |---|---|
-| `src/realization/` (new, `design` feature) | `capability.rs` (the vocabulary and needs derivation, §6); `catalogue.rs` (entries, the embedded standard catalogue, the project catalogue, strictness, §7, §8); `stack.rs` (§9); `choice.rs` (candidates, validity, choice, infeasibility reports, §10); `requirements.rs` (realization requirements over neighbour relations, §11); `checkers/` (the five kinds, §13) |
+| `src/realization/` (new, `design` feature) | `capability.rs` (the vocabulary and needs derivation, §6); `catalogue.rs` (entries, the embedded standard catalogue, the project catalogue, strictness, §7, §8); `stack.rs` (§9); `choice.rs` (candidates, validity, choice, infeasibility reports, §10); `document.rs` (the realization documents, §15.1); `requirements.rs` (realization requirements over neighbour relations, §11); `checkers/` (the five kinds, §13) |
 | `src/analyzer/basis.rs` | the `realization` fact kind (§12) |
 | `src/design/change/` (Part I) | the realization section of the diff, and the gates (§17) |
 | `src/conformance/` (Part IV) | required realization facts, the record field, the binding rule, packet sections, checker reviews, the `unrealizable` condition (§18) |
-| `src/design/mcp.rs` | the three tools (§15.2) |
+| `src/design/mcp.rs` | the three tools (§15.2), in its `realization` child module |
 | `src/main.rs` | `conseqa realize` and `check --require-realizable` (§15.1) |
 | `catalogue/` (new, at the repository root) | the standard catalogue's entries, embedded at build time |
 | `tests/realization/` | entry reproductions where feasible (§8.3), and the tests of §20 |
@@ -638,7 +691,7 @@ The following are each refused by name:
 - a choice file of another format;
 - a stack technology without a version.
 
-A new entry version makes the records naming the old one stale.
+A new entry version makes the records naming the old one stale. That needs the record's `realization` field (§18, item 3), so the test arrives with it; until then, a choice naming an entry's old version is an invalid choice.
 
 ## 20.8 Gates
 
@@ -649,7 +702,8 @@ Part I's `infeasible` and `ambiguous` gates and `conseqa check --require-realiza
 # 21. Open questions
 
 - **Caches and non-durable storage.** A data model is persistent by definition (`durability: committed` is always needed), so a cache cannot honestly realize one. A cache is also a source of stale reads, which the serializability analysis would need to see. Whether caching becomes an L0 concept, with read-staleness semantics the proofs can consume, is a DSL question for its own revision. Until then a cache is outside the model, and a region reading through one is a conformance reviewer's concern.
-- **Kafka's consumer-group assignment.** `kafka.consumer-group@1` claims `assignment: consistent_hash` on the reading that partition affinity within one rebalance generation is the DSL's stable-epoch affinity. That reading must be confirmed against §10.6 of the semantics contract before the entry ships. Entries exist precisely so that judgements like this are settled once.
+- **Kafka's consumer-group assignment. Settled.** `kafka.consumer-group@1` claims `assignment: consistent_hash` on the reading that partition affinity within one rebalance generation is the DSL's stable-epoch affinity. §10.6 of the semantics contract holds equal routing domains on one member during a stable ownership epoch, prescribing no hash function and saying nothing between epochs. A consumer group gives each partition to exactly one member per generation, and equal record keys share a partition while the partition count holds. The reading therefore holds while the topic's records are keyed by the grouping key the dispatch routes on, and while the consumers form a consumer group, never a share group, on the pool's members. The entry states both as requirements.
+- **Compatibility between neighbouring realizations.** Each declaration is judged alone, so nothing stops a Kafka consumer group being chosen for a subscription whose topic runtime is an SQS queue. An entry cannot yet say what it requires of the entries realizing its neighbours.
 - **Per-environment stacks.** Development on a local broker, production on Kafka. One stack per project keeps feasibility simple. Environments may later need stack overlays, each checked separately.
 - **Third-party catalogues.** Vendoring into the project catalogue is enough to start. A registry with signed entries is a later question.
 - **Capability granularity.** Isolation is stated at the semantics contract's three levels. Whether entries should also state anomaly-level detail is open: MySQL's `REPEATABLE READ` is not snapshot isolation in the textbook sense, for example.
