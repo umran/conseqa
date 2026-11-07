@@ -24,7 +24,7 @@ When sources disagree, use this precedence:
 
 ## Historical design records outside the live corpus
 
-The following documents remain at the repository root for design history. They are not safe standalone sources for current documentation because they are proposed revisions, describe earlier DSL contracts, or have been consolidated into the normative semantics.
+The following documents remain at the repository root for design history. They are not safe standalone sources for current documentation because they are proposed revisions, plans or explorations, describe earlier DSL contracts, or have been consolidated into the normative semantics.
 
 | Document | Classification |
 |---|---|
@@ -41,6 +41,8 @@ The following documents remain at the repository root for design history. They a
 | `Conseqa_Conformance_and_Implementation_Guidance_Revision_Specification.md` | Part IV of the spec-versioning work: the design and acceptance record for conformance, amended in implementation. Consult `CONFORMANCE.md` for current behavior. |
 | `Conseqa_Spec_Change_Analysis_Revision_Specification.md` | Part I of the spec-versioning work: the design and acceptance record for change analysis, amended in implementation. Consult `SPEC_CHANGE_ANALYSIS.md` for current behavior. |
 | `Conseqa_Realization_Profiles_Revision_Specification.md` | Part VI of the spec-versioning work: the design and acceptance record for realization profiles, amended in implementation, with its amendments to Parts I and IV. Consult `REALIZATION.md` for current behavior. |
+| `Conseqa_Spec_Versioning_Implementation_Index.md` | The completed brief Parts I, IV and VI were built from, in nine milestones, with the house rules and the decisions taken. Consult the live documents above for current behavior. |
+| `Conseqa_Delivery_Loop_Orchestrator_Design.md` | Design exploration of an orchestrator for the delivery loop, to be built outside Conseqa; not normative. Its tooling gaps T1–T7 were accepted into Parts I and IV and built with them. |
 | `Conseqa_System_One_Orchestration_Revision_Specification.md` | Historical orchestration implementation plan tied to DSL 4; consult current code and tests for the active behavior. |
 | `Conseqa_Transaction_Consistency_and_Ordering_Revision__DSL_v4.md` | DSL 4 design record; its explicit version protocol was replaced by DSL 6 atomic conditional mutations. |
 | `Patch_Specification_Topic_Subscription_Runtime_Grouping_and_Ordering_Scope.md` | Historical proposed patch; current runtime semantics are consolidated into the live contract. |

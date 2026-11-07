@@ -2,11 +2,11 @@
 
 ## 1. Status and purpose
 
-**Status:** Design exploration. Nothing here is implemented, and nothing here is normative for Conseqa.  
+**Status:** Design exploration. The orchestrator is not built, and nothing here is normative for Conseqa. Parts I and IV have since been built, with the tooling gaps T1–T7 of §12 accepted into them; the rest of this document stands as written at its baseline.  
 **Baseline:** Conseqa `master`, commit `4def369`.  
-**Depends on:** the Proposed Part I (`Conseqa_Spec_Change_Analysis_Revision_Specification.md`) and Part IV (`Conseqa_Conformance_and_Implementation_Guidance_Revision_Specification.md`), neither of which is built.
+**Depends on:** Part I (`Conseqa_Spec_Change_Analysis_Revision_Specification.md`) and Part IV (`Conseqa_Conformance_and_Implementation_Guidance_Revision_Specification.md`), both since implemented; `docs/live/SPEC_CHANGE_ANALYSIS.md` and `docs/live/CONFORMANCE.md` describe their current behavior.
 
-This document designs a concrete orchestrator for the delivery loop, the one drawn in the *Conseqa Delivery Loop* diagram. It is built with LangGraph, the proposed Conseqa tooling, and provider-agnostic coding agents (Claude Code, Codex, and any other agent that meets the contract in §7).
+This document designs a concrete orchestrator for the delivery loop, the one drawn in the *Conseqa Delivery Loop* diagram. It is built with LangGraph, the Conseqa tooling of Parts I and IV, and provider-agnostic coding agents (Claude Code, Codex, and any other agent that meets the contract in §7).
 
 The point is not to build it yet. The point is to use it on paper, as a team adopting Conseqa would, and learn three things:
 
@@ -445,7 +445,7 @@ The main result of the exercise. Each property is something the orchestrator nee
 | T14 | Per-worktree independence: one `conseqa-design-mcp serve --project <worktree>` per worktree, minting role tokens the loop requests, and attest beside an open server. | Parallel items run in parallel worktrees, each with its own server. | The per-checkout lock and attest beside a server are specified (Part IV §15.2). Minting tokens per role on request is part of T4. |
 | T15 | The design workflow accepts feedback rounds on an existing spec. | `architect_review → revise → run_design`. | Exists: each `conseqa design` run takes a new prompt, and the loop appends the feedback. |
 
-T1–T7 are small amendments to Parts I and IV and should be made before either is built. T8 is a performance requirement to keep in mind while building. T9–T12 are ergonomics and can follow.
+T1–T7 are small amendments to Parts I and IV and should be made before either is built. T8 is a performance requirement to keep in mind while building. T9–T12 are ergonomics and can follow. T1–T7 were accepted and built with Parts I and IV, in M6 and M7 of `Conseqa_Spec_Versioning_Implementation_Index.md`, whose §6 records how each was settled; T8–T12 were not taken up.
 
 ---
 
@@ -506,4 +506,4 @@ S1 and S2 can run this week, because neither needs Part I or Part IV to exist.
 3. A self-hosted LangGraph process, or a hosted LangGraph deployment?
 4. May the requester approve spec changes, or only the architect?
 5. Should the loop merge on green automatically, as the default configuration does for code, or always wait for a person?
-6. Should T1–T7 be folded into Parts I and IV now, before either is built?
+6. Should T1–T7 be folded into Parts I and IV now, before either is built? **Settled:** yes. Each was accepted and built with the part it amends.
