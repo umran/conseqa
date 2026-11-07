@@ -24,6 +24,7 @@
 pub mod analysis;
 pub mod auth;
 pub mod candidate;
+pub mod change;
 pub mod commit;
 pub mod engine;
 pub mod events;

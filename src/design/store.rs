@@ -195,6 +195,9 @@ pub enum StoreError {
 
     #[error("an empty id cannot be stored")]
     EmptyId,
+
+    #[error("git {command} failed: {message}")]
+    Git { command: String, message: String },
 }
 
 fn io_error(path: &Path) -> impl FnOnce(std::io::Error) -> StoreError + '_ {
@@ -251,7 +254,7 @@ pub struct ProjectRead {
 }
 
 /// The committed files, by path relative to `.conseqa/`.
-type FileSet = BTreeMap<String, String>;
+pub(crate) type FileSet = BTreeMap<String, String>;
 
 /// Where a project's state is kept: the project's own directory, or
 /// memory for tests and ephemeral runs.
@@ -436,7 +439,7 @@ impl ProjectStore {
         // seen as a change at the next look, never missed.
         let fingerprint = scan(&root)?;
 
-        let mut workspace = load_workspace(&root)?;
+        let mut workspace = load_workspace(&ProjectDirectory::at(&root))?;
         let files = render(&workspace)?;
 
         let state = LocalState {
@@ -472,7 +475,7 @@ impl ProjectStore {
             return Err(StoreError::NotAProject(project_dir.to_path_buf()));
         }
 
-        let mut workspace = load_workspace(&root)?;
+        let mut workspace = load_workspace(&ProjectDirectory::at(&root))?;
         let files = render(&workspace)?;
 
         workspace.revision = continued_revision(&root, &files);
@@ -541,7 +544,7 @@ impl ProjectStore {
             return Ok(None);
         }
 
-        let workspace = load_workspace(&directory.root)?;
+        let workspace = load_workspace(&ProjectDirectory::at(&directory.root))?;
         let files = render(&workspace)?;
 
         if files == disk.files {
@@ -907,7 +910,7 @@ fn remove_temporaries(dir: &Path) {
 // ---------------------------------------------------------------------
 
 /// The committed files a workspace is, in canonical form.
-fn render(workspace: &WorkspaceState) -> Result<FileSet, StoreError> {
+pub(crate) fn render(workspace: &WorkspaceState) -> Result<FileSet, StoreError> {
     let mut files = FileSet::new();
 
     let project = ProjectFile {
@@ -978,32 +981,38 @@ fn render_entities<T: Serialize>(
     Ok(())
 }
 
-/// The workspace the files hold, at revision 0.
-fn load_workspace(root: &Path) -> Result<WorkspaceState, StoreError> {
-    let project = read_project_file(root)?;
+/// The workspace a source holds, at revision 0. The source must hold a
+/// project: a `project.yaml`.
+fn load_workspace(source: &dyn FileSource) -> Result<WorkspaceState, StoreError> {
+    let project = read_project_file(source)?;
 
-    check_entries(root, SPEC, &SPEC_ENTRIES, true)?;
-    check_entries(root, RUNTIME, &RUNTIME_ENTRIES, true)?;
-    check_entries(root, INTENT, &INTENT_ENTRIES, false)?;
+    check_entries(source, SPEC, &SPEC_ENTRIES, SourceEntryKind::Directory)?;
+    check_entries(
+        source,
+        RUNTIME,
+        &RUNTIME_ENTRIES,
+        SourceEntryKind::Directory,
+    )?;
+    check_entries(source, INTENT, &INTENT_ENTRIES, SourceEntryKind::File)?;
 
     Ok(WorkspaceState {
         revision: Revision(0),
-        services: load_entities(root, SERVICES)?,
-        schemas: load_entities(root, SCHEMAS)?,
-        data_models: load_entities(root, DATA_MODELS)?,
-        topics: load_entities(root, TOPICS)?,
-        state_machines: load_entities(root, STATE_MACHINES)?,
-        operations: load_entities(root, OPERATIONS)?,
+        services: load_entities(source, SERVICES)?,
+        schemas: load_entities(source, SCHEMAS)?,
+        data_models: load_entities(source, DATA_MODELS)?,
+        topics: load_entities(source, TOPICS)?,
+        state_machines: load_entities(source, STATE_MACHINES)?,
+        operations: load_entities(source, OPERATIONS)?,
         runtime: RuntimeModel {
-            topics: load_entities(root, RUNTIME_TOPICS)?,
-            subscriptions: load_entities(root, RUNTIME_SUBSCRIPTIONS)?,
-            outboxes: load_entities(root, RUNTIME_OUTBOXES)?,
-            execution_pools: load_entities(root, RUNTIME_POOLS)?,
-            routers: load_entities(root, RUNTIME_ROUTERS)?,
-            storage_layouts: load_entities(root, RUNTIME_STORAGE)?,
+            topics: load_entities(source, RUNTIME_TOPICS)?,
+            subscriptions: load_entities(source, RUNTIME_SUBSCRIPTIONS)?,
+            outboxes: load_entities(source, RUNTIME_OUTBOXES)?,
+            execution_pools: load_entities(source, RUNTIME_POOLS)?,
+            routers: load_entities(source, RUNTIME_ROUTERS)?,
+            storage_layouts: load_entities(source, RUNTIME_STORAGE)?,
         },
-        prompt_obligations: load_optional(root, OBLIGATIONS)?.unwrap_or_default(),
-        requirement_proposals: load_optional(root, PROPOSALS)?.unwrap_or_default(),
+        prompt_obligations: load_optional(source, OBLIGATIONS)?.unwrap_or_default(),
+        requirement_proposals: load_optional(source, PROPOSALS)?.unwrap_or_default(),
         run_meta: RunMetadata {
             run: RunId(project.name),
             policy: project.policy,
@@ -1011,9 +1020,24 @@ fn load_workspace(root: &Path) -> Result<WorkspaceState, StoreError> {
     })
 }
 
-fn read_project_file(root: &Path) -> Result<ProjectFile, StoreError> {
-    let path = root.join(PROJECT_FILE);
-    let text = fs::read_to_string(&path).map_err(io_error(&path))?;
+/// The workspace a source holds, at revision 0, or `None` when it holds
+/// no project at all: no `project.yaml`. Every refusal of a project
+/// that is there is the one the project's own directory gets.
+pub fn load_source(source: &dyn FileSource) -> Result<Option<WorkspaceState>, StoreError> {
+    if source.read(PROJECT_FILE)?.is_none() {
+        return Ok(None);
+    }
+
+    load_workspace(source).map(Some)
+}
+
+fn read_project_file(source: &dyn FileSource) -> Result<ProjectFile, StoreError> {
+    let path = source.locate(PROJECT_FILE);
+
+    let text = source.read(PROJECT_FILE)?.ok_or_else(|| StoreError::Io {
+        path: path.clone(),
+        error: std::io::ErrorKind::NotFound.into(),
+    })?;
 
     let probe: ProjectProbe = from_yaml(&text, &path)?;
 
@@ -1037,39 +1061,31 @@ fn read_project_file(root: &Path) -> Result<ProjectFile, StoreError> {
     from_yaml(&text, &path)
 }
 
-/// Refuses anything in `dir` but `allowed`: directories when `dirs`,
-/// else files. Dotfiles are an editor's or the OS's, and pass.
-fn check_entries(root: &Path, dir: &str, allowed: &[&str], dirs: bool) -> Result<(), StoreError> {
-    let path = root.join(dir);
-
-    let entries = match fs::read_dir(&path) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(StoreError::Io { path, error }),
+/// Refuses anything in `dir` but `allowed` entries of `kind`. Dotfiles
+/// are an editor's or the OS's, and pass.
+fn check_entries(
+    source: &dyn FileSource,
+    dir: &str,
+    allowed: &[&str],
+    kind: SourceEntryKind,
+) -> Result<(), StoreError> {
+    let Some(entries) = source.entries(dir)? else {
+        return Ok(());
     };
 
     for entry in entries {
-        let entry = entry.map_err(io_error(&path))?;
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-
-        if name.starts_with('.') {
+        if entry.name.starts_with('.') {
             continue;
         }
 
-        let is_dir = entry.path().is_dir();
-
-        if is_dir != dirs || !allowed.contains(&name.as_ref()) {
+        if entry.kind != kind || !allowed.contains(&entry.name.as_str()) {
             return Err(StoreError::Unexpected {
-                path: entry.path(),
+                path: source.locate(&format!("{dir}/{}", entry.name)),
                 expected: allowed
                     .iter()
-                    .map(|name| {
-                        if dirs {
-                            format!("{name}/")
-                        } else {
-                            name.to_string()
-                        }
+                    .map(|name| match kind {
+                        SourceEntryKind::Directory => format!("{name}/"),
+                        SourceEntryKind::File | SourceEntryKind::Other => name.to_string(),
                     })
                     .collect::<Vec<_>>()
                     .join(", "),
@@ -1081,58 +1097,442 @@ fn check_entries(root: &Path, dir: &str, allowed: &[&str], dirs: bool) -> Result
 }
 
 fn load_entities<T: DeserializeOwned>(
-    root: &Path,
+    source: &dyn FileSource,
     dir: &str,
 ) -> Result<BTreeMap<Id, T>, StoreError> {
-    let path = root.join(dir);
     let mut entities = BTreeMap::new();
 
-    let entries = match fs::read_dir(&path) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(entities),
-        Err(error) => return Err(StoreError::Io { path, error }),
+    let Some(entries) = source.entries(dir)? else {
+        return Ok(entities);
     };
 
     for entry in entries {
-        let entry = entry.map_err(io_error(&path))?;
-        let file = entry.path();
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-
-        if name.starts_with('.') {
+        if entry.name.starts_with('.') {
             continue;
         }
 
+        let file = format!("{dir}/{}", entry.name);
+
         let unexpected = || StoreError::Unexpected {
-            path: file.clone(),
+            path: source.locate(&file),
             expected: "one `<id>.yaml` file per entity".to_string(),
         };
 
-        if file.is_dir() {
+        if entry.kind != SourceEntryKind::File {
             return Err(unexpected());
         }
 
-        let id = name
+        let id = entry
+            .name
             .strip_suffix(".yaml")
             .and_then(decode_file_stem)
             .ok_or_else(unexpected)?;
 
-        let text = fs::read_to_string(&file).map_err(io_error(&file))?;
+        let text = source.read(&file)?.ok_or_else(unexpected)?;
 
-        entities.insert(Id(id), from_yaml(&text, &file)?);
+        entities.insert(Id(id), from_yaml(&text, &source.locate(&file))?);
     }
 
     Ok(entities)
 }
 
-fn load_optional<T: DeserializeOwned>(root: &Path, file: &str) -> Result<Option<T>, StoreError> {
-    let path = root.join(file);
-
-    match fs::read_to_string(&path) {
-        Ok(text) => from_yaml(&text, &path).map(Some),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(StoreError::Io { path, error }),
+fn load_optional<T: DeserializeOwned>(
+    source: &dyn FileSource,
+    file: &str,
+) -> Result<Option<T>, StoreError> {
+    match source.read(file)? {
+        Some(text) => from_yaml(&text, &source.locate(file)).map(Some),
+        None => Ok(None),
     }
+}
+
+// ---------------------------------------------------------------------
+// File sources
+// ---------------------------------------------------------------------
+
+/// What a source lists a directory entry as.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceEntryKind {
+    File,
+    Directory,
+
+    /// Neither: a symbolic link or a submodule a git tree records,
+    /// which no loader reads.
+    Other,
+}
+
+/// One entry of a directory a source lists.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceEntry {
+    pub name: String,
+    pub kind: SourceEntryKind,
+}
+
+/// Where a project's committed files are read from: its own `.conseqa/`
+/// directory, or a tree read from somewhere else, such as a git commit
+/// (§6.2 and §18.1 of the spec change analysis revision). The loader
+/// reads every source through this, so a refusal applies to every source
+/// alike. Paths are relative to `.conseqa/`, with `/` separators.
+pub trait FileSource {
+    /// The text of the file at `path`, or `None` when there is none.
+    fn read(&self, path: &str) -> Result<Option<String>, StoreError>;
+
+    /// The entries of the directory at `path`, or `None` when there is
+    /// none.
+    fn entries(&self, path: &str) -> Result<Option<Vec<SourceEntry>>, StoreError>;
+
+    /// How a refusal names `path`.
+    fn locate(&self, path: &str) -> PathBuf;
+}
+
+/// A project's own `.conseqa/` directory, read as it is on disk.
+pub struct ProjectDirectory {
+    root: PathBuf,
+}
+
+impl ProjectDirectory {
+    /// The `.conseqa/` directory of the project at `project_dir`.
+    pub fn of_project(project_dir: &Path) -> Self {
+        Self {
+            root: project_dir.join(PROJECT_DIR),
+        }
+    }
+
+    fn at(root: &Path) -> Self {
+        Self {
+            root: root.to_path_buf(),
+        }
+    }
+}
+
+impl FileSource for ProjectDirectory {
+    fn read(&self, path: &str) -> Result<Option<String>, StoreError> {
+        let file = self.root.join(path);
+
+        match fs::read_to_string(&file) {
+            Ok(text) => Ok(Some(text)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(StoreError::Io { path: file, error }),
+        }
+    }
+
+    fn entries(&self, path: &str) -> Result<Option<Vec<SourceEntry>>, StoreError> {
+        let dir = self.root.join(path);
+
+        let read = match fs::read_dir(&dir) {
+            Ok(read) => read,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(StoreError::Io { path: dir, error }),
+        };
+
+        let mut entries = Vec::new();
+
+        for entry in read {
+            let entry = entry.map_err(io_error(&dir))?;
+
+            entries.push(SourceEntry {
+                name: entry.file_name().to_string_lossy().into_owned(),
+                kind: if entry.path().is_dir() {
+                    SourceEntryKind::Directory
+                } else {
+                    SourceEntryKind::File
+                },
+            });
+        }
+
+        entries.sort_by(|a, b| a.name.cmp(&b.name));
+
+        Ok(Some(entries))
+    }
+
+    fn locate(&self, path: &str) -> PathBuf {
+        self.root.join(path)
+    }
+}
+
+/// A project's committed files held in memory: what a git commit's tree
+/// is read into, and what a test builds.
+#[derive(Debug, Clone, Default)]
+pub struct FileTree {
+    /// The prefix a refusal names a path with, such as `HEAD:.conseqa/`.
+    label: String,
+
+    entries: BTreeMap<String, TreeEntry>,
+}
+
+#[derive(Debug, Clone)]
+enum TreeEntry {
+    File(Vec<u8>),
+    Other,
+}
+
+impl FileTree {
+    pub fn new(label: impl Into<String>) -> Self {
+        Self {
+            label: label.into(),
+            entries: BTreeMap::new(),
+        }
+    }
+
+    /// A tree holding exactly these files.
+    pub fn of_files(
+        label: impl Into<String>,
+        files: impl IntoIterator<Item = (String, String)>,
+    ) -> Self {
+        let mut tree = Self::new(label);
+
+        for (path, text) in files {
+            tree.insert(path, text.into_bytes());
+        }
+
+        tree
+    }
+
+    pub fn insert(&mut self, path: impl Into<String>, contents: Vec<u8>) {
+        self.entries.insert(path.into(), TreeEntry::File(contents));
+    }
+
+    /// Records an entry that is not a file, such as a symbolic link.
+    pub fn insert_other(&mut self, path: impl Into<String>) {
+        self.entries.insert(path.into(), TreeEntry::Other);
+    }
+}
+
+impl FileSource for FileTree {
+    fn read(&self, path: &str) -> Result<Option<String>, StoreError> {
+        match self.entries.get(path) {
+            None => Ok(None),
+
+            Some(TreeEntry::Other) => Err(StoreError::Unexpected {
+                path: self.locate(path),
+                expected: "a regular file".to_string(),
+            }),
+
+            Some(TreeEntry::File(contents)) => String::from_utf8(contents.clone())
+                .map(Some)
+                .map_err(|_| StoreError::Io {
+                    path: self.locate(path),
+                    error: std::io::ErrorKind::InvalidData.into(),
+                }),
+        }
+    }
+
+    fn entries(&self, path: &str) -> Result<Option<Vec<SourceEntry>>, StoreError> {
+        let prefix = format!("{path}/");
+        let mut entries: BTreeMap<String, SourceEntryKind> = BTreeMap::new();
+
+        for (file, entry) in &self.entries {
+            let Some(rest) = file.strip_prefix(&prefix) else {
+                continue;
+            };
+
+            let (name, kind) = match rest.split_once('/') {
+                Some((name, _)) => (name, SourceEntryKind::Directory),
+
+                None => (
+                    rest,
+                    match entry {
+                        TreeEntry::File(_) => SourceEntryKind::File,
+                        TreeEntry::Other => SourceEntryKind::Other,
+                    },
+                ),
+            };
+
+            entries.insert(name.to_string(), kind);
+        }
+
+        if entries.is_empty() {
+            return Ok(None);
+        }
+
+        Ok(Some(
+            entries
+                .into_iter()
+                .map(|(name, kind)| SourceEntry { name, kind })
+                .collect(),
+        ))
+    }
+
+    fn locate(&self, path: &str) -> PathBuf {
+        PathBuf::from(format!("{}{path}", self.label))
+    }
+}
+
+/// The committed `.conseqa/` of the project at `project`, a path
+/// relative to the repository's root, in `commit`; `None` when the
+/// commit holds no project there (§6.4 of the spec change analysis
+/// revision). Read with git's read-only plumbing: nothing is checked
+/// out, no index is touched, no file is written, and no lock is taken.
+/// `local/` is never read.
+pub fn read_commit(
+    repository: &Path,
+    commit: &str,
+    project: &Path,
+) -> Result<Option<FileTree>, StoreError> {
+    let mut prefix = String::new();
+
+    for component in project.components() {
+        prefix.push_str(&component.as_os_str().to_string_lossy());
+        prefix.push('/');
+    }
+
+    prefix.push_str(PROJECT_DIR);
+    prefix.push('/');
+
+    let listing = git(
+        repository,
+        &["ls-tree", "-r", "-z", "--full-tree", commit, "--", &prefix],
+        None,
+    )?;
+
+    let local = format!("{prefix}{LOCAL}/");
+    let mut blobs: Vec<(String, String)> = Vec::new();
+    let mut tree = FileTree::new(format!("{commit}:{prefix}"));
+
+    for record in listing
+        .split(|byte| *byte == 0)
+        .filter(|record| !record.is_empty())
+    {
+        let record = String::from_utf8_lossy(record);
+
+        let Some((header, path)) = record.split_once('\t') else {
+            continue;
+        };
+
+        if path.starts_with(&local) {
+            continue;
+        }
+
+        let Some(relative) = path.strip_prefix(&prefix) else {
+            continue;
+        };
+
+        let mut fields = header.split(' ');
+
+        let (Some(mode), Some(kind), Some(object)) = (fields.next(), fields.next(), fields.next())
+        else {
+            continue;
+        };
+
+        if kind == "blob" && mode != "120000" {
+            blobs.push((relative.to_string(), object.to_string()));
+        } else {
+            tree.insert_other(relative);
+        }
+    }
+
+    if !blobs.iter().any(|(path, _)| path == PROJECT_FILE) {
+        return Ok(None);
+    }
+
+    let request: String = blobs
+        .iter()
+        .map(|(_, object)| format!("{object}\n"))
+        .collect();
+
+    let contents = git(
+        repository,
+        &["cat-file", "--batch"],
+        Some(request.as_bytes()),
+    )?;
+    let mut rest = contents.as_slice();
+
+    for (path, object) in blobs {
+        let Some(end) = rest.iter().position(|byte| *byte == b'\n') else {
+            return Err(StoreError::Git {
+                command: "cat-file --batch".to_string(),
+                message: format!("no output for {object}"),
+            });
+        };
+
+        let header = String::from_utf8_lossy(&rest[..end]).into_owned();
+        let size: usize = header
+            .rsplit(' ')
+            .next()
+            .and_then(|size| size.parse().ok())
+            .ok_or_else(|| StoreError::Git {
+                command: "cat-file --batch".to_string(),
+                message: format!("unexpected header `{header}` for {object}"),
+            })?;
+
+        let body = rest
+            .get(end + 1..end + 1 + size)
+            .ok_or_else(|| StoreError::Git {
+                command: "cat-file --batch".to_string(),
+                message: format!("short output for {object}"),
+            })?;
+
+        tree.insert(path, body.to_vec());
+
+        // The contents, then one newline.
+        rest = rest.get(end + 2 + size..).unwrap_or_default();
+    }
+
+    Ok(Some(tree))
+}
+
+/// Runs one read-only git command in `repository`, returning its
+/// standard output. Optional locks are off, so no command refreshes the
+/// index behind the caller's back.
+pub(crate) fn git(
+    repository: &Path,
+    args: &[&str],
+    input: Option<&[u8]>,
+) -> Result<Vec<u8>, StoreError> {
+    use std::process::{Command, Stdio};
+
+    let command = args.join(" ");
+
+    let failed = |message: String| StoreError::Git {
+        command: command.clone(),
+        message,
+    };
+
+    let mut child = Command::new("git")
+        .arg("-C")
+        .arg(repository)
+        .args(args)
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .stdin(if input.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| failed(error.to_string()))?;
+
+    // Written from another thread, so a large answer cannot fill the
+    // output pipe while the request is still being written.
+    let writer = match (input, child.stdin.take()) {
+        (Some(input), Some(mut stdin)) => {
+            let input = input.to_vec();
+
+            Some(std::thread::spawn(move || stdin.write_all(&input)))
+        }
+
+        _ => None,
+    };
+
+    let output = child
+        .wait_with_output()
+        .map_err(|error| failed(error.to_string()))?;
+
+    if let Some(writer) = writer {
+        writer
+            .join()
+            .map_err(|_| failed("the request writer panicked".to_string()))?
+            .map_err(|error| failed(error.to_string()))?;
+    }
+
+    if !output.status.success() {
+        return Err(failed(
+            String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        ));
+    }
+
+    Ok(output.stdout)
 }
 
 /// YAML with every enum as a one-key map rather than a YAML tag: the
