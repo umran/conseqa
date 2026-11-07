@@ -1,6 +1,6 @@
 # Conseqa Hierarchical Semantics Refactor
 
-**Status:** Proposed  
+**Status:** Implemented, and revised since. Historical architecture record: its L0/L1 design is consolidated into `docs/live/CONSEQA_DSL_SEMANTICS.md` and the current implementation.  
 **Baseline:** Conseqa `main` at `2fb9bca`  
 **Scope:** DSL semantics, serialized surface, validation, verification, proof provenance, runtime topology, and external-analysis interfaces
 

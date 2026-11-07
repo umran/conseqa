@@ -1,6 +1,6 @@
 # Conseqa Agent Design Harness — Implementation Specification
 
-**Status:** Proposed implementation specification  
+**Status:** Historical implementation plan, tied to the baseline below. Consult the current harness and design code for current behavior.  
 **Repository:** `https://github.com/umran/conseqa`  
 **Baseline:** `master` @ `ec3de07ed18dd6b2f977cba714c3188675f7139f`  
 **Baseline date:** 2026-09-05  
