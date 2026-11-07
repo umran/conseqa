@@ -30,6 +30,7 @@
 //! something the spec no longer declares, which is a condition of the
 //! state (`orphaned`), not of the scan.
 
+use std::collections::BTreeSet;
 use std::fmt;
 use std::fs;
 use std::path::Path;
@@ -289,6 +290,22 @@ pub fn scan_with(
     }
 
     Ok(scan)
+}
+
+/// The keys a file's markers name, as written, whether or not they pair
+/// or parse. A file with a scan error contributes no regions, so these
+/// say which declarations it would have bound: attest refuses to record
+/// one of them while the error remains (§14.2).
+pub fn named(text: &str) -> BTreeSet<String> {
+    if !text.contains("conseqa:") {
+        return BTreeSet::new();
+    }
+
+    lines(text)
+        .into_iter()
+        .filter_map(marker)
+        .filter_map(|marker| marker.key)
+        .collect()
 }
 
 /// Scans one file's text: its regions, each with its digest, and its

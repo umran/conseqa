@@ -2621,15 +2621,7 @@ fn guide_lookup(topic: &str) -> String {
         return guide_toc();
     }
 
-    let matched: Vec<(&str, &str)> = guide_sections()
-        .into_iter()
-        .filter(|(header, body)| {
-            header.to_lowercase().contains(&query)
-                || body
-                    .lines()
-                    .any(|line| line.starts_with("### ") && line.to_lowercase().contains(&query))
-        })
-        .collect();
+    let matched = guide_matches(&query);
 
     if matched.is_empty() {
         return format!("No section matches `{topic}`.\n\n{}", guide_toc());
@@ -2651,6 +2643,24 @@ fn guide_lookup(topic: &str) -> String {
         .map(|(_, body)| body)
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// The sections, header and body, that a topic names: each one whose
+/// header, or a subsection header within it, contains the topic,
+/// case-insensitively. A work item names each semantics topic so that
+/// it matches exactly one (Part IV §12.1).
+pub(crate) fn guide_matches(topic: &str) -> Vec<(&'static str, &'static str)> {
+    let query = topic.trim().to_lowercase();
+
+    guide_sections()
+        .into_iter()
+        .filter(|(header, body)| {
+            header.to_lowercase().contains(&query)
+                || body
+                    .lines()
+                    .any(|line| line.starts_with("### ") && line.to_lowercase().contains(&query))
+        })
+        .collect()
 }
 
 #[cfg(test)]

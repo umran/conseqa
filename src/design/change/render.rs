@@ -195,7 +195,9 @@ fn declaration_change(out: &mut String, change: &DeclarationChange) {
     }
 }
 
-fn delta_entry(entry: &DeltaEntry) -> String {
+/// One delta entry's change, briefly: what a diff and a work item print
+/// beside its path.
+pub(crate) fn delta_entry(entry: &DeltaEntry) -> String {
     match (&entry.base, &entry.head) {
         (Some(base), Some(head)) => format!("{} -> {}", value(base), value(head)),
         (None, Some(head)) => format!("+ {}", value(head)),

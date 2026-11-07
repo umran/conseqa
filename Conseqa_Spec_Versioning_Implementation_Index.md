@@ -232,12 +232,12 @@ T1–T7 come from the orchestrator design's §12. Each is a small amendment to P
 | Decision | Needed by |
 |---|---|
 | T1: documented, versioned JSON output for every `conform` and `realize` command | M7, and M8 for `realize` |
-| T2: `--spec-range` scoping for `conform plan` and `conform check` | M6 |
-| T3: plan items carry `depends_on` and `files` | M6 |
+| T2: `--spec-range` scoping for `conform plan` and `conform check` | M6: accepted, with added and removed obligations scoping too (#48) |
+| T3: plan items carry `depends_on` and `files` | M6: accepted (#48) |
 | T4: implementer and reviewer roles on the design MCP server | M7 |
-| T5: `by` stamped from the credential, not supplied by the agent | M6 |
-| T6: replaying an identical attest or review is a no-op success | M6 |
-| T7: packets carry open disputes and the last refusal reason | M6 |
+| T5: `by` stamped from the credential, not supplied by the agent | M6: accepted; the MCP tool stamps it in M7 (#48) |
+| T6: replaying an identical attest or review is a no-op success | M6: accepted for attest; reviews follow in M7 (#48) |
+| T7: packets carry open disputes and the last refusal reason | M6: accepted, the refusal kept per machine (#48) |
 | The `kafka.consumer-group` entry's reading of `consistent_hash` (VI §21). Recommendation: confirm it against §10.6 of the semantics contract, or ship the entry without the `assignment` claim. | M8 |
 | Anything a spec leaves undecided. Ask; never pick silently (house rule 11). | when found |
 
@@ -254,7 +254,7 @@ Update this table in every milestone PR.
 | M3 Obligation diff, `conseqa diff` | in review | `spec-versioning-m3` | #45 (stacked on #44) |
 | M4 Markers, regions, records | in review | `spec-versioning-m4` | #46 (stacked on #45) |
 | M5 Required facts, state | in review | `spec-versioning-m5` | #47 (stacked on #46) |
-| M6 Work list, items, attest | not started | | |
+| M6 Work list, items, attest | in review | `spec-versioning-m6` | #48 (stacked on #47) |
 | M7 Reviews, surfaces | not started | | |
 | M8 Capabilities, catalogue, choice | not started | | |
 | M9 Realization integration | not started | | |

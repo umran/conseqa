@@ -35,14 +35,14 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fmt::Write as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
 use crate::analyzer::basis::{
     Channel, ConformanceClass, DeclarationKey, Fact, Implementers, ObligationKey, TextualKey,
 };
-use crate::analyzer::report::{Obligation, Status};
+use crate::analyzer::report::{Obligation, ProverReport, Status};
 use crate::design::change::diff::verified;
 use crate::design::change::partition::Partition;
 use crate::design::graph::SymbolGraph;
@@ -52,11 +52,11 @@ use crate::design::workspace::WorkspaceState;
 use crate::spec::{Id, TransactionStep};
 
 use super::completeness::{self, LISTED_MATCHES, Match, Matcher, RequiredScope};
-use super::markers::{self, Region, ScanError};
+use super::markers::{self, Region, Scan, ScanError};
 use super::policy::{Policy, ReviewRule};
 use super::record::{
-    ClaimScope, Party, PartyKind, Record, RecordContent, RecordFile, RecordedRegion, Records,
-    Review, ReviewTarget, Verdict,
+    ClaimScope, CompletenessClaim, Party, PartyKind, Record, RecordContent, RecordFile,
+    RecordedRegion, Records, Review, ReviewTarget, Verdict,
 };
 use super::{ConformanceError, Digest, bindable};
 
@@ -347,134 +347,240 @@ pub struct Blocker {
 /// spec does not assemble and validate, since without proofs nothing is
 /// required, and when the records or the policy do not load.
 pub fn derive(project_dir: &Path, workspace: &WorkspaceState) -> Result<State, ConformanceError> {
-    let report = verified(workspace).map_err(|reason| ConformanceError::Unverifiable { reason })?;
+    Ok(Derivation::of(project_dir, workspace)?.state)
+}
 
-    let proven: BTreeMap<&ObligationKey, &Obligation> = report
-        .obligations
-        .iter()
-        .filter(|obligation| obligation.status == Status::Proven)
-        .map(|obligation| (&obligation.key, obligation))
-        .collect();
+/// One derivation: the state, beside the inputs it was derived from, as
+/// they were read at one moment (§13.1). The work list, work items, and
+/// attest build on these, so no input is read twice.
+pub struct Derivation<'a> {
+    pub state: State,
 
-    let partition = Partition::of(workspace);
-    let graph = graph_build::build(workspace, None);
-    let records = Records::of_project(project_dir).read_all()?;
-    let policy = Policy::read(project_dir)?;
+    pub project_dir: PathBuf,
+    pub workspace: &'a WorkspaceState,
 
-    let reliance = reliance(proven.values().copied());
-    let required = required_facts(&reliance, workspace, &graph);
-    let scopes = completeness::required(reliance.values().map(|relied| &relied.fact), workspace);
+    /// The spec's obligation report, every obligation included.
+    pub report: ProverReport,
 
-    // The claims of every required scope, matched as the scan reads the
-    // files.
-    let mut checked: Vec<(&RequiredScope, usize)> = Vec::new();
+    pub partition: Partition,
+    pub graph: SymbolGraph,
+    pub records: BTreeMap<TextualKey, RecordFile>,
+    pub policy: Policy,
+    pub scan: Scan,
 
-    for scope in &scopes {
-        let Some(record) = readable(records.get(&scope.carrier)) else {
-            continue;
-        };
+    /// The keys each file's markers name, as written, for every file
+    /// with a marker: which declarations a file with a scan error would
+    /// have bound (§14.2).
+    pub named: BTreeMap<String, BTreeSet<String>>,
 
-        for (index, claim) in record.completeness.iter().enumerate() {
-            if claim.scope == scope.scope {
-                checked.push((scope, index));
-            }
-        }
+    /// The anchors of each fact of the reliance, by canonical form.
+    pub anchors: BTreeMap<String, BTreeSet<DeclarationKey>>,
+}
+
+impl<'a> Derivation<'a> {
+    /// Derives the conformance state as [`derive`] does, keeping its
+    /// inputs.
+    pub fn of(project_dir: &Path, workspace: &'a WorkspaceState) -> Result<Self, ConformanceError> {
+        Self::matching(project_dir, workspace, &[]).map(|(derivation, _)| derivation)
     }
 
-    let claim = |(scope, index): &(&RequiredScope, usize)| {
-        &readable(records.get(&scope.carrier))
-            .expect("a checked claim's record is readable")
-            .completeness[*index]
-    };
+    /// Derives as [`Derivation::of`] does, matching `claims` too, as the
+    /// scan reads each file: the claims an attest carries, which must
+    /// hold now (§14.2). Their matches follow in their order. Every
+    /// pattern must compile.
+    pub(crate) fn matching(
+        project_dir: &Path,
+        workspace: &'a WorkspaceState,
+        claims: &[CompletenessClaim],
+    ) -> Result<(Self, Vec<Vec<Match>>), ConformanceError> {
+        let report =
+            verified(workspace).map_err(|reason| ConformanceError::Unverifiable { reason })?;
 
-    let mut matcher = Matcher::new(checked.iter().map(claim))
-        .expect("a record's reader refuses a pattern that does not compile");
-
-    let scan = markers::scan_with(project_dir, |path, text| matcher.visit(path, text))?;
-
-    let mut unheld: BTreeMap<(&TextualKey, ClaimScope), Vec<UnheldClaim>> = BTreeMap::new();
-
-    for (checked, matches) in checked.iter().zip(matcher.into_matches()) {
-        let (scope, index) = checked;
-
-        let declared = completeness::declared(scope.scope, scope.carrier.key(), workspace, &graph);
-
-        let accepted: Vec<&Region> = scan
-            .regions
+        let proven: BTreeMap<&ObligationKey, &Obligation> = report
+            .obligations
             .iter()
-            .filter(|region| declared.contains(region.key.key()))
+            .filter(|obligation| obligation.status == Status::Proven)
+            .map(|obligation| (&obligation.key, obligation))
             .collect();
 
-        let outside = completeness::outside(claim(checked), &matches, &accepted);
+        let partition = Partition::of(workspace);
+        let graph = graph_build::build(workspace, None);
+        let records = Records::of_project(project_dir).read_all()?;
+        let policy = Policy::read(project_dir)?;
 
-        if !outside.is_empty() {
-            unheld
-                .entry((&scope.carrier, scope.scope))
-                .or_default()
-                .push(UnheldClaim {
-                    index: *index,
-                    more: outside.len().saturating_sub(LISTED_MATCHES),
-                    matches: outside.into_iter().take(LISTED_MATCHES).collect(),
-                });
-        }
-    }
+        let reliance = reliance(proven.values().copied());
+        let required = required_facts(&reliance, workspace, &graph);
+        let scopes =
+            completeness::required(reliance.values().map(|relied| &relied.fact), workspace);
 
-    let failures: BTreeMap<(&TextualKey, ClaimScope), ScopeFailure> = scopes
-        .iter()
-        .filter_map(|scope| {
-            let at = (&scope.carrier, scope.scope);
+        // The claims of every required scope, matched as the scan reads
+        // the files.
+        let mut checked: Vec<(&RequiredScope, usize)> = Vec::new();
 
-            let carried = readable(records.get(&scope.carrier)).is_some_and(|record| {
-                record
-                    .completeness
-                    .iter()
-                    .any(|claim| claim.scope == scope.scope)
-            });
-
-            let failure = if !carried {
-                ScopeFailure::Absent
-            } else {
-                ScopeFailure::Unheld {
-                    claims: unheld.remove(&at)?,
-                }
+        for scope in &scopes {
+            let Some(record) = readable(records.get(&scope.carrier)) else {
+                continue;
             };
 
-            Some((at, failure))
-        })
-        .collect();
+            for (index, claim) in record.completeness.iter().enumerate() {
+                if claim.scope == scope.scope {
+                    checked.push((scope, index));
+                }
+            }
+        }
 
-    let inputs = Inputs {
-        project_dir,
-        partition: &partition,
-        records: &records,
-        policy: &policy,
-        regions: &scan.regions,
-        required: &required,
-        scopes: &scopes,
-        failures: &failures,
-    };
+        let claim = |(scope, index): &(&RequiredScope, usize)| {
+            &readable(records.get(&scope.carrier))
+                .expect("a checked claim's record is readable")
+                .completeness[*index]
+        };
 
-    let declarations: Vec<DeclarationState> = partition
-        .members
-        .keys()
-        .filter(|declaration| bindable(declaration))
-        .filter_map(|declaration| TextualKey::new(declaration.clone()))
-        .map(|declaration| inputs.declaration(declaration))
-        .collect();
+        let mut matcher = Matcher::new(checked.iter().map(claim).chain(claims)).expect(
+            "a record's reader refuses a pattern that does not compile, and so does attest",
+        );
 
-    let standings: BTreeMap<&TextualKey, Standing> = declarations
-        .iter()
-        .map(|state| (&state.declaration, Standing::of(state, &records)))
-        .collect();
+        let mut named = BTreeMap::new();
 
-    let obligations = conformance(&proven, workspace, &graph, &standings, &failures);
+        let scan = markers::scan_with(project_dir, |path, text| {
+            matcher.visit(path, text);
 
-    Ok(State {
-        orphaned: orphans(project_dir, &partition, &scan.regions, &records),
-        declarations,
-        obligations,
-        scan_errors: scan.errors,
-    })
+            let keys = markers::named(text);
+
+            if !keys.is_empty() {
+                named.insert(path.to_string(), keys);
+            }
+        })?;
+
+        let mut matches = matcher.into_matches();
+        let extra = matches.split_off(checked.len());
+
+        let mut unheld: BTreeMap<(&TextualKey, ClaimScope), Vec<UnheldClaim>> = BTreeMap::new();
+
+        for (checked, matches) in checked.iter().zip(matches) {
+            let (scope, index) = checked;
+
+            let declared =
+                completeness::declared(scope.scope, scope.carrier.key(), workspace, &graph);
+
+            let accepted: Vec<&Region> = scan
+                .regions
+                .iter()
+                .filter(|region| declared.contains(region.key.key()))
+                .collect();
+
+            let outside = completeness::outside(claim(checked), &matches, &accepted);
+
+            if !outside.is_empty() {
+                unheld
+                    .entry((&scope.carrier, scope.scope))
+                    .or_default()
+                    .push(UnheldClaim {
+                        index: *index,
+                        more: outside.len().saturating_sub(LISTED_MATCHES),
+                        matches: outside.into_iter().take(LISTED_MATCHES).collect(),
+                    });
+            }
+        }
+
+        let failures: BTreeMap<(&TextualKey, ClaimScope), ScopeFailure> = scopes
+            .iter()
+            .filter_map(|scope| {
+                let at = (&scope.carrier, scope.scope);
+
+                let carried = readable(records.get(&scope.carrier)).is_some_and(|record| {
+                    record
+                        .completeness
+                        .iter()
+                        .any(|claim| claim.scope == scope.scope)
+                });
+
+                let failure = if !carried {
+                    ScopeFailure::Absent
+                } else {
+                    ScopeFailure::Unheld {
+                        claims: unheld.remove(&at)?,
+                    }
+                };
+
+                Some((at, failure))
+            })
+            .collect();
+
+        let inputs = Inputs {
+            project_dir,
+            partition: &partition,
+            records: &records,
+            policy: &policy,
+            regions: &scan.regions,
+            required: &required,
+            scopes: &scopes,
+            failures: &failures,
+        };
+
+        let declarations: Vec<DeclarationState> = partition
+            .members
+            .keys()
+            .filter(|declaration| bindable(declaration))
+            .filter_map(|declaration| TextualKey::new(declaration.clone()))
+            .map(|declaration| inputs.declaration(declaration))
+            .collect();
+
+        let standings: BTreeMap<&TextualKey, Standing> = declarations
+            .iter()
+            .map(|state| (&state.declaration, Standing::of(state, &records)))
+            .collect();
+
+        let obligations = conformance(&proven, workspace, &graph, &standings, &failures);
+
+        let state = State {
+            orphaned: orphans(project_dir, &partition, &scan.regions, &records),
+            declarations,
+            obligations,
+            scan_errors: scan.errors.clone(),
+        };
+
+        let anchors = reliance
+            .into_iter()
+            .map(|(canonical, relied)| (canonical, relied.anchors))
+            .collect();
+
+        let derivation = Self {
+            state,
+            project_dir: project_dir.to_path_buf(),
+            workspace,
+            report,
+            partition,
+            graph,
+            records,
+            policy,
+            scan,
+            named,
+            anchors,
+        };
+
+        Ok((derivation, extra))
+    }
+
+    /// The record a declaration's file holds, unless it was set aside.
+    pub fn record(&self, key: &TextualKey) -> Option<&Record> {
+        readable(self.records.get(key))
+    }
+
+    /// The regions bound to a declaration now.
+    pub fn regions_of<'b>(
+        &'b self,
+        declaration: &'b DeclarationKey,
+    ) -> impl Iterator<Item = &'b Region> + 'b {
+        self.scan.regions_of(declaration)
+    }
+
+    /// A proven or unproven obligation of the spec, by key.
+    pub fn obligation(&self, key: &ObligationKey) -> Option<&Obligation> {
+        self.report
+            .obligations
+            .iter()
+            .find(|obligation| &obligation.key == key)
+    }
 }
 
 /// A fact of the reliance, with the union of its anchors and the
@@ -645,7 +751,7 @@ fn readable(file: Option<&RecordFile>) -> Option<&Record> {
 }
 
 /// A path below the project directory, as a status names it.
-fn relative(project_dir: &Path, path: &Path) -> String {
+pub(crate) fn relative(project_dir: &Path, path: &Path) -> String {
     let path = path.strip_prefix(project_dir).unwrap_or(path);
 
     path.components()
@@ -920,7 +1026,8 @@ fn drift(
     (added, unmatched.into_iter().cloned().collect())
 }
 
-fn digests(regions: &[RecordedRegion]) -> Vec<Digest> {
+/// The regions' digests, sorted: a multiset, as a review compares them.
+pub(crate) fn digests(regions: &[RecordedRegion]) -> Vec<Digest> {
     sorted(
         &regions
             .iter()
@@ -929,7 +1036,7 @@ fn digests(regions: &[RecordedRegion]) -> Vec<Digest> {
     )
 }
 
-fn sorted(digests: &[Digest]) -> Vec<Digest> {
+pub(crate) fn sorted(digests: &[Digest]) -> Vec<Digest> {
     let mut digests = digests.to_vec();
 
     digests.sort();
@@ -943,7 +1050,12 @@ fn sorted(digests: &[Digest]) -> Vec<Digest> {
 /// overrides the review's verdict on the record as a whole. A checker
 /// review satisfies only the realization requirements its checker
 /// covers, and no catalogue checker exists yet.
-fn confirms(review: &Review, record: &Record, target: ReviewTarget, current: &[Digest]) -> bool {
+pub(crate) fn confirms(
+    review: &Review,
+    record: &Record,
+    target: ReviewTarget,
+    current: &[Digest],
+) -> bool {
     let items: Vec<Verdict> = review
         .items
         .iter()
