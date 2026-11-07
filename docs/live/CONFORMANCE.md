@@ -11,7 +11,7 @@ Every Conseqa proof is conditional on the code conforming to the declarations it
 
 This document describes the implementation. The design record is `Conseqa_Conformance_and_Implementation_Guidance_Revision_Specification.md` (Part IV), now historical. Where they differ, the code and its tests win (see the README's precedence rule). Nothing here changes a verdict: conformance reads proofs, it never makes them. "Proven" and "conformant" are distinct, reported states: an obligation can be proven of the model and not conformant in the code.
 
-**Not yet implemented.** The realization side of Part IV, which arrives with the realization profiles revision (Part VI): `realization` facts as required facts, the record's `realization` field, binding every realized declaration, a work item's Realization section, the `unrealizable` condition, and catalogue checker reviews.
+With a stack profile, conformance also holds the code to what the chosen realizations demand of it (Part VI): `realization` facts are required facts, every realized declaration is bound, a record names the realization its code was checked against, a declaration the stack cannot realize is `unrealizable`, a work item carries a Realization section, and catalogue checkers review what they cover. `REALIZATION.md` describes them; their place here is noted below.
 
 ## Surfaces
 
@@ -110,6 +110,7 @@ facts:                    # each in its canonical durable form, with evidence
   - fact: { kind: guarded_mutation, … }
     evidence: [{ path: src/payments/apply.rs, lines: [47, 51] }]
 completeness: []          # data_object, topic, and outbox records only
+# realization: { entry: kafka.keyed-topic@1, options: [] }   # a realized declaration's record only
 attested:
   by: { kind: agent, name: claude/claude-opus-5-5, job: job-17 }
   commit: 8883890…        # the commit the attester's tree was based on
@@ -149,7 +150,7 @@ What the code must provide is the current proofs' reliance: every fact of a prov
 | model-wide | `conflict_closure`, `cyclic_components`, `no_deleters` | completeness claims |
 | internal | `relies_on`, `keyed_requirement` | nothing: a relied-on obligation conforms when it does |
 
-An attestable fact's implementers: the transaction for `isolation`, `lock`, `guarded_mutation`, and `deduplicated_by`; every transaction with an `advance_cursor` or a `fence` step on the field for `cursor` and `fence`; the subscription runtime for `delivery`; every effect site and transition publishing the schema to the channel for `message_identity`; the outbox for `outbox_redrive`; the effect site or transition for `retry_may_repeat` and `propagation`; the effect site for `external_guarantee`.
+An attestable fact's implementers: the transaction for `isolation`, `lock`, `guarded_mutation`, and `deduplicated_by`; every transaction with an `advance_cursor` or a `fence` step on the field for `cursor` and `fence`; the subscription runtime for `delivery`; every effect site and transition publishing the schema to the channel for `message_identity`; the outbox for `outbox_redrive`; the effect site or transition for `retry_may_repeat` and `propagation`; the effect site for `external_guarantee`; the declaration it names for `realization`. With a stack profile, every realization requirement in force is a required fact of the declaration it lands on, relied on by no proof (`REALIZATION.md`).
 
 A claim reads: every match of its patterns in the scanned files lies in a region of a declared writer or publisher, or in an excepted file. `writers` claims go on data objects and accept the transactions the design graph declares writing the object; `publishers` claims go on topics and outboxes and accept the effect sites and transitions publishing to, or writing into, the channel. Patterns are Rust `regex`, run over each file's whole text; a non-empty match lies in a region when every line it touches is strictly between the region's markers. Required scopes: `no_deleters`, `writers` of its object; a conflict closure or its cyclic components, `writers` of every object their transactions read, write, or lock; a message identity, `publishers` of its channel. A required scope holds when the carrier's readable record carries at least one claim of it and every one holds; a claim no proof requires is not checked.
 
@@ -164,15 +165,16 @@ Each bindable declaration has conditions, in this order; one with none is curren
 | `unbound` | It has no region, and the policy requires its kind bound. |
 | `orphaned` | A region's key, or a record, names no declaration of the spec. Reported against the key. |
 | `unattested` | It is bound, and has no readable record. A record set aside is named, with its reason. |
-| `stale` | The record's residual is not the current residual. |
+| `stale` | The record's residual is not the current residual, or, with a stack profile, its `realization` is not the declaration's current chosen or automatic realization (or it names one the declaration no longer has). |
 | `drifted` | The record's region digests are not the current ones, as a multiset: moving a region changes nothing, editing, adding, or removing one does. |
 | `missing_facts` | A required attestable fact is not attested, or a required structural fact lacks `structural: true`. Without a readable record nothing is attested. |
 | `incomplete` | A required claim is absent, or has matches outside (the first twenty are listed). |
 | `surplus` | The record attests a fact no proof relies on any longer. |
 | `unreviewed` | The policy requires a review of something the record carries, and no review by another party confirms it at the current digests. |
-| `disputed` | A review at the current digests disputes the record, or one of its items. Anyone's counts. |
+| `disputed` | A review at the current digests disputes the record, or one of its items. Anyone's counts, a catalogue checker's included. |
+| `unrealizable` | With a stack profile, the declaration is ambiguous, has an invalid choice, or is infeasible. |
 
-What needs a review: each attested fact a proof relies on, each claim a proof requires, and the structural claim when a relied-on structural fact rests on it. An item's verdict overrides the review's verdict on the record as a whole, for its target.
+What needs a review: each attested fact a proof relies on, each attested `realization` fact, each claim a proof requires, and the structural claim when a relied-on structural fact rests on it. An item's verdict overrides the review's verdict on the record as a whole, for its target. A catalogue checker's confirmation, derived on every derivation and listed as the declaration's `checker_reviews`, satisfies the review of exactly the realization requirement its checker covers; its dispute raises `disputed`.
 
 A proven obligation is **conformant** when every fact of its basis holds of the code: every implementer's record lists each attestable fact and has not drifted; every bindable anchor's record claims structural conformance and is neither stale nor drifted; every model-wide fact's required claims hold; every relied-on obligation is conformant, read coinductively, so a cycle conforms unless something in it fails. A non-conformant obligation names its blockers (declaration, condition, facts) and, under `through`, the relied-on obligations that fail. Reviews and disputes are not part of conformance; they are gated apart.
 
@@ -182,7 +184,7 @@ A proven obligation is **conformant** when every fact of its basis holds of the 
 
 One item per declaration with conditions, carrying all of them, and one per orphaned key. An item's id is its key. An item states its priority, its conditions, the proven obligations it blocks, `depends_on`, and `files`:
 
-- **priority**: `correctness` when it blocks a proven obligation; otherwise its most urgent condition decides: `unbound`, `unattested`, `stale`, `drifted` are `structure`, `unreviewed` and `disputed` are `review`, `surplus` and orphaned keys are `cleanup`;
+- **priority**: `parked` when it is `unrealizable`, whose remedy is a decision about the spec or the stack, after every other; otherwise `correctness` when it blocks a proven obligation; otherwise its most urgent condition decides: `unbound`, `unattested`, `stale`, `drifted` are `structure`, `unreviewed` and `disputed` are `review`, `surplus` and orphaned keys are `cleanup`;
 - **order** within a priority: data first (`schema`, `data_model`, `data_object`, `outbox`, `topic`, `state_machine`), then `transaction`, `effect_site`, `transition`, then `program`, `input`, `operation`, then the L1 kinds, then the rest; among transactions, effect sites, and transitions, callees before callers (an operation calls what its effect sites request and the transitions its transactions apply; call cycles come in key order); then by key;
 - **`depends_on`**: the items of the declarations its node points to in the design graph, a called operation standing for its transactions and effect sites, only those earlier in that order, so the relation has no cycle;
 - **`files`**: the paths of its regions, its record's regions, and its claims' outside matches, and, while unbound, its container's regions (a transaction's or effect site's program, a program's or input's operation, a data object's or outbox's data model, a transition's state machine).
@@ -202,6 +204,7 @@ A Part I diff scopes the list (`plan::Scope`): from a base to the working tree, 
 | Required facts | Each fact, its class, whether the record provides it, the obligations relying on it, and the load-bearing check: the catalogue's withdrawal applied to the current model and verified, listing every obligation proven now and not after, with both statuses. A kind without a withdrawal lists the relying obligations. |
 | Completeness | Each required claim, why it does not hold, and the declared writers or publishers with their regions. |
 | Code | Its regions, and its neighbours' (callers and callees of its operation, readers and writers of the objects it touches, publishers and consumers of its channels), at most twenty per relation. |
+| Realization | With a stack profile: the entry realizing it and why, each realization requirement on it with its evidence shape and checker findings, the requirements its realization places on its neighbours, and the idioms for the primitives it uses. A realization fact's load-bearing line names what the entry provides for the spec's needs. |
 | Precedents | Per required attestable kind, up to three facts from other current records that another party confirmed at the current digests: same object first, then same data model. |
 | Semantics | The `dsl_guide` topics of what it uses, each naming exactly one guide section. |
 | Done when | The checklist, each step marked done or not. |
@@ -245,7 +248,7 @@ A review gives `confirmed` or `disputed` for the record as a whole, and optional
 
 | Document | Payload |
 |---|---|
-| `status` | `declarations` (each `declaration`, `regions`, `required`, `claims`, `conditions`), `orphaned`, `obligations` (each `obligation`, `summary`, `conformant`, `blockers`, `through`), `scan_errors`. |
+| `status` | `declarations` (each `declaration`, `regions`, `required`, `claims`, `checker_reviews` when a checker ran, `conditions`), `orphaned`, `obligations` (each `obligation`, `summary`, `conformant`, `blockers`, `through`), `scan_errors`. |
 | `plan` | `scope` (`base`, `head`, `changed`, `moved`) when scoped, and `items` (each `key`, `priority`, `conditions`, `blocks`, `depends_on`, `files`). |
 | `item` | The packet's sections, as above. |
 | `attest` | `outcome`: `written` or `unchanged` with `declaration`, `record`, `digest`, `written`, `dropped_reviews`; or `refused` with `refusal` and its fields, and `message`. |

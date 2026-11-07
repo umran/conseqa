@@ -9,7 +9,7 @@ Conseqa treats a change to a spec as an object of its own. Given two spec trees,
 
 This document describes the implementation. The design record is `Conseqa_Spec_Change_Analysis_Revision_Specification.md` (Part I), now historical. Where they differ, the code and its tests win (see the README's precedence rule). The DSL's meaning is the semantics contract's. Nothing here changes a verdict: change analysis reads verdicts, it never makes them.
 
-**Not yet implemented.** The realization changes of Part I §13.4 (stack profiles, needs, chosen realizations, and `realization` facts), the document's `realization` section, and the `infeasible` and `ambiguous` gates arrive with the realization profiles revision (Part VI).
+When either side has a stack profile, the diff also reports what changed in what realizes the spec: the stack, each realizable declaration's needs and chosen realization, what the head's stack cannot realize, and the realization requirements introduced and withdrawn (Part I §13.4). `REALIZATION.md` describes that section.
 
 ## Surfaces
 
@@ -25,7 +25,7 @@ This document describes the implementation. The design record is `Conseqa_Spec_C
 |---|---|
 | 0 | The diff was produced, and no named gate failed. |
 | 1 | The diff could not be produced. Either a side did not load, was of another store format or DSL version, or named a ref that resolves to no commit, or a git side was named for a project outside any git repository. The message names the side: `base (origin/master): …`. |
-| 2 | A named gate failed. A gate named while the obligation diff is unavailable cannot be evaluated, and fails. |
+| 2 | A named gate failed. An obligation gate named while the obligation diff is unavailable cannot be evaluated, and fails. |
 
 | Gate | Fails when |
 |---|---|
@@ -34,6 +34,10 @@ This document describes the implementation. The design record is `Conseqa_Spec_C
 | `added-unproven` | any added obligation is not proven |
 | `rebased` | any obligation was rebased |
 | `unexplained` | any entry is unexplained |
+| `infeasible` | any declaration on head is infeasible on its stack, or has an invalid choice |
+| `ambiguous` | any declaration on head is ambiguous on its stack |
+
+`infeasible` and `ambiguous` read the realization section alone: without a stack profile on either side there is none, and neither fails. A side whose realization profile does not load is refused like a side whose spec does not.
 
 `conseqa diff` does not replace `conseqa check`. CI runs both: `check` judges the head alone, and `diff` judges the change, for example `conseqa diff origin/master HEAD --merge-base --fail-on regressed,removed`.
 
@@ -167,9 +171,9 @@ Two flags apply to matched obligations:
 }
 ```
 
-When the obligation diff is unavailable, `obligations` is `{ "status": "unavailable", "side": …, "reason": …, "other_side": { "proven": …, "unknown": …, "disproven": … } }`, and `impact` and `reliance` are absent.
+When the obligation diff is unavailable, `obligations` is `{ "status": "unavailable", "side": …, "reason": …, "other_side": { "proven": …, "unknown": …, "disproven": … } }`, and `impact` and `reliance` are absent. `realization` is present when either side has a stack profile, whether or not the obligation diff is available, and its shape is in `REALIZATION.md`.
 
-The human output (`src/design/change/render.rs`) prints the same content: the declaration changes with their deltas, the entries by class with what explains them, then the removed and unexplained sections and the reliance. It never says what the document does not.
+The human output (`src/design/change/render.rs`) prints the same content: the declaration changes with their deltas, the entries by class with what explains them, then the removed and unexplained sections, the reliance, and the realization section. It never says what the document does not.
 
 ## The mutation catalogue
 
