@@ -42,7 +42,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::design::store::PROJECT_DIR;
+use crate::design::store::{FileSource, PROJECT_DIR, SourceEntryKind, StoreError};
 
 pub mod capability;
 pub mod catalogue;
@@ -116,6 +116,10 @@ pub enum RealizationError {
     /// validate, so it has no needs to judge.
     #[error("the spec cannot be realized: {reason}")]
     Unloadable { reason: String },
+
+    /// A file source could not be read: a directory or a git tree.
+    #[error(transparent)]
+    Store(#[from] StoreError),
 }
 
 impl RealizationError {
@@ -142,61 +146,76 @@ enum EntryKind {
     Other,
 }
 
-/// A directory's entries, sorted by name, dotfiles left out: they are
-/// an editor's or the OS's. `None` when there is no directory.
-fn entries(dir: &Path) -> Result<Option<Vec<(String, EntryKind)>>, RealizationError> {
-    let read = match fs::read_dir(dir) {
-        Ok(read) => read,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => {
-            return Err(RealizationError::Io {
-                path: dir.to_path_buf(),
-                error,
-            });
-        }
-    };
-
-    let mut entries = Vec::new();
-
-    for entry in read {
-        let entry = entry.map_err(RealizationError::io(dir))?;
-
-        let name = entry.file_name().to_string_lossy().into_owned();
-
-        if name.starts_with('.') {
-            continue;
-        }
-
-        let kind = entry
-            .file_type()
-            .map_err(RealizationError::io(entry.path()))?;
-
-        entries.push((
-            name,
-            if kind.is_dir() {
-                EntryKind::Directory
-            } else if kind.is_file() {
-                EntryKind::File
-            } else {
-                EntryKind::Other
-            },
-        ));
-    }
-
-    entries.sort_by(|(a, _), (b, _)| a.cmp(b));
-
-    Ok(Some(entries))
+/// The realization files of one source, read through the store's file
+/// sources: a project's own directory, or the tree a diff side reads
+/// from a commit (Part I §13.4), so both are read under the same rules.
+/// Paths are relative to the realization directory.
+pub(crate) struct Files<'a> {
+    source: &'a dyn FileSource,
 }
 
-/// Reads a realization file's text and checks its `format` first,
-/// leniently, so that a file of another format is refused by its format
-/// rather than for a field this build's format does not share (§14).
-fn read_versioned(path: &Path) -> Result<String, RealizationError> {
-    let text = fs::read_to_string(path).map_err(RealizationError::io(path))?;
+impl<'a> Files<'a> {
+    pub(crate) fn new(source: &'a dyn FileSource) -> Self {
+        Self { source }
+    }
 
-    check_format(path, &text)?;
+    fn relative(path: &str) -> String {
+        if path.is_empty() {
+            DIR.to_string()
+        } else {
+            format!("{DIR}/{path}")
+        }
+    }
 
-    Ok(text)
+    /// How a refusal names `path`.
+    pub(crate) fn locate(&self, path: &str) -> PathBuf {
+        self.source.locate(&Self::relative(path))
+    }
+
+    /// The file's text, or `None` when there is none.
+    pub(crate) fn read(&self, path: &str) -> Result<Option<String>, RealizationError> {
+        Ok(self.source.read(&Self::relative(path))?)
+    }
+
+    /// The file's text, its `format` checked first, leniently, so that
+    /// a file of another format is refused by its format rather than for
+    /// a field this build's format does not share (§14).
+    pub(crate) fn read_versioned(&self, path: &str) -> Result<Option<String>, RealizationError> {
+        let Some(text) = self.read(path)? else {
+            return Ok(None);
+        };
+
+        check_format(&self.locate(path), &text)?;
+
+        Ok(Some(text))
+    }
+
+    /// A directory's entries, sorted by name, dotfiles left out: they are
+    /// an editor's or the OS's, as the temporary of an atomic write is.
+    /// `None` when there is no directory.
+    fn entries(&self, path: &str) -> Result<Option<Vec<(String, EntryKind)>>, RealizationError> {
+        let Some(entries) = self.source.entries(&Self::relative(path))? else {
+            return Ok(None);
+        };
+
+        let mut entries: Vec<(String, EntryKind)> = entries
+            .into_iter()
+            .filter(|entry| !entry.name.starts_with('.'))
+            .map(|entry| {
+                let kind = match entry.kind {
+                    SourceEntryKind::File => EntryKind::File,
+                    SourceEntryKind::Directory => EntryKind::Directory,
+                    SourceEntryKind::Other => EntryKind::Other,
+                };
+
+                (entry.name, kind)
+            })
+            .collect();
+
+        entries.sort_by(|(a, _), (b, _)| a.cmp(b));
+
+        Ok(Some(entries))
+    }
 }
 
 /// Refuses a file whose `format` is missing, or another format.

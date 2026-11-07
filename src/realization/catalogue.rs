@@ -34,9 +34,11 @@ use std::path::{Path, PathBuf};
 use serde::de::{self, Visitor};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
+use crate::design::store::ProjectDirectory;
+
 use super::capability::{Capability, RealizableKind};
 use super::stack::{VersionRange, technology_name};
-use super::{EntryKind, RealizationError, check_format, entries};
+use super::{EntryKind, Files, RealizationError, check_format};
 
 /// The standard catalogue's name, as a stack names it with its version.
 pub const STANDARD: &str = "conseqa-standard";
@@ -1190,12 +1192,16 @@ impl Catalogue {
 
     /// The standard catalogue and the project's own, strictly.
     pub fn read(project_dir: &Path) -> Result<Self, RealizationError> {
+        Self::read_from(&Files::new(&ProjectDirectory::of_project(project_dir)))
+    }
+
+    /// The standard catalogue and the project entries `files` hold.
+    pub(crate) fn read_from(files: &Files<'_>) -> Result<Self, RealizationError> {
         let mut catalogue = Self::standard()?;
 
-        let dir = super::dir(project_dir).join(DIR);
-
-        for (name, kind) in entries(&dir)?.unwrap_or_default() {
-            let path = dir.join(&name);
+        for (name, kind) in files.entries(DIR)?.unwrap_or_default() {
+            let file = format!("{DIR}/{name}");
+            let path = files.locate(&file);
 
             let id = (kind == EntryKind::File)
                 .then(|| name.strip_suffix(".yaml"))
@@ -1206,7 +1212,7 @@ impl Catalogue {
                     expected: "the project catalogue holds `<entry id>.yaml` files".to_string(),
                 })?;
 
-            let text = std::fs::read_to_string(&path).map_err(RealizationError::io(&path))?;
+            let text = files.read(&file)?.unwrap_or_default();
             let entry = Entry::parse(&path, &text)?;
 
             if entry.id() != id {
@@ -1232,7 +1238,7 @@ impl Catalogue {
             );
         }
 
-        catalogue.check_platforms(&dir)?;
+        catalogue.check_platforms(&files.locate(DIR))?;
 
         Ok(catalogue)
     }

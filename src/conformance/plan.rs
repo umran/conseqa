@@ -35,6 +35,7 @@ use crate::design::change::side::{self, Side, SideName, Source};
 use crate::design::graph::EdgeKind;
 use crate::design::symbol::SymbolKey;
 use crate::design::workspace::WorkspaceState;
+use crate::realization::choice::Profile;
 
 use super::completeness;
 use super::state::{
@@ -727,6 +728,7 @@ impl Scope {
             commit: None,
             merge_base: false,
             workspace: Some(head.clone()),
+            realization: Profile::read(project_dir).map_err(|error| error.to_string())?,
         };
 
         let base = if merge_base {

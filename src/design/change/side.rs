@@ -20,6 +20,8 @@ use std::path::{Path, PathBuf};
 
 use crate::design::store::{self, ProjectDirectory, StoreError};
 use crate::design::workspace::WorkspaceState;
+use crate::realization::RealizationError;
+use crate::realization::choice::Profile;
 
 /// Where one side is read from (§6.1).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -74,6 +76,10 @@ pub struct Side {
 
     /// What the side holds, or `None` for the empty project.
     pub workspace: Option<WorkspaceState>,
+
+    /// The side's realization profile, read from the same tree under
+    /// the same rules (§13.4), or `None` without a stack profile.
+    pub realization: Option<Profile>,
 }
 
 impl Side {
@@ -171,6 +177,9 @@ pub enum SideErrorReason {
     /// version: the store's own refusal, naming the file and both
     /// versions (§6.2, §6.5).
     Store(StoreError),
+
+    /// The side's realization profile does not load (§13.4).
+    Realization(RealizationError),
 }
 
 impl fmt::Display for SideError {
@@ -191,6 +200,7 @@ impl fmt::Display for SideError {
             }
 
             SideErrorReason::Store(error) => error.fmt(f),
+            SideErrorReason::Realization(error) => error.fmt(f),
         }
     }
 }
@@ -208,8 +218,13 @@ pub fn read(project_dir: &Path, name: SideName, source: &Source) -> Result<Side,
 
     match source {
         Source::WorkingTree => {
-            let workspace = store::load_source(&ProjectDirectory::of_project(project_dir))
+            let directory = ProjectDirectory::of_project(project_dir);
+
+            let workspace = store::load_source(&directory)
                 .map_err(|refusal| error(SideErrorReason::Store(refusal)))?;
+
+            let realization = Profile::read_source(&directory)
+                .map_err(|refusal| error(SideErrorReason::Realization(refusal)))?;
 
             Ok(Side {
                 name,
@@ -217,6 +232,7 @@ pub fn read(project_dir: &Path, name: SideName, source: &Source) -> Result<Side,
                 commit: None,
                 merge_base: false,
                 workspace,
+                realization,
             })
         }
 
@@ -234,11 +250,15 @@ pub fn read(project_dir: &Path, name: SideName, source: &Source) -> Result<Side,
             let tree = store::read_commit(repository.root(), &commit, repository.project())
                 .map_err(|refusal| error(SideErrorReason::Store(refusal)))?;
 
-            let workspace = match tree {
-                Some(tree) => store::load_source(&tree)
-                    .map_err(|refusal| error(SideErrorReason::Store(refusal)))?,
+            let (workspace, realization) = match tree {
+                Some(tree) => (
+                    store::load_source(&tree)
+                        .map_err(|refusal| error(SideErrorReason::Store(refusal)))?,
+                    Profile::read_source(&tree)
+                        .map_err(|refusal| error(SideErrorReason::Realization(refusal)))?,
+                ),
 
-                None => None,
+                None => (None, None),
             };
 
             Ok(Side {
@@ -247,6 +267,7 @@ pub fn read(project_dir: &Path, name: SideName, source: &Source) -> Result<Side,
                 commit: Some(commit),
                 merge_base: false,
                 workspace,
+                realization,
             })
         }
     }

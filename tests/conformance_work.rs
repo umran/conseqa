@@ -623,6 +623,7 @@ fn side(name: SideName, workspace: WorkspaceState) -> Side {
         commit: None,
         merge_base: false,
         workspace: Some(workspace),
+        realization: None,
     }
 }
 
