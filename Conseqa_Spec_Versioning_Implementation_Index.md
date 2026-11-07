@@ -253,7 +253,7 @@ Update this table in every milestone PR.
 | M2 Two trees, partition | in review | `spec-versioning-m2` | #44 (stacked on #43) |
 | M3 Obligation diff, `conseqa diff` | in review | `spec-versioning-m3` | #45 (stacked on #44) |
 | M4 Markers, regions, records | in review | `spec-versioning-m4` | #46 (stacked on #45) |
-| M5 Required facts, state | not started | | |
+| M5 Required facts, state | in review | `spec-versioning-m5` | #47 (stacked on #46) |
 | M6 Work list, items, attest | not started | | |
 | M7 Reviews, surfaces | not started | | |
 | M8 Capabilities, catalogue, choice | not started | | |

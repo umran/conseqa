@@ -14,7 +14,12 @@
 //!   per declaration stating what its regions were checked to provide
 //!   (§8);
 //! - [`policy`] reads which kinds must be bound and what needs a review
-//!   (§14.4).
+//!   (§14.4);
+//! - [`completeness`] re-checks the claims that no unbound code touches
+//!   what a model-wide fact depends on (§9);
+//! - [`state`] derives each declaration's conditions and each proven
+//!   obligation's conformance, from the spec, the files, the records,
+//!   and the policy read at one moment (§10).
 //!
 //! Records and the policy live in `.conseqa/conformance/`, beside the
 //! spec but outside what the store loads and scans (§8.1). Writing a
@@ -29,9 +34,11 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::analyzer::basis::DeclarationKey;
 
+pub mod completeness;
 pub mod markers;
 pub mod policy;
 pub mod record;
+pub mod state;
 
 /// The conformance format, of records and of the policy file alike
 /// (§8.2, §14.4). It counts every change to either: a field added,
@@ -194,6 +201,12 @@ pub enum ConformanceError {
     /// written.
     #[error("cannot write {}: {message}", .path.display())]
     Refused { path: PathBuf, message: String },
+
+    /// The spec does not assemble into a model, or the model does not
+    /// validate, so it has no proofs and nothing is required of its
+    /// code.
+    #[error("the spec cannot be verified: {reason}")]
+    Unverifiable { reason: String },
 
     /// The record a write meant to replace is not the one on disk
     /// (§8.4): someone wrote it in the meantime.

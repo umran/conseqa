@@ -25,6 +25,11 @@
 //! [`FACT_FORMAT`] and guarded by golden files (§10.9). No analyzer type
 //! appears in a fact: the analyzer may rename its structures freely,
 //! while a fact's spelling changes only with a format bump.
+//!
+//! A proof holds of the code only where the code conforms to what the
+//! proof consumed, so each fact also says how code provides it: its
+//! [`ConformanceClass`], and for an attestable fact, the rule naming its
+//! [`Implementers`] (§7.1 and §7.2 of the conformance revision).
 
 mod declaration;
 mod durable;
@@ -595,6 +600,198 @@ impl Fact {
         // string-keyed map, so serialization cannot fail.
         durable::canonical_text(&serde_json::to_value(self).expect("a fact serializes"))
     }
+
+    /// How the code provides the fact (§7.1 of the conformance
+    /// revision).
+    pub fn conformance_class(&self) -> ConformanceClass {
+        match self {
+            Self::Isolation { .. }
+            | Self::Lock { .. }
+            | Self::GuardedMutation { .. }
+            | Self::Cursor { .. }
+            | Self::Fence { .. }
+            | Self::DeduplicatedBy { .. }
+            | Self::Delivery { .. }
+            | Self::MessageIdentity { .. }
+            | Self::OutboxRedrive { .. }
+            | Self::RetryMayRepeat { .. }
+            | Self::ExternalGuarantee { .. }
+            | Self::Propagation { .. }
+            | Self::Realization { .. } => ConformanceClass::Attestable,
+
+            Self::NaturallyReplayable { .. }
+            | Self::ArtifactRoute { .. }
+            | Self::AdmitsNoMessages { .. }
+            | Self::NoAdmittedPaths { .. }
+            | Self::ReturnsNoResult { .. }
+            | Self::Terminal { .. }
+            | Self::StableRoot { .. } => ConformanceClass::Structural,
+
+            Self::ConflictClosure { .. }
+            | Self::CyclicComponents { .. }
+            | Self::NoDeleters { .. } => ConformanceClass::ModelWide,
+
+            Self::ReliesOn { .. } | Self::KeyedRequirement { .. } => ConformanceClass::Internal,
+        }
+    }
+
+    /// The declarations whose code must provide the fact (§7.2 of the
+    /// conformance revision), or `None` when it is not attestable.
+    pub fn implementers(&self) -> Option<Implementers> {
+        Some(match self {
+            Self::Isolation {
+                operation,
+                transaction,
+                ..
+            }
+            | Self::Lock {
+                operation,
+                transaction,
+                ..
+            }
+            | Self::GuardedMutation {
+                operation,
+                transaction,
+                ..
+            }
+            | Self::DeduplicatedBy {
+                operation,
+                transaction,
+                ..
+            } => Implementers::Named(DeclarationKey::Transaction {
+                operation: operation.clone(),
+                transaction: transaction.clone(),
+            }),
+
+            Self::Cursor {
+                data_model,
+                object,
+                field,
+                rule: _,
+            } => Implementers::CursorAdvancers {
+                data_model: data_model.clone(),
+                object: object.clone(),
+                field: field.clone(),
+            },
+
+            Self::Fence {
+                data_model,
+                object,
+                field,
+            } => Implementers::Fencers {
+                data_model: data_model.clone(),
+                object: object.clone(),
+                field: field.clone(),
+            },
+
+            Self::Delivery {
+                operation, input, ..
+            } => Implementers::Named(DeclarationKey::SubscriptionRuntime {
+                operation: operation.clone(),
+                input: input.clone(),
+            }),
+
+            Self::MessageIdentity {
+                channel,
+                schema,
+                fields: _,
+            } => Implementers::Producers {
+                channel: channel.clone(),
+                schema: schema.clone(),
+            },
+
+            Self::OutboxRedrive {
+                data_model, outbox, ..
+            } => Implementers::Named(DeclarationKey::Outbox {
+                data_model: data_model.clone(),
+                outbox: outbox.clone(),
+            }),
+
+            Self::RetryMayRepeat { site } => Implementers::Named(site.declaration()),
+
+            Self::ExternalGuarantee {
+                operation, effect, ..
+            } => Implementers::Named(DeclarationKey::EffectSite {
+                operation: operation.clone(),
+                effect: effect.clone(),
+            }),
+
+            Self::Propagation { producer, .. } => Implementers::Named(producer.declaration()),
+
+            Self::Realization { declaration, .. } => Implementers::Named(declaration.key().clone()),
+
+            Self::NaturallyReplayable { .. }
+            | Self::ArtifactRoute { .. }
+            | Self::AdmitsNoMessages { .. }
+            | Self::NoAdmittedPaths { .. }
+            | Self::ReturnsNoResult { .. }
+            | Self::Terminal { .. }
+            | Self::StableRoot { .. }
+            | Self::ConflictClosure { .. }
+            | Self::CyclicComponents { .. }
+            | Self::NoDeleters { .. }
+            | Self::ReliesOn { .. }
+            | Self::KeyedRequirement { .. } => return None,
+        })
+    }
+}
+
+/// How the code provides a fact (§7.1 of the conformance revision),
+/// which decides whose records its truth in the code rests on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConformanceClass {
+    /// A region of each implementer provides it, and the implementer's
+    /// record attests it with evidence.
+    Attestable,
+
+    /// It follows from its anchors' content, so it holds of the code
+    /// when every anchor that can be bound claims structural
+    /// conformance: its regions implement its residual and do no
+    /// modeled work beyond it.
+    Structural,
+
+    /// It holds of the code only while no code the model does not
+    /// declare touches what it is about, so it rests on completeness
+    /// claims (§9).
+    ModelWide,
+
+    /// A statement about the spec, which no code provides: a relied-on
+    /// obligation, conformant when that obligation is, or a requirement
+    /// declared, which no basis holds.
+    Internal,
+}
+
+/// The declarations whose code must provide an attestable fact (§7.2 of
+/// the conformance revision), as a rule over the model.
+///
+/// Most facts name their implementer in their own fields. A cursor, a
+/// fence, and a message identity are provided by every transaction or
+/// producer the model declares doing the work, which only the model can
+/// list, so the rule is resolved against it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Implementers {
+    /// The one declaration the fact names.
+    Named(DeclarationKey),
+
+    /// Every transaction with an `advance_cursor` step on the field.
+    CursorAdvancers {
+        data_model: Id,
+        object: Id,
+        field: FieldPath,
+    },
+
+    /// Every transaction with a `fence` step on the field.
+    Fencers {
+        data_model: Id,
+        object: Id,
+        field: FieldPath,
+    },
+
+    /// Every effect site publishing or writing the schema to the
+    /// channel, and every transition whose side effect publishes it
+    /// there.
+    Producers { channel: Channel, schema: Id },
 }
 
 /// The fact in one line, in the functional shorthand the specs write
@@ -960,6 +1157,28 @@ pub enum Site {
         transition: Id,
         effect: Id,
     },
+}
+
+impl Site {
+    /// The declaration owning the site: the effect site, or the
+    /// transition whose side effect it is.
+    pub fn declaration(&self) -> DeclarationKey {
+        match self {
+            Self::EffectSite { operation, effect } => DeclarationKey::EffectSite {
+                operation: operation.clone(),
+                effect: effect.clone(),
+            },
+
+            Self::TransitionEffect {
+                machine,
+                transition,
+                effect: _,
+            } => DeclarationKey::Transition {
+                machine: machine.clone(),
+                transition: transition.clone(),
+            },
+        }
+    }
 }
 
 /// A catalogue entry at one version, written `id@version` (Part VI
