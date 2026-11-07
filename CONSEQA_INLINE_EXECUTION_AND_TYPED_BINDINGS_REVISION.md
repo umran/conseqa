@@ -1,6 +1,6 @@
 # Conseqa — Inline Operation Execution and Typed Bindings Revision
 
-**Status:** Proposed comprehensive semantic revision  
+**Status:** Implemented. Historical design record: its semantics are consolidated into `docs/live/CONSEQA_DSL_SEMANTICS.md`.  
 **Repository:** https://github.com/umran/conseqa  
 **Baseline:** `master` @ `e32a192a13b8a1be71345d16092698ffc6ab63a8`  
 **Baseline date:** 2026-09-05

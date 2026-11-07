@@ -494,7 +494,7 @@ Added to Part I §10.9's catalogue of fields:
 |---|---|
 | `realization` | `declaration` (the textual key the requirement applies to), `entry` (`id@version` of the chosen entry), `realizes` (the textual key of the declaration that entry realizes), `requirement` (the requirement's id) |
 
-Part I is Proposed and `FACT_FORMAT` 1 has not shipped, so the kind joins format 1 rather than bumping it.
+Part I was still Proposed and `FACT_FORMAT` 1 had not shipped, so the kind joined format 1 rather than bumping it.
 
 ---
 

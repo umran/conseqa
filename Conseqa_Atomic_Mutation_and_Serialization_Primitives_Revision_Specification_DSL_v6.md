@@ -2,7 +2,7 @@
 
 ## 1. Status
 
-**Status:** Proposed  
+**Status:** Implemented as DSL 6. Historical design and acceptance record: `docs/live/CONSEQA_DSL_SEMANTICS.md` is normative, and the implementation and tests are authoritative for current behavior.  
 **Target DSL version:** 6  
 **Baseline:** Conseqa `master`, commit `14e692d102e7db468efcfd764fc4f96f6bc7be2a`  
 **Primary affected subsystem:** L0 transaction semantics and transaction serializability verification

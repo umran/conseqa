@@ -1,5 +1,7 @@
 # Conseqa Spec Versioning Implementation Index
 
+**Status:** Complete. All nine milestones merged into `master` on 2026-11-07 (§7), so Parts I, IV and VI are implemented and are now historical design records; the live documents in `docs/live/` describe current behavior. This brief stays as the record of the build order, the house rules, and the decisions taken.
+
 **Read this first if you are an agent asked to implement the spec-versioning specifications.** It is your brief:
 - what to read;
 - the order to build in;
@@ -225,6 +227,8 @@ Do not build, stub, or leave hooks for:
 
 ## 6. Decisions pending
 
+None is pending: each row below records how it was settled.
+
 Ask the maintainer before you reach the milestone named. Do not decide these yourself.
 
 T1–T7 come from the orchestrator design's §12. Each is a small amendment to Part IV, or to Part I. The recommendation for all seven is to accept, amending the spec in the PR that implements the affected section.
@@ -245,19 +249,19 @@ T1–T7 come from the orchestrator design's §12. Each is a small amendment to P
 
 ## 7. Progress
 
-Update this table in every milestone PR.
+Every milestone is merged. The PRs were stacked, each on the one before it, and were merged bottom up on 2026-11-07, each retargeted to `master` once the one below it had merged.
 
-| Milestone | State | Branch | PR |
-|---|---|---|---|
-| M1 Durable facts, keys, basis | in review | `spec-versioning-m1` | #43 |
-| M2 Two trees, partition | in review | `spec-versioning-m2` | #44 (stacked on #43) |
-| M3 Obligation diff, `conseqa diff` | in review | `spec-versioning-m3` | #45 (stacked on #44) |
-| M4 Markers, regions, records | in review | `spec-versioning-m4` | #46 (stacked on #45) |
-| M5 Required facts, state | in review | `spec-versioning-m5` | #47 (stacked on #46) |
-| M6 Work list, items, attest | in review | `spec-versioning-m6` | #48 (stacked on #47) |
-| M7 Reviews, surfaces | in review | `spec-versioning-m7` | #49 (stacked on #48) |
-| M8 Capabilities, catalogue, choice | in review | `spec-versioning-m8` | #50 (stacked on #49) |
-| M9 Realization integration | in review | `spec-versioning-m9` | #51 (stacked on #50) |
+| Milestone | State | Branch | PR | Merge commit |
+|---|---|---|---|---|
+| M1 Durable facts, keys, basis | merged | `spec-versioning-m1` | #43 | `ca322da` |
+| M2 Two trees, partition | merged | `spec-versioning-m2` | #44 | `6b69f68` |
+| M3 Obligation diff, `conseqa diff` | merged | `spec-versioning-m3` | #45 | `43c767d` |
+| M4 Markers, regions, records | merged | `spec-versioning-m4` | #46 | `180e70a` |
+| M5 Required facts, state | merged | `spec-versioning-m5` | #47 | `79ca4b9` |
+| M6 Work list, items, attest | merged | `spec-versioning-m6` | #48 | `887b2f8` |
+| M7 Reviews, surfaces | merged | `spec-versioning-m7` | #49 | `9bb209e` |
+| M8 Capabilities, catalogue, choice | merged | `spec-versioning-m8` | #50 | `484afc6` |
+| M9 Realization integration | merged | `spec-versioning-m9` | #51 | `95f4b02` |
 
 ---
 

@@ -1,7 +1,7 @@
 # Patch Specification — Runtime Grouping and Ordering Scope
 
 **Applies to:** `Conseqa Hierarchical Semantics Refactor Specification`  
-**Status:** Proposed patch  
+**Status:** Historical proposed patch. The current runtime semantics are consolidated into `docs/live/CONSEQA_DSL_SEMANTICS.md`.  
 **Purpose:** Replace the current topic-runtime ordering model with a stricter and more compositional runtime grouping/ordering model.
 
 ---
