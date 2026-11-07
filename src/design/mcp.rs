@@ -37,6 +37,10 @@ use uuid::Uuid;
 use crate::spec::{Id, Revision};
 
 use super::analysis::AnalysisState;
+use super::change::{
+    self,
+    side::{Side, SideName, Source},
+};
 use super::commit::{CommitRejection, CommitRequest};
 use super::engine::{DesignEngine, EngineError, OperationReadMode};
 use super::graph_query::GraphQuery;
@@ -119,7 +123,10 @@ returns status `success`.
 validation errors, or the verification verdict with exactly which \
 obligations are proven and which are not; requirement_report gives an \
 operation's open obligations in full. Fix what they name narrowly, \
-yourself, and build again.
+yourself, and build again. Before you finish, diff_spec shows what your \
+work changed relative to a commit (`merge_base` for the branch it \
+began from): every obligation it regressed, removed, or rebased, and \
+the declarations that explain each.
 
 An unproven transaction serializability or ordering obligation \
 carries `remedy: application`, always: the fix is in the L0 model. \
@@ -227,6 +234,20 @@ pub struct RequirementReportParams {
     /// is open.
     #[serde(default)]
     pub include_proven: bool,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct DiffSpecParams {
+    /// The base: a git commit expression (a branch, a tag, `HEAD~2`, a
+    /// hash). `HEAD` when omitted.
+    #[serde(default)]
+    pub base: Option<String>,
+
+    /// Compare against the merge base of `base` and the project's
+    /// current files, which count as `HEAD`: what this work changed,
+    /// not what the base branch changed since it began.
+    #[serde(default)]
+    pub merge_base: bool,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -1059,6 +1080,69 @@ impl ConseqaMcp {
             Ok(report) => json_result(report),
             Err(error) => engine_error(error),
         }
+    }
+
+    #[tool(
+        description = "What the project's current files change relative to a base commit \
+                       (default HEAD; merge_base for what this work changed since it \
+                       branched): the declarations added, removed, and modified; every \
+                       obligation that changed, matched by key and classed regressed, \
+                       removed, rebased, improved, unproven, added, or held, with the changed \
+                       declarations explaining it; and the facts the proofs newly rely on or \
+                       no longer rely on. A short summary, then the diff document (JSON). \
+                       Read-only."
+    )]
+    async fn diff_spec(
+        &self,
+        params: Parameters<DiffSpecParams>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        let resolved = resolved!(self, context);
+        let engine = resolved.engine;
+        let params = params.0;
+
+        let Some(project) = engine.project_dir() else {
+            return json_error(serde_json::json!({
+                "error": "the model lives in no project directory, so it has no history to \
+                          diff against",
+            }));
+        };
+
+        // The head is the engine's head, which the files were adopted
+        // into before this call: the project's current files, read
+        // whole rather than while another call may be writing them.
+        let head = Side {
+            name: SideName::Head,
+            source: Source::WorkingTree,
+            commit: None,
+            merge_base: false,
+            workspace: Some(engine.head_snapshot().workspace.as_ref().clone()),
+        };
+
+        let base = params.base.as_deref().unwrap_or("HEAD");
+
+        let base = if params.merge_base {
+            change::side::read_merge_base(&project, base, &Source::WorkingTree)
+        } else {
+            change::side::read(&project, SideName::Base, &Source::Commit(base.to_string()))
+        };
+
+        let base = match base {
+            Ok(base) => base,
+            Err(error) => {
+                return json_error(serde_json::json!({ "error": error.to_string() }));
+            }
+        };
+
+        let document = change::diff::diff(&base, &head);
+
+        let json = serde_json::to_string(&document)
+            .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+
+        Ok(CallToolResult::success(vec![
+            ContentBlock::text(change::render::summary(&document)),
+            ContentBlock::text(json),
+        ]))
     }
 
     #[tool(

@@ -68,6 +68,10 @@ pub struct Side {
     /// The commit a git side resolved to.
     pub commit: Option<String>,
 
+    /// The commit is the merge base of the commit `source` names and
+    /// the head (§15.1), not that commit itself.
+    pub merge_base: bool,
+
     /// What the side holds, or `None` for the empty project.
     pub workspace: Option<WorkspaceState>,
 }
@@ -211,6 +215,7 @@ pub fn read(project_dir: &Path, name: SideName, source: &Source) -> Result<Side,
                 name,
                 source: source.clone(),
                 commit: None,
+                merge_base: false,
                 workspace,
             })
         }
@@ -240,10 +245,26 @@ pub fn read(project_dir: &Path, name: SideName, source: &Source) -> Result<Side,
                 name,
                 source: source.clone(),
                 commit: Some(commit),
+                merge_base: false,
                 workspace,
             })
         }
     }
+}
+
+/// Reads the base side at the merge base of `base` and `head`, as
+/// `--merge-base` does (§15.1). The side records `base` as its source,
+/// and the merge base as its commit.
+pub fn read_merge_base(project_dir: &Path, base: &str, head: &Source) -> Result<Side, SideError> {
+    let commit = merge_base(project_dir, base, head)?;
+
+    let side = read(project_dir, SideName::Base, &Source::Commit(commit))?;
+
+    Ok(Side {
+        source: Source::Commit(base.to_string()),
+        merge_base: true,
+        ..side
+    })
 }
 
 /// The merge base of `base` and `head`, which `--merge-base` reads in

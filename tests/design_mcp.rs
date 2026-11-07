@@ -4,8 +4,8 @@
 //! rejected with restart guidance.
 
 use conseqa::design::{
-    DesignEngine, CreateTask, RunId, RunMetadata, TaskBudget, TaskHandle, TaskKind,
-    WorkspaceState, WriteScope, mcp,
+    CreateTask, DesignEngine, RunId, RunMetadata, TaskBudget, TaskHandle, TaskKind, WorkspaceState,
+    WriteScope, mcp,
 };
 use conseqa::spec::Id;
 
@@ -195,6 +195,38 @@ impl McpClient {
             .unwrap_or_else(|_| serde_json::Value::String(text.to_string()));
 
         (payload, is_error)
+    }
+
+    /// Calls a tool and returns every content block's text, for a tool
+    /// that answers with more than one.
+    async fn call_texts(
+        &mut self,
+        name: &str,
+        arguments: serde_json::Value,
+    ) -> (Vec<String>, bool) {
+        let id = self.next_id;
+
+        self.next_id += 1;
+
+        let response = self
+            .rpc(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": "tools/call",
+                "params": {"name": name, "arguments": arguments},
+            }))
+            .await;
+
+        let result = &response["result"];
+
+        let texts = result["content"]
+            .as_array()
+            .unwrap_or_else(|| panic!("tool returned content: {response}"))
+            .iter()
+            .map(|block| block["text"].as_str().expect("text content").to_string())
+            .collect();
+
+        (texts, result["isError"].as_bool().unwrap_or(false))
     }
 }
 
@@ -675,6 +707,7 @@ async fn a_session_and_a_task_are_each_served_their_own_role() {
             "read_symbol",
             "submit_patch",
             "requirement_report",
+            "diff_spec",
             "dsl_guide",
         ] {
             assert!(names.iter().any(|name| name == shared), "{names:?}");
@@ -1491,4 +1524,116 @@ async fn the_server_and_its_artifacts_declare_the_dsl_contract_version() {
 
     std::fs::remove_dir_all(&dir).ok();
     server.shutdown().await;
+}
+
+fn git(dir: &std::path::Path, args: &[&str]) {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args([
+            "-c",
+            "user.name=Conseqa Test",
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "commit.gpgsign=false",
+            "-c",
+            "init.defaultBranch=master",
+        ])
+        .args(args)
+        .output()
+        .expect("git runs");
+
+    assert!(
+        output.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// `diff_spec` (§16 of the spec change analysis revision): served to
+/// every role, it compares the project's current files, as the engine
+/// adopted them, with a commit.
+#[tokio::test]
+async fn diff_spec_compares_the_current_files_with_a_commit_for_every_role() {
+    let dir = std::env::temp_dir().join(format!("conseqa-diff-spec-{}", uuid::Uuid::new_v4()));
+
+    std::fs::create_dir_all(&dir).expect("the repository");
+    git(&dir, &["init", "-q"]);
+
+    drop(conseqa::design::ProjectStore::create(&dir, &fixture_workspace()).expect("the project"));
+
+    git(&dir, &["add", "-A"]);
+    git(&dir, &["commit", "-q", "-m", "the project"]);
+
+    let engine = DesignEngine::open_project(&dir).expect("the project opens");
+
+    let server = mcp::serve(engine.clone(), "127.0.0.1:0".parse().expect("addr"))
+        .await
+        .expect("mcp server binds");
+
+    let url = format!("http://{}/mcp", server.local_addr);
+
+    let coordinator = session(&engine);
+    let worker = task(&engine, "operation.apply_payment");
+
+    for token in [&coordinator.token.0, &worker.token.0] {
+        let mut client = McpClient::connect(&url, token).await;
+
+        let (texts, is_error) = client.call_texts("diff_spec", serde_json::json!({})).await;
+
+        assert!(!is_error, "{texts:?}");
+        assert_eq!(texts.len(), 2, "a summary, then the document");
+        assert!(texts[0].contains("no semantic change"), "{}", texts[0]);
+
+        let document: serde_json::Value = serde_json::from_str(&texts[1]).expect("the document");
+
+        assert_eq!(document["format"], 1);
+        assert_eq!(document["head"]["source"]["working_tree"], true);
+        assert_eq!(document["obligations"]["status"], "available");
+    }
+
+    // An edit to the files is adopted before the call, and diffed.
+    let file = dir.join(".conseqa/spec/operations/operation.apply_payment.yaml");
+    let text = std::fs::read_to_string(&file).expect("the operation file");
+
+    std::fs::write(
+        &file,
+        text.replacen("isolation: read_committed", "isolation: serializable", 1),
+    )
+    .expect("the edit");
+
+    let mut client = McpClient::connect(&url, &coordinator.token.0).await;
+
+    let (texts, is_error) = client
+        .call_texts("diff_spec", serde_json::json!({ "merge_base": true }))
+        .await;
+
+    assert!(!is_error, "{texts:?}");
+    assert!(texts[0].contains("1 modified"), "{}", texts[0]);
+
+    let document: serde_json::Value = serde_json::from_str(&texts[1]).expect("the document");
+
+    assert_eq!(document["base"]["source"]["merge_base"], true);
+    assert_eq!(
+        document["obligations"]["counts"]["rebased"], 2,
+        "{document}"
+    );
+
+    // A base that names no commit is refused in band.
+    let (refused, is_error) = client
+        .call("diff_spec", serde_json::json!({ "base": "no-such-branch" }))
+        .await;
+
+    assert!(is_error, "{refused}");
+    assert!(
+        refused["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("names no commit"),
+        "{refused}"
+    );
+
+    drop(server);
+    let _ = std::fs::remove_dir_all(&dir);
 }

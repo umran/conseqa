@@ -4,7 +4,7 @@
 //! describes. `init` is the only command that works outside a project;
 //! every other command discovers the nearest project at or above the
 //! current directory, so a pipeline with no MCP client — CI, a script —
-//! can check, export, visualize, and design the committed model.
+//! can check, diff, export, visualize, and design the committed model.
 //!
 //! Validation errors are fatal: verification is meaningful only over a
 //! structurally coherent model. Verification verdicts are epistemic —
@@ -21,6 +21,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 
 use conseqa::analyzer::report::{self, ProverReport, Status};
 use conseqa::analyzer::{self, Diagnostic, Severity};
+use conseqa::design::change::{self, diff::Gate, render, side::Source};
 use conseqa::design::export::write_artifacts;
 use conseqa::design::{
     DesignEngine, PROJECT_DIR, ProjectRead, ProjectStore, mcp, new_project_workspace,
@@ -34,7 +35,7 @@ use conseqa::spec::Model;
 #[derive(Parser)]
 #[command(
     name = "conseqa",
-    about = "Initialize, inspect, check, export, visualize, and design a Conseqa project"
+    about = "Initialize, inspect, check, diff, export, visualize, and design a Conseqa project"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -64,6 +65,31 @@ enum Command {
         /// Write the obligation report (JSON) here.
         #[arg(long)]
         report: Option<PathBuf>,
+    },
+
+    /// Compare two versions of the project's spec: the declarations
+    /// added, removed, and modified, and what changed in what they
+    /// prove. Exits 1 when a side cannot be read, and 2 when a gate
+    /// named by `--fail-on` fails.
+    Diff {
+        /// The base, a commit expression; `HEAD` when omitted.
+        base: Option<String>,
+
+        /// The head, a commit expression; the working tree when omitted.
+        head: Option<String>,
+
+        /// Read the base at its merge base with the head: what a branch
+        /// changed, not what its target changed since the branch point.
+        #[arg(long)]
+        merge_base: bool,
+
+        /// Write the diff document (JSON) here.
+        #[arg(long)]
+        report: Option<PathBuf>,
+
+        /// Exit 2 when any of these occurs.
+        #[arg(long, value_enum, value_delimiter = ',')]
+        fail_on: Vec<FailOn>,
     },
 
     /// Write the canonical model, the verification report, and the
@@ -149,6 +175,38 @@ struct DesignArgs {
     system_one: conseqa::harness::executors::cli::SystemOneArgs,
 }
 
+/// The gates `diff --fail-on` names (§15.3 of the spec change analysis
+/// revision).
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum FailOn {
+    /// Any obligation regressed.
+    Regressed,
+
+    /// Any obligation was removed, whatever its base status.
+    Removed,
+
+    /// Any added obligation is not proven.
+    AddedUnproven,
+
+    /// Any obligation was rebased.
+    Rebased,
+
+    /// Any entry is unexplained.
+    Unexplained,
+}
+
+impl From<FailOn> for Gate {
+    fn from(gate: FailOn) -> Self {
+        match gate {
+            FailOn::Regressed => Self::Regressed,
+            FailOn::Removed => Self::Removed,
+            FailOn::AddedUnproven => Self::AddedUnproven,
+            FailOn::Rebased => Self::Rebased,
+            FailOn::Unexplained => Self::Unexplained,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum Backend {
     Claude,
@@ -163,6 +221,13 @@ fn main() -> ExitCode {
             require_proven,
             report,
         } => check(require_proven, report),
+        Command::Diff {
+            base,
+            head,
+            merge_base,
+            report,
+            fail_on,
+        } => diff(base, head, merge_base, report, &fail_on),
         Command::Export {
             dir,
             no_render,
@@ -298,6 +363,47 @@ fn check(require_proven: bool, report_path: Option<PathBuf>) -> Result<ExitCode,
     }
 
     Ok(ExitCode::SUCCESS)
+}
+
+fn diff(
+    base: Option<String>,
+    head: Option<String>,
+    merge_base: bool,
+    report_path: Option<PathBuf>,
+    fail_on: &[FailOn],
+) -> Result<ExitCode, String> {
+    let project = project_dir()?;
+    let head = head.map_or(Source::WorkingTree, Source::Commit);
+
+    let document = change::run(
+        &project,
+        base.as_deref().unwrap_or("HEAD"),
+        &head,
+        merge_base,
+    )
+    .map_err(|error| error.to_string())?;
+
+    print!("{}", render::render(&document));
+
+    if let Some(path) = report_path {
+        let json = serde_json::to_string_pretty(&document)
+            .map_err(|error| format!("cannot serialize the diff: {error}"))?;
+
+        write_file(&path, &format!("{json}\n"))?;
+    }
+
+    let gates: Vec<Gate> = fail_on.iter().map(|gate| Gate::from(*gate)).collect();
+    let failed = document.failed_gates(&gates);
+
+    for gate in &failed {
+        eprintln!("gate failed: {gate}");
+    }
+
+    Ok(if failed.is_empty() {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(2)
+    })
 }
 
 fn export(dir: PathBuf, no_render: bool, title: Option<String>) -> Result<ExitCode, String> {

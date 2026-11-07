@@ -134,6 +134,8 @@ The collections describe one architecture snapshot.
 
 The current DSL assigns no ordering, compatibility, migration, or version-negotiation semantics beyond its numeric identity. A verifier must not infer that revision `2` is semantically compatible with, derived from, or newer in any meaningful architectural sense than revision `1` unless surrounding tooling establishes that convention.
 
+Change analysis (`conseqa diff`, `SPEC_CHANGE_ANALYSIS.md`) establishes no such convention. It compares two spec trees, typically two git commits of a project's `.conseqa/`, analyzed by one build, and never compares revisions.
+
 `revision` is not the `dsl` contract version, and neither is the project store's `FORMAT` (a storage-encoding counter, `src/design/store.rs`) or the crate build version: four counters on four axes. The one invariant relating them: a `dsl` bump forces a `FORMAT` bump — a project's files hold the spec types — never conversely. A project's files never record a `revision`: the authoring engine numbers its commits on one machine, and the repository's version control is the model's history (`PROJECT_STATE.md`). A server states its `dsl` version at the MCP handshake and on the served guide, and never refuses a *connection* over any version axis: a connecting agent adapts to what the server states, and refusal lives at the artifact boundaries — a patch envelope declaring a mismatched `dsl`, a whole document probed before parsing — where a stale authored claim actually meets the server.
 
 ### `Id`
@@ -3089,7 +3091,11 @@ The scope records a **dependency**, nothing more. A `runtime_dependent` proof is
 
 `l0_only` does **not** mean implementation-free. A proof resting on `isolation: serializable` is L0-only, and still assumes the concrete database implements serializable execution. Scope identifies dependency on semantic layers, not the absence of conformance assumptions.
 
-Alongside the scope, a proof carries the declarations it consumed, so a report can say precisely why a verdict holds:
+Alongside the scope, a proof carries the declarations it consumed, so a report can say precisely why a verdict holds.
+
+The **basis** is the structured form of "the declarations it consumed". It is the set of facts a proof consumed: declared facts (an isolation level, a lock, a guarded mutation, a delivery, a message identity, a commit-deduplication key, an external guarantee) and model-wide query results (a conflict closure, the absence of any transaction deleting an object). Each fact is stated without positions, in a durable form with one spelling. It is anchored to the declarations its truth was read from. The basis is exactly what §1.3 makes a proof conditional on: the implementation conforms to every fact in it. An unproven verdict has a blocked-on set instead, naming the facts its obstacles found present but insufficient or missing, and the declarations they read. Both appear in the obligation report (format 10), and a change that moves a proof from one basis to another is reported as such, though the verdict held (`SPEC_CHANGE_ANALYSIS.md`).
+
+The evidence reads:
 
 ```
 Requirement:  SerializableBy(order_id) on tx.apply_payment

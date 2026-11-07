@@ -1,0 +1,17 @@
+{
+  "fact_format": 1,
+  "facts": [
+    {
+      "input": "input.ship.paid",
+      "kind": "keyed_requirement",
+      "operation": "operation.ship",
+      "property": "idempotency"
+    },
+    {
+      "input": "input.quote.request",
+      "kind": "keyed_requirement",
+      "operation": "operation.quote",
+      "property": "result_replay"
+    }
+  ]
+}
