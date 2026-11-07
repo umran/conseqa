@@ -12,6 +12,9 @@
 //!   spec/runtime/<kind>/<id>.yaml   one file per runtime declaration
 //!   intent/obligations.yaml         the prompt's correctness obligations
 //!   intent/proposals.yaml           requirement proposals, with provenance
+//!   conformance/                    conformance records and their policy,
+//!                                   read by `crate::conformance`; never
+//!                                   loaded or scanned here
 //!   .gitignore                      keeps local/ out of version control
 //!   local/                          this machine's engine state
 //! ```
