@@ -98,7 +98,7 @@ impl Scan {
 
 /// One region: the lines strictly between a begin marker and its end
 /// marker, in one file (§6.2).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct Region {
     /// The declaration the region binds.
     pub key: TextualKey,

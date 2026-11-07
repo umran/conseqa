@@ -231,10 +231,10 @@ T1–T7 come from the orchestrator design's §12. Each is a small amendment to P
 
 | Decision | Needed by |
 |---|---|
-| T1: documented, versioned JSON output for every `conform` and `realize` command | M7, and M8 for `realize` |
+| T1: documented, versioned JSON output for every `conform` and `realize` command | M7: accepted, with a conformance document format of its own (#49); M8 follows it for `realize` |
 | T2: `--spec-range` scoping for `conform plan` and `conform check` | M6: accepted, with added and removed obligations scoping too (#48) |
 | T3: plan items carry `depends_on` and `files` | M6: accepted (#48) |
-| T4: implementer and reviewer roles on the design MCP server | M7 |
+| T4: implementer and reviewer roles on the design MCP server | M7: accepted, tokens minted on the admin surface; the coordinator and the CLI stamp git's `user.name` (#49) |
 | T5: `by` stamped from the credential, not supplied by the agent | M6: accepted; the MCP tool stamps it in M7 (#48) |
 | T6: replaying an identical attest or review is a no-op success | M6: accepted for attest; reviews follow in M7 (#48) |
 | T7: packets carry open disputes and the last refusal reason | M6: accepted, the refusal kept per machine (#48) |
@@ -255,7 +255,7 @@ Update this table in every milestone PR.
 | M4 Markers, regions, records | in review | `spec-versioning-m4` | #46 (stacked on #45) |
 | M5 Required facts, state | in review | `spec-versioning-m5` | #47 (stacked on #46) |
 | M6 Work list, items, attest | in review | `spec-versioning-m6` | #48 (stacked on #47) |
-| M7 Reviews, surfaces | not started | | |
+| M7 Reviews, surfaces | in review | `spec-versioning-m7` | #49 (stacked on #48) |
 | M8 Capabilities, catalogue, choice | not started | | |
 | M9 Realization integration | not started | | |
 

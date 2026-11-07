@@ -2,7 +2,7 @@
 
 ## 1. Status
 
-**Status:** Proposed  
+**Status:** Implemented, except the realization requirements Part VI's amendment adds (realization facts as required facts, the record's `realization` field, stack-driven binding, a work item's Realization section, `unrealizable`, and checker reviews), which arrive with Part VI. Historical design record: the current behavior is described in `docs/live/CONFORMANCE.md`.  
 **Part:** IV of the spec-versioning programme: realization bindings. It is drafted ahead of Parts II and III, because Part II's deployment baseline is defined in terms of the records this part introduces (§16).  
 **Depends on:** Part I, `Conseqa_Spec_Change_Analysis_Revision_Specification.md`. It uses Part I's declaration partition (§7), obligation keys (§9), the basis and the durable form of facts (§10, §10.9), and the reliance delta (§13).  
 **Amended by:** Part VI, `Conseqa_Realization_Profiles_Revision_Specification.md` (§7.1–§7.3, §8.2, §10.1, §12.1, §12.2, §14.3, §14.4, §19, §21). Realization requirements become required facts, a stack profile brings realized declarations under binding, and catalogue checkers record reviews.  
@@ -28,6 +28,12 @@
 - §12.1–§12.3: packets for every bindable declaration and orphaned key, open disputes and the last refusal, neighbours, semantics topics, the checklist, what the load-bearing check lists, and precedents;
 - §8.4, §13.1, §13.2, §14.1, §14.2, and §14.5: the read set's members, the last refusal kept per machine, `by` stamped by the surface, an identical attest replayed as a no-op, the refusals by name, what attest writes, and when reviews survive;
 - §15.1–§15.3, §17.1, and §18.5–§18.8.
+
+**Amended in implementation (M7, 2026-10-31):** with the maintainer's approval, taking the delivery loop orchestrator's tooling asks T1 and T4:
+- §8.2 and §14.5: a record's `by` may name the `job` it acted in, which the independence rule ignores; who a write is stamped with on each surface;
+- §14.3: recording a review, its refusals, one review per party at one set of digests, an identical review replayed as a no-op, and `conseqa conform review`'s targets, agents, and server;
+- §15.1–§15.4: the implementer and reviewer roles and their tokens, each subcommand's output and exit codes, and the conformance documents;
+- §17.1, §17.3, §17.5, and §18.9–§18.11.
 
 This revision connects a spec to the code that implements it, and turns the spec's changes into guided implementation work for LLM agents. It introduces:
 
@@ -382,7 +388,7 @@ reviews:
 
 The format's rules beyond its shape:
 
-- `by.kind` is `agent`, `person`, or `checker`. `attested.commit` is optional, and absent outside git.
+- `by.kind` is `agent`, `person`, or `checker`. `by.job`, optional, names the job the party acted in when its credential names one: provenance, which the rule that a reviewer is another party ignores (§14.5). `attested.commit` is optional, and absent outside git.
 - Each attested fact is in its canonical durable form, appears once, and cites at least one evidence span.
 - A `writers` claim belongs on a `data_object` record, and a `publishers` claim on a `topic` or `outbox` record. Each claim names at least one pattern, and each pattern compiles as a regular expression (§9.2).
 - A review item names exactly one target: `fact: <index>`, `completeness: <index>`, or `structural: true`. Each index lies within the record.
@@ -693,7 +699,9 @@ A review is a second party's check of a record against the code. It gives a verd
 
 An item's verdict overrides the review's verdict on the record as a whole, for the item's target. A review confirms one thing the record carries when it saw the current digests, is by another party than `attested.by` (§14.5), and its verdict on that thing is `confirmed`. A checker review satisfies only the realization requirements its checker covers (below), so until catalogue checkers exist (Part VI §13) it satisfies no required review.
 
-`conseqa conform review [<key>…] --backend claude|codex` runs one fresh-context worker per record, through the harness backends `conseqa design` already uses, with their scratch configuration outside the repository. A worker receives the record, the item's packet, and read access to the files, but not the attester's reasoning. It reports through the review operation. Done this way, a review is an independent read, not the attester's argument repeated back.
+A review supplies the declaration, its verdict on the record as a whole, its verdicts on single items with their notes, and, optionally, the digest of the record it read. The tool records the record's region digests, which are the current ones, and stamps `by` (§14.5). It refuses, by name: `unknown_declaration`; `no_record` (none, or one set aside); `drifted` and `stale`, since such a record is to be attested again first; `record_changed`, when the record it read is not the one on disk; and `malformed`, when an item names a fact or claim the record does not hold. One party keeps one review at one set of digests: a new review replaces its earlier one where it stands, and a review that would leave the record as it is writes nothing and succeeds, so a retry replays as a success.
+
+`conseqa conform review [<key>…] --backend claude|codex` runs one fresh-context worker per record, through the harness backends `conseqa design` already uses, with their scratch configuration outside the repository. With no key named, it reviews every record with an item the policy requires reviewed that no review confirms; a record that cannot be reviewed as it stands is reported refused, and given no worker. A worker receives the record, the item's packet, and read access to the files, but not the attester's reasoning. It reports through the review operation, with a reviewer's token stamped `{kind: agent, name: <backend>[/<model>], job: <run and worker>}`, to a review server the command runs in process. That server reads the spec from the project's files, so it takes no writer lock and runs beside an open design server. Done this way, a review is an independent read, not the attester's argument repeated back. The command reports what each worker recorded, and exits 2 when one recorded nothing.
 
 **Checker reviews.** A catalogue entry's deterministic checkers (Part VI §13) run on every derivation, over the regions bound to the declaration their requirement applies to. Each result is recorded as a review, `by: { kind: checker, name: <entry id>/<checker id>@<entry version> }`, at the digests it read. Like any review, it lapses when they change.
 
@@ -728,9 +736,14 @@ A confirming checker review satisfies the required review of exactly the require
 
 ## 14.5 Provenance
 
-`by` is a claim. Conseqa records it and cannot authenticate it: the pull request that commits a record is the trust boundary, as it is for the spec itself. The surface stamps it from the credential a call came with, and neither an attest's input nor a review's names it, so an agent cannot declare itself someone else. Two rules keep the claim honest within the tool:
+`by` is a claim. Conseqa records it and cannot authenticate it: the pull request that commits a record is the trust boundary, as it is for the spec itself. The surface stamps it from the credential a call came with, and neither an attest's input nor a review's names it, so an agent cannot declare itself someone else:
 
-- a review whose `by` equals the record's `attested.by` does not satisfy a required review;
+- an implementer's or a reviewer's token stamps the `by` it was minted with (§15.1);
+- the coordinator's surfaces and the CLI stamp the person running the checkout, `{kind: person, name: <git config user.name>}`, and refuse to write while git names no one.
+
+Two rules keep the claim honest within the tool:
+
+- a review whose `by` names the record's `attested.by`, by kind and name, whatever jobs they acted in, does not satisfy a required review;
 - the tool computes everything it can, so a record can be wrong only in its judgments, never in what code it describes.
 
 ---
@@ -744,10 +757,14 @@ A confirming checker review satisfies the required review of exactly the require
 | `conformance_status` | every role | The summary of §10.3, with each declaration's conditions and each proven obligation's conformance. |
 | `implementation_plan` | every role | The ordered work list. `base` and `merge_base`, or `spec_range`, scope it as in §11.5. |
 | `work_item` | every role | The packet for one item, by key: any bindable declaration of the spec, or an orphaned key. |
-| `attest` | the coordinator | §14.1–§14.2. |
-| `record_review` | the coordinator | Records one review of one record. |
+| `attest` | the coordinator, an implementer | §14.1–§14.2. |
+| `record_review` | the coordinator, a reviewer | Records one review of one record (§14.3). |
 
-The read tools join the shared router. The write tools join the coordinator router, which serves the stdio client, the API key, and session tokens. A design-task worker's job is a design task, so it is not served the write tools. The tools read the spec through the engine's head, which already adopts outside edits before every call. Records are written outside the spec, so attesting never contends with the commit gate.
+The read tools are served to every role. Two roles work on a project's code and records, never its spec: an **implementer** reads and attests, and a **reviewer** reads and records reviews. Neither is served `submit_patch` or `build_design`. The coordinator, which serves the stdio client, the API key, and session tokens, is served both write tools. A design-task worker's job is a design task, so it is not served the write tools.
+
+An implementer's and a reviewer's tokens are minted on a single-project server's localhost admin surface, as task and session tokens are: `POST /admin/credentials` with the role and the `by` the token's writes are stamped with, an agent or a person named by provider and model, with an optional job. Each token is a read-only session of the engine carrying its role and `by`. The global and stdio servers serve the coordinator alone. A review server, which `conseqa conform review` runs for its workers, has no engine: it serves the read tools, `dsl_guide`, and `record_review` to the tokens it minted.
+
+On an engine, the tools read the spec through the engine's head, which already adopts outside edits before every call. Records are written outside the spec, so attesting never contends with the commit gate. The status and a work item answer with a text rendering, then their document; the plan with its list, then its document; attest and `record_review` with their document, an error result when refused.
 
 ## 15.2 CLI
 
@@ -762,7 +779,7 @@ conseqa conform check [<base>] [--merge-base] [--spec-range <a>..<b>]
                       [--fail-on <condition>[,<condition>…]] [--report <path>]
 ```
 
-`attest --input` takes the same JSON the MCP tool takes. Like every `conseqa` subcommand, `conform` discovers the project from the working directory. It takes no spec writer lock, so it runs beside an open design MCP server, and §8.4's optimistic replace keeps two writers from losing each other's records.
+Every subcommand's `--json` prints its conformance document (§15.4). `attest --input` takes the same JSON the MCP tool takes, `-` reading it from stdin. `review` also takes `--backend-program`, `--model` (recorded in its workers' `by`), and `--max-agents` (default 4). `scan` lists every region and every scan error from the files alone, so it runs when the spec does not verify; orphaned keys need the spec, and stay in `status`. `item` serves any key §12.1 gives a packet. Like every `conseqa` subcommand, `conform` discovers the project from the working directory. It takes no spec writer lock, so it runs beside an open design MCP server, and §8.4's optimistic replace keeps two writers from losing each other's records.
 
 ## 15.3 Gates and exit codes
 
@@ -776,9 +793,22 @@ A feature branch might gate on scan errors alone, letting the spec lead. Given a
 
 | Exit | Meaning |
 |---|---|
-| 0 | Derived, and no gate failed. |
-| 1 | Could not derive: the spec, the records, or the policy file did not load (§8.1), the spec does not assemble and validate (it then has no proofs, and nothing is required of its code), or git failed. |
-| 2 | A gate failed, or there is a scan error. |
+| 0 | Derived, and nothing failed. |
+| 1 | Could not derive: the spec, the records, or the policy file did not load (§8.1), the spec does not assemble and validate (it then has no proofs, and nothing is required of its code), or git failed. Also an input that does not parse, and a key with no packet. |
+| 2 | `check`: a gate failed, or there is a scan error. `scan`: a scan error. `attest`: refused. `review`: a record was left unreviewed. |
+
+`status` derives without gating, so a scan error does not fail it.
+
+## 15.4 Documents
+
+Each subcommand's `--json`, and each MCP tool, gives one JSON object, versioned apart from records and the policy so that a tool driving Conseqa routes on fields, never on text:
+
+- `format`: the conformance document format, `1`;
+- `document`: `status`, `plan`, `item`, `attest`, `review`, `scan`, or `check`;
+- `dsl` and `fact_format`;
+- the payload: the state of §10; the work list and, when scoped, the diff's sides, changed declarations, and moved obligations; a packet; an attest's outcome, `written`, `unchanged`, or `refused` by name; each review's outcome, `recorded`, `unchanged`, `refused`, or `not_reported`; the scan's regions and errors; a check's gates and what failed them.
+
+`docs/live/CONFORMANCE.md` documents each payload's fields. The same inputs give a byte-identical document on any machine.
 
 ---
 
@@ -814,6 +844,9 @@ A feature branch might gate on scan errors alone, letting the spec lead. Given a
 | `plan.rs` | The work list, priorities, order, dependencies and files, and scoping (§11). |
 | `packet.rs` | Work items, the load-bearing check, precedents, and read sets (§12, §13.2). |
 | `attest.rs` | Validation and writing, and the last refusal this machine keeps (§13.1, §14.1–§14.2). |
+| `review.rs` | Recording a review (§14.3). |
+| `check.rs` | Gates (§15.3). |
+| `document.rs` | The conformance documents (§15.4). |
 
 ## 17.2 `src/analyzer/basis.rs` (Part I)
 
@@ -821,7 +854,7 @@ Each fact kind gains its conformance class and the rule naming its implementers 
 
 ## 17.3 `src/design/mcp.rs`
 
-The five tools of §15.1: reads in the shared router, writes in a new `conformance_tools` router joined to the coordinator and session routers.
+The five tools of §15.1, in `src/design/mcp/conformance.rs` with the role credentials: the reads in a router joined to every role's, `attest` and `record_review` each in a router of its own, joined to the coordinator's and to the implementer's or the reviewer's. `submit_patch` leaves the shared router for one joined to the worker's and the coordinator's, and `dsl_guide` for one every role, a review server's included, is served.
 
 ## 17.4 `src/main.rs`
 
@@ -829,7 +862,7 @@ The `conform` subcommand group (§15.2).
 
 ## 17.5 `src/harness/`
 
-A review workflow that runs fresh-context workers through the existing backends and reports through the review operation (§14.3).
+A review workflow, in `review.rs`, that runs fresh-context workers through the existing backends and reports through the review operation (§14.3). The Claude and Codex backends launch a session from what any session needs, so a review, which is no design task, launches as a design task does.
 
 ## 17.6 `docs/live/PROJECT_STATE.md`
 
@@ -917,12 +950,15 @@ A packet contains the delta from the recorded residual, the required facts with 
 ## 18.9 Reviews
 
 - A review lapses on a digest change.
-- An attester reviewing itself does not satisfy a required review.
+- An attester reviewing itself does not satisfy a required review, from another job as from its own.
 - A disputed review raises `disputed`.
+- A review is refused by name, a party's new review replaces its earlier one, and an identical review replayed writes nothing.
+- Each role is served its tools, and each write is stamped by its credential, or by the person git names.
+- The review workflow gives each record a fresh worker, and reports what it recorded.
 
 ## 18.10 Determinism
 
-The same inputs produce byte-identical status, plan, and packet JSON.
+The same inputs produce byte-identical status, plan, and packet JSON, and every conformance document names its format and kind.
 
 ## 18.11 CLI
 

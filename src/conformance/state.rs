@@ -1072,7 +1072,7 @@ pub(crate) fn confirms(
     };
 
     sorted(&review.digests) == current
-        && review.by != record.attested.by
+        && !review.by.same_as(&record.attested.by)
         && review.by.kind != PartyKind::Checker
         && verdict == Verdict::Confirmed
 }

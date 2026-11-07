@@ -265,17 +265,22 @@ async fn serve(options: ServeOptions) -> Result<(), String> {
     let engine = DesignEngine::open(&options.project, initial)
         .map_err(|error| format!("cannot open {}: {error}", options.project.display()))?;
 
+    let credentials = mcp::Credentials::default();
+
     let admin = axum::Router::new()
         .route("/admin/status", get(admin_status))
         .route("/admin/tasks", post(admin_create_task))
         .route("/admin/session", post(admin_create_session))
+        .route("/admin/credentials", post(admin_create_credential))
         .route("/admin/tasks/{task}/cancel", post(admin_cancel_task))
         .route("/admin/analysis/{revision}", get(admin_analysis))
         .with_state(AdminState {
             engine: engine.clone(),
+            credentials: credentials.clone(),
         });
 
-    let router = mcp::router_with_builder(engine.clone(), builder).merge(admin);
+    let router =
+        mcp::router_with_credentials(engine.clone(), Some(builder), credentials).merge(admin);
 
     let server = mcp::serve_router(router, options.bind)
         .await
@@ -493,6 +498,9 @@ fn print_session_config(mcp_url: &str, token: &str) {
 #[derive(Clone)]
 struct AdminState {
     engine: DesignEngine,
+
+    /// The implementer and reviewer tokens the MCP router serves.
+    credentials: mcp::Credentials,
 }
 
 #[derive(Deserialize)]
@@ -538,6 +546,38 @@ async fn admin_create_session(State(state): State<AdminState>) -> Json<serde_jso
             "token": handle.token.0,
             "snapshot_revision": handle.snapshot_revision.0,
             "authorization_header": format!("Bearer {}", handle.token.0),
+        })),
+
+        Err(error) => Json(serde_json::json!({ "error": error.to_string() })),
+    }
+}
+
+#[derive(Deserialize)]
+struct AdminCreateCredential {
+    role: mcp::CredentialRole,
+    by: conseqa::conformance::record::Party,
+}
+
+/// Mints an implementer's or a reviewer's token (T4 of the delivery
+/// loop orchestrator design): the attests or reviews made with it are
+/// stamped with `by`, never with what its holder says of itself.
+async fn admin_create_credential(
+    State(state): State<AdminState>,
+    Json(request): Json<AdminCreateCredential>,
+) -> Json<serde_json::Value> {
+    if let Err(error) = mcp::Credentials::admissible(&request.by) {
+        return Json(serde_json::json!({ "error": error }));
+    }
+
+    match state
+        .credentials
+        .issue(&state.engine, request.role, request.by.clone())
+    {
+        Ok(token) => Json(serde_json::json!({
+            "role": request.role,
+            "by": request.by,
+            "token": token,
+            "authorization_header": format!("Bearer {token}"),
         })),
 
         Err(error) => Json(serde_json::json!({ "error": error.to_string() })),

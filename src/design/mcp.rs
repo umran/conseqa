@@ -1,6 +1,6 @@
 //! The MCP tool surface (§42–§53 of the harness spec).
 //!
-//! One server, two roles, each served its own brief and only its own
+//! One server, four roles, each served its own brief and only its own
 //! tools. The coordinator — the stdio client, the holder of the API
 //! key, or an interactive session's token — designs the system: it
 //! selects projects, authors through `submit_patch`, builds in process
@@ -9,6 +9,15 @@
 //! capability — reads its pinned snapshot, commits through the same
 //! gate, and files dependency requests. Both read through tracked
 //! reads and canonical queries.
+//!
+//! An implementer and a reviewer work on a project's code and its
+//! conformance records, never its spec (T4 of the delivery loop
+//! orchestrator design): an implementer reads and attests, a reviewer
+//! reads and records reviews. Their tokens are minted on a
+//! single-project server's admin surface, each carrying the party its
+//! writes are stamped with. A review server, with no engine, serves the
+//! agents `conseqa conform review` starts. The conformance tools are in
+//! [`conformance`].
 //!
 //! DSL payloads — symbol keys, graph queries, patches — travel in
 //! their canonical serialized JSON forms; `dsl_guide` documents the
@@ -51,6 +60,10 @@ use super::task::{TaskId, TaskState};
 use super::workspace::EvidenceRef;
 use super::workspace_manager::WorkspaceManager;
 
+mod conformance;
+
+pub use conformance::{Credential, CredentialRole, Credentials};
+
 /// The invariants every worker operates under (§89), served as its
 /// brief: one scoped task, one patch, restart on invalidation.
 const WORKER_INSTRUCTIONS: &str = "\
@@ -67,6 +80,37 @@ Conseqa shared architecture state. Invariants:
 reporting unresolved.
 Call dsl_guide for the DSL's semantics by topic, and for the JSON \
 shapes of symbols, queries, and patches under its `JSON shapes` topics.";
+
+/// The brief served to an implementer (T4 of the delivery loop
+/// orchestrator design): one work item's loop, from packet to attest.
+const IMPLEMENTER_INSTRUCTIONS: &str = "\
+Conseqa conformance: you make this repository's code conform to one \
+declaration of its spec. work_item gives that declaration's packet: \
+what it declares, what is wrong with its code now, the facts the \
+proofs rely on and what deleting each would cost, where its code and \
+its neighbours' code are, how this project already does it, and when \
+you are done. Change the code, bind it with `conseqa:begin <key>` and \
+`conseqa:end <key>` comment lines, then call attest with the facts and \
+their evidence spans, the structural claim, any completeness claims, \
+and the packet's read set. Attest computes the regions, digests, and \
+residual itself, and refuses by name what does not hold: read the \
+refusal, fix the cause, and attest again. You cannot change the spec; \
+if it is wrong, say so instead of working around it. Call dsl_guide for \
+the semantics of each primitive the packet names.";
+
+/// The brief served to a reviewer: an independent read of one record.
+const REVIEWER_INSTRUCTIONS: &str = "\
+Conseqa conformance review: you check one record of this repository \
+against its code, independently of whoever attested it. work_item \
+gives the declaration's packet; the record is in \
+`.conseqa/conformance/`. Read its regions and each fact's evidence: \
+does the code provide every fact it attests, implement the residual \
+and nothing beyond it where it claims structural conformance, and do \
+its completeness patterns catch every write they must? Then call \
+record_review once: a verdict on the record as a whole, a verdict per \
+fact and claim where you can give one, each with a note saying what \
+you saw. Dispute what you cannot confirm. Do not edit any file. Call \
+dsl_guide for the semantics of each primitive the packet names.";
 
 /// The brief served to the coordinator: the authoring loop, stated up
 /// front, so an agent asked to design a system with Conseqa knows
@@ -438,6 +482,12 @@ enum Backing {
     /// the `stdio` command for the Claude Desktop / Code UI, which
     /// accepts a command-based (stdio) MCP server without TLS.
     Local(ProjectHost),
+
+    /// One project's reviews, with no engine: what `conseqa conform
+    /// review` serves its agents (§14.3 of the conformance revision).
+    /// It reads the spec from the project's files on every call, so it
+    /// takes no writer lock and runs beside an open design server.
+    Review { project_dir: PathBuf },
 }
 
 /// What one authenticated architecture request resolves to.
@@ -468,6 +518,13 @@ enum Role {
 
     /// A scoped task's agent, holding that task's capability.
     Worker,
+
+    /// An agent implementing a work item: it reads, and attests (T4 of
+    /// the delivery loop orchestrator design).
+    Implementer,
+
+    /// An agent reviewing a record: it reads, and records its review.
+    Reviewer,
 }
 
 /// Each role's tools, built once: a router generates every tool's
@@ -483,26 +540,58 @@ struct Routers {
     /// session, with no project to select.
     session: ToolRouter<ConseqaMcp>,
 
+    /// An implementer and a reviewer: the read tools, and the one write
+    /// each role's work ends in. Neither changes the spec or builds the
+    /// design.
+    implementer: ToolRouter<ConseqaMcp>,
+    reviewer: ToolRouter<ConseqaMcp>,
+
+    /// A review server's agents, with no engine to read through.
+    review_server: ToolRouter<ConseqaMcp>,
+
     /// Every tool, for looking one up by name.
     all: ToolRouter<ConseqaMcp>,
 }
 
-static ROUTERS: LazyLock<Routers> = LazyLock::new(|| Routers {
-    worker: ConseqaMcp::shared_tools() + ConseqaMcp::worker_tools(),
-    coordinator: ConseqaMcp::shared_tools()
-        + ConseqaMcp::coordinator_tools()
-        + ConseqaMcp::project_tools(),
-    session: ConseqaMcp::shared_tools() + ConseqaMcp::coordinator_tools(),
-    all: ConseqaMcp::shared_tools()
-        + ConseqaMcp::worker_tools()
-        + ConseqaMcp::coordinator_tools()
-        + ConseqaMcp::project_tools(),
+static ROUTERS: LazyLock<Routers> = LazyLock::new(|| {
+    let reads =
+        || ConseqaMcp::shared_tools() + ConseqaMcp::guide_tools() + ConseqaMcp::conformance_reads();
+
+    Routers {
+        worker: reads() + ConseqaMcp::patch_tools() + ConseqaMcp::worker_tools(),
+        coordinator: reads()
+            + ConseqaMcp::patch_tools()
+            + ConseqaMcp::coordinator_tools()
+            + ConseqaMcp::project_tools()
+            + ConseqaMcp::attest_tools()
+            + ConseqaMcp::review_tools(),
+        session: reads()
+            + ConseqaMcp::patch_tools()
+            + ConseqaMcp::coordinator_tools()
+            + ConseqaMcp::attest_tools()
+            + ConseqaMcp::review_tools(),
+        implementer: reads() + ConseqaMcp::attest_tools(),
+        reviewer: reads() + ConseqaMcp::review_tools(),
+        review_server: ConseqaMcp::guide_tools()
+            + ConseqaMcp::conformance_reads()
+            + ConseqaMcp::review_tools(),
+        all: reads()
+            + ConseqaMcp::patch_tools()
+            + ConseqaMcp::worker_tools()
+            + ConseqaMcp::coordinator_tools()
+            + ConseqaMcp::project_tools()
+            + ConseqaMcp::attest_tools()
+            + ConseqaMcp::review_tools(),
+    }
 });
 
 #[derive(Clone)]
 pub struct ConseqaMcp {
     backing: Backing,
     builder: Option<Arc<dyn DesignBuilder>>,
+
+    /// The implementer and reviewer tokens minted for this server.
+    credentials: Credentials,
 }
 
 impl ConseqaMcp {
@@ -510,6 +599,7 @@ impl ConseqaMcp {
         Self {
             backing: Backing::Single(engine),
             builder: None,
+            credentials: Credentials::default(),
         }
     }
 
@@ -519,6 +609,7 @@ impl ConseqaMcp {
         Self {
             backing: Backing::Single(engine),
             builder: Some(builder),
+            credentials: Credentials::default(),
         }
     }
 
@@ -535,6 +626,7 @@ impl ConseqaMcp {
                 api_key: api_key.into(),
             },
             builder,
+            credentials: Credentials::default(),
         }
     }
 
@@ -550,13 +642,40 @@ impl ConseqaMcp {
         Self {
             backing: Backing::Local(ProjectHost::new(manager, home)),
             builder,
+            credentials: Credentials::default(),
         }
     }
 
-    /// The role of a request's caller. A single-project server serves
-    /// its workers and its interactive sessions alike, so there the
-    /// bearer decides; every other server's caller is its coordinator.
+    /// A review server for the project at `project_dir`, serving the
+    /// agents `credentials` names (§14.3 of the conformance revision).
+    pub fn review(project_dir: PathBuf, credentials: Credentials) -> Self {
+        Self {
+            backing: Backing::Review { project_dir },
+            builder: None,
+            credentials,
+        }
+    }
+
+    /// The server, serving the implementer and reviewer tokens
+    /// `credentials` holds and will hold.
+    pub fn with_credentials(mut self, credentials: Credentials) -> Self {
+        self.credentials = credentials;
+        self
+    }
+
+    /// The role of a request's caller. An implementer's or a
+    /// reviewer's token says so. A single-project server serves its
+    /// workers and its interactive sessions alike, so there the bearer
+    /// decides; a review server's callers are its reviewers, and every
+    /// other server's caller is its coordinator.
     fn role(&self, context: &RequestContext<RoleServer>) -> Role {
+        if let Some(credential) = self.credential(context) {
+            return match credential.role {
+                CredentialRole::Implementer => Role::Implementer,
+                CredentialRole::Reviewer => Role::Reviewer,
+            };
+        }
+
         match &self.backing {
             Backing::Single(engine) => match Self::bearer(context)
                 .ok()
@@ -566,14 +685,27 @@ impl ConseqaMcp {
                 _ => Role::Worker,
             },
 
+            Backing::Review { .. } => Role::Reviewer,
+
             Backing::Multi { .. } | Backing::Local(_) => Role::Coordinator,
         }
+    }
+
+    /// The implementer's or reviewer's credential a request carries, if
+    /// it carries one.
+    fn credential(&self, context: &RequestContext<RoleServer>) -> Option<Credential> {
+        let bearer = Self::bearer(context).ok()?;
+
+        self.credentials.get(&bearer)
     }
 
     /// The tools `role` is served on this server.
     fn tools(&self, role: Role) -> &'static ToolRouter<Self> {
         match (role, &self.backing) {
+            (_, Backing::Review { .. }) => &ROUTERS.review_server,
             (Role::Worker, _) => &ROUTERS.worker,
+            (Role::Implementer, _) => &ROUTERS.implementer,
+            (Role::Reviewer, _) => &ROUTERS.reviewer,
             (Role::Coordinator, Backing::Single(_)) => &ROUTERS.session,
             (Role::Coordinator, _) => &ROUTERS.coordinator,
         }
@@ -600,6 +732,8 @@ impl ConseqaMcp {
             match role {
                 Role::Worker => WORKER_INSTRUCTIONS,
                 Role::Coordinator => COORDINATOR_INSTRUCTIONS,
+                Role::Implementer => IMPLEMENTER_INSTRUCTIONS,
+                Role::Reviewer => REVIEWER_INSTRUCTIONS,
             }
         ));
 
@@ -663,6 +797,12 @@ impl ConseqaMcp {
 
             // stdio: the local client is trusted; no bearer to check.
             Backing::Local(host) => host.active_resolved(),
+
+            Backing::Review { .. } => Err(ResolveError::Unauthorized(
+                "this server serves conformance reviews, and holds no engine to read the \
+                 design through"
+                    .to_string(),
+            )),
         }
     }
 
@@ -685,7 +825,7 @@ impl ConseqaMcp {
 
             Backing::Local(host) => Ok(host.clone()),
 
-            Backing::Single(_) => Err(McpError::invalid_request(
+            Backing::Single(_) | Backing::Review { .. } => Err(McpError::invalid_request(
                 "project selection is only available on a multi-project server",
                 None,
             )),
@@ -953,8 +1093,8 @@ pub struct ExportSpecParams {
     pub title: Option<String>,
 }
 
-/// The tools of both roles: tracked reads, canonical queries, the one
-/// mutation tool, and the guide.
+/// The read tools of every role an engine serves: tracked reads,
+/// canonical queries, and the diff.
 #[tool_router(router = shared_tools)]
 impl ConseqaMcp {
     #[tool(
@@ -1144,7 +1284,13 @@ impl ConseqaMcp {
             ContentBlock::text(json),
         ]))
     }
+}
 
+/// The one tool that changes the spec, served to the roles that do: a
+/// design task's worker and the coordinator. An implementer or a
+/// reviewer works on code and records, never on the spec (T4).
+#[tool_router(router = patch_tools)]
+impl ConseqaMcp {
     #[tool(
         description = "Submit your typed patch through the serializable commit gate. The \
                        gate revalidates everything you observed and rejects with precise \
@@ -1249,6 +1395,11 @@ impl ConseqaMcp {
                          (open_project with no path) to move it there, re-read what the \
                          rejection names, and submit again with a fresh nonce."
                     }
+                    // Served neither role, so neither reaches here; a
+                    // fresh read is the remedy all the same.
+                    (true, Role::Implementer | Role::Reviewer) => {
+                        "Your snapshot is behind the head: read again before you submit."
+                    }
                     (false, _) => {
                         "This is fixable in this session: adjust the patch (or read the \
                          missing symbols) and submit again with a fresh nonce."
@@ -1265,7 +1416,11 @@ impl ConseqaMcp {
             }
         }
     }
+}
 
+/// The guide, served to every role, a review server's included.
+#[tool_router(router = guide_tools)]
+impl ConseqaMcp {
     #[tool(
         description = "The Conseqa DSL, by topic: what services, schemas, data models, \
                        topics, state machines, operations, programs, transactions, effects, \
@@ -1829,6 +1984,7 @@ impl ServerHandler for ConseqaMcp {
     fn get_info(&self) -> ServerInfo {
         self.info(match &self.backing {
             Backing::Single(_) => Role::Worker,
+            Backing::Review { .. } => Role::Reviewer,
             Backing::Multi { .. } | Backing::Local(_) => Role::Coordinator,
         })
     }
@@ -1933,6 +2089,38 @@ pub fn router(engine: DesignEngine) -> axum::Router {
 /// session's `build_design` can build.
 pub fn router_with_builder(engine: DesignEngine, builder: Arc<dyn DesignBuilder>) -> axum::Router {
     build_router(ConseqaMcp::with_builder(engine, builder))
+}
+
+/// The `/mcp` router of a single-project server that serves the
+/// implementer and reviewer tokens `credentials` holds and will hold
+/// (T4): the daemon mints them on its admin surface.
+pub fn router_with_credentials(
+    engine: DesignEngine,
+    builder: Option<Arc<dyn DesignBuilder>>,
+    credentials: Credentials,
+) -> axum::Router {
+    let mcp = match builder {
+        Some(builder) => ConseqaMcp::with_builder(engine, builder),
+        None => ConseqaMcp::new(engine),
+    };
+
+    build_router(mcp.with_credentials(credentials))
+}
+
+/// Serves a review server for the project at `project_dir` on `bind`
+/// (§14.3 of the conformance revision): the agents `credentials` names
+/// read work items and record their reviews, through the project's
+/// files.
+pub async fn serve_review(
+    project_dir: PathBuf,
+    credentials: Credentials,
+    bind: SocketAddr,
+) -> std::io::Result<McpServer> {
+    serve_router(
+        build_router(ConseqaMcp::review(project_dir, credentials)),
+        bind,
+    )
+    .await
 }
 
 /// The `/mcp` router for a multi-project server: a stable API key

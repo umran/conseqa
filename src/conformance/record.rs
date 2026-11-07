@@ -210,7 +210,48 @@ pub struct Attestation {
 #[serde(deny_unknown_fields)]
 pub struct Party {
     pub kind: PartyKind,
+
+    /// A person's name, or an agent's provider and model.
     pub name: String,
+
+    /// The job the party acted in, when its credential names one:
+    /// provenance, which lets a run's report trace a record to the job
+    /// that wrote it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job: Option<String>,
+}
+
+impl Party {
+    /// Whether two parties are one, for the rule that a review by the
+    /// attester satisfies no required review (§14.5): by kind and name,
+    /// whatever jobs they acted in, so an agent cannot review its own
+    /// work from a second job.
+    pub fn same_as(&self, other: &Party) -> bool {
+        self.kind == other.kind && self.name == other.name
+    }
+
+    /// The person running a command in the project at `project_dir`,
+    /// by git's `user.name`: whom the coordinator's surfaces and the CLI
+    /// stamp attests and reviews with (§14.5). Refused when git has
+    /// none, rather than recording a guess.
+    pub fn person(project_dir: &Path) -> Result<Party, ConformanceError> {
+        let output = crate::design::store::git(project_dir, &["config", "user.name"], None);
+
+        let name = output
+            .ok()
+            .and_then(|bytes| String::from_utf8(bytes).ok())
+            .map(|name| name.trim().to_string())
+            .filter(|name| !name.is_empty())
+            .ok_or_else(|| ConformanceError::NoPerson {
+                path: project_dir.to_path_buf(),
+            })?;
+
+        Ok(Party {
+            kind: PartyKind::Person,
+            name,
+            job: None,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -541,6 +582,12 @@ pub(crate) fn pattern_error(error: &regex::Error) -> String {
 fn check_party(party: &Party, at: &str) -> Result<(), String> {
     if party.name.trim().is_empty() {
         Err(format!("{at} has no name"))
+    } else if party
+        .job
+        .as_deref()
+        .is_some_and(|job| job.trim().is_empty())
+    {
+        Err(format!("{at} names an empty job"))
     } else {
         Ok(())
     }

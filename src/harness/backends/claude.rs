@@ -14,7 +14,7 @@ use async_trait::async_trait;
 use crate::design::AgentBackendMetadata;
 use crate::harness::backend::{
     AgentBackend, AgentBackendError, AgentEvent, AgentEventSink, AgentExit, AgentHandle,
-    AgentInvocation, AgentUsage, mcp_config_json,
+    AgentInvocation, AgentUsage, SessionLaunch, mcp_config_json,
 };
 
 use super::process::{LineParser, supervise};
@@ -94,17 +94,18 @@ impl ClaudeCliBackend {
         self
     }
 
-    /// Writes the task's strict MCP config into the work directory and
-    /// returns its path. The token is referenced as `${CONSEQA_TASK_TOKEN}`
-    /// and supplied through the environment, never written to the file.
-    fn write_mcp_config(&self, invocation: &AgentInvocation) -> Result<PathBuf, AgentBackendError> {
-        std::fs::create_dir_all(&invocation.work_dir)?;
+    /// Writes the session's strict MCP config into the work directory
+    /// and returns its path. The token is referenced as
+    /// `${CONSEQA_TASK_TOKEN}` and supplied through the environment,
+    /// never written to the file.
+    fn write_mcp_config(&self, launch: &SessionLaunch) -> Result<PathBuf, AgentBackendError> {
+        std::fs::create_dir_all(&launch.work_dir)?;
 
-        let path = invocation
+        let path = launch
             .work_dir
-            .join(format!("conseqa-mcp-{}.json", invocation.task.0));
+            .join(format!("conseqa-mcp-{}.json", launch.name));
 
-        let config = mcp_config_json(&invocation.mcp_url, TOKEN_ENV_VAR);
+        let config = mcp_config_json(&launch.mcp_url, TOKEN_ENV_VAR);
 
         std::fs::write(
             &path,
@@ -114,10 +115,10 @@ impl ClaudeCliBackend {
         Ok(path)
     }
 
-    fn build_args(&self, invocation: &AgentInvocation, mcp_config: &Path) -> Vec<String> {
+    fn build_args(&self, launch: &SessionLaunch, mcp_config: &Path) -> Vec<String> {
         let mut args = vec![
             "-p".to_string(),
-            invocation.prompt.clone(),
+            launch.prompt.clone(),
             "--output-format".to_string(),
             "stream-json".to_string(),
             // stream-json in print mode requires --verbose.
@@ -143,7 +144,7 @@ impl ClaudeCliBackend {
             args.push(model.clone());
         }
 
-        if let Some(max_turns) = invocation.budget.max_turns {
+        if let Some(max_turns) = launch.budget.max_turns {
             args.push("--max-turns".to_string());
             args.push(max_turns.to_string());
         }
@@ -166,21 +167,34 @@ impl AgentBackend for ClaudeCliBackend {
         handle: AgentHandle,
         events: AgentEventSink,
     ) -> Result<AgentExit, AgentBackendError> {
-        let mcp_config = self.write_mcp_config(&invocation)?;
-        let args = self.build_args(&invocation, &mcp_config);
+        self.launch(SessionLaunch::from(&invocation), &handle, &events)
+            .await
+    }
+}
 
-        let env = vec![(TOKEN_ENV_VAR.to_string(), invocation.task_token.clone())];
+impl ClaudeCliBackend {
+    /// Runs one session to completion, or until `handle` cancels it.
+    pub async fn launch(
+        &self,
+        launch: SessionLaunch,
+        handle: &AgentHandle,
+        events: &AgentEventSink,
+    ) -> Result<AgentExit, AgentBackendError> {
+        let mcp_config = self.write_mcp_config(&launch)?;
+        let args = self.build_args(&launch, &mcp_config);
+
+        let env = vec![(TOKEN_ENV_VAR.to_string(), launch.token.clone())];
 
         let outcome = supervise(
             &self.program,
             &args,
             &env,
-            invocation.repo.as_ref(),
+            launch.repo.as_ref(),
             None,
             Box::new(ClaudeStreamParser::default()),
-            &handle,
-            &events,
-            invocation.budget.max_wall_time_secs,
+            handle,
+            events,
+            launch.budget.max_wall_time_secs,
         )
         .await?;
 

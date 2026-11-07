@@ -15,6 +15,7 @@ pub mod build;
 #[cfg(feature = "system-one")]
 pub mod executors;
 pub mod handoff;
+pub mod review;
 pub mod scheduler;
 pub mod supervisor;
 pub mod task_prompt;

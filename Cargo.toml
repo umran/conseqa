@@ -137,6 +137,14 @@ name = "conformance_work"
 required-features = ["design"]
 
 [[test]]
+name = "conformance_mcp"
+required-features = ["design"]
+
+[[test]]
+name = "conformance_cli"
+required-features = ["design"]
+
+[[test]]
 name = "harness_backends"
 required-features = ["design"]
 
