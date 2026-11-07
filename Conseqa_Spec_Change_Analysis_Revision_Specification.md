@@ -2,7 +2,7 @@
 
 ## 1. Status
 
-**Status:** Implemented, except the realization changes of §13.4, their two gates, and §19.15, which arrive with Part VI. Historical design record: the current behavior is described in `docs/live/SPEC_CHANGE_ANALYSIS.md`.  
+**Status:** Implemented, the realization changes of §13.4 and their gates included. Historical design record: the current behavior is described in `docs/live/SPEC_CHANGE_ANALYSIS.md` and, for the realization section, `docs/live/REALIZATION.md`.  
 **Part:** I of VI: semantic diff and obligation diff. Parts II, III and V are outlined in §21 and are not normative. Part IV (conformance) and Part VI (realization profiles) are specified in their own documents.  
 **Target DSL version:** 6 (unchanged)  
 **Project store format:** 10 (unchanged)  
@@ -12,7 +12,8 @@
 **Primary affected subsystems:** the obligation report, the project store reader, the `conseqa` CLI, the design MCP server  
 **Amended in implementation (M1, 2026-10-29):** §9.2, §10.5, §10.7, §10.9, §17, §18.2, and §18.4, with the maintainer's approval. The catalogue now covers every proof structure, the blocked-on set has a shape and a catalogue of its own, and the reliance the proofs used without stating it is exposed in their structures.  
 **Amended in implementation (M2, 2026-10-29):** §7.2, §7.3, §7.4, §8.2, §18.1, and §18.5, with the maintainer's approval. The partition names who owns a requirement's `result` and the effect contracts inside a transaction; the invariant states the rename case; the authoring items and the delta's notation are fixed; and the module layout is recorded.  
-**Amended in implementation (M3, 2026-10-30):** §10.1, §10.5, §10.6, §10.7, §10.9, §11.4, §12.1, §12.2, §12.3, §14, §15.3, §16, §18.5, and §19.2, with the maintainer's approval. The document's entries, counts, and removed section are specified; a modified requirement explains the obligations its change adds or removes; a change is explained through the relied-on obligations whose own change is explained; a requirement's absence is a query fact, `keyed_requirement`, and absence queries are read on both sides; and the mutation catalogue is library code.
+**Amended in implementation (M3, 2026-10-30):** §10.1, §10.5, §10.6, §10.7, §10.9, §11.4, §12.1, §12.2, §12.3, §14, §15.3, §16, §18.5, and §19.2, with the maintainer's approval. The document's entries, counts, and removed section are specified; a modified requirement explains the obligations its change adds or removes; a change is explained through the relied-on obligations whose own change is explained; a requirement's absence is a query fact, `keyed_requirement`, and absence queries are read on both sides; and the mutation catalogue is library code.  
+**Amended in implementation (Part VI's M9, 2026-11-07):** §13.4, §14, and §15.3, with the maintainer's approval. A side's realization files are read through its spec's file source, and a profile that does not load refuses the side; needs come even from a spec whose operations lack programs; the realization section's shape is fixed; and the `infeasible` and `ambiguous` gates read that section alone.
 
 This revision makes a **change to a Conseqa spec** a first-class object. Given two spec trees, typically two git revisions of one repository's `.conseqa/`, Conseqa SHALL report:
 
@@ -743,6 +744,8 @@ When either side has a stack profile (Part VI §9), the diff reads `.conseqa/rea
 
 A spec change that adds a need the chosen realization does not provide is reported here, at the spec gate, rather than discovered by an implementing agent.
 
+A side's realization files are read through the same file source as its spec, a commit's tree included, and a profile that does not load refuses the side, naming it. Needs are derived even from a spec whose operations do not all have programs yet: such an operation asks nothing of its data models. In the document, `base` and `head` give each side's `state`, with the `entry` and `options` when an entry realizes the declaration; an `unrealizable` entry gives its `declaration`, `state`, and `needs`, with `valid` for an ambiguous one, `problems` for an invalid choice, and `gaps` for an infeasible one.
+
 ---
 
 # 14. The diff document
@@ -911,7 +914,7 @@ Removed obligations and unexplained entries, when there are any, are printed in 
 | `infeasible` | any declaration on head is `infeasible`, or has an `invalid_choice` (§13.4) |
 | `ambiguous` | any declaration on head is `ambiguous` (§13.4) |
 
-`infeasible` and `ambiguous` arrive with Part VI's realization section (§13.4). Until then `conseqa diff` does not accept them.
+`infeasible` and `ambiguous` read the realization section alone, whether or not the obligation diff is available: without a stack profile on either side there is no section, and neither fails.
 
 | Exit | Meaning |
 |---|---|

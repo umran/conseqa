@@ -2,7 +2,7 @@
 
 ## 1. Status
 
-**Status:** Implemented, except the realization requirements Part VI's amendment adds (realization facts as required facts, the record's `realization` field, stack-driven binding, a work item's Realization section, `unrealizable`, and checker reviews), which arrive with Part VI. Historical design record: the current behavior is described in `docs/live/CONFORMANCE.md`.  
+**Status:** Implemented, the realization requirements Part VI's amendment adds included. Historical design record: the current behavior is described in `docs/live/CONFORMANCE.md` and, for realization, `docs/live/REALIZATION.md`.  
 **Part:** IV of the spec-versioning programme: realization bindings. It is drafted ahead of Parts II and III, because Part II's deployment baseline is defined in terms of the records this part introduces (§16).  
 **Depends on:** Part I, `Conseqa_Spec_Change_Analysis_Revision_Specification.md`. It uses Part I's declaration partition (§7), obligation keys (§9), the basis and the durable form of facts (§10, §10.9), and the reliance delta (§13).  
 **Amended by:** Part VI, `Conseqa_Realization_Profiles_Revision_Specification.md` (§7.1–§7.3, §8.2, §10.1, §12.1, §12.2, §14.3, §14.4, §19, §21). Realization requirements become required facts, a stack profile brings realized declarations under binding, and catalogue checkers record reviews.  
@@ -34,6 +34,12 @@
 - §14.3: recording a review, its refusals, one review per party at one set of digests, an identical review replayed as a no-op, and `conseqa conform review`'s targets, agents, and server;
 - §15.1–§15.4: the implementer and reviewer roles and their tokens, each subcommand's output and exit codes, and the conformance documents;
 - §17.1, §17.3, §17.5, and §18.9–§18.11.
+
+**Amended in implementation (Part VI's M9, 2026-11-07):** with the maintainer's approval:
+- §8.2 and §10.1: attest writes a realized declaration's `realization`, a record is `stale` under any other choice or once the declaration is no longer realized, and the field is refused on a kind that is not realizable;
+- §11.3 and §12.1: an `unrealizable` item's priority is `parked`, after every other, and the Realization section's idioms are matched by the stack, the realizing entry, and the primitives the declaration contributes;
+- §12.2: a realization fact's load-bearing line names what the entry provides for the spec's needs;
+- §14.3 and §14.4: checker reviews are derived on every derivation and never written into records.
 
 This revision connects a spec to the code that implements it, and turns the spec's changes into guided implementation work for LLM agents. It introduces:
 
@@ -546,6 +552,7 @@ An item's id is its declaration's textual key. The same item has the same id on 
 2. **Structure.** Items for `unbound`, `unattested`, `stale`, or `drifted` declarations that block no proven obligation.
 3. **Review.** Items whose only conditions are `unreviewed` or `disputed`.
 4. **Cleanup.** `orphaned` keys and `surplus` facts. This is optional work. A surplus fact is one no proof needs any longer, which is not the same as one the code may stop providing (Part I §13.2).
+5. **Parked.** Items of `unrealizable` declarations, whatever else they carry: the remedy is a decision about the spec or the stack, not code, so they come after every other.
 
 An item that blocks no proven obligation takes the priority of its most urgent condition: `unbound`, `unattested`, `stale`, and `drifted` are structure, `unreviewed` and `disputed` are review, and `surplus` is cleanup. `missing_facts` and `incomplete` always block what relies on them.
 
@@ -620,7 +627,7 @@ The withdrawals at this revision:
 | `retry_may_repeat` | set the retry to `unspecified` |
 | `message_identity` | set the identity to `unspecified` |
 
-A kind without a withdrawal, structural facts among them, falls back to listing the obligations that rely on the fact. A `realization` fact has no proof cost, so the packet states instead the capability its requirement secures: "without it, `topic_runtime topic.payment_captured` no longer provides `ordering: within_group` as the spec declares". Models are small and verification is fast, so the check runs on every packet. This is the sentence that stops an agent from deleting the `version = $2`: not a rule that it should be careful, but the named properties it would break.
+A kind without a withdrawal, structural facts among them, falls back to listing the obligations that rely on the fact. A `realization` fact has no proof cost, so the packet states instead what the requirement's entry provides for the spec's needs of the declaration it realizes: "without it, `topic_runtime topic.payment_captured` is no longer realized as `kafka.keyed-topic@1` provides `grouping: keyed`, `ordering: within_group`, as the spec declares". An entry does not tie a requirement to one capability, so the line names every need the entry covers. Models are small and verification is fast, so the check runs on every packet. This is the sentence that stops an agent from deleting the `version = $2`: not a rule that it should be careful, but the named properties it would break.
 
 ## 12.3 Precedents
 
@@ -697,13 +704,13 @@ Partial attestation is allowed. Attesting two of three required facts leaves `mi
 
 A review is a second party's check of a record against the code. It gives a verdict, `confirmed` or `disputed`, for the record as a whole and optionally per fact and per claim, with notes. It records the digests it saw. It applies while they are the record's region digests, counted as a multiset, so it lapses when a region is edited, added, or removed.
 
-An item's verdict overrides the review's verdict on the record as a whole, for the item's target. A review confirms one thing the record carries when it saw the current digests, is by another party than `attested.by` (§14.5), and its verdict on that thing is `confirmed`. A checker review satisfies only the realization requirements its checker covers (below), so until catalogue checkers exist (Part VI §13) it satisfies no required review.
+An item's verdict overrides the review's verdict on the record as a whole, for the item's target. A review confirms one thing the record carries when it saw the current digests, is by another party than `attested.by` (§14.5), and its verdict on that thing is `confirmed`. A checker review satisfies only the realization requirements its checker covers (below), and a review written into a record as a checker's satisfies nothing.
 
 A review supplies the declaration, its verdict on the record as a whole, its verdicts on single items with their notes, and, optionally, the digest of the record it read. The tool records the record's region digests, which are the current ones, and stamps `by` (§14.5). It refuses, by name: `unknown_declaration`; `no_record` (none, or one set aside); `drifted` and `stale`, since such a record is to be attested again first; `record_changed`, when the record it read is not the one on disk; and `malformed`, when an item names a fact or claim the record does not hold. One party keeps one review at one set of digests: a new review replaces its earlier one where it stands, and a review that would leave the record as it is writes nothing and succeeds, so a retry replays as a success.
 
 `conseqa conform review [<key>…] --backend claude|codex` runs one fresh-context worker per record, through the harness backends `conseqa design` already uses, with their scratch configuration outside the repository. With no key named, it reviews every record with an item the policy requires reviewed that no review confirms; a record that cannot be reviewed as it stands is reported refused, and given no worker. A worker receives the record, the item's packet, and read access to the files, but not the attester's reasoning. It reports through the review operation, with a reviewer's token stamped `{kind: agent, name: <backend>[/<model>], job: <run and worker>}`, to a review server the command runs in process. That server reads the spec from the project's files, so it takes no writer lock and runs beside an open design server. Done this way, a review is an independent read, not the attester's argument repeated back. The command reports what each worker recorded, and exits 2 when one recorded nothing.
 
-**Checker reviews.** A catalogue entry's deterministic checkers (Part VI §13) run on every derivation, over the regions bound to the declaration their requirement applies to. Each result is recorded as a review, `by: { kind: checker, name: <entry id>/<checker id>@<entry version> }`, at the digests it read. Like any review, it lapses when they change.
+**Checker reviews.** A catalogue entry's deterministic checkers (Part VI §13) run on every derivation, over the regions bound to the declaration their requirement applies to. Each result is a review, `by: { kind: checker, name: <entry id>/<checker id>@<entry version> }`, at the digests it read. It is derived, never written into the record, so the derivation stays read-only and the review holds of the regions as they are: it lapses the moment they change. The status lists a declaration's checker reviews beside its conditions. A confirmation satisfies the review of the requirement it covers, for the fact kinds `checker_satisfies` lists; a dispute raises `disputed`, whoever else confirms.
 
 ## 14.4 Policy
 

@@ -2,7 +2,7 @@
 
 ## 1. Status
 
-**Status:** Proposed  
+**Status:** Implemented. Historical design record: the current behavior is described in `docs/live/REALIZATION.md`.  
 **Part:** VI of the spec-versioning programme: realization profiles.  
 **Depends on:**
 - Part I (`Conseqa_Spec_Change_Analysis_Revision_Specification.md`): the declaration partition (§7), the textual declaration key and durable facts (§10.9), and the diff (§14).
@@ -19,6 +19,11 @@ Both are amended by this revision (§17, §18).
 - §7.1, §7.2, §8.1–§8.3, and §9: entries carry `format`, realize one kind, cite each claim, give options their own requirements and exclusions; the standard catalogue's first entries; the stack pins the standard catalogue; versions and ranges;
 - §10.1, §10.3, §10.4, §13.1, §14, and §15: a choice file's fields, the `unneeded` state, the infeasibility report, checker assertions' shapes, the realization documents, each subcommand's output and exit codes, and where the tools read;
 - §20.7 and §21: the record-staleness test moves with the record's `realization` field; Kafka's consumer-group assignment is settled, and compatibility between neighbouring realizations is a new open question.
+
+**Amended in implementation (M9, 2026-11-07):** with the maintainer's approval:
+- §7.2 and §11.2: the first standard checkers, and how each neighbour relation is resolved;
+- §13.1 and §13.2: which files a checker reads, what it reads of a region, `yaml_path` paths, its outcomes, and checker reviews derived on every derivation, never written;
+- §17 and §18: the diff's realization section as Part I now specifies it; the record's `realization` field and its staleness; the `parked` priority; the Realization section's idioms; and a realization fact's load-bearing line.
 
 This revision connects a spec to the concrete technologies that can realize it. It introduces:
 
@@ -273,7 +278,7 @@ citations:
 
 The table is illustrative: the standard catalogue's entries are authored with their citations under §8.3. The PostgreSQL, Oracle and DynamoDB rows are the cases §2.1 needs, and the version bound on PostgreSQL is part of the entry, not a footnote: PostgreSQL's `SERIALIZABLE` is serializable from 9.1, and `ON CONFLICT DO UPDATE` arrived in 9.5.
 
-The standard catalogue `conseqa-standard@1` ships `postgres.database`, `postgres.partitioned-table`, `oracle.database`, `dynamodb.table`, `kafka.topic`, `kafka.keyed-topic`, `kafka.consumer-group`, `sqs.fifo`, `sqs.standard`, `envoy.ring-hash`, `envoy.round-robin`, and `debezium.outbox-relay`, at version 1. Their checkers arrive with the checkers themselves.
+The standard catalogue `conseqa-standard@1` ships `postgres.database`, `postgres.partitioned-table`, `oracle.database`, `dynamodb.table`, `kafka.topic`, `kafka.keyed-topic`, `kafka.consumer-group`, `sqs.fifo`, `sqs.standard`, `envoy.ring-hash`, `envoy.round-robin`, and `debezium.outbox-relay`, at version 1. Three checkers ship with them: Envoy ring hash's `lb_policy` (one of `RING_HASH`, `MAGLEV`), and Kafka's `enable.idempotence=true` and, for `single_partition`, a Terraform topic with `partitions = 1`.
 
 ## 7.3 Requirements of the declaration's own regions
 
@@ -457,13 +462,15 @@ A requirement applies `of: self`, or to the declarations in one neighbour relati
 | Relation | Of a | Means | Graph query |
 |---|---|---|---|
 | `producers` | `topic`, `topic_runtime` | every effect site publishing to the topic | `Publishers` |
-| `producers` | `outbox`, `outbox_runtime` | every effect site writing the outbox | the outbox's writers |
+| `producers` | `outbox`, `outbox_runtime` | every effect site and transition writing the outbox; an outbox runtime's outbox is the one its input consumes | `Publishers`, keyed by the outbox |
 | `consumers` | `topic`, `topic_runtime` | every subscription input of the topic | `Consumers` |
-| `callers` | `router` | every request effect site targeting the router's boundary operation | `Callers` |
-| `writers` | `data_model`, `data_object` | every transaction mutating the object | `Writers` |
+| `callers` | `router` | every request effect site targeting the router's boundary operation and input | `Callers`, filtered by the input |
+| `writers` | `data_model`, `data_object` | every transaction mutating an object of the data model | `Writers`, per object |
 | `transactions` | `data_model` | every transaction declaring the data model | the data model's transactions |
 | `serializable_transactions` | `data_model` | every transaction declaring `isolation: serializable` | the data model's transactions, filtered |
-| `guarded_transactions` | `data_model` | every transaction with a conditional mutation | the data model's transactions, filtered |
+| `guarded_transactions` | `data_model` | every transaction with a guarded mutation: a `compare_and_set`, `transition`, `advance_cursor`, or `fence` | the data model's transactions, filtered |
+
+A topic's producers include the transitions whose side effects publish to it, as the graph's `Publishers` reports them, and an outbox's the transitions whose admissions write it.
 
 So Kafka's `record-key` lands on every producing effect site. Envoy's header requirement lands on every caller. PostgreSQL's `40001` retry lands on every serializable transaction.
 
@@ -507,6 +514,8 @@ Conseqa ships a closed set of checker kinds. Entries configure them; they never 
 
 A checker reads only regions bound to the declaration its requirement applies to. It never searches the repository.
 
+It applies to a region by its file's type: `hcl` to `.tf` and `.hcl` files, `yaml_path` to `.yaml`, `.yml`, and `.json`, `properties` to `.properties`, `.conf`, and `.cfg`, `sql_ddl` to `.sql`, and `pattern` to any file. It reads the region's own text, nested regions left out, as its digest does. A `yaml_path` path is dotted keys matched at any depth, crossing lists, so a region cut from inside a larger document reads. A checker finds `confirmed` when every value it finds holds, `disputed` when the value is absent or one found fails, since configuration that does not state a requirement does not show it holds, and `not_applicable` when no region bound to the declaration is a file of its kind.
+
 Each kind's `assert` has one shape, and asserts exactly one thing:
 
 | Kind | `assert` |
@@ -521,7 +530,7 @@ A value is a string, a boolean, or an integer, compared as it is written. An idi
 
 ## 13.2 Results are reviews
 
-A checker run yields `confirmed`, `disputed`, or `not_applicable` for each requirement it covers. It is recorded as a Part IV review, `by: { kind: checker, name: <entry id>/<checker id>@<entry version> }`, at the digests it read. Its review lapses when those digests change, like any other.
+A checker run yields `confirmed`, `disputed`, or `not_applicable` for each requirement it covers. It is a Part IV review, `by: { kind: checker, name: <entry id>/<checker id>@<entry version> }`, at the digests it read. It is derived on every derivation and never written into a record, so the derivation stays read-only and the review holds of the regions as they are: it lapses the moment their digests change. A confirmation satisfies the review of the requirement it covers, and a dispute raises `disputed`.
 
 ## 13.3 When a checker suffices
 
@@ -616,20 +625,20 @@ Part I (`Conseqa_Spec_Change_Analysis_Revision_Specification.md`) changes as fol
 Part IV (`Conseqa_Conformance_and_Implementation_Guidance_Revision_Specification.md`) changes as follows:
 
 1. **§7.1 and §7.2.** The `realization` kind is attestable, and its implementer is the declaration named in its `declaration` field.
-2. **§7.3, required facts.** A declaration's required facts are the attestable facts proofs rely on, as before, plus every `realization` fact applying to it. A record's `realization` field (§8.2) names the chosen entry, and a different chosen entry, version or option set makes the record `stale`.
-3. **§8.2, records** gain `realization: { entry: <id@version>, options: [...] }` on records of realized declarations.
+2. **§7.3, required facts.** A declaration's required facts are the attestable facts proofs rely on, as before, plus every `realization` fact applying to it. A record's `realization` field (§8.2) names the chosen entry, and a different chosen entry, version or option set makes the record `stale`, as does the declaration's no longer being realized.
+3. **§8.2, records** gain `realization: { entry: <id@version>, options: [...] }` on records of realized declarations, written by attest from the chosen or automatic realization. The reader refuses the field on a kind that is not realizable.
 4. **§14.4, policy.** When a stack profile exists, every declaration with a chosen realization must be bound, whatever `require_binding` lists. This is what brings routers, pools, storage layouts and topic runtimes under conformance.
 5. **§12.1, work items** gain a **Realization** section, before Precedents, holding:
    - the chosen entry, and why it was chosen (automatic or the architect's reason);
    - each realization requirement on this declaration, with its statement and evidence shape;
    - the requirements this declaration imposes on its neighbours, so a topic's implementer knows producers must set keys;
-   - the idiom entries matching the project's frameworks for the primitives the declaration uses.
+   - the idiom entries matching the project's frameworks for the primitives the declaration uses: an idiom whose technology the stack names, whose platforms include the entry realizing the declaration a primitive is contributed to, and whose primitive is a need the declaration contributes.
 
-   This answers T11 of the orchestrator design: guidance exists before any precedent does.
+   This answers T11 of the orchestrator design: guidance exists before any precedent does. A `realization` fact's load-bearing line (§12.2) names what its entry provides for the spec's needs of the declaration it realizes, since an entry does not tie a requirement to one capability.
 6. **§14.3, reviews** gain checker reviews (§13.2). **§14.4's policy** gains two keys:
    - `review.realization: required`, the default;
    - `review.checker_satisfies: [realization]`, the default, naming the fact kinds a confirming checker review satisfies.
-7. **§10.1, conditions** gain `unrealizable`: the declaration is ambiguous, has an invalid choice, or is infeasible. Its work item is parked, since the remedy is a spec or stack decision, not code.
+7. **§10.1, conditions** gain `unrealizable`: the declaration is ambiguous, has an invalid choice, or is infeasible. Its work item is parked, since the remedy is a spec or stack decision, not code: **§11.3** gains a last priority, `parked`, which such an item takes whatever else it carries.
 8. **§21** records deterministic checkers as partly resolved by §13.
 
 ---
