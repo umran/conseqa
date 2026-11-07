@@ -201,8 +201,12 @@ pub enum Resolution {
     KeyedCommit { key: Vec<StableRoot> },
 
     /// Route A: the re-encounter safely re-executes the naturally
-    /// replayable body.
-    NaturalReplay,
+    /// replayable body, resting on the stable roots of its update
+    /// targets and derivations.
+    NaturalReplay {
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        body: Vec<StableRoot>,
+    },
 
     /// The transaction is the final step of a path ending at
     /// `complete`: no failing prefix follows its commit, so it is
@@ -520,7 +524,9 @@ fn analyze_path(
                     let resolution = match (recovery, natural) {
                         (Ok(key), _) => Some(Resolution::KeyedCommit { key: key.clone() }),
 
-                        (Err(_), Ok(())) => Some(Resolution::NaturalReplay),
+                        (Err(_), Ok(body)) => {
+                            Some(Resolution::NaturalReplay { body: body.clone() })
+                        }
 
                         (Err(recovery), Err(reconstruction)) => {
                             obstacles.push(RecoverabilityObstacle::TransactionNotResolvable {

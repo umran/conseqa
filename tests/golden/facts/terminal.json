@@ -1,0 +1,10 @@
+{
+  "fact_format": 1,
+  "facts": [
+    {
+      "input": "input.ship.paid",
+      "kind": "terminal",
+      "operation": "operation.ship"
+    }
+  ]
+}

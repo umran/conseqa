@@ -1701,6 +1701,7 @@ mod tests {
         application_repair_tasks, dependency_repair_task, group_dependency_requests,
         operation_owned_ids, unproven_targets,
     };
+    use crate::analyzer::basis::{ObligationKey, ObligationProperty, ObligationSubject};
     use crate::analyzer::report::{Obligation, Property, ProverReport, Status, Subject};
     use crate::analyzer::verification::VerificationReport;
     use crate::design::symbol::RequirementFamily;
@@ -1720,9 +1721,36 @@ mod tests {
         Id(text.to_string())
     }
 
+    /// A key distinct per subject, property, and index; the repair
+    /// planning under test addresses obligations by id.
+    fn key(subject: ObligationSubject, property: &Property, index: usize) -> ObligationKey {
+        ObligationKey {
+            subject,
+            property: match property {
+                Property::TransactionSerializability => {
+                    ObligationProperty::TransactionSerializability
+                }
+                Property::TransactionOrdering => ObligationProperty::TransactionOrdering,
+                Property::Idempotency => ObligationProperty::Idempotency,
+                Property::Recoverability => ObligationProperty::Recoverability,
+                Property::ResultReplay => ObligationProperty::ResultReplay,
+                Property::Custom { .. } => unreachable!("no test declares a custom property"),
+            },
+            requirement_key: Vec::new(),
+            occurrence: index as u32,
+        }
+    }
+
     fn obligation(operation: &str, property: Property, family: &str, index: usize) -> Obligation {
         Obligation {
             id: format!("oblig.{operation}.{family}.{index}"),
+            key: key(
+                ObligationSubject::Operation {
+                    operation: id(operation),
+                },
+                &property,
+                index,
+            ),
             property,
             subject: Subject::Operation {
                 operation: id(operation),
@@ -1734,6 +1762,8 @@ mod tests {
             remedy: None,
             assumptions: Vec::new(),
             evidence: Vec::new(),
+            basis: None,
+            blocked_on: None,
             counterexample: None,
         }
     }
@@ -1747,6 +1777,14 @@ mod tests {
     ) -> Obligation {
         Obligation {
             id: format!("oblig.{operation}.{transaction}.{family}.{index}"),
+            key: key(
+                ObligationSubject::Transaction {
+                    operation: id(operation),
+                    transaction: id(transaction),
+                },
+                &property,
+                index,
+            ),
             property,
             subject: Subject::Transaction {
                 operation: id(operation),
@@ -1759,6 +1797,8 @@ mod tests {
             remedy: None,
             assumptions: Vec::new(),
             evidence: Vec::new(),
+            basis: None,
+            blocked_on: None,
             counterexample: None,
         }
     }
@@ -1777,6 +1817,7 @@ mod tests {
             obligations: ProverReport {
                 format: crate::analyzer::report::FORMAT,
                 dsl: Some(crate::spec::DSL_VERSION),
+                fact_format: crate::analyzer::basis::FACT_FORMAT,
                 model_revision: Some(7),
                 obligations,
                 notes: Vec::new(),

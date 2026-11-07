@@ -309,6 +309,11 @@ pub enum ArtifactReplay {
     Reconstructed {
         transaction: Id,
         derivation: Vec<StableRoot>,
+
+        /// The stable roots the transaction's natural replay rests on:
+        /// the targets and derivations of its updates.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        body: Vec<StableRoot>,
     },
 
     /// Neither route holds; both routes' gaps are recorded.
@@ -677,7 +682,9 @@ pub enum TracedStep<'a> {
         transaction: &'a Transaction,
         before: PathContext,
         recovery: Result<Vec<StableRoot>, Vec<ReplayGap>>,
-        natural: Result<(), Vec<ReplayGap>>,
+
+        /// Route A, with the stable roots natural replay rests on.
+        natural: Result<Vec<StableRoot>, Vec<ReplayGap>>,
     },
 
     Effect {
@@ -1923,7 +1930,7 @@ impl<'a> ReplayAnalysis<'a> {
         body: &'a Transaction,
     ) -> (
         Result<Vec<StableRoot>, Vec<ReplayGap>>,
-        Result<(), Vec<ReplayGap>>,
+        Result<Vec<StableRoot>, Vec<ReplayGap>>,
         Vec<OutboxWriteTrace<'a>>,
     ) {
         let recovery = self.recovery_route(context, body);
@@ -2062,19 +2069,37 @@ impl<'a> ReplayAnalysis<'a> {
     }
 
     /// Route A precondition: the V1 natural-replay judgment over the
-    /// transaction body.
+    /// transaction body, with the stable roots it rests on — the
+    /// targets and derivations of its updates — so a proof citing the
+    /// route states what it relied on.
     fn natural_route(
         &self,
         context: &PathContext,
         transaction: &Transaction,
-    ) -> Result<(), Vec<ReplayGap>> {
+    ) -> Result<Vec<StableRoot>, Vec<ReplayGap>> {
         let mut gaps = Vec::new();
+        let mut roots: Vec<StableRoot> = Vec::new();
 
         let push = |gaps: &mut Vec<ReplayGap>, gap: ReplayGap| {
             if !gaps.contains(&gap) {
                 gaps.push(gap);
             }
         };
+
+        let mut stable =
+            |gaps: &mut Vec<ReplayGap>,
+             root: &ValueRef,
+             unstable: fn(ValueRef, StabilityGap) -> ReplayGap| {
+                match self.root_stability(context, root) {
+                    Ok(stable) => {
+                        if !roots.contains(&stable) {
+                            roots.push(stable);
+                        }
+                    }
+
+                    Err(gap) => push(gaps, unstable(root.clone(), gap)),
+                }
+            };
 
         for step in &transaction.steps {
             match step {
@@ -2093,15 +2118,9 @@ impl<'a> ReplayAnalysis<'a> {
                     }
 
                     for root in update.target.predicate.roots() {
-                        if let Err(gap) = self.root_stability(context, root) {
-                            push(
-                                &mut gaps,
-                                ReplayGap::MutationTargetRootUnstable {
-                                    root: root.clone(),
-                                    gap,
-                                },
-                            );
-                        }
+                        stable(&mut gaps, root, |root, gap| {
+                            ReplayGap::MutationTargetRootUnstable { root, gap }
+                        });
                     }
 
                     match &update.values {
@@ -2111,15 +2130,9 @@ impl<'a> ReplayAnalysis<'a> {
 
                         Derivation::Deterministic { from } => {
                             for root in from {
-                                if let Err(gap) = self.root_stability(context, root) {
-                                    push(
-                                        &mut gaps,
-                                        ReplayGap::MutationDerivationRootUnstable {
-                                            root: root.clone(),
-                                            gap,
-                                        },
-                                    );
-                                }
+                                stable(&mut gaps, root, |root, gap| {
+                                    ReplayGap::MutationDerivationRootUnstable { root, gap }
+                                });
                             }
                         }
                     }
@@ -2173,7 +2186,7 @@ impl<'a> ReplayAnalysis<'a> {
             }
         }
 
-        if gaps.is_empty() { Ok(()) } else { Err(gaps) }
+        if gaps.is_empty() { Ok(roots) } else { Err(gaps) }
     }
 
     /// §17 route selection for one established artifact. Recovery
@@ -2183,7 +2196,7 @@ impl<'a> ReplayAnalysis<'a> {
         &self,
         transaction: &Id,
         recovery: &Result<Vec<StableRoot>, Vec<ReplayGap>>,
-        natural: &Result<(), Vec<ReplayGap>>,
+        natural: &Result<Vec<StableRoot>, Vec<ReplayGap>>,
         derivation: &Derivation,
         context: &PathContext,
     ) -> ArtifactReplay {
@@ -2223,6 +2236,7 @@ impl<'a> ReplayAnalysis<'a> {
             ArtifactReplay::Reconstructed {
                 transaction: transaction.clone(),
                 derivation: roots,
+                body: natural.clone().unwrap_or_default(),
             }
         } else {
             ArtifactReplay::Unavailable {

@@ -1,0 +1,33 @@
+{
+  "fact_format": 1,
+  "facts": [
+    {
+      "channel": {
+        "kind": "topic",
+        "topic": "topic.payments"
+      },
+      "kind": "propagation",
+      "producer": {
+        "effect": "effect.charge.publish_captured",
+        "kind": "effect_site",
+        "operation": "operation.charge"
+      },
+      "schema": "schema.PaymentCaptured"
+    },
+    {
+      "channel": {
+        "data_model": "data.orders",
+        "kind": "outbox",
+        "outbox": "outbox.order_events"
+      },
+      "kind": "propagation",
+      "producer": {
+        "effect": "effect.order.paid",
+        "kind": "transition_effect",
+        "machine": "machine.order",
+        "transition": "transition.order.pay"
+      },
+      "schema": "schema.OrderPaid"
+    }
+  ]
+}

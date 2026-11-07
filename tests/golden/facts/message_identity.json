@@ -1,0 +1,35 @@
+{
+  "fact_format": 1,
+  "facts": [
+    {
+      "channel": {
+        "kind": "topic",
+        "topic": "topic.payments"
+      },
+      "fields": [
+        [
+          "event_id"
+        ]
+      ],
+      "kind": "message_identity",
+      "schema": "schema.PaymentCaptured"
+    },
+    {
+      "channel": {
+        "data_model": "data.orders",
+        "kind": "outbox",
+        "outbox": "outbox.order_events"
+      },
+      "fields": [
+        [
+          "order_id"
+        ],
+        [
+          "sequence"
+        ]
+      ],
+      "kind": "message_identity",
+      "schema": "schema.OrderPaid"
+    }
+  ]
+}

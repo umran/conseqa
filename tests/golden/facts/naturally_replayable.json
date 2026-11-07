@@ -1,0 +1,10 @@
+{
+  "fact_format": 1,
+  "facts": [
+    {
+      "kind": "naturally_replayable",
+      "operation": "operation.apply_payment",
+      "transaction": "tx.apply_payment"
+    }
+  ]
+}

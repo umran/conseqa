@@ -1,10 +1,31 @@
 {
-  "format": 9,
+  "format": 10,
   "dsl": 6,
+  "fact_format": 1,
   "model_revision": 1,
   "obligations": [
     {
       "id": "oblig.operation.apply_payment.tx.apply_payment.transaction_serializability.0",
+      "key": {
+        "subject": {
+          "kind": "transaction",
+          "operation": "operation.apply_payment",
+          "transaction": "tx.apply_payment"
+        },
+        "property": "transaction_serializability",
+        "requirement_key": [
+          {
+            "source": {
+              "kind": "input",
+              "id": "input.apply_payment.captured"
+            },
+            "path": [
+              "order_id"
+            ]
+          }
+        ],
+        "occurrence": 0
+      },
       "property": {
         "kind": "transaction_serializability"
       },
@@ -78,10 +99,424 @@
         "the write-write from `tx.create_order.new` (step 1) to `tx.create_order.new` (step 1) on `object.order` is commit-ordered: conflicting writes under declared isolation (read_committed and read_committed) are installed in commit order",
         "no cyclic conflict component contains an unconstrained dependency: an apparent cycle would imply a cycle in strict commit order and cannot occur in a committed history"
       ],
-      "evidence": []
+      "evidence": [],
+      "basis": [
+        {
+          "fact": {
+            "kind": "guarded_mutation",
+            "operation": "operation.apply_payment",
+            "transaction": "tx.apply_payment",
+            "data_model": "data.checkout",
+            "object": "object.order",
+            "mechanism": "advance_cursor",
+            "coverage": {
+              "kind": "atomic"
+            },
+            "compared_fields": [
+              [
+                "version"
+              ]
+            ]
+          },
+          "anchors": [
+            {
+              "kind": "data_object",
+              "value": {
+                "data_model": "data.checkout",
+                "object": "object.order"
+              }
+            },
+            {
+              "kind": "transaction",
+              "value": {
+                "operation": "operation.apply_payment",
+                "transaction": "tx.apply_payment"
+              }
+            }
+          ],
+          "layer": "l0"
+        },
+        {
+          "fact": {
+            "kind": "guarded_mutation",
+            "operation": "operation.cancel_order",
+            "transaction": "tx.cancel_order",
+            "data_model": "data.checkout",
+            "object": "object.order",
+            "mechanism": "transition",
+            "coverage": {
+              "kind": "atomic"
+            },
+            "compared_fields": [
+              [
+                "version"
+              ]
+            ]
+          },
+          "anchors": [
+            {
+              "kind": "data_object",
+              "value": {
+                "data_model": "data.checkout",
+                "object": "object.order"
+              }
+            },
+            {
+              "kind": "transaction",
+              "value": {
+                "operation": "operation.cancel_order",
+                "transaction": "tx.cancel_order"
+              }
+            }
+          ],
+          "layer": "l0"
+        },
+        {
+          "fact": {
+            "kind": "guarded_mutation",
+            "operation": "operation.apply_payment",
+            "transaction": "tx.apply_payment",
+            "data_model": "data.checkout",
+            "object": "object.order",
+            "mechanism": "advance_cursor",
+            "coverage": {
+              "kind": "observed_version",
+              "read": "read.apply_payment.order",
+              "version_field": [
+                "version"
+              ]
+            },
+            "compared_fields": [
+              [
+                "version"
+              ]
+            ]
+          },
+          "anchors": [
+            {
+              "kind": "data_object",
+              "value": {
+                "data_model": "data.checkout",
+                "object": "object.order"
+              }
+            },
+            {
+              "kind": "transaction",
+              "value": {
+                "operation": "operation.apply_payment",
+                "transaction": "tx.apply_payment"
+              }
+            }
+          ],
+          "layer": "l0"
+        },
+        {
+          "fact": {
+            "kind": "guarded_mutation",
+            "operation": "operation.cancel_order",
+            "transaction": "tx.cancel_order",
+            "data_model": "data.checkout",
+            "object": "object.order",
+            "mechanism": "transition",
+            "coverage": {
+              "kind": "observed_version",
+              "read": "read.cancel_order.order",
+              "version_field": [
+                "version"
+              ]
+            },
+            "compared_fields": [
+              [
+                "version"
+              ]
+            ]
+          },
+          "anchors": [
+            {
+              "kind": "data_object",
+              "value": {
+                "data_model": "data.checkout",
+                "object": "object.order"
+              }
+            },
+            {
+              "kind": "transaction",
+              "value": {
+                "operation": "operation.cancel_order",
+                "transaction": "tx.cancel_order"
+              }
+            }
+          ],
+          "layer": "l0"
+        },
+        {
+          "fact": {
+            "kind": "guarded_mutation",
+            "operation": "operation.apply_payment",
+            "transaction": "tx.apply_payment",
+            "data_model": "data.checkout",
+            "object": "object.order",
+            "mechanism": "transition",
+            "coverage": {
+              "kind": "atomic"
+            },
+            "compared_fields": []
+          },
+          "anchors": [
+            {
+              "kind": "data_object",
+              "value": {
+                "data_model": "data.checkout",
+                "object": "object.order"
+              }
+            },
+            {
+              "kind": "transaction",
+              "value": {
+                "operation": "operation.apply_payment",
+                "transaction": "tx.apply_payment"
+              }
+            }
+          ],
+          "layer": "l0"
+        },
+        {
+          "fact": {
+            "kind": "cyclic_components",
+            "root": {
+              "operation": "operation.apply_payment",
+              "transaction": "tx.apply_payment"
+            },
+            "key": {
+              "source": {
+                "kind": "input",
+                "id": "input.apply_payment.captured"
+              },
+              "path": [
+                "order_id"
+              ]
+            },
+            "components": [
+              [
+                {
+                  "operation": "operation.apply_payment",
+                  "transaction": "tx.apply_payment"
+                },
+                {
+                  "operation": "operation.cancel_order",
+                  "transaction": "tx.cancel_order"
+                },
+                {
+                  "operation": "operation.create_order",
+                  "transaction": "tx.create_order.new"
+                }
+              ]
+            ]
+          },
+          "anchors": [
+            {
+              "kind": "transaction",
+              "value": {
+                "operation": "operation.apply_payment",
+                "transaction": "tx.apply_payment"
+              }
+            },
+            {
+              "kind": "transaction",
+              "value": {
+                "operation": "operation.cancel_order",
+                "transaction": "tx.cancel_order"
+              }
+            },
+            {
+              "kind": "transaction",
+              "value": {
+                "operation": "operation.create_order",
+                "transaction": "tx.create_order.new"
+              }
+            }
+          ],
+          "layer": "l0"
+        },
+        {
+          "fact": {
+            "kind": "cursor",
+            "data_model": "data.checkout",
+            "object": "object.order",
+            "field": [
+              "last_applied_sequence"
+            ],
+            "rule": "successor"
+          },
+          "anchors": [
+            {
+              "kind": "data_object",
+              "value": {
+                "data_model": "data.checkout",
+                "object": "object.order"
+              }
+            },
+            {
+              "kind": "transaction",
+              "value": {
+                "operation": "operation.apply_payment",
+                "transaction": "tx.apply_payment"
+              }
+            }
+          ],
+          "layer": "l0"
+        },
+        {
+          "fact": {
+            "kind": "no_deleters",
+            "data_model": "data.checkout",
+            "object": "object.order"
+          },
+          "anchors": [
+            {
+              "kind": "data_object",
+              "value": {
+                "data_model": "data.checkout",
+                "object": "object.order"
+              }
+            }
+          ],
+          "layer": "l0"
+        },
+        {
+          "fact": {
+            "kind": "conflict_closure",
+            "root": {
+              "operation": "operation.apply_payment",
+              "transaction": "tx.apply_payment"
+            },
+            "key": {
+              "source": {
+                "kind": "input",
+                "id": "input.apply_payment.captured"
+              },
+              "path": [
+                "order_id"
+              ]
+            },
+            "members": [
+              {
+                "operation": "operation.apply_payment",
+                "transaction": "tx.apply_payment"
+              },
+              {
+                "operation": "operation.cancel_order",
+                "transaction": "tx.cancel_order"
+              },
+              {
+                "operation": "operation.create_order",
+                "transaction": "tx.create_order.new"
+              }
+            ]
+          },
+          "anchors": [
+            {
+              "kind": "transaction",
+              "value": {
+                "operation": "operation.apply_payment",
+                "transaction": "tx.apply_payment"
+              }
+            },
+            {
+              "kind": "transaction",
+              "value": {
+                "operation": "operation.cancel_order",
+                "transaction": "tx.cancel_order"
+              }
+            },
+            {
+              "kind": "transaction",
+              "value": {
+                "operation": "operation.create_order",
+                "transaction": "tx.create_order.new"
+              }
+            }
+          ],
+          "layer": "l0"
+        },
+        {
+          "fact": {
+            "kind": "isolation",
+            "operation": "operation.apply_payment",
+            "transaction": "tx.apply_payment",
+            "level": "read_committed"
+          },
+          "anchors": [
+            {
+              "kind": "transaction",
+              "value": {
+                "operation": "operation.apply_payment",
+                "transaction": "tx.apply_payment"
+              }
+            }
+          ],
+          "layer": "l0"
+        },
+        {
+          "fact": {
+            "kind": "isolation",
+            "operation": "operation.cancel_order",
+            "transaction": "tx.cancel_order",
+            "level": "read_committed"
+          },
+          "anchors": [
+            {
+              "kind": "transaction",
+              "value": {
+                "operation": "operation.cancel_order",
+                "transaction": "tx.cancel_order"
+              }
+            }
+          ],
+          "layer": "l0"
+        },
+        {
+          "fact": {
+            "kind": "isolation",
+            "operation": "operation.create_order",
+            "transaction": "tx.create_order.new",
+            "level": "read_committed"
+          },
+          "anchors": [
+            {
+              "kind": "transaction",
+              "value": {
+                "operation": "operation.create_order",
+                "transaction": "tx.create_order.new"
+              }
+            }
+          ],
+          "layer": "l0"
+        }
+      ]
     },
     {
       "id": "oblig.operation.apply_payment.tx.apply_payment.transaction_ordering.0",
+      "key": {
+        "subject": {
+          "kind": "transaction",
+          "operation": "operation.apply_payment",
+          "transaction": "tx.apply_payment"
+        },
+        "property": "transaction_ordering",
+        "requirement_key": [
+          {
+            "source": {
+              "kind": "input",
+              "id": "input.apply_payment.captured"
+            },
+            "path": [
+              "order_id"
+            ]
+          }
+        ],
+        "occurrence": 0
+      },
       "property": {
         "kind": "transaction_ordering"
       },
@@ -160,10 +595,423 @@
         "the successor rule additionally makes accepted progression gap-free: a stale, duplicate, or skipped position rejects",
         "no update, compare-and-set, or upsert assigns object.order.last_applied_sequence, and every advance of it uses the successor rule"
       ],
-      "evidence": []
+      "evidence": [],
+      "basis": [
+        {
+          "fact": {
+            "kind": "guarded_mutation",
+            "operation": "operation.apply_payment",
+            "transaction": "tx.apply_payment",
+            "data_model": "data.checkout",
+            "object": "object.order",
+            "mechanism": "advance_cursor",
+            "coverage": {
+              "kind": "atomic"
+            },
+            "compared_fields": [
+              [
+                "version"
+              ]
+            ]
+          },
+          "anchors": [
+            {
+              "kind": "data_object",
+              "value": {
+                "data_model": "data.checkout",
+                "object": "object.order"
+              }
+            },
+            {
+              "kind": "transaction",
+              "value": {
+                "operation": "operation.apply_payment",
+                "transaction": "tx.apply_payment"
+              }
+            }
+          ],
+          "layer": "l0"
+        },
+        {
+          "fact": {
+            "kind": "guarded_mutation",
+            "operation": "operation.cancel_order",
+            "transaction": "tx.cancel_order",
+            "data_model": "data.checkout",
+            "object": "object.order",
+            "mechanism": "transition",
+            "coverage": {
+              "kind": "atomic"
+            },
+            "compared_fields": [
+              [
+                "version"
+              ]
+            ]
+          },
+          "anchors": [
+            {
+              "kind": "data_object",
+              "value": {
+                "data_model": "data.checkout",
+                "object": "object.order"
+              }
+            },
+            {
+              "kind": "transaction",
+              "value": {
+                "operation": "operation.cancel_order",
+                "transaction": "tx.cancel_order"
+              }
+            }
+          ],
+          "layer": "l0"
+        },
+        {
+          "fact": {
+            "kind": "guarded_mutation",
+            "operation": "operation.apply_payment",
+            "transaction": "tx.apply_payment",
+            "data_model": "data.checkout",
+            "object": "object.order",
+            "mechanism": "advance_cursor",
+            "coverage": {
+              "kind": "observed_version",
+              "read": "read.apply_payment.order",
+              "version_field": [
+                "version"
+              ]
+            },
+            "compared_fields": [
+              [
+                "version"
+              ]
+            ]
+          },
+          "anchors": [
+            {
+              "kind": "data_object",
+              "value": {
+                "data_model": "data.checkout",
+                "object": "object.order"
+              }
+            },
+            {
+              "kind": "transaction",
+              "value": {
+                "operation": "operation.apply_payment",
+                "transaction": "tx.apply_payment"
+              }
+            }
+          ],
+          "layer": "l0"
+        },
+        {
+          "fact": {
+            "kind": "guarded_mutation",
+            "operation": "operation.cancel_order",
+            "transaction": "tx.cancel_order",
+            "data_model": "data.checkout",
+            "object": "object.order",
+            "mechanism": "transition",
+            "coverage": {
+              "kind": "observed_version",
+              "read": "read.cancel_order.order",
+              "version_field": [
+                "version"
+              ]
+            },
+            "compared_fields": [
+              [
+                "version"
+              ]
+            ]
+          },
+          "anchors": [
+            {
+              "kind": "data_object",
+              "value": {
+                "data_model": "data.checkout",
+                "object": "object.order"
+              }
+            },
+            {
+              "kind": "transaction",
+              "value": {
+                "operation": "operation.cancel_order",
+                "transaction": "tx.cancel_order"
+              }
+            }
+          ],
+          "layer": "l0"
+        },
+        {
+          "fact": {
+            "kind": "guarded_mutation",
+            "operation": "operation.apply_payment",
+            "transaction": "tx.apply_payment",
+            "data_model": "data.checkout",
+            "object": "object.order",
+            "mechanism": "transition",
+            "coverage": {
+              "kind": "atomic"
+            },
+            "compared_fields": []
+          },
+          "anchors": [
+            {
+              "kind": "data_object",
+              "value": {
+                "data_model": "data.checkout",
+                "object": "object.order"
+              }
+            },
+            {
+              "kind": "transaction",
+              "value": {
+                "operation": "operation.apply_payment",
+                "transaction": "tx.apply_payment"
+              }
+            }
+          ],
+          "layer": "l0"
+        },
+        {
+          "fact": {
+            "kind": "cyclic_components",
+            "root": {
+              "operation": "operation.apply_payment",
+              "transaction": "tx.apply_payment"
+            },
+            "key": {
+              "source": {
+                "kind": "input",
+                "id": "input.apply_payment.captured"
+              },
+              "path": [
+                "order_id"
+              ]
+            },
+            "components": [
+              [
+                {
+                  "operation": "operation.apply_payment",
+                  "transaction": "tx.apply_payment"
+                },
+                {
+                  "operation": "operation.cancel_order",
+                  "transaction": "tx.cancel_order"
+                },
+                {
+                  "operation": "operation.create_order",
+                  "transaction": "tx.create_order.new"
+                }
+              ]
+            ]
+          },
+          "anchors": [
+            {
+              "kind": "transaction",
+              "value": {
+                "operation": "operation.apply_payment",
+                "transaction": "tx.apply_payment"
+              }
+            },
+            {
+              "kind": "transaction",
+              "value": {
+                "operation": "operation.cancel_order",
+                "transaction": "tx.cancel_order"
+              }
+            },
+            {
+              "kind": "transaction",
+              "value": {
+                "operation": "operation.create_order",
+                "transaction": "tx.create_order.new"
+              }
+            }
+          ],
+          "layer": "l0"
+        },
+        {
+          "fact": {
+            "kind": "cursor",
+            "data_model": "data.checkout",
+            "object": "object.order",
+            "field": [
+              "last_applied_sequence"
+            ],
+            "rule": "successor"
+          },
+          "anchors": [
+            {
+              "kind": "data_object",
+              "value": {
+                "data_model": "data.checkout",
+                "object": "object.order"
+              }
+            },
+            {
+              "kind": "transaction",
+              "value": {
+                "operation": "operation.apply_payment",
+                "transaction": "tx.apply_payment"
+              }
+            }
+          ],
+          "layer": "l0"
+        },
+        {
+          "fact": {
+            "kind": "no_deleters",
+            "data_model": "data.checkout",
+            "object": "object.order"
+          },
+          "anchors": [
+            {
+              "kind": "data_object",
+              "value": {
+                "data_model": "data.checkout",
+                "object": "object.order"
+              }
+            }
+          ],
+          "layer": "l0"
+        },
+        {
+          "fact": {
+            "kind": "conflict_closure",
+            "root": {
+              "operation": "operation.apply_payment",
+              "transaction": "tx.apply_payment"
+            },
+            "key": {
+              "source": {
+                "kind": "input",
+                "id": "input.apply_payment.captured"
+              },
+              "path": [
+                "order_id"
+              ]
+            },
+            "members": [
+              {
+                "operation": "operation.apply_payment",
+                "transaction": "tx.apply_payment"
+              },
+              {
+                "operation": "operation.cancel_order",
+                "transaction": "tx.cancel_order"
+              },
+              {
+                "operation": "operation.create_order",
+                "transaction": "tx.create_order.new"
+              }
+            ]
+          },
+          "anchors": [
+            {
+              "kind": "transaction",
+              "value": {
+                "operation": "operation.apply_payment",
+                "transaction": "tx.apply_payment"
+              }
+            },
+            {
+              "kind": "transaction",
+              "value": {
+                "operation": "operation.cancel_order",
+                "transaction": "tx.cancel_order"
+              }
+            },
+            {
+              "kind": "transaction",
+              "value": {
+                "operation": "operation.create_order",
+                "transaction": "tx.create_order.new"
+              }
+            }
+          ],
+          "layer": "l0"
+        },
+        {
+          "fact": {
+            "kind": "isolation",
+            "operation": "operation.apply_payment",
+            "transaction": "tx.apply_payment",
+            "level": "read_committed"
+          },
+          "anchors": [
+            {
+              "kind": "transaction",
+              "value": {
+                "operation": "operation.apply_payment",
+                "transaction": "tx.apply_payment"
+              }
+            }
+          ],
+          "layer": "l0"
+        },
+        {
+          "fact": {
+            "kind": "isolation",
+            "operation": "operation.cancel_order",
+            "transaction": "tx.cancel_order",
+            "level": "read_committed"
+          },
+          "anchors": [
+            {
+              "kind": "transaction",
+              "value": {
+                "operation": "operation.cancel_order",
+                "transaction": "tx.cancel_order"
+              }
+            }
+          ],
+          "layer": "l0"
+        },
+        {
+          "fact": {
+            "kind": "isolation",
+            "operation": "operation.create_order",
+            "transaction": "tx.create_order.new",
+            "level": "read_committed"
+          },
+          "anchors": [
+            {
+              "kind": "transaction",
+              "value": {
+                "operation": "operation.create_order",
+                "transaction": "tx.create_order.new"
+              }
+            }
+          ],
+          "layer": "l0"
+        }
+      ]
     },
     {
       "id": "oblig.operation.apply_payment.idempotency.0",
+      "key": {
+        "subject": {
+          "kind": "operation",
+          "operation": "operation.apply_payment"
+        },
+        "property": "idempotency",
+        "requirement_key": [
+          {
+            "source": {
+              "kind": "input",
+              "id": "input.apply_payment.captured"
+            },
+            "path": [
+              "event_id"
+            ]
+          }
+        ],
+        "occurrence": 0
+      },
       "property": {
         "kind": "idempotency"
       },
@@ -187,10 +1035,173 @@
           "subject": "tx.apply_payment",
           "message": "the outcome of tx.apply_payment is not established to replay; a rejection commits nothing and performs only its rejection block's work, judged duplicate-safe on its own path, so divergence between rejection and commit cannot duplicate modeled work — the returned result is the result-replay obligation's concern."
         }
+      ],
+      "basis": [
+        {
+          "fact": {
+            "kind": "artifact_route",
+            "operation": "operation.apply_payment",
+            "transaction": "tx.apply_payment",
+            "artifact": "intent.apply_payment.order_paid",
+            "route": "recovered"
+          },
+          "anchors": [
+            {
+              "kind": "transaction",
+              "value": {
+                "operation": "operation.apply_payment",
+                "transaction": "tx.apply_payment"
+              }
+            }
+          ],
+          "layer": "l0"
+        },
+        {
+          "fact": {
+            "kind": "message_identity",
+            "channel": {
+              "kind": "topic",
+              "topic": "topic.order_events"
+            },
+            "schema": "schema.OrderPaid",
+            "fields": [
+              [
+                "event_id"
+              ]
+            ]
+          },
+          "anchors": [
+            {
+              "kind": "topic",
+              "value": "topic.order_events"
+            },
+            {
+              "kind": "transition",
+              "value": {
+                "machine": "machine.order_lifecycle",
+                "transition": "transition.order.mark_paid"
+              }
+            }
+          ],
+          "layer": "l0"
+        },
+        {
+          "fact": {
+            "kind": "propagation",
+            "producer": {
+              "kind": "effect_site",
+              "operation": "operation.charge_payment",
+              "effect": "effect.charge_payment.publish_captured"
+            },
+            "schema": "schema.PaymentCaptured",
+            "channel": {
+              "kind": "topic",
+              "topic": "topic.order_events"
+            }
+          },
+          "anchors": [
+            {
+              "kind": "effect_site",
+              "value": {
+                "operation": "operation.charge_payment",
+                "effect": "effect.charge_payment.publish_captured"
+              }
+            }
+          ],
+          "layer": "l0"
+        },
+        {
+          "fact": {
+            "kind": "deduplicated_by",
+            "operation": "operation.apply_payment",
+            "transaction": "tx.apply_payment",
+            "key": [
+              {
+                "source": {
+                  "kind": "input",
+                  "id": "input.apply_payment.captured"
+                },
+                "path": [
+                  "event_id"
+                ]
+              }
+            ]
+          },
+          "anchors": [
+            {
+              "kind": "transaction",
+              "value": {
+                "operation": "operation.apply_payment",
+                "transaction": "tx.apply_payment"
+              }
+            }
+          ],
+          "layer": "l0"
+        },
+        {
+          "fact": {
+            "kind": "stable_root",
+            "operation": "operation.apply_payment",
+            "rule": "key_component",
+            "root": {
+              "source": {
+                "kind": "input",
+                "id": "input.apply_payment.captured"
+              },
+              "path": [
+                "event_id"
+              ]
+            }
+          },
+          "anchors": [
+            {
+              "kind": "requirement",
+              "value": {
+                "subject": {
+                  "kind": "operation",
+                  "operation": "operation.apply_payment"
+                },
+                "family": "idempotency",
+                "requirement_key": [
+                  {
+                    "source": {
+                      "kind": "input",
+                      "id": "input.apply_payment.captured"
+                    },
+                    "path": [
+                      "event_id"
+                    ]
+                  }
+                ],
+                "occurrence": 0
+              }
+            }
+          ],
+          "layer": "l0"
+        }
       ]
     },
     {
       "id": "oblig.operation.apply_payment.recoverability.0",
+      "key": {
+        "subject": {
+          "kind": "operation",
+          "operation": "operation.apply_payment"
+        },
+        "property": "recoverability",
+        "requirement_key": [
+          {
+            "source": {
+              "kind": "input",
+              "id": "input.apply_payment.captured"
+            },
+            "path": [
+              "event_id"
+            ]
+          }
+        ],
+        "occurrence": 0
+      },
       "property": {
         "kind": "recoverability"
       },
@@ -207,10 +1218,137 @@
         "on committed(tx.apply_payment): tx.apply_payment resolves on re-encounter through its keyed commit (input.apply_payment.captured.event_id)",
         "on committed(tx.apply_payment): artifact intent.apply_payment.order_paid is recovered from tx.apply_payment's keyed commit on resumption"
       ],
-      "evidence": []
+      "evidence": [],
+      "basis": [
+        {
+          "fact": {
+            "kind": "artifact_route",
+            "operation": "operation.apply_payment",
+            "transaction": "tx.apply_payment",
+            "artifact": "intent.apply_payment.order_paid",
+            "route": "recovered"
+          },
+          "anchors": [
+            {
+              "kind": "transaction",
+              "value": {
+                "operation": "operation.apply_payment",
+                "transaction": "tx.apply_payment"
+              }
+            }
+          ],
+          "layer": "l0"
+        },
+        {
+          "fact": {
+            "kind": "delivery",
+            "operation": "operation.apply_payment",
+            "input": "input.apply_payment.captured",
+            "semantics": "at_least_once"
+          },
+          "anchors": [
+            {
+              "kind": "subscription_runtime",
+              "value": {
+                "operation": "operation.apply_payment",
+                "input": "input.apply_payment.captured"
+              }
+            }
+          ],
+          "layer": "l1"
+        },
+        {
+          "fact": {
+            "kind": "deduplicated_by",
+            "operation": "operation.apply_payment",
+            "transaction": "tx.apply_payment",
+            "key": [
+              {
+                "source": {
+                  "kind": "input",
+                  "id": "input.apply_payment.captured"
+                },
+                "path": [
+                  "event_id"
+                ]
+              }
+            ]
+          },
+          "anchors": [
+            {
+              "kind": "transaction",
+              "value": {
+                "operation": "operation.apply_payment",
+                "transaction": "tx.apply_payment"
+              }
+            }
+          ],
+          "layer": "l0"
+        },
+        {
+          "fact": {
+            "kind": "stable_root",
+            "operation": "operation.apply_payment",
+            "rule": "key_component",
+            "root": {
+              "source": {
+                "kind": "input",
+                "id": "input.apply_payment.captured"
+              },
+              "path": [
+                "event_id"
+              ]
+            }
+          },
+          "anchors": [
+            {
+              "kind": "requirement",
+              "value": {
+                "subject": {
+                  "kind": "operation",
+                  "operation": "operation.apply_payment"
+                },
+                "family": "recoverability",
+                "requirement_key": [
+                  {
+                    "source": {
+                      "kind": "input",
+                      "id": "input.apply_payment.captured"
+                    },
+                    "path": [
+                      "event_id"
+                    ]
+                  }
+                ],
+                "occurrence": 0
+              }
+            }
+          ],
+          "layer": "l0"
+        }
+      ]
     },
     {
       "id": "oblig.operation.charge_payment.idempotency.0",
+      "key": {
+        "subject": {
+          "kind": "operation",
+          "operation": "operation.charge_payment"
+        },
+        "property": "idempotency",
+        "requirement_key": [
+          {
+            "source": {
+              "kind": "input",
+              "id": "input.charge_payment.reserved"
+            },
+            "path": [
+              "event_id"
+            ]
+          }
+        ],
+        "occurrence": 0
+      },
       "property": {
         "kind": "idempotency"
       },
@@ -236,10 +1374,53 @@
           "subject": "effect.charge_payment.publish_failed",
           "message": "The instance `effect.charge_payment.publish_failed` constructs on the path `err:declined(result.charge_payment.card)` depends on roots that are not replay-stable: `reason` (effect result `result.charge_payment.card` of `effect.charge_payment.card` is not replay-stable: the external boundary declares no terminal-result replay guarantee, so no same-identity terminal result is fixed)."
         }
-      ]
+      ],
+      "blocked_on": {
+        "present": [],
+        "missing": [],
+        "anchors": [
+          {
+            "kind": "program",
+            "value": "operation.charge_payment"
+          },
+          {
+            "kind": "effect_site",
+            "value": {
+              "operation": "operation.charge_payment",
+              "effect": "effect.charge_payment.card"
+            }
+          },
+          {
+            "kind": "effect_site",
+            "value": {
+              "operation": "operation.charge_payment",
+              "effect": "effect.charge_payment.publish_failed"
+            }
+          }
+        ]
+      }
     },
     {
       "id": "oblig.operation.create_order.idempotency.0",
+      "key": {
+        "subject": {
+          "kind": "operation",
+          "operation": "operation.create_order"
+        },
+        "property": "idempotency",
+        "requirement_key": [
+          {
+            "source": {
+              "kind": "input",
+              "id": "input.create_order.request"
+            },
+            "path": [
+              "idempotency_key"
+            ]
+          }
+        ],
+        "occurrence": 0
+      },
       "property": {
         "kind": "idempotency"
       },
@@ -256,10 +1437,96 @@
           "subject": "operation.reserve_inventory",
           "message": "The program publishes `schema.OrderCreated` to `topic.order_events` through `effect.create_order.publish_created`, and `operation.reserve_inventory` consumes it through `input.reserve_inventory.created`, whose idempotency requirement is not proven in this analysis, so the duplicate work a duplicate delivery causes there is not established to collapse."
         }
-      ]
+      ],
+      "blocked_on": {
+        "present": [
+          {
+            "fact": {
+              "kind": "relies_on",
+              "obligation": {
+                "subject": {
+                  "kind": "operation",
+                  "operation": "operation.reserve_inventory"
+                },
+                "property": "idempotency",
+                "requirement_key": [
+                  {
+                    "source": {
+                      "kind": "input",
+                      "id": "input.reserve_inventory.created"
+                    },
+                    "path": [
+                      "event_id"
+                    ]
+                  }
+                ],
+                "occurrence": 0
+              }
+            },
+            "anchors": [
+              {
+                "kind": "requirement",
+                "value": {
+                  "subject": {
+                    "kind": "operation",
+                    "operation": "operation.reserve_inventory"
+                  },
+                  "family": "idempotency",
+                  "requirement_key": [
+                    {
+                      "source": {
+                        "kind": "input",
+                        "id": "input.reserve_inventory.created"
+                      },
+                      "path": [
+                        "event_id"
+                      ]
+                    }
+                  ],
+                  "occurrence": 0
+                }
+              }
+            ],
+            "layer": "l0"
+          }
+        ],
+        "missing": [],
+        "anchors": [
+          {
+            "kind": "topic",
+            "value": "topic.order_events"
+          },
+          {
+            "kind": "effect_site",
+            "value": {
+              "operation": "operation.create_order",
+              "effect": "effect.create_order.publish_created"
+            }
+          }
+        ]
+      }
     },
     {
       "id": "oblig.operation.create_order.result_replay.0",
+      "key": {
+        "subject": {
+          "kind": "operation",
+          "operation": "operation.create_order"
+        },
+        "property": "result_replay",
+        "requirement_key": [
+          {
+            "source": {
+              "kind": "input",
+              "id": "input.create_order.request"
+            },
+            "path": [
+              "idempotency_key"
+            ]
+          }
+        ],
+        "occurrence": 0
+      },
       "property": {
         "kind": "result_replay"
       },
@@ -275,10 +1542,111 @@
         "the returned ok payload is derived deterministically from output.create_order.order_id, output.create_order.status",
         "output.create_order is recovered from tx.create_order.new's keyed commit on every retry"
       ],
-      "evidence": []
+      "evidence": [],
+      "basis": [
+        {
+          "fact": {
+            "kind": "deduplicated_by",
+            "operation": "operation.create_order",
+            "transaction": "tx.create_order.new",
+            "key": [
+              {
+                "source": {
+                  "kind": "input",
+                  "id": "input.create_order.request"
+                },
+                "path": [
+                  "idempotency_key"
+                ]
+              }
+            ]
+          },
+          "anchors": [
+            {
+              "kind": "transaction",
+              "value": {
+                "operation": "operation.create_order",
+                "transaction": "tx.create_order.new"
+              }
+            }
+          ],
+          "layer": "l0"
+        },
+        {
+          "fact": {
+            "kind": "stable_root",
+            "operation": "operation.create_order",
+            "rule": "recovered_artifact",
+            "root": {
+              "source": {
+                "kind": "transaction_output",
+                "id": "output.create_order"
+              },
+              "path": [
+                "order_id"
+              ]
+            }
+          },
+          "anchors": [
+            {
+              "kind": "transaction",
+              "value": {
+                "operation": "operation.create_order",
+                "transaction": "tx.create_order.new"
+              }
+            }
+          ],
+          "layer": "l0"
+        },
+        {
+          "fact": {
+            "kind": "stable_root",
+            "operation": "operation.create_order",
+            "rule": "recovered_artifact",
+            "root": {
+              "source": {
+                "kind": "transaction_output",
+                "id": "output.create_order"
+              },
+              "path": [
+                "status"
+              ]
+            }
+          },
+          "anchors": [
+            {
+              "kind": "transaction",
+              "value": {
+                "operation": "operation.create_order",
+                "transaction": "tx.create_order.new"
+              }
+            }
+          ],
+          "layer": "l0"
+        }
+      ]
     },
     {
       "id": "oblig.operation.create_order.recoverability.0",
+      "key": {
+        "subject": {
+          "kind": "operation",
+          "operation": "operation.create_order"
+        },
+        "property": "recoverability",
+        "requirement_key": [
+          {
+            "source": {
+              "kind": "input",
+              "id": "input.create_order.request"
+            },
+            "path": [
+              "idempotency_key"
+            ]
+          }
+        ],
+        "occurrence": 0
+      },
       "property": {
         "kind": "recoverability"
       },
@@ -295,10 +1663,139 @@
         "artifact intent.create_order.publish_created is recovered from tx.create_order.new's keyed commit on resumption",
         "artifact output.create_order is recovered from tx.create_order.new's keyed commit on resumption"
       ],
-      "evidence": []
+      "evidence": [],
+      "basis": [
+        {
+          "fact": {
+            "kind": "artifact_route",
+            "operation": "operation.create_order",
+            "transaction": "tx.create_order.new",
+            "artifact": "intent.create_order.publish_created",
+            "route": "recovered"
+          },
+          "anchors": [
+            {
+              "kind": "transaction",
+              "value": {
+                "operation": "operation.create_order",
+                "transaction": "tx.create_order.new"
+              }
+            }
+          ],
+          "layer": "l0"
+        },
+        {
+          "fact": {
+            "kind": "artifact_route",
+            "operation": "operation.create_order",
+            "transaction": "tx.create_order.new",
+            "artifact": "output.create_order",
+            "route": "recovered"
+          },
+          "anchors": [
+            {
+              "kind": "transaction",
+              "value": {
+                "operation": "operation.create_order",
+                "transaction": "tx.create_order.new"
+              }
+            }
+          ],
+          "layer": "l0"
+        },
+        {
+          "fact": {
+            "kind": "deduplicated_by",
+            "operation": "operation.create_order",
+            "transaction": "tx.create_order.new",
+            "key": [
+              {
+                "source": {
+                  "kind": "input",
+                  "id": "input.create_order.request"
+                },
+                "path": [
+                  "idempotency_key"
+                ]
+              }
+            ]
+          },
+          "anchors": [
+            {
+              "kind": "transaction",
+              "value": {
+                "operation": "operation.create_order",
+                "transaction": "tx.create_order.new"
+              }
+            }
+          ],
+          "layer": "l0"
+        },
+        {
+          "fact": {
+            "kind": "stable_root",
+            "operation": "operation.create_order",
+            "rule": "key_component",
+            "root": {
+              "source": {
+                "kind": "input",
+                "id": "input.create_order.request"
+              },
+              "path": [
+                "idempotency_key"
+              ]
+            }
+          },
+          "anchors": [
+            {
+              "kind": "requirement",
+              "value": {
+                "subject": {
+                  "kind": "operation",
+                  "operation": "operation.create_order"
+                },
+                "family": "recoverability",
+                "requirement_key": [
+                  {
+                    "source": {
+                      "kind": "input",
+                      "id": "input.create_order.request"
+                    },
+                    "path": [
+                      "idempotency_key"
+                    ]
+                  }
+                ],
+                "occurrence": 0
+              }
+            }
+          ],
+          "layer": "l0"
+        }
+      ]
     },
     {
       "id": "oblig.operation.reserve_inventory.tx.reserve_inventory.transaction_serializability.0",
+      "key": {
+        "subject": {
+          "kind": "transaction",
+          "operation": "operation.reserve_inventory",
+          "transaction": "tx.reserve_inventory"
+        },
+        "property": "transaction_serializability",
+        "requirement_key": [
+          {
+            "source": {
+              "kind": "input",
+              "id": "input.reserve_inventory.created"
+            },
+            "path": [
+              "order_id"
+            ]
+          }
+        ],
+        "occurrence": 0
+      },
       "property": {
         "kind": "transaction_serializability"
       },
@@ -333,10 +1830,236 @@
           "subject": "tx.reserve_inventory",
           "message": "Read-write anti-dependency: `tx.reserve_inventory` may read `object.stock` (step 1) before `tx.transfer_stock` writes it (step 5), and neither strict locking nor an atomic conditional mutation constrains the commit order — the anti-dependency behind write skew. Lock coverage is missing on the reader side: `tx.reserve_inventory` holds no shared or exclusive lock covering its step-1 access to `object.stock`. `tx.reserve_inventory` reads this `object.stock` instance at step 1 and later commits a decision that can conflict with another writer, but it does not lock the observation, run in a serializable closure, or condition a mutation of the instance on the observed state — a stale observation can still participate in a successful commit. The selected `object.stock` domains could not be proven disjoint, so the dependency is assumed (unknown selector overlap is never treated as disjoint)."
         }
-      ]
+      ],
+      "blocked_on": {
+        "present": [
+          {
+            "fact": {
+              "kind": "isolation",
+              "operation": "operation.reserve_inventory",
+              "transaction": "tx.reserve_inventory",
+              "level": "read_committed"
+            },
+            "anchors": [
+              {
+                "kind": "transaction",
+                "value": {
+                  "operation": "operation.reserve_inventory",
+                  "transaction": "tx.reserve_inventory"
+                }
+              }
+            ],
+            "layer": "l0"
+          },
+          {
+            "fact": {
+              "kind": "isolation",
+              "operation": "operation.transfer_stock",
+              "transaction": "tx.transfer_stock",
+              "level": "read_committed"
+            },
+            "anchors": [
+              {
+                "kind": "transaction",
+                "value": {
+                  "operation": "operation.transfer_stock",
+                  "transaction": "tx.transfer_stock"
+                }
+              }
+            ],
+            "layer": "l0"
+          }
+        ],
+        "missing": [
+          {
+            "fact": {
+              "kind": "lock",
+              "operation": "operation.reserve_inventory",
+              "transaction": "tx.reserve_inventory",
+              "data_model": "data.inventory",
+              "object": "object.stock",
+              "selector": {
+                "object": "object.stock",
+                "predicate": {
+                  "kind": "and",
+                  "predicates": [
+                    {
+                      "kind": "eq",
+                      "field": [
+                        "warehouse_id"
+                      ],
+                      "value": {
+                        "kind": "value",
+                        "value": {
+                          "source": {
+                            "kind": "input",
+                            "id": "input.reserve_inventory.created"
+                          },
+                          "path": [
+                            "warehouse_id"
+                          ]
+                        }
+                      }
+                    },
+                    {
+                      "kind": "eq",
+                      "field": [
+                        "sku"
+                      ],
+                      "value": {
+                        "kind": "value",
+                        "value": {
+                          "source": {
+                            "kind": "input",
+                            "id": "input.reserve_inventory.created"
+                          },
+                          "path": [
+                            "sku"
+                          ]
+                        }
+                      }
+                    }
+                  ]
+                }
+              },
+              "mode": "exclusive"
+            },
+            "anchors": [
+              {
+                "kind": "data_object",
+                "value": {
+                  "data_model": "data.inventory",
+                  "object": "object.stock"
+                }
+              },
+              {
+                "kind": "transaction",
+                "value": {
+                  "operation": "operation.reserve_inventory",
+                  "transaction": "tx.reserve_inventory"
+                }
+              }
+            ],
+            "layer": "l0"
+          },
+          {
+            "fact": {
+              "kind": "lock",
+              "operation": "operation.reserve_inventory",
+              "transaction": "tx.reserve_inventory",
+              "data_model": "data.inventory",
+              "object": "object.stock",
+              "selector": {
+                "object": "object.stock",
+                "predicate": {
+                  "kind": "and",
+                  "predicates": [
+                    {
+                      "kind": "eq",
+                      "field": [
+                        "warehouse_id"
+                      ],
+                      "value": {
+                        "kind": "value",
+                        "value": {
+                          "source": {
+                            "kind": "input",
+                            "id": "input.reserve_inventory.created"
+                          },
+                          "path": [
+                            "warehouse_id"
+                          ]
+                        }
+                      }
+                    },
+                    {
+                      "kind": "eq",
+                      "field": [
+                        "sku"
+                      ],
+                      "value": {
+                        "kind": "value",
+                        "value": {
+                          "source": {
+                            "kind": "input",
+                            "id": "input.reserve_inventory.created"
+                          },
+                          "path": [
+                            "sku"
+                          ]
+                        }
+                      }
+                    }
+                  ]
+                }
+              },
+              "mode": "shared"
+            },
+            "anchors": [
+              {
+                "kind": "data_object",
+                "value": {
+                  "data_model": "data.inventory",
+                  "object": "object.stock"
+                }
+              },
+              {
+                "kind": "transaction",
+                "value": {
+                  "operation": "operation.reserve_inventory",
+                  "transaction": "tx.reserve_inventory"
+                }
+              }
+            ],
+            "layer": "l0"
+          }
+        ],
+        "anchors": [
+          {
+            "kind": "data_object",
+            "value": {
+              "data_model": "data.inventory",
+              "object": "object.stock"
+            }
+          },
+          {
+            "kind": "transaction",
+            "value": {
+              "operation": "operation.reserve_inventory",
+              "transaction": "tx.reserve_inventory"
+            }
+          },
+          {
+            "kind": "transaction",
+            "value": {
+              "operation": "operation.transfer_stock",
+              "transaction": "tx.transfer_stock"
+            }
+          }
+        ]
+      }
     },
     {
       "id": "oblig.operation.reserve_inventory.idempotency.0",
+      "key": {
+        "subject": {
+          "kind": "operation",
+          "operation": "operation.reserve_inventory"
+        },
+        "property": "idempotency",
+        "requirement_key": [
+          {
+            "source": {
+              "kind": "input",
+              "id": "input.reserve_inventory.created"
+            },
+            "path": [
+              "event_id"
+            ]
+          }
+        ],
+        "occurrence": 0
+      },
       "property": {
         "kind": "idempotency"
       },
@@ -363,10 +2086,125 @@
           "subject": "tx.reserve_inventory",
           "message": "Intent `intent.reserve_inventory.publish_reserved` on the program is established by `tx.reserve_inventory` but replay-available through neither route, so a retry's instance may differ. Recovery: the transaction declares no keyed commit deduplication. Reconstruction: a mutation value depends on `reserved`, which is not replay-stable (it reaches transaction read `read.reserve_inventory.stock`, which is never replay-stable)."
         }
-      ]
+      ],
+      "blocked_on": {
+        "present": [
+          {
+            "fact": {
+              "kind": "relies_on",
+              "obligation": {
+                "subject": {
+                  "kind": "operation",
+                  "operation": "operation.charge_payment"
+                },
+                "property": "idempotency",
+                "requirement_key": [
+                  {
+                    "source": {
+                      "kind": "input",
+                      "id": "input.charge_payment.reserved"
+                    },
+                    "path": [
+                      "event_id"
+                    ]
+                  }
+                ],
+                "occurrence": 0
+              }
+            },
+            "anchors": [
+              {
+                "kind": "requirement",
+                "value": {
+                  "subject": {
+                    "kind": "operation",
+                    "operation": "operation.charge_payment"
+                  },
+                  "family": "idempotency",
+                  "requirement_key": [
+                    {
+                      "source": {
+                        "kind": "input",
+                        "id": "input.charge_payment.reserved"
+                      },
+                      "path": [
+                        "event_id"
+                      ]
+                    }
+                  ],
+                  "occurrence": 0
+                }
+              }
+            ],
+            "layer": "l0"
+          }
+        ],
+        "missing": [
+          {
+            "fact": {
+              "kind": "naturally_replayable",
+              "operation": "operation.reserve_inventory",
+              "transaction": "tx.reserve_inventory"
+            },
+            "anchors": [
+              {
+                "kind": "transaction",
+                "value": {
+                  "operation": "operation.reserve_inventory",
+                  "transaction": "tx.reserve_inventory"
+                }
+              }
+            ],
+            "layer": "l0"
+          }
+        ],
+        "anchors": [
+          {
+            "kind": "topic",
+            "value": "topic.order_events"
+          },
+          {
+            "kind": "program",
+            "value": "operation.reserve_inventory"
+          },
+          {
+            "kind": "transaction",
+            "value": {
+              "operation": "operation.reserve_inventory",
+              "transaction": "tx.reserve_inventory"
+            }
+          },
+          {
+            "kind": "effect_site",
+            "value": {
+              "operation": "operation.reserve_inventory",
+              "effect": "effect.reserve_inventory.publish_reserved"
+            }
+          }
+        ]
+      }
     },
     {
       "id": "oblig.operation.reserve_inventory.recoverability.0",
+      "key": {
+        "subject": {
+          "kind": "operation",
+          "operation": "operation.reserve_inventory"
+        },
+        "property": "recoverability",
+        "requirement_key": [
+          {
+            "source": {
+              "kind": "input",
+              "id": "input.reserve_inventory.created"
+            },
+            "path": [
+              "event_id"
+            ]
+          }
+        ],
+        "occurrence": 0
+      },
       "property": {
         "kind": "recoverability"
       },
@@ -387,7 +2225,42 @@
           "subject": "tx.reserve_inventory",
           "message": "The program consumes artifact `intent.reserve_inventory.publish_reserved`, established by `tx.reserve_inventory`, but a resumption can supply it through neither route. Recovery: the transaction declares no keyed commit deduplication. Reconstruction: a mutation value depends on `reserved`, which is not replay-stable (it reaches transaction read `read.reserve_inventory.stock`, which is never replay-stable)."
         }
-      ]
+      ],
+      "blocked_on": {
+        "present": [],
+        "missing": [
+          {
+            "fact": {
+              "kind": "naturally_replayable",
+              "operation": "operation.reserve_inventory",
+              "transaction": "tx.reserve_inventory"
+            },
+            "anchors": [
+              {
+                "kind": "transaction",
+                "value": {
+                  "operation": "operation.reserve_inventory",
+                  "transaction": "tx.reserve_inventory"
+                }
+              }
+            ],
+            "layer": "l0"
+          }
+        ],
+        "anchors": [
+          {
+            "kind": "program",
+            "value": "operation.reserve_inventory"
+          },
+          {
+            "kind": "transaction",
+            "value": {
+              "operation": "operation.reserve_inventory",
+              "transaction": "tx.reserve_inventory"
+            }
+          }
+        ]
+      }
     }
   ]
 }

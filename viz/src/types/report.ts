@@ -54,11 +54,57 @@ export type ProofScope = "l0_only" | "runtime_dependent";
  *  obligation is always `application`. */
 export type RemedyLayer = "application" | "runtime";
 
+/** A value reference in canonical form. */
+export interface ValueRefJson {
+  source: { kind: string; id: Id };
+  path: string[];
+}
+
+/** The obligation's identity across reports: subject, property, and
+ *  requirement key, which reordering requirements leaves unchanged. */
+export interface ObligationKey {
+  subject:
+    | { kind: "operation"; operation: Id }
+    | { kind: "transaction"; operation: Id; transaction: Id };
+  property:
+    | "transaction_serializability"
+    | "transaction_ordering"
+    | "idempotency"
+    | "recoverability"
+    | "result_replay";
+  requirement_key: ValueRefJson[];
+  occurrence: number;
+}
+
+/** A member of the declaration partition, in its `kind` / `value` form. */
+export interface DeclarationKey {
+  kind: string;
+  value: unknown;
+}
+
+/** One fact a proof consumed, with the declarations it was read from.
+ *  `fact` is tagged by `kind`; its fields depend on the kind. */
+export interface BasisFact {
+  fact: { kind: string; [field: string]: unknown };
+  anchors: DeclarationKey[];
+  layer: "l0" | "l1";
+}
+
+/** What an unproven verdict is blocked on. */
+export interface BlockedOn {
+  present: BasisFact[];
+  missing: BasisFact[];
+  anchors: DeclarationKey[];
+}
+
 export interface Obligation {
   /** `oblig.<operation>.<transaction>.<family>.<index>` for the
    *  transaction families, `oblig.<operation>.<family>.<index>`
    *  otherwise. */
   id: string;
+  /** The obligation's position-free identity. Nothing in the viz reads
+   *  it yet. */
+  key?: ObligationKey;
   property: Property;
   subject: Subject;
   status: Status;
@@ -70,6 +116,10 @@ export interface Obligation {
   remedy?: RemedyLayer;
   assumptions: string[];
   evidence: EvidenceItem[];
+  /** The facts a proof consumed. Present only for a proven obligation. */
+  basis?: BasisFact[];
+  /** What an unproven verdict is blocked on. */
+  blocked_on?: BlockedOn;
   counterexample?: { trace: TraceStep[] };
 }
 
@@ -77,6 +127,8 @@ export interface ProverReport {
   format: number;
   /** The DSL contract version the verdicts are relative to. */
   dsl?: number | null;
+  /** The fact vocabulary the bases are written in. */
+  fact_format?: number;
   model_revision: number | null;
   obligations: Obligation[];
   /** Model-wide warnings that belong to no single obligation. */
@@ -88,7 +140,7 @@ export interface ProverReport {
  *  may no longer correspond to the model, so it is refused rather than
  *  rendered. The refusal is shown, never silent: a rendered verdict the
  *  reader cannot see is indistinguishable from no verdict at all. */
-export const REPORT_FORMAT = 9;
+export const REPORT_FORMAT = 10;
 
 export function propertyName(property: Property): string {
   return property.kind === "custom" ? property.name : property.kind;

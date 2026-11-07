@@ -1,0 +1,19 @@
+{
+  "fact_format": 1,
+  "facts": [
+    {
+      "artifact": "output.apply_payment",
+      "kind": "artifact_route",
+      "operation": "operation.apply_payment",
+      "route": "recovered",
+      "transaction": "tx.apply_payment"
+    },
+    {
+      "artifact": "intent.apply_payment.notify",
+      "kind": "artifact_route",
+      "operation": "operation.apply_payment",
+      "route": "reconstructed",
+      "transaction": "tx.apply_payment"
+    }
+  ]
+}

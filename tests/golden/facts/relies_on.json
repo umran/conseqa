@@ -1,0 +1,50 @@
+{
+  "fact_format": 1,
+  "facts": [
+    {
+      "kind": "relies_on",
+      "obligation": {
+        "occurrence": 0,
+        "property": "transaction_serializability",
+        "requirement_key": [
+          {
+            "path": [
+              "order_id"
+            ],
+            "source": {
+              "id": "input.apply_payment.request",
+              "kind": "input"
+            }
+          }
+        ],
+        "subject": {
+          "kind": "transaction",
+          "operation": "operation.apply_payment",
+          "transaction": "tx.apply_payment"
+        }
+      }
+    },
+    {
+      "kind": "relies_on",
+      "obligation": {
+        "occurrence": 1,
+        "property": "result_replay",
+        "requirement_key": [
+          {
+            "path": [
+              "idempotency_key"
+            ],
+            "source": {
+              "id": "input.reserve.request",
+              "kind": "input"
+            }
+          }
+        ],
+        "subject": {
+          "kind": "operation",
+          "operation": "operation.reserve"
+        }
+      }
+    }
+  ]
+}

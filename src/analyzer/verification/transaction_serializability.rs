@@ -600,6 +600,7 @@ pub fn evidence_sentence(dependency: &DependencyEvidence) -> String {
             mechanism,
             guard,
             compared_fields,
+            ..
         } => {
             let at = format!(
                 "`{guarded_by}`'s {mechanism} of `{object}` at step {}",

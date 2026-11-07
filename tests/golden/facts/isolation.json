@@ -1,0 +1,17 @@
+{
+  "fact_format": 1,
+  "facts": [
+    {
+      "kind": "isolation",
+      "level": "read_committed",
+      "operation": "operation.apply_payment",
+      "transaction": "tx.apply_payment"
+    },
+    {
+      "kind": "isolation",
+      "level": "unspecified",
+      "operation": "operation.apply_payment",
+      "transaction": "tx.apply_payment"
+    }
+  ]
+}

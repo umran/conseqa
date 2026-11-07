@@ -1,0 +1,21 @@
+{
+  "fact_format": 1,
+  "facts": [
+    {
+      "key": [
+        {
+          "path": [
+            "event_id"
+          ],
+          "source": {
+            "id": "input.apply_payment.request",
+            "kind": "input"
+          }
+        }
+      ],
+      "kind": "deduplicated_by",
+      "operation": "operation.apply_payment",
+      "transaction": "tx.apply_payment"
+    }
+  ]
+}

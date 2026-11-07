@@ -441,7 +441,7 @@ checkout DSL model with `operation.create_order`,
 `operation.reserve_inventory`, `operation.charge_payment`,
 `operation.cancel_order`, `operation.apply_payment`,
 `operation.transfer_stock`. Its golden report,
-`tests/fixtures/flash_checkout.report.json` (report format 9), records 11
+`tests/fixtures/flash_checkout.report.json` (report format 10), records 11
 obligations: 6 proven, 5 unknown. Three view-model tests exercise exactly
 this model:
 

@@ -6,7 +6,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::spec::{FieldPath, Id};
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ValueRef {
     pub source: ValueSource,
@@ -30,7 +30,7 @@ pub struct ValueRef {
 /// separate namespaces, and inferring would let the meaning of a
 /// declaration depend on what happens to resolve — silently choosing
 /// for an id declared in two of them.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(tag = "kind", content = "id", rename_all = "snake_case")]
 pub enum ValueSource {
     Input(Id),

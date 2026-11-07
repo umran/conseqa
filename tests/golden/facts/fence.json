@@ -1,0 +1,13 @@
+{
+  "fact_format": 1,
+  "facts": [
+    {
+      "data_model": "data.orders",
+      "field": [
+        "fence_token"
+      ],
+      "kind": "fence",
+      "object": "object.order"
+    }
+  ]
+}

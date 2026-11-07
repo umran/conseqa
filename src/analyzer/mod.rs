@@ -1,3 +1,4 @@
+pub mod basis;
 pub mod diagnostic;
 pub mod report;
 pub mod validation;

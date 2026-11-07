@@ -1,0 +1,12 @@
+{
+  "fact_format": 1,
+  "facts": [
+    {
+      "declaration": "transaction operation.apply_payment/tx.apply_payment",
+      "entry": "postgres.database@1",
+      "kind": "realization",
+      "realizes": "data_model data.orders",
+      "requirement": "conditional-update"
+    }
+  ]
+}

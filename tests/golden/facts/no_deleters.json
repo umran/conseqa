@@ -1,0 +1,10 @@
+{
+  "fact_format": 1,
+  "facts": [
+    {
+      "data_model": "data.orders",
+      "kind": "no_deleters",
+      "object": "object.order"
+    }
+  ]
+}

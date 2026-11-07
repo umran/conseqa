@@ -1,0 +1,22 @@
+{
+  "fact_format": 1,
+  "facts": [
+    {
+      "kind": "retry_may_repeat",
+      "site": {
+        "effect": "effect.checkout.pay",
+        "kind": "effect_site",
+        "operation": "operation.checkout"
+      }
+    },
+    {
+      "kind": "retry_may_repeat",
+      "site": {
+        "effect": "effect.order.charge",
+        "kind": "transition_effect",
+        "machine": "machine.order",
+        "transition": "transition.order.pay"
+      }
+    }
+  ]
+}
