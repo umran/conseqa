@@ -38,6 +38,11 @@ evidence:
   lb-policy: { look_for: "the cluster's lb_policy in the Envoy configuration" }
   hash-policy: { look_for: "the route's hash_policy in the Envoy configuration" }
   routing-header: { look_for: "the request construction that sets the hashed header" }
+checkers:
+  - id: lb-policy
+    kind: yaml_path
+    covers: [lb-policy]
+    assert: { path: lb_policy, one_of: [RING_HASH, MAGLEV] }
 citations:
   - https://www.envoyproxy.io/docs/envoy/latest/intro/arch_overview/upstream/load_balancing/load_balancers#ring-hash
   - https://www.envoyproxy.io/docs/envoy/latest/intro/arch_overview/upstream/load_balancing/load_balancers#maglev

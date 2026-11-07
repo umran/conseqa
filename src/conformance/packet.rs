@@ -54,7 +54,8 @@ use super::completeness;
 use super::plan::{self, Priority};
 use super::record::{ClaimScope, Party, Record, RecordedRegion, ReviewTarget, Span, Verdict};
 use super::state::{
-    self, Condition, ConditionKind, DeclarationState, Derivation, Orphan, ScopeFailure,
+    self, CheckerReview, Condition, ConditionKind, DeclarationState, Derivation, Orphan,
+    ScopeFailure,
 };
 
 /// The packet for one work item (§12.1).
@@ -193,6 +194,11 @@ pub struct RealizationSection {
     /// Each realization requirement on it, with its statement and the
     /// shape of its evidence.
     pub requirements: Vec<Placed>,
+
+    /// What the catalogue's checkers found of those requirements, over
+    /// its regions as they are now.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub checker_reviews: Vec<CheckerReview>,
 
     /// What its realization requires of its neighbours, by requirement:
     /// a topic's implementer learns that producers must set the record
@@ -646,7 +652,7 @@ impl<'d, 'a> Builder<'d, 'a> {
                 .collect(),
             disputes,
             last_refusal,
-            realization: realization(derivation, key),
+            realization: realization(derivation, state),
             precedents: precedents(derivation, state),
             semantics: topics(derivation.workspace, declaration, state),
             done_when: done_when(state, record),
@@ -1187,8 +1193,9 @@ fn load_bearing(derivation: &Derivation, fact: &Fact) -> LoadBearing {
 /// 5): the entry realizing it and why, the requirements on it, those its
 /// realization places on its neighbours, and the idioms for the
 /// primitives it uses.
-fn realization(derivation: &Derivation, key: &TextualKey) -> Option<RealizationSection> {
+fn realization(derivation: &Derivation, declared: &DeclarationState) -> Option<RealizationSection> {
     let realization = derivation.realization.as_ref()?;
+    let key = &declared.declaration;
     let state = realization.state(key);
 
     let chosen = state.and_then(|state| match state {
@@ -1301,6 +1308,7 @@ fn realization(derivation: &Derivation, key: &TextualKey) -> Option<RealizationS
         chosen,
         unrealizable,
         requirements,
+        checker_reviews: declared.checker_reviews.clone(),
         neighbours: imposed.into_values().collect(),
         idioms,
     })
@@ -2346,8 +2354,18 @@ impl Packet {
                 let _ = writeln!(out, "  evidence: {look_for}");
             }
 
-            if !placed.checkers.is_empty() {
-                let _ = writeln!(out, "  checked by: {}", placed.checkers.join(", "));
+            for review in realization
+                .checker_reviews
+                .iter()
+                .filter(|review| review.fact == placed.fact)
+            {
+                let _ = writeln!(
+                    out,
+                    "  {}: {}, {}",
+                    review.checker,
+                    review.finding.outcome.name(),
+                    review.finding.detail
+                );
             }
         }
 

@@ -2506,3 +2506,148 @@ fn a_packet_says_what_the_stack_requires_of_its_declaration() {
 
     assert_eq!(idioms, ["laravel.compare-and-set@1"]);
 }
+
+/// The kinds of a declaration's checker reviews, with their outcomes.
+fn checked(state: &State, text: &str) -> Vec<(String, String)> {
+    state
+        .declaration(&key(text))
+        .unwrap()
+        .checker_reviews
+        .iter()
+        .map(|review| {
+            (
+                review.checker.clone(),
+                review.finding.outcome.name().to_string(),
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn a_checker_disputes_a_router_that_round_robins_and_satisfies_only_what_it_covers() {
+    const ROUTER: &str = "router router.create_order";
+
+    let dir = temp_dir("checker");
+    stack(&dir, &STACK, 1);
+
+    // The router's cluster, beside another declaration's region in the
+    // same file that hashes as the entry needs: a checker reads only
+    // the regions bound to its own declaration.
+    let clusters = |policy: &str| {
+        format!(
+            "static_resources:\n\
+             \x20 clusters:\n\
+             \x20 # conseqa:begin router router.create_order\n\
+             \x20 - name: checkout\n\
+             \x20   lb_policy: {policy}\n\
+             \x20 # conseqa:end router router.create_order\n\
+             \x20 # conseqa:begin router router.cancel_order\n\
+             \x20 - name: cancel\n\
+             \x20   lb_policy: RING_HASH\n\
+             \x20 # conseqa:end router router.cancel_order\n"
+        )
+    };
+
+    put(&dir, "envoy/clusters.yaml", clusters("ROUND_ROBIN"));
+
+    let checkout = checkout();
+    let state = state::derive(&dir, &checkout).unwrap();
+
+    assert_eq!(
+        realization_facts(&state, ROUTER),
+        ["hash-policy", "lb-policy"]
+    );
+    assert_eq!(
+        checked(&state, ROUTER),
+        [(
+            "envoy.ring-hash/lb-policy@1".to_string(),
+            "disputed".to_string()
+        )]
+    );
+
+    let facts = required(&state, ROUTER, ConformanceClass::Attestable);
+
+    attest_as(&dir, &checkout, &input(&dir, ROUTER, &facts), attester()).unwrap();
+
+    let disputed = |dir: &Path| -> Vec<String> {
+        state::derive(dir, &checkout)
+            .unwrap()
+            .declaration(&key(ROUTER))
+            .unwrap()
+            .conditions
+            .iter()
+            .filter_map(|condition| match condition {
+                state::Condition::Disputed { reviews } => Some(
+                    reviews
+                        .iter()
+                        .map(|dispute| format!("{:?} {}", dispute.by.kind, dispute.by.name))
+                        .collect::<Vec<_>>(),
+                ),
+                _ => None,
+            })
+            .flatten()
+            .collect()
+    };
+
+    assert_eq!(disputed(&dir), ["Checker envoy.ring-hash/lb-policy@1"]);
+
+    // Another party's confirmation leaves the checker's dispute standing.
+    review(&dir, ROUTER, confirming(&dir, ROUTER, reviewer()));
+
+    let state = state::derive(&dir, &checkout).unwrap();
+
+    assert_eq!(kinds(&state, ROUTER), [ConditionKind::Disputed]);
+    assert_eq!(disputed(&dir), ["Checker envoy.ring-hash/lb-policy@1"]);
+
+    // Hashing as the entry needs: the checker confirms, at the new
+    // digests, and its confirmation satisfies the review of the one
+    // requirement it covers, and not the other.
+    put(&dir, "envoy/clusters.yaml", clusters("MAGLEV"));
+
+    let state = state::derive(&dir, &checkout).unwrap();
+
+    assert_eq!(
+        checked(&state, ROUTER),
+        [(
+            "envoy.ring-hash/lb-policy@1".to_string(),
+            "confirmed".to_string()
+        )]
+    );
+
+    attest_as(&dir, &checkout, &input(&dir, ROUTER, &facts), attester()).unwrap();
+
+    let state = state::derive(&dir, &checkout).unwrap();
+    let record = record_of(&dir, ROUTER);
+
+    let unreviewed: Vec<String> = state
+        .declaration(&key(ROUTER))
+        .unwrap()
+        .conditions
+        .iter()
+        .filter_map(|condition| match condition {
+            state::Condition::Unreviewed { items } => Some(items.clone()),
+            _ => None,
+        })
+        .flatten()
+        .filter_map(|item| match item {
+            ReviewTarget::Fact(index) => match &record.facts[index].fact {
+                Fact::Realization { requirement, .. } => Some(requirement.clone()),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect();
+
+    assert_eq!(unreviewed, ["hash-policy"]);
+    assert!(disputed(&dir).is_empty());
+
+    let packet = packet_of(&derive(&dir, &checkout), ROUTER);
+
+    assert!(
+        packet
+            .render()
+            .contains("envoy.ring-hash/lb-policy@1: confirmed, `lb_policy` is `MAGLEV`"),
+        "{}",
+        packet.render()
+    );
+}

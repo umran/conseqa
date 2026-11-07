@@ -27,6 +27,9 @@
 //! - [`requirements`] resolves what each chosen entry demands, of the
 //!   declaration it realizes and of that declaration's neighbours, into
 //!   the `realization` facts Part IV requires of the code (§11);
+//! - [`checkers`] are the deterministic checks an entry configures for
+//!   the evidence of some requirements, over the regions bound to the
+//!   declaration a requirement is on (§13);
 //! - [`document`] is the JSON each `conseqa realize` subcommand prints,
 //!   and each realization tool of the design MCP server returns.
 //!
@@ -43,6 +46,7 @@ use crate::design::store::PROJECT_DIR;
 
 pub mod capability;
 pub mod catalogue;
+pub mod checkers;
 pub mod choice;
 pub mod document;
 pub mod requirements;

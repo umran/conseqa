@@ -62,6 +62,15 @@ evidence:
   idempotent-producer: { look_for: "the producer's configuration" }
   stable-partitions: { look_for: "the topic's infrastructure definition" }
   single-partition: { look_for: "the partition count in the topic's infrastructure definition" }
+checkers:
+  - id: producer-idempotence
+    kind: properties
+    covers: [idempotent-producer]
+    assert: { key: enable.idempotence, equals: "true" }
+  - id: single-partition
+    kind: hcl
+    covers: [single-partition]
+    assert: { resource: kafka_topic, attribute: partitions, equals: 1 }
 citations:
   - https://kafka.apache.org/44/getting-started/introduction#main-concepts-and-terminology
   - https://kafka.apache.org/44/configuration/producer-configs/#producerconfigs_partitioner.class
