@@ -2400,3 +2400,109 @@ fn an_unrealizable_declarations_item_is_parked() {
         packet.render()
     );
 }
+
+#[test]
+fn a_packet_says_what_the_stack_requires_of_its_declaration() {
+    const TOPIC: &str = "topic_runtime topic.order_events";
+    const PRODUCER: &str = "effect_site operation.create_order/effect.create_order.publish_created";
+
+    let dir = temp_dir("realization-packet");
+    stack(&dir, &STACK, 1);
+
+    let checkout = checkout();
+    let derivation = derive(&dir, &checkout);
+
+    let packet = packet_of(&derivation, TOPIC);
+    let section = packet.realization.as_ref().expect("a realization section");
+    let chosen = section.chosen.as_ref().expect("a realized topic runtime");
+
+    assert_eq!(chosen.entry.to_string(), "kafka.keyed-topic@1");
+    assert!(chosen.automatic);
+    assert_eq!(
+        section
+            .requirements
+            .iter()
+            .map(|placed| placed.requirement())
+            .collect::<Vec<_>>(),
+        ["stable-partitions"]
+    );
+    assert_eq!(
+        section
+            .neighbours
+            .iter()
+            .map(|imposed| (imposed.requirement.as_str(), imposed.declarations.len()))
+            .collect::<Vec<_>>(),
+        [("idempotent-producer", 6), ("record-key", 6)]
+    );
+
+    let text = packet.render();
+
+    assert!(text.contains("## Realization"), "{text}");
+    assert!(
+        text.contains(
+            "Realized by `kafka.keyed-topic@1`, chosen automatically, as the one valid candidate."
+        ),
+        "{text}"
+    );
+    assert!(
+        text.find("## Realization").unwrap() < text.find("## Done when").unwrap(),
+        "the section comes before the checklist"
+    );
+
+    // A producer learns what the topic's realization requires of it, and
+    // what dropping it would cost.
+    let packet = packet_of(&derivation, PRODUCER);
+
+    let record_key = packet
+        .required
+        .iter()
+        .find(|required| {
+            matches!(&required.fact, Fact::Realization { requirement, .. } if requirement == "record-key")
+        })
+        .expect("the record key is required of the producer");
+
+    assert_eq!(
+        serde_json::to_value(&record_key.load_bearing).unwrap(),
+        json!({
+            "kind": "realization",
+            "realizes": TOPIC,
+            "entry": "kafka.keyed-topic@1",
+            "provides": [{ "grouping": "keyed" }, { "ordering": "within_group" }],
+        })
+    );
+    assert!(packet.render().contains(
+        "without it: `topic_runtime topic.order_events` is no longer realized as \
+         `kafka.keyed-topic@1` provides `grouping: keyed`, `ordering: within_group`, as the spec \
+         declares"
+    ));
+
+    // An idiom for a primitive the declaration uses, on a framework the
+    // stack names.
+    let dir = temp_dir("idiom");
+    stack(&dir, &["postgres@16", "laravel@11"], 1);
+
+    put(
+        &dir,
+        ".conseqa/realization/catalogue/laravel.compare-and-set.yaml",
+        "format: 1\nid: laravel.compare-and-set\nversion: 1\n\
+         technology: { name: laravel, versions: \">=10\" }\n\
+         platforms: [postgres.database]\nprimitive: { mutation: conditional }\n\
+         template: |\n  $affected = DB::table('accounts')->where('version', $observed)->update($values);\n\
+         evidence: { look_for: \"the update carrying every comparison, and the affected-rows check\" }\n",
+    );
+
+    let wallet = wallet("serializable");
+    let derivation = derive(&dir, &wallet);
+    let packet = packet_of(&derivation, DEBIT);
+
+    let idioms: Vec<String> = packet
+        .realization
+        .as_ref()
+        .expect("a realization section")
+        .idioms
+        .iter()
+        .map(|idiom| idiom.entry.to_string())
+        .collect();
+
+    assert_eq!(idioms, ["laravel.compare-and-set@1"]);
+}
