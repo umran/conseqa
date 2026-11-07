@@ -40,13 +40,18 @@ use conseqa::harness::review::{ReviewBackend, ReviewRun, Reviewer};
 use conseqa::harness::{
     AgentBackend, RunStatus, Scheduler, SchedulerPolicy, Supervisor, Workflow, WorkflowConfig,
 };
+use conseqa::realization::catalogue::Catalogue;
+use conseqa::realization::choice::{
+    self, ChooseError, ChooseRequest, Explanation, Profile, Refusal,
+};
+use conseqa::realization::document::{self as realization_document, ChoiceOutcome, Listing};
 use conseqa::spec::Model;
 
 #[derive(Parser)]
 #[command(
     name = "conseqa",
     about = "Initialize, inspect, check, diff, export, visualize, and design a Conseqa project, \
-             and hold its code to it"
+             judge which technologies can realize it, and hold its code to it"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -67,11 +72,17 @@ enum Command {
     Status,
 
     /// Validate and verify the project. Exits 1 when an operation has no
-    /// program yet or the model is invalid.
+    /// program yet, the model is invalid, or the realization profile
+    /// `--require-realizable` reads does not load.
     Check {
         /// Also exit 2 when any obligation is not proven.
         #[arg(long)]
         require_proven: bool,
+
+        /// Also exit 2 when a realizable declaration is ambiguous, has an
+        /// invalid choice, or is infeasible on the project's stack.
+        #[arg(long)]
+        require_realizable: bool,
 
         /// Write the obligation report (JSON) here.
         #[arg(long)]
@@ -147,6 +158,92 @@ enum Command {
     /// conformance document.
     #[command(subcommand)]
     Conform(ConformCommand),
+
+    /// Judge which technologies realize the spec: each realizable
+    /// declaration's needs and state, the candidates for one, the
+    /// architect's choices, and the catalogue of entries. `--json`
+    /// prints each command's realization document.
+    #[command(subcommand)]
+    Realize(RealizeCommand),
+}
+
+#[derive(Subcommand)]
+enum RealizeCommand {
+    /// Each realizable declaration's needs and state: chosen, automatic,
+    /// ambiguous, invalid_choice, infeasible, or unneeded. Exits 1 when
+    /// the spec, the stack, or the catalogue does not load.
+    Status {
+        /// Also exit 2 when a declaration is ambiguous, has an invalid
+        /// choice, or is infeasible.
+        #[arg(long)]
+        require_realizable: bool,
+
+        /// Print the status document instead of the summary.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Every candidate for one declaration: what each provides, the
+    /// needs it misses and why, and the kind's entries outside the
+    /// stack. Exits 1 when the declaration is not realizable.
+    Explain {
+        /// The declaration's textual key, e.g. "data_model data.orders".
+        key: String,
+
+        /// Print the explain document instead of the report.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Choose the entry that realizes a declaration, written to its
+    /// choice file. Exits 2 when refused, naming what the entry lacks.
+    Choose {
+        /// The declaration's textual key.
+        key: String,
+
+        /// The entry's id, or its id at a version, e.g.
+        /// "kafka.keyed-topic@1".
+        entry: String,
+
+        /// An option of the entry to choose with it; repeat for several.
+        #[arg(long = "option")]
+        options: Vec<String>,
+
+        /// Why it was chosen, recorded in the choice file.
+        #[arg(long)]
+        reason: Option<String>,
+
+        /// Print the choice document.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// The entries the project can choose from: the standard
+    /// catalogue's and its own. Lists them when no action is given.
+    Catalogue {
+        #[command(subcommand)]
+        action: Option<CatalogueAction>,
+    },
+}
+
+#[derive(Subcommand)]
+enum CatalogueAction {
+    /// Every entry, with its technology and what it realizes.
+    List {
+        /// Print the catalogue document instead of the list.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// One entry in full. Exits 1 when no catalogue holds it.
+    Show {
+        /// The entry's id, or its id at a version.
+        entry: String,
+
+        /// Print the entry document instead of its YAML.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -369,8 +466,9 @@ fn main() -> ExitCode {
         Command::Status => status(),
         Command::Check {
             require_proven,
+            require_realizable,
             report,
-        } => check(require_proven, report),
+        } => check(require_proven, require_realizable, report),
         Command::Diff {
             base,
             head,
@@ -390,6 +488,7 @@ fn main() -> ExitCode {
             .map_err(|error| format!("cannot start the runtime: {error}"))
             .and_then(|runtime| runtime.block_on(design(*args))),
         Command::Conform(command) => conform(command),
+        Command::Realize(command) => realize(command),
     };
 
     match outcome {
@@ -468,8 +567,12 @@ fn status() -> Result<ExitCode, String> {
     Ok(ExitCode::SUCCESS)
 }
 
-fn check(require_proven: bool, report_path: Option<PathBuf>) -> Result<ExitCode, String> {
-    let (_, _, model) = project_model()?;
+fn check(
+    require_proven: bool,
+    require_realizable: bool,
+    report_path: Option<PathBuf>,
+) -> Result<ExitCode, String> {
+    let (project, _, model) = project_model()?;
 
     let (report, notes) = match analyze(&model) {
         Ok(analysis) => analysis,
@@ -507,13 +610,55 @@ fn check(require_proven: bool, report_path: Option<PathBuf>) -> Result<ExitCode,
         write_file(&path, &format!("{json}\n"))?;
     }
 
+    let mut failed = false;
+
     if require_proven && proven < report.obligations.len() {
         eprintln!("not every obligation is proven");
 
-        return Ok(ExitCode::from(2));
+        failed = true;
     }
 
-    Ok(ExitCode::SUCCESS)
+    if require_realizable && !realizable(&project, &model)? {
+        failed = true;
+    }
+
+    Ok(if failed {
+        ExitCode::from(2)
+    } else {
+        ExitCode::SUCCESS
+    })
+}
+
+/// Whether every realizable declaration is realizable on the project's
+/// stack: the gate `--require-realizable` applies, printing each
+/// declaration that fails it. Without a stack profile nothing is
+/// realized, and the gate passes.
+fn realizable(project: &Path, model: &Model) -> Result<bool, String> {
+    let status = choice::Status::derive(project, model).map_err(|error| error.to_string())?;
+
+    if status.profile.is_none() {
+        println!("realization: no stack profile, so nothing to realize");
+
+        return Ok(true);
+    }
+
+    let failing: Vec<_> = status.failing().collect();
+
+    println!(
+        "realization: {} realizable declarations, {} not realizable",
+        status.declarations.len(),
+        failing.len()
+    );
+
+    for realized in &failing {
+        eprintln!("{} {}", realized.state.name(), realized.declaration);
+    }
+
+    if !failing.is_empty() {
+        eprintln!("not every realizable declaration is realizable");
+    }
+
+    Ok(failing.is_empty())
 }
 
 fn diff(
@@ -555,6 +700,195 @@ fn diff(
     } else {
         ExitCode::from(2)
     })
+}
+
+fn realize(command: RealizeCommand) -> Result<ExitCode, String> {
+    match command {
+        RealizeCommand::Status {
+            require_realizable,
+            json,
+        } => realize_status(require_realizable, json),
+        RealizeCommand::Explain { key, json } => realize_explain(&key, json),
+        RealizeCommand::Choose {
+            key,
+            entry,
+            options,
+            reason,
+            json,
+        } => realize_choose(&key, entry, options, reason, json),
+        RealizeCommand::Catalogue { action } => {
+            realize_catalogue(action.unwrap_or(CatalogueAction::List { json: false }))
+        }
+    }
+}
+
+/// The project's model, validated: what realization derives needs from.
+fn realizable_model() -> Result<(PathBuf, Model), String> {
+    let (project, _, model) = project_model()?;
+
+    let errors = analyzer::validate(&model);
+
+    if !errors.is_empty() {
+        for error in errors {
+            print_diagnostic(&Diagnostic::from(error));
+        }
+
+        return Err("the model is invalid, so it has no needs to realize".to_string());
+    }
+
+    Ok((project, model))
+}
+
+fn realize_status(require_realizable: bool, json: bool) -> Result<ExitCode, String> {
+    let (project, model) = realizable_model()?;
+    let status = choice::Status::derive(&project, &model).map_err(|error| error.to_string())?;
+
+    if json {
+        println!("{}", realization_document::status(&status).to_pretty_json());
+    } else {
+        print!("{}", status.render());
+    }
+
+    if require_realizable && status.failing().next().is_some() {
+        eprintln!("not every realizable declaration is realizable");
+
+        return Ok(ExitCode::from(2));
+    }
+
+    Ok(ExitCode::SUCCESS)
+}
+
+fn realize_explain(key: &str, json: bool) -> Result<ExitCode, String> {
+    let key: TextualKey = key
+        .parse()
+        .map_err(|error| format!("`{key}` is not a textual key: {error}"))?;
+
+    let (project, model) = realizable_model()?;
+
+    let profile = Profile::read(&project)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| Refusal::NoStack.to_string())?;
+
+    let explanation =
+        Explanation::of(&profile, &model, &key).map_err(|refusal| refusal.to_string())?;
+
+    if json {
+        println!(
+            "{}",
+            realization_document::explain(&explanation).to_pretty_json()
+        );
+    } else {
+        print!("{}", explanation.render());
+    }
+
+    Ok(ExitCode::SUCCESS)
+}
+
+fn realize_choose(
+    key: &str,
+    entry: String,
+    options: Vec<String>,
+    reason: Option<String>,
+    json: bool,
+) -> Result<ExitCode, String> {
+    let declaration: TextualKey = key
+        .parse()
+        .map_err(|error| format!("`{key}` is not a textual key: {error}"))?;
+
+    let (project, model) = realizable_model()?;
+
+    let request = ChooseRequest {
+        declaration,
+        entry,
+        options,
+        reason,
+    };
+
+    let outcome = match choice::choose(&project, &model, &request) {
+        Ok(chosen) => Ok(chosen),
+        Err(ChooseError::Refused(refusal)) => Err(refusal),
+        Err(ChooseError::Failed(error)) => return Err(error.to_string()),
+    };
+
+    if json {
+        let document = realization_document::choice(ChoiceOutcome::of(
+            outcome.as_ref().map_err(|refusal| refusal.as_ref()),
+        ));
+
+        println!("{}", document.to_pretty_json());
+    }
+
+    match outcome {
+        Ok(chosen) => {
+            if !json {
+                print!("{}", chosen.render());
+            }
+
+            Ok(ExitCode::SUCCESS)
+        }
+
+        Err(refusal) => {
+            if !json {
+                eprintln!("refused: {refusal}");
+            }
+
+            Ok(ExitCode::from(2))
+        }
+    }
+}
+
+fn realize_catalogue(action: CatalogueAction) -> Result<ExitCode, String> {
+    // The standard catalogue reads anywhere; inside a project, the
+    // project's own entries join it.
+    let catalogue = match ProjectStore::discover(&current_dir()?) {
+        Some(project) => Catalogue::read(&project),
+        None => Catalogue::standard(),
+    }
+    .map_err(|error| error.to_string())?;
+
+    match action {
+        CatalogueAction::List { json } => {
+            let listing = Listing::of(&catalogue);
+
+            if json {
+                println!(
+                    "{}",
+                    realization_document::catalogue(&listing).to_pretty_json()
+                );
+            } else {
+                print!("{}", listing.render());
+            }
+        }
+
+        CatalogueAction::Show { entry, json } => {
+            let (id, version) = match entry.rsplit_once('@') {
+                Some((id, version)) => (id, Some(version)),
+                None => (entry.as_str(), None),
+            };
+
+            let catalogued = catalogue
+                .get(id)
+                .filter(|catalogued| {
+                    version.is_none_or(|version| catalogued.entry.version().to_string() == version)
+                })
+                .ok_or_else(|| format!("no catalogue holds `{entry}`"))?;
+
+            if json {
+                println!(
+                    "{}",
+                    realization_document::catalogue_entry(catalogued).to_pretty_json()
+                );
+            } else {
+                let yaml = serde_yaml::to_string(&catalogued.entry)
+                    .map_err(|error| format!("cannot write `{entry}` as YAML: {error}"))?;
+
+                println!("# {} ({})", catalogued.entry.entry_ref(), catalogued.source);
+                print!("{yaml}");
+            }
+        }
+    }
+
+    Ok(ExitCode::SUCCESS)
 }
 
 fn conform(command: ConformCommand) -> Result<ExitCode, String> {

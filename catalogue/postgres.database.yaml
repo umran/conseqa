@@ -1,0 +1,95 @@
+format: 1
+id: postgres.database
+version: 1
+technology: { name: postgres, versions: ">=9.5" }
+realizes:
+  kind: data_model
+provides:
+  - capability: { durability: committed }
+    cite:
+      - https://www.postgresql.org/docs/current/tutorial-transactions.html
+      - https://www.postgresql.org/docs/current/runtime-config-wal.html#GUC-SYNCHRONOUS-COMMIT
+  - capability: { isolation: read_committed }
+    cite: [https://www.postgresql.org/docs/current/transaction-iso.html#XACT-READ-COMMITTED]
+  - capability: { isolation: snapshot }
+    cite: [https://www.postgresql.org/docs/current/transaction-iso.html#XACT-REPEATABLE-READ]
+  - capability: { isolation: serializable }
+    cite:
+      - https://www.postgresql.org/docs/current/transaction-iso.html#XACT-SERIALIZABLE
+      - https://www.postgresql.org/docs/9.1/release-9-1.html
+  - capability: { transaction: interactive }
+    cite: [https://www.postgresql.org/docs/current/tutorial-transactions.html]
+  - capability: { transaction: multi_instance }
+    cite: [https://www.postgresql.org/docs/current/tutorial-transactions.html]
+  - capability: { lock: shared }
+    cite: [https://www.postgresql.org/docs/current/explicit-locking.html#LOCKING-ROWS]
+  - capability: { lock: exclusive }
+    cite: [https://www.postgresql.org/docs/current/explicit-locking.html#LOCKING-ROWS]
+  - capability: { mutation: conditional }
+    cite:
+      - https://www.postgresql.org/docs/current/transaction-iso.html#XACT-READ-COMMITTED
+      - https://www.postgresql.org/docs/current/sql-update.html
+  - capability: { mutation: upsert }
+    cite:
+      - https://www.postgresql.org/docs/current/sql-insert.html#SQL-ON-CONFLICT
+      - https://www.postgresql.org/docs/9.5/sql-insert.html#SQL-ON-CONFLICT
+  - capability: { uniqueness: identity }
+    cite: [https://www.postgresql.org/docs/current/ddl-constraints.html#DDL-CONSTRAINTS-PRIMARY-KEYS]
+  - capability: { outbox: atomic }
+    cite: [https://www.postgresql.org/docs/current/tutorial-transactions.html]
+requirements:
+  - id: durable-commit
+    of: self
+    statement: >-
+      The database runs with fsync on, and synchronous_commit is not off for this data
+      model's transactions, so a commit the application has seen survives a crash.
+    cite:
+      - https://www.postgresql.org/docs/current/runtime-config-wal.html#GUC-SYNCHRONOUS-COMMIT
+      - https://www.postgresql.org/docs/current/runtime-config-wal.html#GUC-FSYNC
+  - id: identity-key
+    of: self
+    statement: >-
+      Each object's table has a primary key over exactly the object's identity fields, so
+      inserting an existing identity fails.
+    cite: [https://www.postgresql.org/docs/current/ddl-constraints.html#DDL-CONSTRAINTS-PRIMARY-KEYS]
+  - id: lock-statement
+    of: transactions
+    statement: >-
+      Each lock step is a SELECT ... FOR UPDATE (exclusive) or FOR SHARE (shared) over the
+      instances it locks, issued before the reads and writes it protects.
+    cite: [https://www.postgresql.org/docs/current/explicit-locking.html#LOCKING-ROWS]
+  - id: guarded-update
+    of: guarded_transactions
+    statement: >-
+      Each guarded mutation is one UPDATE whose WHERE clause carries the instance's identity
+      and every comparison, and the transaction takes its rejected arm unless exactly one row
+      was updated. An upsert is one INSERT ... ON CONFLICT DO UPDATE on the identity's key.
+    cite:
+      - https://www.postgresql.org/docs/current/transaction-iso.html#XACT-READ-COMMITTED
+      - https://www.postgresql.org/docs/current/sql-update.html
+      - https://www.postgresql.org/docs/current/sql-insert.html#SQL-ON-CONFLICT
+  - id: serialization-retry
+    of: serializable_transactions
+    statement: >-
+      Every serializable transaction runs at SERIALIZABLE and is retried from its first
+      statement when it fails with SQLSTATE 40001.
+    cite: [https://www.postgresql.org/docs/current/transaction-iso.html#XACT-SERIALIZABLE]
+evidence:
+  durable-commit: { look_for: "the database's configuration, or the session settings the application connects with" }
+  identity-key: { look_for: "the migration that creates each object's table" }
+  lock-statement: { look_for: "the SELECT ... FOR UPDATE or FOR SHARE ahead of the protected reads" }
+  guarded-update: { look_for: "the UPDATE carrying every comparison, and the check of the updated row count" }
+  serialization-retry: { look_for: "the retry loop around the transaction, and the SQLSTATE it retries on" }
+citations:
+  - https://www.postgresql.org/docs/current/tutorial-transactions.html
+  - https://www.postgresql.org/docs/current/runtime-config-wal.html#GUC-SYNCHRONOUS-COMMIT
+  - https://www.postgresql.org/docs/current/runtime-config-wal.html#GUC-FSYNC
+  - https://www.postgresql.org/docs/current/transaction-iso.html#XACT-READ-COMMITTED
+  - https://www.postgresql.org/docs/current/transaction-iso.html#XACT-REPEATABLE-READ
+  - https://www.postgresql.org/docs/current/transaction-iso.html#XACT-SERIALIZABLE
+  - https://www.postgresql.org/docs/9.1/release-9-1.html
+  - https://www.postgresql.org/docs/current/explicit-locking.html#LOCKING-ROWS
+  - https://www.postgresql.org/docs/current/sql-update.html
+  - https://www.postgresql.org/docs/current/sql-insert.html#SQL-ON-CONFLICT
+  - https://www.postgresql.org/docs/9.5/sql-insert.html#SQL-ON-CONFLICT
+  - https://www.postgresql.org/docs/current/ddl-constraints.html#DDL-CONSTRAINTS-PRIMARY-KEYS

@@ -1,0 +1,27 @@
+format: 1
+id: envoy.round-robin
+version: 1
+technology: { name: envoy, versions: ">=1.18" }
+realizes:
+  kind: router
+provides:
+  - capability: { assignment: round_robin }
+    cite:
+      - https://www.envoyproxy.io/docs/envoy/latest/intro/arch_overview/upstream/load_balancing/load_balancers#weighted-round-robin
+      - https://www.envoyproxy.io/docs/envoy/latest/api-v3/config/cluster/v3/cluster.proto#envoy-v3-api-enum-config-cluster-v3-cluster-lbpolicy
+cannot_provide:
+  - capability: { assignment: consistent_hash }
+    reason: >-
+      Round robin selects hosts in rotation, whatever key a request carries.
+    cite: [https://www.envoyproxy.io/docs/envoy/latest/intro/arch_overview/upstream/load_balancing/load_balancers#weighted-round-robin]
+requirements:
+  - id: lb-policy
+    of: self
+    statement: >-
+      The router's cluster uses lb_policy ROUND_ROBIN, the default.
+    cite: [https://www.envoyproxy.io/docs/envoy/latest/api-v3/config/cluster/v3/cluster.proto#envoy-v3-api-enum-config-cluster-v3-cluster-lbpolicy]
+evidence:
+  lb-policy: { look_for: "the cluster's lb_policy in the Envoy configuration" }
+citations:
+  - https://www.envoyproxy.io/docs/envoy/latest/intro/arch_overview/upstream/load_balancing/load_balancers#weighted-round-robin
+  - https://www.envoyproxy.io/docs/envoy/latest/api-v3/config/cluster/v3/cluster.proto#envoy-v3-api-enum-config-cluster-v3-cluster-lbpolicy

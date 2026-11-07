@@ -29,6 +29,10 @@ Implementation: [`src/design/store.rs`](../../src/design/store.rs).
   conformance/
     policy.yaml                   what must be bound and reviewed (optional)
     <kind>/<id>[/<id>].yaml       one conformance record per declaration
+  realization/
+    stack.yaml                    the technologies the project uses (optional)
+    catalogue/<entry id>.yaml     the project's own catalogue entries
+    choices/<kind>/<id>[/<id>].yaml  the architect's choice per declaration
   .gitignore                      ignores local/
   local/                          this machine's engine state (not committed)
 ```
@@ -38,6 +42,8 @@ Everything except `local/` is committed. The committed state is the authoring wo
 Empty collections have no directory and no file. `intent/` files exist only when they hold something.
 
 `conformance/` holds what the code was checked to provide (`CONFORMANCE.md`). The store neither loads nor scans it: writing a record never adopts a spec revision, invalidates a task, or takes the writer lock, and its strict reader is the conformance module's own.
+
+`realization/` holds which technologies realize the spec (`Conseqa_Realization_Profiles_Revision_Specification.md`): the stack profile, the project's catalogue entries beside the standard catalogue built into `conseqa`, and the architect's choices. Without `stack.yaml` none of it applies. The store neither loads nor scans it either, and its strict reader is the realization module's own.
 
 ## File format
 
@@ -73,6 +79,7 @@ Empty collections have no directory and no file. `intent/` files exist only when
 | `design/` | The last design run's finalized `conseqa.yaml`, verification report, and manifest. |
 | `conformance.lock` | The short lock a conformance record's write holds while it compares and renames. |
 | `conformance/refusals/` | The last refused attest of each declaration, which its work item shows until an attest succeeds. |
+| `realization.lock` | The short lock a realization choice's write holds. |
 
 All of it can be deleted while no engine has the project open; nothing in it is part of the design.
 
@@ -89,15 +96,16 @@ All of it can be deleted while no engine has the project open; nothing in it is 
 | `conseqa-design-mcp stdio` | The project at or above the directory the app starts the server in opens on the first call that needs a project, with no `open_project`. |
 | `conseqa init` | Scaffolds `.conseqa/` in the current directory with a minimal spec: a `project.yaml` named after the directory, no entities yet, and the `.gitignore` for `local/`. `--model` adopts an existing `conseqa.yaml` instead of starting empty. This is the only Conseqa CLI command valid outside a project. It refuses a nested project, and the home directory, whose `.conseqa/` is the machine's configuration. |
 | `conseqa status` | Discovers `.conseqa/project.yaml` in the current directory or its nearest ancestor, reads it without taking the writer lock, and prints its root, revision, commit count, and tasks. |
-| `conseqa check` | Validates and verifies the project and prints the obligation counts. Exits 1 when an operation has no program or the model is invalid; `--require-proven` also exits 2 when any obligation is not proven; `--report` writes the obligation report. For CI. |
+| `conseqa check` | Validates and verifies the project and prints the obligation counts. Exits 1 when an operation has no program or the model is invalid; `--require-proven` also exits 2 when any obligation is not proven; `--require-realizable` also exits 2 when a realizable declaration is ambiguous, has an invalid choice, or is infeasible on the project's stack, and 1 when the realization profile does not load; `--report` writes the obligation report. For CI. |
 | `conseqa diff [<base>] [<head>]` | Compares two versions of the project's spec, each read through the store's own loader without the writer lock: `<base>` is a commit (default `HEAD`), `<head>` a commit or, by default, the working tree. Prints the declarations added, removed, and modified, every obligation that changed with the declarations explaining it, and the change in what the proofs rely on. `--merge-base` reads the base at its merge base with the head; `--report` writes the diff document; `--fail-on` exits 2 on the classes it names. Exits 1 when a side cannot be read. For CI, beside `check`; see `SPEC_CHANGE_ANALYSIS.md`. |
 | `conseqa export <dir>` | Writes `conseqa.yaml`, `verification-report.json` (when the model is valid), and `spec.html` (unless `--no-render`) into `<dir>`, through the same writer as `export_spec`. |
 | `conseqa viz` | Renders `spec.html`, with the verdicts overlaid when the model is valid, into `.conseqa/local/` or `--out`; `--json` writes the page data instead. |
 | `conseqa conform` | Holds the code to the spec, reading the project's files without the writer lock: `status`, `plan`, `item`, `attest`, `review`, `scan`, and `check`, each with `--json` for its conformance document. `check --fail-on` is the CI gate. See `CONFORMANCE.md`. |
+| `conseqa realize` | Judges which technologies realize the spec, reading the project's files without the writer lock: `status` (`--require-realizable` exits 2 on an ambiguous, invalid, or infeasible declaration), `explain <key>`, `choose <key> <entry>`, and `catalogue [list \| show <entry>]`, each with `--json` for its realization document. `catalogue` also runs outside a project, on the standard catalogue alone. |
 | `conseqa design` | Runs the design workflow on the project with coding agents (`--backend claude|codex`; a System One decider and the `--system-one-kinds` whose builders go in front of the agents), writing its run artifacts into `.conseqa/local/design`. `--prompt` or `--prompt-file` says what to build, for this run only; a project with no operations needs one. Exits 2 when the run ends incomplete. |
 | `conseqa-design-mcp serve` | `--project`, default `.`. Opens that project for the design MCP and admin surfaces; its existing server options may initialize a workspace when one is absent. Its localhost admin surface mints task, session, and implementer and reviewer tokens (`POST /admin/credentials`). |
 
-The repository builds two binaries: `conseqa`, the project CLI, and `conseqa-design-mcp`, the design MCP server. The `conseqa` CLI has no project path flag: after initialization, its context is the `.conseqa/` directory discovered from the working directory. Its subcommands give a pipeline with no MCP client — CI, a script — what the design MCP server gives an agent: checking, exporting, visualizing, and designing the committed model, and holding the code to it.
+The repository builds two binaries: `conseqa`, the project CLI, and `conseqa-design-mcp`, the design MCP server. The `conseqa` CLI has no project path flag: after initialization, its context is the `.conseqa/` directory discovered from the working directory. Its subcommands give a pipeline with no MCP client — CI, a script — what the design MCP server gives an agent: checking, exporting, visualizing, and designing the committed model, judging what can realize it, and holding the code to it.
 
 Discovery never looks at or above the home directory: its `.conseqa/` is the machine's configuration (below), so a project there would claim every directory of the user's as its own.
 

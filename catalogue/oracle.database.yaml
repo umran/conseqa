@@ -1,0 +1,72 @@
+format: 1
+id: oracle.database
+version: 1
+technology: { name: oracle, versions: ">=19" }
+realizes:
+  kind: data_model
+provides:
+  - capability: { durability: committed }
+    cite: [https://docs.oracle.com/en/database/oracle/oracle-database/19/cncpt/transactions.html#GUID-C3FE1082-94AA-4BE8-98F2-480205D99DCA]
+  - capability: { isolation: read_committed }
+    cite: [https://docs.oracle.com/en/database/oracle/oracle-database/19/cncpt/data-concurrency-and-consistency.html#GUID-DB571DA8-864F-4FE9-93B9-3EC2DD0604FE]
+  - capability: { isolation: snapshot }
+    cite: [https://docs.oracle.com/en/database/oracle/oracle-database/19/cncpt/data-concurrency-and-consistency.html#GUID-8DA9A191-4CA3-4B1A-995F-4B17471C2738]
+  - capability: { transaction: interactive }
+    cite: [https://docs.oracle.com/en/database/oracle/oracle-database/19/cncpt/transactions.html#GUID-31319EA7-994C-4D25-8814-0214ABD3CBDA]
+  - capability: { transaction: multi_instance }
+    cite: [https://docs.oracle.com/en/database/oracle/oracle-database/19/cncpt/transactions.html#GUID-31319EA7-994C-4D25-8814-0214ABD3CBDA]
+  - capability: { lock: exclusive }
+    cite: [https://docs.oracle.com/en/database/oracle/oracle-database/19/cncpt/data-concurrency-and-consistency.html#GUID-92D38952-A7A0-486F-9547-BDB6E624F125]
+  - capability: { mutation: conditional }
+    cite: [https://docs.oracle.com/en/database/oracle/oracle-database/19/cncpt/data-concurrency-and-consistency.html#GUID-92D38952-A7A0-486F-9547-BDB6E624F125]
+  - capability: { uniqueness: identity }
+    cite: [https://docs.oracle.com/en/database/oracle/oracle-database/19/cncpt/data-integrity.html#GUID-E1033BB9-0F67-4E59-82AC-B8B572FD82BB]
+  - capability: { outbox: atomic }
+    cite: [https://docs.oracle.com/en/database/oracle/oracle-database/19/cncpt/transactions.html#GUID-31319EA7-994C-4D25-8814-0214ABD3CBDA]
+cannot_provide:
+  - capability: { isolation: serializable }
+    reason: >-
+      Oracle's SERIALIZABLE level gives each transaction the snapshot committed when it
+      began, and refuses only a write to a row another transaction changed since. That is
+      snapshot isolation: two transactions that each read what the other writes, and write
+      different rows, both commit (write skew), so committed histories need not be
+      serializable.
+    cite: [https://docs.oracle.com/en/database/oracle/oracle-database/19/cncpt/data-concurrency-and-consistency.html#GUID-8DA9A191-4CA3-4B1A-995F-4B17471C2738]
+requirements:
+  - id: durable-commit
+    of: self
+    statement: >-
+      Commits wait for their redo to be written, as by default: no COMMIT WRITE NOWAIT or
+      BATCH, and no COMMIT_WAIT or COMMIT_LOGGING setting that defers the redo write.
+    cite: [https://docs.oracle.com/en/database/oracle/oracle-database/19/cncpt/transactions.html#GUID-C3FE1082-94AA-4BE8-98F2-480205D99DCA]
+  - id: identity-key
+    of: self
+    statement: >-
+      Each object's table has a primary key over exactly the object's identity fields, so
+      inserting an existing identity fails.
+    cite: [https://docs.oracle.com/en/database/oracle/oracle-database/19/cncpt/data-integrity.html#GUID-E1033BB9-0F67-4E59-82AC-B8B572FD82BB]
+  - id: guarded-update
+    of: guarded_transactions
+    statement: >-
+      Each guarded mutation locks its row with SELECT ... FOR UPDATE, then compares and
+      updates it, and the transaction takes its rejected arm when the comparison fails or no
+      row is locked.
+    cite: [https://docs.oracle.com/en/database/oracle/oracle-database/19/cncpt/data-concurrency-and-consistency.html#GUID-92D38952-A7A0-486F-9547-BDB6E624F125]
+  - id: snapshot-retry
+    of: transactions
+    statement: >-
+      Every transaction run at SERIALIZABLE, the snapshot level, is retried from its start
+      when it fails with ORA-08177.
+    cite: [https://docs.oracle.com/en/database/oracle/oracle-database/19/cncpt/data-concurrency-and-consistency.html#GUID-8DA9A191-4CA3-4B1A-995F-4B17471C2738]
+evidence:
+  durable-commit: { look_for: "the COMMIT statements, and the instance's COMMIT_WAIT and COMMIT_LOGGING parameters" }
+  identity-key: { look_for: "the migration that creates each object's table" }
+  guarded-update: { look_for: "the SELECT ... FOR UPDATE, the comparison, and the UPDATE that follows it" }
+  snapshot-retry: { look_for: "the retry loop around the transaction, and the error it retries on" }
+citations:
+  - https://docs.oracle.com/en/database/oracle/oracle-database/19/cncpt/transactions.html#GUID-31319EA7-994C-4D25-8814-0214ABD3CBDA
+  - https://docs.oracle.com/en/database/oracle/oracle-database/19/cncpt/transactions.html#GUID-C3FE1082-94AA-4BE8-98F2-480205D99DCA
+  - https://docs.oracle.com/en/database/oracle/oracle-database/19/cncpt/data-concurrency-and-consistency.html#GUID-DB571DA8-864F-4FE9-93B9-3EC2DD0604FE
+  - https://docs.oracle.com/en/database/oracle/oracle-database/19/cncpt/data-concurrency-and-consistency.html#GUID-8DA9A191-4CA3-4B1A-995F-4B17471C2738
+  - https://docs.oracle.com/en/database/oracle/oracle-database/19/cncpt/data-concurrency-and-consistency.html#GUID-92D38952-A7A0-486F-9547-BDB6E624F125
+  - https://docs.oracle.com/en/database/oracle/oracle-database/19/cncpt/data-integrity.html#GUID-E1033BB9-0F67-4E59-82AC-B8B572FD82BB

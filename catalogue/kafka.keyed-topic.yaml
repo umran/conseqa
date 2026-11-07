@@ -1,0 +1,70 @@
+format: 1
+id: kafka.keyed-topic
+version: 1
+technology: { name: kafka, versions: ">=2.8" }
+realizes:
+  kind: topic_runtime
+provides:
+  - capability: { grouping: keyed }
+    cite:
+      - https://kafka.apache.org/44/getting-started/introduction#main-concepts-and-terminology
+      - https://kafka.apache.org/44/configuration/producer-configs/#producerconfigs_partitioner.class
+  - capability: { ordering: within_group }
+    cite: [https://kafka.apache.org/44/getting-started/introduction#main-concepts-and-terminology]
+  - capability: { ordering: global }
+    with: { option: single_partition }
+    cite: [https://kafka.apache.org/44/getting-started/introduction#main-concepts-and-terminology]
+cannot_provide:
+  - capability: { ordering: global }
+    unless: { option: single_partition }
+    reason: >-
+      Kafka orders records within a partition only; records in different partitions have no
+      order.
+    cite: [https://kafka.apache.org/44/getting-started/introduction#main-concepts-and-terminology]
+options:
+  single_partition:
+    description: >-
+      The topic has exactly one partition, which gives one order over every record at the
+      cost of all parallelism.
+requirements:
+  - id: record-key
+    of: producers
+    statement: >-
+      Every record is produced with its key set to the message's grouping key, serialized
+      the same way by every producer, and partitioned by a hash of that key, as the default
+      partitioner does.
+    cite:
+      - https://kafka.apache.org/44/getting-started/introduction#main-concepts-and-terminology
+      - https://kafka.apache.org/44/configuration/producer-configs/#producerconfigs_partitioner.class
+  - id: idempotent-producer
+    of: producers
+    statement: >-
+      Producers set enable.idempotence=true, with acks=all and
+      max.in.flight.requests.per.connection of at most 5, so a retried send can neither
+      duplicate nor reorder records.
+    cite:
+      - https://kafka.apache.org/44/configuration/producer-configs/#producerconfigs_enable.idempotence
+      - https://kafka.apache.org/44/configuration/producer-configs/#producerconfigs_max.in.flight.requests.per.connection
+  - id: stable-partitions
+    of: self
+    statement: >-
+      The topic's partition count does not change while its grouping or ordering is relied
+      on: adding partitions moves keys to other partitions.
+    cite: [https://kafka.apache.org/44/operations/basic-kafka-operations/#modifying-topics]
+  - id: single-partition
+    of: self
+    with: { option: single_partition }
+    statement: >-
+      The topic has exactly one partition.
+    cite: [https://kafka.apache.org/44/getting-started/introduction#main-concepts-and-terminology]
+evidence:
+  record-key: { look_for: "the producer call that sets the record key" }
+  idempotent-producer: { look_for: "the producer's configuration" }
+  stable-partitions: { look_for: "the topic's infrastructure definition" }
+  single-partition: { look_for: "the partition count in the topic's infrastructure definition" }
+citations:
+  - https://kafka.apache.org/44/getting-started/introduction#main-concepts-and-terminology
+  - https://kafka.apache.org/44/configuration/producer-configs/#producerconfigs_partitioner.class
+  - https://kafka.apache.org/44/configuration/producer-configs/#producerconfigs_enable.idempotence
+  - https://kafka.apache.org/44/configuration/producer-configs/#producerconfigs_max.in.flight.requests.per.connection
+  - https://kafka.apache.org/44/operations/basic-kafka-operations/#modifying-topics

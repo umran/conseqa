@@ -1,0 +1,23 @@
+format: 1
+id: postgres.partitioned-table
+version: 1
+technology: { name: postgres, versions: ">=10" }
+realizes:
+  kind: storage_layout
+provides:
+  - capability: { partitioning: keyed }
+    cite: [https://www.postgresql.org/docs/10/ddl-partitioning.html#DDL-PARTITIONING-DECLARATIVE]
+  - capability: { partitioning: composite }
+    cite: [https://www.postgresql.org/docs/10/ddl-partitioning.html#DDL-PARTITIONING-DECLARATIVE]
+requirements:
+  - id: partition-key
+    of: self
+    statement: >-
+      The object's table is declared PARTITION BY over exactly the layout's partition-key
+      columns, in the layout's order.
+    cite: [https://www.postgresql.org/docs/current/ddl-partitioning.html#DDL-PARTITIONING-DECLARATIVE]
+evidence:
+  partition-key: { look_for: "the CREATE TABLE ... PARTITION BY in the object's migration" }
+citations:
+  - https://www.postgresql.org/docs/10/ddl-partitioning.html#DDL-PARTITIONING-DECLARATIVE
+  - https://www.postgresql.org/docs/current/ddl-partitioning.html#DDL-PARTITIONING-DECLARATIVE

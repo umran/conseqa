@@ -620,7 +620,9 @@ async fn a_review_server_serves_its_reviewers_and_nothing_of_the_design() {
         [
             "conformance_status",
             "dsl_guide",
+            "explain_realization",
             "implementation_plan",
+            "realization_status",
             "record_review",
             "work_item"
         ]

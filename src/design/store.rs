@@ -15,6 +15,10 @@
 //!   conformance/                    conformance records and their policy,
 //!                                   read by `crate::conformance`; never
 //!                                   loaded or scanned here
+//!   realization/                    the stack profile, project catalogue
+//!                                   entries, and choices, read by
+//!                                   `crate::realization`; never loaded or
+//!                                   scanned here
 //!   .gitignore                      keeps local/ out of version control
 //!   local/                          this machine's engine state
 //! ```

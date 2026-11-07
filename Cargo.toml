@@ -141,6 +141,18 @@ name = "conformance_mcp"
 required-features = ["design"]
 
 [[test]]
+name = "realization"
+required-features = ["design"]
+
+[[test]]
+name = "realization_cli"
+required-features = ["design"]
+
+[[test]]
+name = "realization_mcp"
+required-features = ["design"]
+
+[[test]]
 name = "conformance_cli"
 required-features = ["design"]
 

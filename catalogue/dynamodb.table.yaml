@@ -1,0 +1,76 @@
+format: 1
+id: dynamodb.table
+version: 1
+# DynamoDB has no product versions; a stack names it at its API version,
+# as dynamodb@2012.08.10.
+technology: { name: dynamodb, versions: ">=2012.8.10" }
+realizes:
+  kind: data_model
+provides:
+  - capability: { durability: committed }
+    cite: [https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/Introduction.html#ddb-intro-resilience]
+  - capability: { isolation: serializable }
+    cite: [https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/transaction-apis.html#transaction-isolation-serializable]
+  - capability: { transaction: multi_instance }
+    cite: [https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/transaction-apis.html#transaction-apis-txwriteitems]
+  - capability: { mutation: conditional }
+    cite: [https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/Expressions.ConditionExpressions.html#Expressions.ConditionExpressions.SimpleComparisons]
+  - capability: { mutation: upsert }
+    cite: [https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/transaction-apis.html#transaction-apis-txwriteitems]
+  - capability: { uniqueness: identity }
+    cite: [https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/Expressions.ConditionExpressions.html#Expressions.ConditionExpressions.PreventingOverwrites]
+  - capability: { outbox: atomic }
+    cite: [https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/transaction-apis.html#transaction-apis-txwriteitems]
+cannot_provide:
+  - capability: { transaction: interactive }
+    reason: >-
+      A DynamoDB transaction is one TransactWriteItems call, whose writes and condition
+      checks are fixed when it is sent, or one TransactGetItems call, which only reads: no
+      transaction spans a read, a decision and a write. Express the decision as conditions
+      on the writes.
+    cite:
+      - https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/transaction-apis.html#transaction-apis-txwriteitems
+      - https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/transaction-apis.html#transaction-apis-txgetitems
+requirements:
+  - id: single-call
+    of: transactions
+    statement: >-
+      Every transaction is one TransactWriteItems call or one single-item PutItem,
+      UpdateItem or DeleteItem, never a BatchWriteItem; it reads through TransactGetItems or
+      GetItem, never BatchGetItem, Query or Scan.
+    cite:
+      - https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/transaction-apis.html#transaction-apis-txwriteitems
+      - https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/transaction-apis.html#transaction-isolation-serializable
+  - id: decisions-as-conditions
+    of: guarded_transactions
+    statement: >-
+      Each guarded mutation is a write whose ConditionExpression carries every comparison,
+      sent in the same call as the transaction's other writes.
+    cite:
+      - https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/Expressions.ConditionExpressions.html#Expressions.ConditionExpressions.SimpleComparisons
+      - https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/transaction-apis.html#transaction-apis-txwriteitems
+  - id: insert-if-absent
+    of: writers
+    statement: >-
+      Every insert is a Put whose ConditionExpression is attribute_not_exists on the
+      table's key, so inserting an existing identity fails.
+    cite: [https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/Expressions.ConditionExpressions.html#Expressions.ConditionExpressions.PreventingOverwrites]
+  - id: conflict-retry
+    of: transactions
+    statement: >-
+      A transaction cancelled with TransactionCanceledException for a transaction conflict
+      is retried.
+    cite: [https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/transaction-apis.html#transaction-conflict-handling]
+evidence:
+  single-call: { look_for: "the DynamoDB calls each transaction makes" }
+  decisions-as-conditions: { look_for: "the ConditionExpression on each guarded write" }
+  insert-if-absent: { look_for: "the condition on each Put that inserts" }
+  conflict-retry: { look_for: "the handling of TransactionCanceledException" }
+citations:
+  - https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/Introduction.html#ddb-intro-resilience
+  - https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/transaction-apis.html#transaction-apis-txwriteitems
+  - https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/transaction-apis.html#transaction-apis-txgetitems
+  - https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/transaction-apis.html#transaction-isolation-serializable
+  - https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/transaction-apis.html#transaction-conflict-handling
+  - https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/Expressions.ConditionExpressions.html#Expressions.ConditionExpressions.SimpleComparisons
+  - https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/Expressions.ConditionExpressions.html#Expressions.ConditionExpressions.PreventingOverwrites

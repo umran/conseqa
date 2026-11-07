@@ -395,6 +395,12 @@ impl DesignEngine {
         self.inner.head.load()
     }
 
+    /// The snapshot a task reads: the head it pinned, which its reads
+    /// see until it commits or is invalidated.
+    pub fn task_snapshot(&self, task: TaskId) -> Result<Arc<WorkspaceSnapshot>, EngineError> {
+        Ok(self.active_entry(task)?.snapshot.clone())
+    }
+
     pub fn head_revision(&self) -> Revision {
         self.inner.head.load().revision
     }
