@@ -1270,12 +1270,20 @@ impl ConseqaMcp {
         // The head is the engine's head, which the files were adopted
         // into before this call: the project's current files, read
         // whole rather than while another call may be writing them.
+        let realization = match crate::realization::choice::Profile::read(&project) {
+            Ok(realization) => realization,
+            Err(error) => {
+                return json_error(serde_json::json!({ "error": error.to_string() }));
+            }
+        };
+
         let head = Side {
             name: SideName::Head,
             source: Source::WorkingTree,
             commit: None,
             merge_base: false,
             workspace: Some(engine.head_snapshot().workspace.as_ref().clone()),
+            realization,
         };
 
         let base = params.base.as_deref().unwrap_or("HEAD");

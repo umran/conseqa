@@ -388,3 +388,103 @@ fn the_catalogue_reads_outside_a_project() {
     assert!(stdout(&output).contains("postgres.database@1"));
     assert!(!stdout(&output).contains("project "));
 }
+
+impl Checkout {
+    fn git(&self, args: &[&str]) {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(&self.0)
+            .args(args)
+            .output()
+            .expect("git runs");
+
+        assert!(output.status.success(), "git {args:?}: {}", stderr(&output));
+    }
+
+    /// Commits everything, as the spec's pull request would.
+    fn commit(&self, message: &str) {
+        self.git(&["add", "-A"]);
+        self.git(&["commit", "-q", "-m", message]);
+    }
+}
+
+#[test]
+fn the_diff_gates_fail_on_what_the_heads_stack_cannot_realize() {
+    let checkout = Checkout::new("gates");
+
+    checkout.git(&["init", "-q"]);
+    checkout.git(&["config", "user.name", "Ana Tester"]);
+    checkout.git(&["config", "user.email", "ana@example.test"]);
+    checkout.git(&["config", "commit.gpgsign", "false"]);
+    checkout.commit("the checkout, realizable");
+
+    let gates = |checkout: &Checkout| {
+        let output = checkout.conseqa(&["diff", "--fail-on", "infeasible,ambiguous"]);
+
+        (code(&output), stdout(&output), stderr(&output))
+    };
+
+    let (exit, text, _) = gates(&checkout);
+
+    assert_eq!(exit, 0, "{text}");
+    assert!(text.contains("realization\n"), "{text}");
+
+    // SQS joins the stack: the topic runtime needs a choice.
+    checkout.stack(&[
+        "postgres@16",
+        "kafka@3.7",
+        "envoy@1.30",
+        "nomad@1.8",
+        "sqs@2012.11.05",
+    ]);
+
+    let (exit, text, errors) = gates(&checkout);
+
+    assert_eq!(exit, 2, "{text}{errors}");
+    assert!(text.contains("  + stack sqs@2012.11.05"), "{text}");
+    assert!(
+        text.contains("! ambiguous     topic_runtime topic.order_events"),
+        "{text}"
+    );
+    assert!(errors.contains("gate failed: ambiguous"), "{errors}");
+    assert!(!errors.contains("gate failed: infeasible"), "{errors}");
+
+    let (document, exit) = {
+        let output = checkout.conseqa(&["diff", "--report", "diff.json", "--fail-on", "ambiguous"]);
+
+        (
+            serde_json::from_slice::<Value>(&fs::read(checkout.path().join("diff.json")).unwrap())
+                .unwrap(),
+            code(&output),
+        )
+    };
+
+    assert_eq!(exit, 2);
+    assert_eq!(
+        document["realization"]["stack"]["added"][0],
+        "sqs@2012.11.05"
+    );
+    assert_eq!(
+        document["realization"]["unrealizable"][0]["state"],
+        "ambiguous"
+    );
+
+    // The worker runtime's entry leaves the catalogue: every bounded pool
+    // is infeasible.
+    checkout.stack(&["postgres@16", "kafka@3.7", "envoy@1.30", "nomad@1.8"]);
+    fs::remove_file(
+        checkout
+            .path()
+            .join(".conseqa/realization/catalogue/nomad.job.yaml"),
+    )
+    .unwrap();
+
+    let (exit, text, errors) = gates(&checkout);
+
+    assert_eq!(exit, 2, "{text}{errors}");
+    assert!(
+        text.contains("! infeasible    execution_pool pool.order_workers"),
+        "{text}"
+    );
+    assert!(errors.contains("gate failed: infeasible"), "{errors}");
+}

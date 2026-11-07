@@ -440,6 +440,13 @@ enum FailOn {
 
     /// Any entry is unexplained.
     Unexplained,
+
+    /// Any declaration on head is infeasible on its stack, or has an
+    /// invalid choice.
+    Infeasible,
+
+    /// Any declaration on head is ambiguous on its stack.
+    Ambiguous,
 }
 
 impl From<FailOn> for Gate {
@@ -450,6 +457,8 @@ impl From<FailOn> for Gate {
             FailOn::AddedUnproven => Self::AddedUnproven,
             FailOn::Rebased => Self::Rebased,
             FailOn::Unexplained => Self::Unexplained,
+            FailOn::Infeasible => Self::Infeasible,
+            FailOn::Ambiguous => Self::Ambiguous,
         }
     }
 }

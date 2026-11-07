@@ -257,7 +257,7 @@ Update this table in every milestone PR.
 | M6 Work list, items, attest | in review | `spec-versioning-m6` | #48 (stacked on #47) |
 | M7 Reviews, surfaces | in review | `spec-versioning-m7` | #49 (stacked on #48) |
 | M8 Capabilities, catalogue, choice | in review | `spec-versioning-m8` | #50 (stacked on #49) |
-| M9 Realization integration | not started | | |
+| M9 Realization integration | in review | `spec-versioning-m9` | #51 (stacked on #50) |
 
 ---
 

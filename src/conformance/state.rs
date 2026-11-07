@@ -31,6 +31,14 @@
 //!
 //! Reviews and disputes are conditions of their own, gated apart: they
 //! say who else checked a record, not what it records.
+//!
+//! With a stack profile, what the code must provide also includes what
+//! each chosen realization demands of it (Part VI §11): every
+//! `realization` fact is required of the declaration it is on, whether
+//! or not a proof relies on it. Every declaration a catalogue entry
+//! realizes must then be bound, its record names the realization its
+//! code was checked against, and a declaration the stack cannot realize
+//! is `unrealizable` (Part VI §18).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -49,6 +57,10 @@ use crate::design::graph::SymbolGraph;
 use crate::design::graph_build;
 use crate::design::graph_query::{self, GraphQuery, QueryRow};
 use crate::design::workspace::WorkspaceState;
+use crate::realization::capability::{self as capability, Spec};
+use crate::realization::checkers::{self, Finding, Outcome, Read};
+use crate::realization::choice::{Profile, Status as RealizationStatus};
+use crate::realization::requirements::{self, Placed};
 use crate::spec::{Id, TransactionStep};
 
 use super::completeness::{self, LISTED_MATCHES, Match, Matcher, RequiredScope};
@@ -56,7 +68,7 @@ use super::markers::{self, Region, Scan, ScanError};
 use super::policy::{Policy, ReviewRule};
 use super::record::{
     ClaimScope, CompletenessClaim, Party, PartyKind, Record, RecordContent, RecordFile,
-    RecordedRegion, Records, Review, ReviewTarget, Verdict,
+    RecordedRealization, RecordedRegion, Records, Review, ReviewTarget, Verdict,
 };
 use super::{ConformanceError, Digest, bindable};
 
@@ -96,9 +108,47 @@ pub struct DeclarationState {
     /// The completeness claims its record must carry (§9.4).
     pub claims: Vec<RequiredScope>,
 
+    /// What the catalogue's checkers found of the realization
+    /// requirements on it, over its regions as they are now (Part VI
+    /// §13.2).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub checker_reviews: Vec<CheckerReview>,
+
     /// Its conditions, in §10.1's order. A declaration with none is
     /// current.
     pub conditions: Vec<Condition>,
+}
+
+/// A catalogue checker's review of one realization requirement (Part VI
+/// §13.2). It is derived on every derivation and never written, so it
+/// holds of the regions as they are now: a review that lapses as soon
+/// as the digests it read change.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct CheckerReview {
+    /// `<entry id>/<checker id>@<entry version>`, the name its reviews
+    /// are by.
+    pub checker: String,
+
+    /// The realization fact it reviews.
+    pub fact: Fact,
+
+    #[serde(flatten)]
+    pub finding: Finding,
+
+    /// The digests of the regions it read: every region bound to the
+    /// declaration.
+    pub digests: Vec<Digest>,
+}
+
+impl CheckerReview {
+    /// The party its reviews are by.
+    pub fn by(&self) -> Party {
+        Party {
+            kind: PartyKind::Checker,
+            name: self.checker.clone(),
+            job: None,
+        }
+    }
 }
 
 impl DeclarationState {
@@ -176,6 +226,11 @@ pub enum Condition {
     /// Reviews at the current digests disputing the record, or items of
     /// it.
     Disputed { reviews: Vec<Dispute> },
+
+    /// With a stack profile, the declaration is ambiguous, has an
+    /// invalid choice, or is infeasible (Part VI §10.3): a decision
+    /// about the spec or the stack, not code, is owed.
+    Unrealizable { state: String },
 }
 
 impl Condition {
@@ -190,6 +245,7 @@ impl Condition {
             Self::Surplus { .. } => ConditionKind::Surplus,
             Self::Unreviewed { .. } => ConditionKind::Unreviewed,
             Self::Disputed { .. } => ConditionKind::Disputed,
+            Self::Unrealizable { .. } => ConditionKind::Unrealizable,
         }
     }
 }
@@ -209,11 +265,12 @@ pub enum ConditionKind {
     Surplus,
     Unreviewed,
     Disputed,
+    Unrealizable,
 }
 
 impl ConditionKind {
     /// Every condition, in §10.1's order.
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 11] = [
         Self::Unbound,
         Self::Orphaned,
         Self::Unattested,
@@ -224,6 +281,7 @@ impl ConditionKind {
         Self::Surplus,
         Self::Unreviewed,
         Self::Disputed,
+        Self::Unrealizable,
     ];
 }
 
@@ -240,6 +298,7 @@ impl fmt::Display for ConditionKind {
             Self::Surplus => "surplus",
             Self::Unreviewed => "unreviewed",
             Self::Disputed => "disputed",
+            Self::Unrealizable => "unrealizable",
         })
     }
 }
@@ -375,6 +434,44 @@ pub struct Derivation<'a> {
 
     /// The anchors of each fact of the reliance, by canonical form.
     pub anchors: BTreeMap<String, BTreeSet<DeclarationKey>>,
+
+    /// The realization profile and what it puts in force, when the
+    /// project has a stack profile (Part VI).
+    pub realization: Option<Realization>,
+}
+
+/// A project's realization profile, as one derivation read it, with each
+/// declaration's state and every requirement in force (Part VI §10,
+/// §11).
+pub struct Realization {
+    pub profile: Profile,
+    pub status: RealizationStatus,
+    pub placed: Vec<Placed>,
+}
+
+impl Realization {
+    /// The realization a realized declaration's record must name: its
+    /// chosen or automatic entry, with its options.
+    pub fn of(&self, declaration: &TextualKey) -> Option<RecordedRealization> {
+        self.status
+            .declarations
+            .iter()
+            .find(|realized| &realized.declaration == declaration)
+            .and_then(|realized| realized.state.realization())
+            .map(|(entry, options)| RecordedRealization {
+                entry: entry.clone(),
+                options: options.to_vec(),
+            })
+    }
+
+    /// The state of a realizable declaration, if it is one.
+    pub fn state(&self, declaration: &TextualKey) -> Option<&crate::realization::choice::State> {
+        self.status
+            .declarations
+            .iter()
+            .find(|realized| &realized.declaration == declaration)
+            .map(|realized| &realized.state)
+    }
 }
 
 impl<'a> Derivation<'a> {
@@ -408,8 +505,39 @@ impl<'a> Derivation<'a> {
         let records = Records::of_project(project_dir).read_all()?;
         let policy = Policy::read(project_dir)?;
 
+        let realization = Profile::read(project_dir)?.map(|profile| {
+            let status = RealizationStatus::with_needs(
+                &profile,
+                capability::needs_of(&Spec::of_workspace(workspace)),
+            );
+            let placed = requirements::placed(&status, &profile.catalogue, workspace, &graph);
+
+            Realization {
+                profile,
+                status,
+                placed,
+            }
+        });
+
         let reliance = reliance(proven.values().copied());
-        let required = required_facts(&reliance, workspace, &graph);
+        let mut required = required_facts(&reliance, workspace, &graph);
+
+        // What the chosen realizations demand of each declaration, which
+        // no proof relies on.
+        for placed in realization
+            .iter()
+            .flat_map(|realization| &realization.placed)
+        {
+            required
+                .entry(placed.declaration().key().clone())
+                .or_default()
+                .entry(placed.fact.canonical())
+                .or_insert_with(|| RequiredFact {
+                    fact: placed.fact.clone(),
+                    class: ConformanceClass::Attestable,
+                    relied_on_by: Vec::new(),
+                });
+        }
         let scopes =
             completeness::required(reliance.values().map(|relied| &relied.fact), workspace);
 
@@ -453,6 +581,11 @@ impl<'a> Derivation<'a> {
 
         let mut matches = matcher.into_matches();
         let extra = matches.split_off(checked.len());
+
+        let checker_reviews = realization
+            .as_ref()
+            .map(|realization| checker_reviews(realization, &scan.regions))
+            .unwrap_or_default();
 
         let mut unheld: BTreeMap<(&TextualKey, ClaimScope), Vec<UnheldClaim>> = BTreeMap::new();
 
@@ -515,6 +648,8 @@ impl<'a> Derivation<'a> {
             required: &required,
             scopes: &scopes,
             failures: &failures,
+            realization: realization.as_ref(),
+            checker_reviews: &checker_reviews,
         };
 
         let declarations: Vec<DeclarationState> = partition
@@ -556,6 +691,7 @@ impl<'a> Derivation<'a> {
             scan,
             named,
             anchors,
+            realization,
         };
 
         Ok((derivation, extra))
@@ -770,6 +906,73 @@ struct Inputs<'a> {
     required: &'a BTreeMap<DeclarationKey, BTreeMap<String, RequiredFact>>,
     scopes: &'a [RequiredScope],
     failures: &'a BTreeMap<(&'a TextualKey, ClaimScope), ScopeFailure>,
+    realization: Option<&'a Realization>,
+    checker_reviews: &'a BTreeMap<DeclarationKey, Vec<CheckerReview>>,
+}
+
+/// Every catalogue checker's review of every realization requirement in
+/// force, by the declaration the requirement is on (Part VI §13): each
+/// checker of the chosen entry covering the requirement, run over the
+/// regions bound to that declaration and no others.
+fn checker_reviews(
+    realization: &Realization,
+    regions: &[Region],
+) -> BTreeMap<DeclarationKey, Vec<CheckerReview>> {
+    let mut reviews: BTreeMap<DeclarationKey, Vec<CheckerReview>> = BTreeMap::new();
+
+    for placed in &realization.placed {
+        if placed.checkers.is_empty() {
+            continue;
+        }
+
+        let Some(entry) = realization
+            .profile
+            .catalogue
+            .platform(&placed.entry().id)
+            .filter(|entry| entry.version == placed.entry().version)
+        else {
+            continue;
+        };
+
+        let declaration = placed.declaration().key();
+
+        let bound: Vec<&Region> = regions
+            .iter()
+            .filter(|region| region.key.key() == declaration)
+            .collect();
+
+        let reads: Vec<Read<'_>> = bound
+            .iter()
+            .map(|region| Read {
+                path: &region.path,
+                text: &region.residual,
+            })
+            .collect();
+
+        let digests = sorted(&bound.iter().map(|region| region.digest).collect::<Vec<_>>());
+
+        for checker in &entry.checkers {
+            if !checker
+                .covers
+                .iter()
+                .any(|covered| covered == placed.requirement())
+            {
+                continue;
+            }
+
+            reviews
+                .entry(declaration.clone())
+                .or_default()
+                .push(CheckerReview {
+                    checker: format!("{}/{}@{}", entry.id, checker.id, entry.version),
+                    fact: placed.fact.clone(),
+                    finding: checkers::run(checker.kind, &checker.assert, &reads),
+                    digests: digests.clone(),
+                });
+        }
+    }
+
+    reviews
 }
 
 impl Inputs<'_> {
@@ -796,12 +999,22 @@ impl Inputs<'_> {
             .cloned()
             .collect();
 
+        let checker_reviews: Vec<CheckerReview> =
+            self.checker_reviews.get(key).cloned().unwrap_or_default();
+
         let file = self.records.get(&declaration);
         let record = readable(file);
 
         let mut conditions = Vec::new();
 
-        if regions.is_empty() && self.policy.requires_binding(key.kind()) {
+        // The realization the record must name, when a catalogue entry
+        // realizes the declaration: which also brings it under binding,
+        // whatever the policy lists (Part VI §18, item 4).
+        let realized = self
+            .realization
+            .and_then(|realization| realization.of(&declaration));
+
+        if regions.is_empty() && (self.policy.requires_binding(key.kind()) || realized.is_some()) {
             conditions.push(Condition::Unbound);
         }
 
@@ -819,7 +1032,8 @@ impl Inputs<'_> {
         }
 
         if let Some(record) = record
-            && Some(&record.residual) != self.partition.members.get(key)
+            && (Some(&record.residual) != self.partition.members.get(key)
+                || record.realization != realized)
         {
             conditions.push(Condition::Stale);
         }
@@ -903,6 +1117,24 @@ impl Inputs<'_> {
 
             let current = digests(&regions);
 
+            // A confirming checker satisfies the review of exactly the
+            // requirement it covers, for the fact kinds the policy lets
+            // it (§14.4).
+            let checked = |target: &ReviewTarget| match target {
+                ReviewTarget::Fact(index) => record.facts.get(*index).is_some_and(|attested| {
+                    self.policy
+                        .review
+                        .checker_satisfies
+                        .contains(attested.fact.kind())
+                        && checker_reviews.iter().any(|review| {
+                            review.finding.outcome == Outcome::Confirmed
+                                && review.fact.canonical() == attested.fact.canonical()
+                        })
+                }),
+
+                ReviewTarget::Completeness(_) | ReviewTarget::Structural => false,
+            };
+
             let items: Vec<ReviewTarget> = self
                 .needs_review(record, &needed, &claims, &required)
                 .into_iter()
@@ -911,6 +1143,7 @@ impl Inputs<'_> {
                         .reviews
                         .iter()
                         .any(|review| confirms(review, record, *target, &current))
+                        && !checked(target)
                 })
                 .collect();
 
@@ -918,7 +1151,7 @@ impl Inputs<'_> {
                 conditions.push(Condition::Unreviewed { items });
             }
 
-            let disputes: Vec<Dispute> = record
+            let mut disputes: Vec<Dispute> = record
                 .reviews
                 .iter()
                 .filter(|review| sorted(&review.digests) == current)
@@ -940,9 +1173,39 @@ impl Inputs<'_> {
                 })
                 .collect();
 
+            // A checker disputing a requirement the record attests, at
+            // the digests it read now.
+            for review in &checker_reviews {
+                if review.finding.outcome != Outcome::Disputed {
+                    continue;
+                }
+
+                if let Some(index) = record
+                    .facts
+                    .iter()
+                    .position(|attested| attested.fact.canonical() == review.fact.canonical())
+                {
+                    disputes.push(Dispute {
+                        by: review.by(),
+                        record: false,
+                        items: vec![ReviewTarget::Fact(index)],
+                    });
+                }
+            }
+
             if !disputes.is_empty() {
                 conditions.push(Condition::Disputed { reviews: disputes });
             }
+        }
+
+        if let Some(state) = self
+            .realization
+            .and_then(|realization| realization.state(&declaration))
+            .filter(|state| state.fails())
+        {
+            conditions.push(Condition::Unrealizable {
+                state: state.name().to_string(),
+            });
         }
 
         DeclarationState {
@@ -950,6 +1213,7 @@ impl Inputs<'_> {
             regions,
             required,
             claims,
+            checker_reviews,
             conditions,
         }
     }
@@ -1047,9 +1311,10 @@ pub(crate) fn sorted(digests: &[Digest]) -> Vec<Digest> {
 /// Whether a review confirms one thing a record carries (§14.3, §14.5):
 /// it saw the current digests, it is by another party than the attester,
 /// and its verdict on the thing is `confirmed`. An item's verdict
-/// overrides the review's verdict on the record as a whole. A checker
-/// review satisfies only the realization requirements its checker
-/// covers, and no catalogue checker exists yet.
+/// overrides the review's verdict on the record as a whole. A checker's
+/// review is derived, never written, and satisfies only the realization
+/// requirements its checker covers, so a review written as a checker's
+/// confirms nothing.
 pub(crate) fn confirms(
     review: &Review,
     record: &Record,

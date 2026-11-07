@@ -39,7 +39,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::analyzer::basis::TextualKey;
-use crate::design::store::PROJECT_DIR;
+use crate::design::store::{FileSource, PROJECT_DIR, ProjectDirectory};
 use crate::spec::{Id, Model};
 
 use super::capability::{self, Capability, Need, RealizableKind, realized_by};
@@ -48,10 +48,7 @@ use super::catalogue::{
     standard_name,
 };
 use super::stack::{self, Stack};
-use super::{
-    EntryKind, REALIZATION_FORMAT, RealizationError, check_format, entries, read_versioned,
-    write_atomic,
-};
+use super::{EntryKind, Files, REALIZATION_FORMAT, RealizationError, check_format, write_atomic};
 
 /// The choices' directory, in the realization directory.
 pub const DIR: &str = "choices";
@@ -93,9 +90,15 @@ impl Profile {
     /// The project's realization profile, or `None` when it has no
     /// stack profile, so nothing of realization applies (§9).
     pub fn read(project_dir: &Path) -> Result<Option<Self>, RealizationError> {
-        let dir = super::dir(project_dir);
+        Self::read_source(&ProjectDirectory::of_project(project_dir))
+    }
 
-        for (name, kind) in entries(&dir)?.unwrap_or_default() {
+    /// The realization profile a file source holds: a project's
+    /// directory, or the tree a diff side read from a commit.
+    pub fn read_source(source: &dyn FileSource) -> Result<Option<Self>, RealizationError> {
+        let files = Files::new(source);
+
+        for (name, kind) in files.entries("")?.unwrap_or_default() {
             let expected = match name.as_str() {
                 stack::FILE => EntryKind::File,
                 super::catalogue::DIR | DIR => EntryKind::Directory,
@@ -104,7 +107,7 @@ impl Profile {
 
             if kind != expected || expected == EntryKind::Other {
                 return Err(RealizationError::Unexpected {
-                    path: dir.join(&name),
+                    path: files.locate(&name),
                     expected: format!(
                         "it holds `{}`, `{}/`, and `{DIR}/`",
                         stack::FILE,
@@ -114,17 +117,16 @@ impl Profile {
             }
         }
 
-        let Some(stack) = Stack::read(project_dir)? else {
+        let Some(stack) = Stack::read_from(&files)? else {
             return Ok(None);
         };
 
-        let catalogue = Catalogue::read(project_dir)?;
+        let catalogue = Catalogue::read_from(&files)?;
         let mut choices = BTreeMap::new();
 
-        let choices_dir = dir.join(DIR);
-
-        for (name, kind) in entries(&choices_dir)?.unwrap_or_default() {
-            let path = choices_dir.join(&name);
+        for (name, kind) in files.entries(DIR)?.unwrap_or_default() {
+            let dir = format!("{DIR}/{name}");
+            let path = files.locate(&dir);
 
             let Some(realizable) =
                 RealizableKind::named(&name).filter(|_| kind == EntryKind::Directory)
@@ -142,7 +144,7 @@ impl Profile {
                 });
             };
 
-            read_level(realizable, &path, &mut Vec::new(), &mut choices)?;
+            read_level(&files, realizable, &dir, &mut Vec::new(), &mut choices)?;
         }
 
         Ok(Some(Self {
@@ -171,15 +173,17 @@ impl Profile {
 /// Reads one level of a kind's choices: directories named by the
 /// containing declarations' ids, then `<id>.yaml` choices.
 fn read_level(
+    files: &Files<'_>,
     kind: RealizableKind,
-    dir: &Path,
+    dir: &str,
     ids: &mut Vec<Id>,
     choices: &mut BTreeMap<TextualKey, ChoiceFile>,
 ) -> Result<(), RealizationError> {
     let last = ids.len() + 1 == kind.arity();
 
-    for (name, entry) in entries(dir)?.unwrap_or_default() {
-        let path = dir.join(&name);
+    for (name, entry) in files.entries(dir)?.unwrap_or_default() {
+        let file = format!("{dir}/{name}");
+        let path = files.locate(&file);
 
         let unexpected = || RealizationError::Unexpected {
             path: path.clone(),
@@ -212,7 +216,7 @@ fn read_level(
 
             ids.pop();
 
-            let choice = read_choice(&path, &key)?;
+            let choice = read_choice(files, &file, &key)?;
 
             choices.insert(key, ChoiceFile { path, choice });
         } else {
@@ -222,7 +226,7 @@ fn read_level(
                 .ok_or_else(unexpected)?;
 
             ids.push(id);
-            read_level(kind, &path, ids, choices)?;
+            read_level(files, kind, &file, ids, choices)?;
             ids.pop();
         }
     }
@@ -230,9 +234,14 @@ fn read_level(
     Ok(())
 }
 
-/// Reads the choice of `key` at `path`, strictly.
-fn read_choice(path: &Path, key: &TextualKey) -> Result<Choice, RealizationError> {
-    let text = read_versioned(path)?;
+/// Reads the choice of `key` at `file`, strictly.
+fn read_choice(
+    files: &Files<'_>,
+    file: &str,
+    key: &TextualKey,
+) -> Result<Choice, RealizationError> {
+    let path = &files.locate(file);
+    let text = files.read_versioned(file)?.unwrap_or_default();
 
     let choice: Choice = serde_yaml::from_str(&text)
         .map_err(|error| RealizationError::parse(path, error.to_string()))?;
@@ -290,11 +299,12 @@ pub fn path(project_dir: &Path, key: &TextualKey) -> PathBuf {
 }
 
 /// A need a candidate does not cover, and why it cannot, if it says.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Missing {
     pub capability: Capability,
 
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
 }
 
@@ -310,14 +320,16 @@ impl Missing {
 }
 
 /// A valid candidate with one of its minimal option sets.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Valid {
     pub entry: EntryRef,
     pub options: Vec<String>,
 }
 
 /// What a candidate of an infeasible declaration misses.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Gap {
     pub entry: EntryRef,
 
@@ -326,13 +338,13 @@ pub struct Gap {
 
     /// It provides every need, but only with options that exclude one
     /// another.
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub options_conflict: bool,
 }
 
 /// Why a choice does not hold, or cannot be made (§10.3).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(tag = "problem", rename_all = "snake_case")]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "problem", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Problem {
     /// No catalogue holds the entry.
     UnknownEntry { entry: String },
@@ -575,8 +587,11 @@ impl Status {
 
     /// The status of a model under a profile.
     pub fn of(profile: &Profile, model: &Model) -> Self {
-        let needs = capability::needs(model);
+        Self::with_needs(profile, capability::needs(model))
+    }
 
+    /// The status of a spec's needs under a profile.
+    pub fn with_needs(profile: &Profile, needs: BTreeMap<TextualKey, Vec<Need>>) -> Self {
         let orphaned = profile
             .choices
             .iter()

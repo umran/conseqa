@@ -20,7 +20,11 @@
 //! - [`render`] writes the diff for people (§15.2);
 //! - [`mutation`] holds the fixed catalogue of model mutations the
 //!   explanation corpus applies (§19.2), and the fact withdrawals a
-//!   work item's load-bearing check applies (Part IV §12.2).
+//!   work item's load-bearing check applies (Part IV §12.2);
+//! - [`realization`] compares the two sides' realization profiles: the
+//!   stack, each declaration's needs and chosen realization, what the
+//!   head cannot realize, and the realization requirements introduced
+//!   and withdrawn (§13.4).
 
 use std::path::Path;
 
@@ -28,6 +32,7 @@ pub mod delta;
 pub mod diff;
 pub mod mutation;
 pub mod partition;
+pub mod realization;
 pub mod render;
 pub mod side;
 

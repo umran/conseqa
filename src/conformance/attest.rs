@@ -458,6 +458,13 @@ fn run(
     record.facts = input.facts.clone();
     record.completeness = input.completeness.clone();
 
+    // The realization the code is checked against, when a catalogue
+    // entry realizes the declaration (Part VI §18, item 3).
+    record.realization = derivation
+        .realization
+        .as_ref()
+        .and_then(|realization| realization.of(key));
+
     record
         .check()
         .map_err(|message| refused(Refusal::Malformed { message }))?;
@@ -641,8 +648,8 @@ fn run(
 }
 
 /// Whether two records attest the same things of the same code: the
-/// residual, the structural claim, the facts in order, the claims, and
-/// the region digests.
+/// residual, the structural claim, the realization, the facts in order,
+/// the claims, and the region digests.
 fn attests_the_same(previous: &Record, record: &Record) -> bool {
     let canonical = |record: &Record| -> Vec<String> {
         record
@@ -654,6 +661,7 @@ fn attests_the_same(previous: &Record, record: &Record) -> bool {
 
     previous.residual == record.residual
         && previous.structural == record.structural
+        && previous.realization == record.realization
         && canonical(previous) == canonical(record)
         && previous.completeness == record.completeness
         && previous.digests() == record.digests()

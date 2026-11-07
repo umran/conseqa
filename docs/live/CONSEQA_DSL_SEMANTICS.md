@@ -1274,6 +1274,8 @@ can be run against `MessageReads.members = 16` or `= 128`, against a uniform `ch
 
 This is also why L1 carries facts no proof reads. Every routing and assignment fact is inert to the verifier and decisive to the simulator: under a skewed key distribution, consistent-hash concentrates load on the members owning the hot domains while round-robin spreads it and gives up locality. Same pool, same cardinality, different answer.
 
+Realization profiles map L1, and the L0 declarations a store or a broker realizes, to the technologies that provide them, outside the model and never inside it: no technology, product setting, or number enters a declaration, and no verdict depends on a profile (`REALIZATION.md`).
+
 ---
 
 ## 11. Value references

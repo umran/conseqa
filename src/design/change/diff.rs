@@ -40,6 +40,7 @@ use crate::spec::{DSL_VERSION, DslVersion, ValueSource};
 
 use super::delta::{DeltaEntry, delta};
 use super::partition::{AuthoringItem, DeclarationLayer, Partition, layer};
+use super::realization::{self, RealizationChanges};
 use super::side::{Side, SideName, Source};
 
 /// The diff document's format (§14), counted apart from the obligation
@@ -182,6 +183,12 @@ pub struct DiffDocument {
     /// Absent when the obligation diff is unavailable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reliance: Option<RelianceDelta>,
+
+    /// What changed in what realizes the spec (§13.4). Present when
+    /// either side has a stack profile, whether or not the obligation
+    /// diff is available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub realization: Option<RealizationChanges>,
 }
 
 /// Where a side was read from, and whether it held a project.
@@ -531,6 +538,13 @@ pub enum Gate {
 
     /// Any entry is unexplained.
     Unexplained,
+
+    /// Any declaration on head is infeasible, or has an invalid choice
+    /// (§13.4).
+    Infeasible,
+
+    /// Any declaration on head is ambiguous (§13.4).
+    Ambiguous,
 }
 
 impl fmt::Display for Gate {
@@ -541,6 +555,8 @@ impl fmt::Display for Gate {
             Self::AddedUnproven => "added-unproven",
             Self::Rebased => "rebased",
             Self::Unexplained => "unexplained",
+            Self::Infeasible => "infeasible",
+            Self::Ambiguous => "ambiguous",
         })
     }
 }
@@ -554,6 +570,25 @@ impl DiffDocument {
 
         for gate in gates {
             if failed.contains(gate) {
+                continue;
+            }
+
+            // The realization gates read the realization section alone:
+            // without a stack profile on either side there is none, and
+            // they cannot fail.
+            if let Gate::Infeasible | Gate::Ambiguous = gate {
+                let fails = self.realization.as_ref().is_some_and(|realization| {
+                    if *gate == Gate::Infeasible {
+                        realization.infeasible()
+                    } else {
+                        realization.ambiguous()
+                    }
+                });
+
+                if fails {
+                    failed.push(*gate);
+                }
+
                 continue;
             }
 
@@ -576,6 +611,7 @@ impl DiffDocument {
 
                     Gate::Rebased => counts.rebased > 0,
                     Gate::Unexplained => !unexplained.is_empty(),
+                    Gate::Infeasible | Gate::Ambiguous => unreachable!("read above"),
                 },
             };
 
@@ -674,6 +710,7 @@ pub(crate) fn analyzed(base: &Side, head: &Side) -> (DiffDocument, Option<[Oblig
         obligations,
         impact,
         reliance,
+        realization: realization::changes(base, head),
     };
 
     (document, analyses)

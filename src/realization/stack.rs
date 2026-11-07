@@ -15,14 +15,13 @@
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::fmt;
-use std::path::Path;
 use std::str::FromStr;
 
 use serde::de::{self, Visitor};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use super::catalogue::standard_name;
-use super::{RealizationError, read_versioned};
+use super::{Files, RealizationError};
 
 /// The stack profile's file name, in the realization directory.
 pub const FILE: &str = "stack.yaml";
@@ -234,15 +233,13 @@ struct StackFile {
 }
 
 impl Stack {
-    /// The project's stack profile, or `None` when it has none.
-    pub fn read(project_dir: &Path) -> Result<Option<Self>, RealizationError> {
-        let path = super::dir(project_dir).join(FILE);
+    /// The stack profile `files` holds, or `None` when they hold none.
+    pub(crate) fn read_from(files: &Files<'_>) -> Result<Option<Self>, RealizationError> {
+        let path = files.locate(FILE);
 
-        if !path.exists() {
+        let Some(text) = files.read_versioned(FILE)? else {
             return Ok(None);
-        }
-
-        let text = read_versioned(&path)?;
+        };
 
         let file: StackFile = serde_yaml::from_str(&text)
             .map_err(|error| RealizationError::parse(&path, error.to_string()))?;

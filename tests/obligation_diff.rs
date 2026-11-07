@@ -64,6 +64,7 @@ fn side(name: SideName, workspace: WorkspaceState) -> Side {
         commit: None,
         merge_base: false,
         workspace: Some(workspace),
+        realization: None,
     }
 }
 
@@ -909,6 +910,7 @@ fn an_empty_base_adds_everything() {
         commit: Some("0".repeat(40)),
         merge_base: false,
         workspace: None,
+        realization: None,
     };
 
     let document = diff(&empty, &side(SideName::Head, head.clone()));

@@ -20,6 +20,7 @@ use super::diff::{
     ObligationEntry, RelianceDelta, SideRecord,
 };
 use super::partition::DeclarationLayer;
+use super::realization::{RealizationChanges, Realizing};
 
 /// The classes in the order entries are printed: what fails a review
 /// first, what only informs it last.
@@ -47,6 +48,11 @@ pub fn render(document: &DiffDocument) -> String {
         reliance_section(&mut out, reliance);
     }
 
+    if let Some(realization) = &document.realization {
+        out.push('\n');
+        realization_section(&mut out, realization);
+    }
+
     out
 }
 
@@ -69,7 +75,112 @@ pub fn summary(document: &DiffDocument) -> String {
         );
     }
 
+    if let Some(realization) = &document.realization {
+        let _ = writeln!(
+            out,
+            "realization    {} changed, {} unrealizable, {} requirements introduced, {} withdrawn",
+            realization.declarations.len(),
+            realization.unrealizable.len(),
+            realization.requirements.introduced.len(),
+            realization.requirements.withdrawn.len()
+        );
+
+        for unrealizable in &realization.unrealizable {
+            let _ = writeln!(
+                out,
+                "  {:<13} {}",
+                unrealizable.state, unrealizable.declaration
+            );
+        }
+    }
+
     out
+}
+
+/// The realization section (§13.4): the stack's change, each changed
+/// declaration's needs and realization, what the head cannot realize,
+/// and the requirements introduced and withdrawn.
+fn realization_section(out: &mut String, realization: &RealizationChanges) {
+    let _ = writeln!(out, "realization");
+
+    for technology in &realization.stack.added {
+        let _ = writeln!(out, "  + stack {technology}");
+    }
+
+    for technology in &realization.stack.removed {
+        let _ = writeln!(out, "  - stack {technology}");
+    }
+
+    let realizing = |side: &Option<Realizing>| match side {
+        None => "none".to_string(),
+        Some(realizing) => match &realizing.entry {
+            Some(entry) => format!("{} {entry}", realizing.state),
+            None => realizing.state.clone(),
+        },
+    };
+
+    for change in &realization.declarations {
+        let _ = writeln!(
+            out,
+            "  ~ {}  {} -> {}",
+            change.declaration,
+            realizing(&change.base),
+            realizing(&change.head)
+        );
+
+        for capability in &change.needs.added {
+            let _ = writeln!(out, "      + needs {capability}");
+        }
+
+        for capability in &change.needs.removed {
+            let _ = writeln!(out, "      - needs {capability}");
+        }
+    }
+
+    for unrealizable in &realization.unrealizable {
+        let _ = writeln!(
+            out,
+            "  ! {:<13} {}",
+            unrealizable.state, unrealizable.declaration
+        );
+
+        for gap in &unrealizable.gaps {
+            for missing in &gap.missing {
+                let _ = writeln!(
+                    out,
+                    "      {}  {} {}{}",
+                    gap.entry,
+                    if missing.reason.is_some() {
+                        "cannot provide"
+                    } else {
+                        "does not provide"
+                    },
+                    missing.capability,
+                    missing
+                        .reason
+                        .as_ref()
+                        .map(|reason| format!(": {}", reason.trim()))
+                        .unwrap_or_default()
+                );
+            }
+        }
+
+        for valid in &unrealizable.valid {
+            let _ = writeln!(out, "      valid {}", valid.entry);
+        }
+
+        for problem in &unrealizable.problems {
+            let _ = writeln!(out, "      {problem}");
+        }
+    }
+
+    for fact in &realization.requirements.introduced {
+        let _ = writeln!(out, "  + requires {fact}");
+    }
+
+    for fact in &realization.requirements.withdrawn {
+        let _ = writeln!(out, "  - requires {fact}");
+    }
 }
 
 fn header(out: &mut String, document: &DiffDocument) {

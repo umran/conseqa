@@ -112,6 +112,12 @@ pub struct Region {
 
     /// The digest of its residual (§6.3).
     pub digest: Digest,
+
+    /// Its residual: its own lines, nested regions each one line holding
+    /// its key. What a catalogue checker reads of it (Part VI §13.1),
+    /// as it was read when its digest was taken.
+    #[serde(skip)]
+    pub residual: String,
 }
 
 /// A scan error (§6.6), at the file and line it was found on.
@@ -417,14 +423,19 @@ pub fn scan_file(path: &str, text: &str) -> (Vec<Region>, Vec<ScanError>) {
 
     let mut regions: Vec<Region> = closed
         .iter()
-        .map(|region| Region {
-            key: region
-                .key
-                .parse()
-                .expect("a file without scan errors has only bindable keys"),
-            path: path.to_string(),
-            lines: region.lines,
-            digest: Digest::of(residual(&lines, region).as_bytes()),
+        .map(|region| {
+            let residual = residual(&lines, region);
+
+            Region {
+                key: region
+                    .key
+                    .parse()
+                    .expect("a file without scan errors has only bindable keys"),
+                path: path.to_string(),
+                lines: region.lines,
+                digest: Digest::of(residual.as_bytes()),
+                residual,
+            }
         })
         .collect();
 

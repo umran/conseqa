@@ -51,9 +51,11 @@ use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 
 use crate::analyzer::basis::{
-    FACT_FORMAT, Fact, FactFormat, FactVersionError, TextualKey, check_versions, read_canonical,
+    EntryRef, FACT_FORMAT, Fact, FactFormat, FactVersionError, TextualKey, check_versions,
+    read_canonical,
 };
 use crate::design::store::PROJECT_DIR;
+use crate::realization::capability::RealizableKind;
 use crate::spec::{DSL_VERSION, DslVersion, Id};
 
 use super::markers::Region;
@@ -88,6 +90,12 @@ pub struct Record {
     /// and do no modeled work beyond it.
     pub structural: bool,
 
+    /// The realization the code was checked against, on a record of a
+    /// declaration a catalogue entry realizes (Part VI §10). Another
+    /// choice since makes the record stale (§10.1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub realization: Option<RecordedRealization>,
+
     pub facts: Vec<AttestedFact>,
 
     /// Claims that no unbound code touches what a model-wide fact
@@ -100,6 +108,17 @@ pub struct Record {
 
     #[serde(default)]
     pub reviews: Vec<Review>,
+}
+
+/// The chosen realization a record of a realized declaration names: the
+/// entry at its version, and the options chosen with it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecordedRealization {
+    pub entry: EntryRef,
+
+    #[serde(default)]
+    pub options: Vec<String>,
 }
 
 /// A region as a record holds it (§8.2): its line range is
@@ -379,6 +398,7 @@ impl Record {
             residual,
             regions: Vec::new(),
             structural: false,
+            realization: None,
             facts: Vec::new(),
             completeness: Vec::new(),
             attested,
@@ -430,6 +450,23 @@ impl Record {
                 "`{}` is not bindable, so it has no record",
                 self.declaration
             ));
+        }
+
+        if let Some(realization) = &self.realization {
+            if RealizableKind::named(kind).is_none() {
+                return Err(format!(
+                    "a `{kind}` record carries no `realization`: only a declaration a catalogue \
+                     entry realizes does"
+                ));
+            }
+
+            let mut options = BTreeSet::new();
+
+            for option in &realization.options {
+                if !options.insert(option) {
+                    return Err(format!("`realization` names the option `{option}` twice"));
+                }
+            }
         }
 
         for (index, region) in self.regions.iter().enumerate() {

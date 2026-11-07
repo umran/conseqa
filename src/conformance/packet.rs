@@ -39,6 +39,10 @@ use crate::design::change::render::delta_entry;
 use crate::design::fingerprint::SemanticHash;
 use crate::design::graph_query::{self, GraphQuery, QueryResult, QueryRow};
 use crate::design::workspace::WorkspaceState;
+use crate::realization::capability::Capability;
+use crate::realization::catalogue::{Entry, EntryRef, Relation as NeighbourRelation};
+use crate::realization::choice::State as RealizationState;
+use crate::realization::requirements::Placed;
 use crate::spec::{
     Effect, Id, IdempotencyGuarantee, Input, MessageIdentity, TransactionStep, TransitionEffect,
     TransitionSideEffect,
@@ -50,7 +54,8 @@ use super::completeness;
 use super::plan::{self, Priority};
 use super::record::{ClaimScope, Party, Record, RecordedRegion, ReviewTarget, Span, Verdict};
 use super::state::{
-    self, Condition, ConditionKind, DeclarationState, Derivation, Orphan, ScopeFailure,
+    self, CheckerReview, Condition, ConditionKind, DeclarationState, Derivation, Orphan,
+    ScopeFailure,
 };
 
 /// The packet for one work item (§12.1).
@@ -85,6 +90,12 @@ pub struct Packet {
     pub completeness: Vec<ClaimSection>,
 
     pub code: CodeSection,
+
+    /// What the project's stack says of it (Part VI §18, item 5): the
+    /// guidance an agent has before any precedent exists. Absent without
+    /// a stack profile, and when the stack says nothing of it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub realization: Option<RealizationSection>,
 
     /// For each kind of attestable fact required of it, how this
     /// project already provides one.
@@ -168,6 +179,69 @@ pub struct RequiredSection {
     pub load_bearing: LoadBearing,
 }
 
+/// What the project's stack says of a declaration.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct RealizationSection {
+    /// The entry realizing it, when one does, and why.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chosen: Option<ChosenEntry>,
+
+    /// Its state, when the stack cannot realize it: its work waits for a
+    /// decision about the spec or the stack.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unrealizable: Option<String>,
+
+    /// Each realization requirement on it, with its statement and the
+    /// shape of its evidence.
+    pub requirements: Vec<Placed>,
+
+    /// What the catalogue's checkers found of those requirements, over
+    /// its regions as they are now.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub checker_reviews: Vec<CheckerReview>,
+
+    /// What its realization requires of its neighbours, by requirement:
+    /// a topic's implementer learns that producers must set the record
+    /// key.
+    pub neighbours: Vec<Imposed>,
+
+    /// The idiom entries for the primitives it uses, on the project's
+    /// frameworks (§7.4 there).
+    pub idioms: Vec<IdiomGuide>,
+}
+
+/// The entry realizing a declaration, and why it was chosen.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ChosenEntry {
+    pub entry: EntryRef,
+    pub options: Vec<String>,
+
+    /// The only valid candidate, chosen automatically.
+    pub automatic: bool,
+
+    /// The architect's recorded reason, for a choice.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// One requirement a realization places on the declaration's neighbours.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Imposed {
+    pub requirement: String,
+    pub relation: NeighbourRelation,
+    pub statement: String,
+    pub declarations: Vec<TextualKey>,
+}
+
+/// An idiom entry for a primitive the declaration uses.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct IdiomGuide {
+    pub entry: EntryRef,
+    pub primitive: Capability,
+    pub template: String,
+    pub look_for: String,
+}
+
 /// An obligation, by key and display name, with its summary line.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Relying {
@@ -193,6 +267,15 @@ pub enum LoadBearing {
     /// The fact's kind has no withdrawal, or the model declares none
     /// for it: the obligations relying on it are what it costs.
     Relied,
+
+    /// A realization requirement has no proof cost: without it, the
+    /// declaration it realizes is no longer realized as its entry
+    /// provides for the spec's needs.
+    Realization {
+        realizes: TextualKey,
+        entry: EntryRef,
+        provides: Vec<Capability>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -569,6 +652,7 @@ impl<'d, 'a> Builder<'d, 'a> {
                 .collect(),
             disputes,
             last_refusal,
+            realization: realization(derivation, state),
             precedents: precedents(derivation, state),
             semantics: topics(derivation.workspace, declaration, state),
             done_when: done_when(state, record),
@@ -633,6 +717,7 @@ impl<'d, 'a> Builder<'d, 'a> {
                 regions: spans(&orphan.regions),
                 neighbours: Vec::new(),
             },
+            realization: None,
             precedents: Vec::new(),
             semantics: Vec::new(),
             done_when,
@@ -1034,6 +1119,28 @@ fn site_effect(workspace: &WorkspaceState, operation: &Id, effect: &Id) -> Optio
 /// applied to the current model and verified, against the obligations
 /// proven now.
 fn load_bearing(derivation: &Derivation, fact: &Fact) -> LoadBearing {
+    if let Fact::Realization {
+        realizes, entry, ..
+    } = fact
+    {
+        return LoadBearing::Realization {
+            realizes: realizes.clone(),
+            entry: entry.clone(),
+            provides: derivation
+                .realization
+                .as_ref()
+                .and_then(|realization| {
+                    realization
+                        .status
+                        .declarations
+                        .iter()
+                        .find(|realized| &realized.declaration == realizes)
+                })
+                .map(|realized| realized.needs.iter().map(|need| need.capability).collect())
+                .unwrap_or_default(),
+        };
+    }
+
     let Some(mutation) = withdrawal(fact) else {
         return LoadBearing::Relied;
     };
@@ -1080,6 +1187,131 @@ fn load_bearing(derivation: &Derivation, fact: &Fact) -> LoadBearing {
         withdrawal: mutation.to_string(),
         regressions,
     }
+}
+
+/// What the project's stack says of a declaration (Part VI §18, item
+/// 5): the entry realizing it and why, the requirements on it, those its
+/// realization places on its neighbours, and the idioms for the
+/// primitives it uses.
+fn realization(derivation: &Derivation, declared: &DeclarationState) -> Option<RealizationSection> {
+    let realization = derivation.realization.as_ref()?;
+    let key = &declared.declaration;
+    let state = realization.state(key);
+
+    let chosen = state.and_then(|state| match state {
+        RealizationState::Chosen {
+            entry,
+            options,
+            reason,
+        } => Some(ChosenEntry {
+            entry: entry.clone(),
+            options: options.clone(),
+            automatic: false,
+            reason: reason.clone(),
+        }),
+
+        RealizationState::Automatic { entry, options } => Some(ChosenEntry {
+            entry: entry.clone(),
+            options: options.clone(),
+            automatic: true,
+            reason: None,
+        }),
+
+        _ => None,
+    });
+
+    let unrealizable = state
+        .filter(|state| state.fails())
+        .map(|state| state.name().to_string());
+
+    let requirements: Vec<Placed> = realization
+        .placed
+        .iter()
+        .filter(|placed| placed.declaration() == key)
+        .cloned()
+        .collect();
+
+    let mut imposed: BTreeMap<String, Imposed> = BTreeMap::new();
+
+    for placed in &realization.placed {
+        if placed.realizes() != key || placed.relation == NeighbourRelation::Itself {
+            continue;
+        }
+
+        imposed
+            .entry(placed.requirement().to_string())
+            .or_insert_with(|| Imposed {
+                requirement: placed.requirement().to_string(),
+                relation: placed.relation,
+                statement: placed.statement.clone(),
+                declarations: Vec::new(),
+            })
+            .declarations
+            .push(placed.declaration().clone());
+    }
+
+    // The primitives it uses: the needs it contributes to the
+    // declarations a chosen entry realizes, each with that entry.
+    let mut used: BTreeSet<(String, Capability)> = BTreeSet::new();
+
+    for realized in &realization.status.declarations {
+        let Some((entry, _)) = realized.state.realization() else {
+            continue;
+        };
+
+        for need in &realized.needs {
+            if need.sources.iter().any(|source| &source.declaration == key) {
+                used.insert((entry.id.clone(), need.capability));
+            }
+        }
+    }
+
+    let stack = &realization.profile.stack;
+
+    let idioms: Vec<IdiomGuide> = realization
+        .profile
+        .catalogue
+        .entries()
+        .filter_map(|catalogued| match &catalogued.entry {
+            Entry::Idiom(idiom) => Some(idiom),
+            Entry::Platform(_) => None,
+        })
+        .filter(|idiom| {
+            stack
+                .version(&idiom.technology.name)
+                .is_some_and(|version| idiom.technology.versions.contains(version))
+        })
+        .filter(|idiom| {
+            idiom
+                .platforms
+                .iter()
+                .any(|platform| used.contains(&(platform.clone(), idiom.primitive)))
+        })
+        .map(|idiom| IdiomGuide {
+            entry: EntryRef {
+                id: idiom.id.clone(),
+                version: idiom.version,
+            },
+            primitive: idiom.primitive,
+            template: idiom.template.clone(),
+            look_for: idiom.evidence.look_for.clone(),
+        })
+        .collect();
+
+    let says_nothing = chosen.is_none()
+        && unrealizable.is_none()
+        && requirements.is_empty()
+        && imposed.is_empty()
+        && idioms.is_empty();
+
+    (!says_nothing).then(|| RealizationSection {
+        chosen,
+        unrealizable,
+        requirements,
+        checker_reviews: declared.checker_reviews.clone(),
+        neighbours: imposed.into_values().collect(),
+        idioms,
+    })
 }
 
 /// The reviews at the current digests disputing a record, or items of
@@ -1350,6 +1582,12 @@ fn done_when(state: &DeclarationState, record: Option<&Record>) -> Vec<Step> {
 /// A condition in a sentence.
 fn sentence(condition: &Condition, key: &TextualKey, record: Option<&Record>) -> String {
     match condition {
+        Condition::Unrealizable { state } => format!(
+            "The project's stack cannot realize it: it is {state}, and `conseqa realize explain \
+             {key}` says why. The remedy is a decision about the spec or the stack, not code, so \
+             its work is parked until then."
+        ),
+
         Condition::Unbound => format!(
             "It has no region, and the policy requires every `{}` bound. Mark its code with \
              `conseqa:begin {key}` and `conseqa:end {key}` comment lines.",
@@ -1992,6 +2230,7 @@ impl Packet {
         self.render_required(&mut out);
         self.render_completeness(&mut out);
         self.render_code(&mut out);
+        self.render_realization(&mut out);
 
         if !self.precedents.is_empty() {
             let _ = writeln!(out, "## Precedents\n");
@@ -2065,6 +2304,96 @@ impl Packet {
         out
     }
 
+    fn render_realization(&self, out: &mut String) {
+        let Some(realization) = &self.realization else {
+            return;
+        };
+
+        let _ = writeln!(out, "## Realization\n");
+
+        if let Some(chosen) = &realization.chosen {
+            let options = if chosen.options.is_empty() {
+                String::new()
+            } else {
+                format!(" with {}", chosen.options.join(", "))
+            };
+
+            let why = match (&chosen.reason, chosen.automatic) {
+                (_, true) => "automatically, as the one valid candidate".to_string(),
+                (Some(reason), false) => format!("by the architect: {reason}"),
+                (None, false) => "by the architect".to_string(),
+            };
+
+            let _ = writeln!(
+                out,
+                "Realized by `{}`{options}, chosen {why}.\n",
+                chosen.entry
+            );
+        }
+
+        if let Some(state) = &realization.unrealizable {
+            let _ = writeln!(
+                out,
+                "The stack cannot realize it: it is {state}. `conseqa realize explain {}` says \
+                 why.\n",
+                self.key
+            );
+        }
+
+        for placed in &realization.requirements {
+            let _ = writeln!(
+                out,
+                "- `{}` of `{}`, which `{}` realizes: {}",
+                placed.requirement(),
+                placed.entry(),
+                placed.realizes(),
+                placed.statement.trim()
+            );
+
+            if let Some(look_for) = &placed.look_for {
+                let _ = writeln!(out, "  evidence: {look_for}");
+            }
+
+            for review in realization
+                .checker_reviews
+                .iter()
+                .filter(|review| review.fact == placed.fact)
+            {
+                let _ = writeln!(
+                    out,
+                    "  {}: {}, {}",
+                    review.checker,
+                    review.finding.outcome.name(),
+                    review.finding.detail
+                );
+            }
+        }
+
+        for imposed in &realization.neighbours {
+            let _ = writeln!(
+                out,
+                "- of its {}: `{}`: {}",
+                imposed.relation,
+                imposed.requirement,
+                imposed.statement.trim()
+            );
+
+            for declaration in &imposed.declarations {
+                let _ = writeln!(out, "  - {declaration}");
+            }
+        }
+
+        for idiom in &realization.idioms {
+            let _ = writeln!(
+                out,
+                "- idiom `{}` for `{}`, evidence: {}\n\n```\n{}```",
+                idiom.entry, idiom.primitive, idiom.look_for, idiom.template
+            );
+        }
+
+        out.push('\n');
+    }
+
     fn render_declaration(&self, out: &mut String) {
         let section = &self.declaration;
 
@@ -2133,7 +2462,11 @@ impl Packet {
                 }
             );
 
-            let _ = writeln!(out, "  relied on by:");
+            if required.obligations.is_empty() {
+                let _ = writeln!(out, "  relied on by no proof");
+            } else {
+                let _ = writeln!(out, "  relied on by:");
+            }
 
             for relying in &required.obligations {
                 let _ = writeln!(out, "  - {}: {}", relying.display, relying.summary);
@@ -2179,6 +2512,28 @@ impl Packet {
                     let _ = writeln!(
                         out,
                         "  without it: every obligation above loses a fact its proof rests on"
+                    );
+                }
+
+                LoadBearing::Realization {
+                    realizes,
+                    entry,
+                    provides,
+                } => {
+                    let provides = if provides.is_empty() {
+                        "what it chose".to_string()
+                    } else {
+                        provides
+                            .iter()
+                            .map(|capability| format!("`{capability}`"))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    };
+
+                    let _ = writeln!(
+                        out,
+                        "  without it: `{realizes}` is no longer realized as `{entry}` provides \
+                         {provides}, as the spec declares"
                     );
                 }
             }

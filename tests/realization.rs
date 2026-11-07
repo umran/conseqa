@@ -6,8 +6,13 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use conseqa::analyzer::basis::TextualKey;
+use conseqa::analyzer::basis::{Fact, TextualKey};
 use conseqa::analyzer::validation;
+use conseqa::design::change::diff::{DiffDocument, Gate, diff};
+use conseqa::design::change::realization::RealizationChanges;
+use conseqa::design::change::render;
+use conseqa::design::change::side::{Side, SideName, Source as SideSource};
+use conseqa::design::{RunId, RunMetadata, WorkspaceState};
 use conseqa::parser::yaml;
 use conseqa::realization::RealizationError;
 use conseqa::realization::capability::{Because, Capability, needs};
@@ -17,8 +22,8 @@ use conseqa::realization::choice::{
 };
 use conseqa::realization::document;
 use conseqa::spec::{
-    FieldPath, Id, MemberConcurrency, Model, OrderingSemantics, TransactionStep, ValueRef,
-    ValueSource,
+    FieldPath, Id, Lock, LockMode, LockOrder, MemberConcurrency, Model, OrderingSemantics,
+    TransactionStep, ValueRef, ValueSource,
 };
 
 fn manifest() -> &'static Path {
@@ -1501,4 +1506,255 @@ fn realization_documents_name_their_format_and_kind_and_are_byte_identical() {
     assert_eq!(value["document"], "realization_explain");
     assert_eq!(value["candidates"][2]["entry"], "sqs.standard@1");
     assert_eq!(value["candidates"][2]["option_sets"], serde_json::json!([]));
+}
+
+// ---- Part I §19.15: realization changes ---------------------------------
+
+fn side(name: SideName, workspace: WorkspaceState, profile: Option<Profile>) -> Side {
+    Side {
+        name,
+        source: SideSource::WorkingTree,
+        commit: None,
+        merge_base: false,
+        workspace: Some(workspace),
+        realization: profile,
+    }
+}
+
+fn workspace(model: &Model) -> WorkspaceState {
+    WorkspaceState::from_model(model, RunMetadata::new(RunId("realization".to_string())))
+}
+
+/// The realization section of a diff between two specs, each read with
+/// its own profile.
+fn realization_diff(
+    base: (&Model, &ProfileDir),
+    head: (&Model, &ProfileDir),
+) -> (DiffDocument, RealizationChanges) {
+    let document = diff(
+        &side(SideName::Base, workspace(base.0), Some(base.1.profile())),
+        &side(SideName::Head, workspace(head.0), Some(head.1.profile())),
+    );
+
+    let realization = document
+        .realization
+        .clone()
+        .expect("a stack on both sides gives a realization section");
+
+    (document, realization)
+}
+
+#[test]
+fn a_lock_on_a_dynamodb_data_model_makes_it_infeasible_at_the_spec_gate() {
+    let base = fixture("video_streaming.yaml");
+    let mut head = base.clone();
+
+    // A lock in the transcoder's failure, whose transactions DynamoDB
+    // realizes until then: they write with conditions and never read.
+    let fail = head
+        .operations
+        .get_mut(&id("operation.transcode_video"))
+        .unwrap()
+        .program
+        .transaction_mut(&id("tx.transcode_video.fail"))
+        .expect("the failure");
+
+    let TransactionStep::Transition(transition) = &fail.steps[0] else {
+        panic!("the failure transitions first");
+    };
+
+    let target = transition.subject.clone();
+
+    fail.steps.insert(
+        0,
+        TransactionStep::Lock(Lock {
+            target,
+            mode: LockMode::Exclusive,
+            order: LockOrder::Unspecified,
+        }),
+    );
+
+    let dir = ProfileDir::new(&["dynamodb@2012.08.10", "kafka@3.7"]);
+    let (document, realization) = realization_diff((&base, &dir), (&head, &dir));
+
+    let transcoder = realization
+        .declarations
+        .iter()
+        .find(|change| change.declaration.to_string() == "data_model data.transcoder")
+        .expect("the transcoder's realization changed");
+
+    assert_eq!(texts(&transcoder.needs.added), ["lock: exclusive"]);
+    assert_eq!(
+        transcoder.base.as_ref().map(|base| (
+            base.state.as_str(),
+            base.entry.as_ref().map(ToString::to_string)
+        )),
+        Some(("automatic", Some("dynamodb.table@1".to_string())))
+    );
+    assert_eq!(
+        transcoder.head.as_ref().map(|head| head.state.as_str()),
+        Some("infeasible")
+    );
+
+    let reported = realization
+        .unrealizable
+        .iter()
+        .find(|unrealizable| unrealizable.declaration.to_string() == "data_model data.transcoder")
+        .expect("reported unrealizable on head");
+
+    assert_eq!(reported.state, "infeasible");
+    assert!(
+        reported.gaps[0]
+            .missing
+            .iter()
+            .any(|missing| missing.capability == Capability::LockExclusive)
+    );
+
+    assert_eq!(
+        document.failed_gates(&[Gate::Infeasible]),
+        [Gate::Infeasible]
+    );
+    assert!(render::render(&document).contains("! infeasible    data_model data.transcoder"));
+}
+
+#[test]
+fn adding_sqs_to_a_kafka_stack_makes_the_topic_runtime_ambiguous_at_the_spec_gate() {
+    let checkout = postgres_and_kafka_checkout();
+
+    let kafka = ProfileDir::new(&["postgres@16", "kafka@3.7"]);
+    let both = ProfileDir::new(&["postgres@16", "kafka@3.7", "sqs@2012.11.05"]);
+
+    let (document, realization) = realization_diff((&checkout, &kafka), (&checkout, &both));
+
+    assert_eq!(realization.stack.added, ["sqs@2012.11.05"]);
+    assert!(realization.stack.removed.is_empty());
+
+    let runtime = realization
+        .declarations
+        .iter()
+        .find(|change| change.declaration.to_string() == "topic_runtime topic.order_events")
+        .expect("the topic runtime's realization changed");
+
+    assert_eq!(runtime.base.as_ref().unwrap().state, "automatic");
+    assert_eq!(runtime.head.as_ref().unwrap().state, "ambiguous");
+
+    assert_eq!(
+        realization
+            .unrealizable
+            .iter()
+            .map(|unrealizable| (
+                unrealizable.declaration.to_string(),
+                unrealizable.state.clone()
+            ))
+            .collect::<Vec<_>>(),
+        [(
+            "topic_runtime topic.order_events".to_string(),
+            "ambiguous".to_string()
+        )]
+    );
+
+    assert_eq!(document.failed_gates(&[Gate::Ambiguous]), [Gate::Ambiguous]);
+    assert!(document.failed_gates(&[Gate::Infeasible]).is_empty());
+
+    // The topic runtime's own requirement is withdrawn while nothing
+    // realizes it.
+    assert!(
+        realization
+            .requirements
+            .withdrawn
+            .iter()
+            .any(|fact| matches!(
+                fact,
+                Fact::Realization { requirement, .. } if requirement == "stable-partitions"
+            ))
+    );
+}
+
+#[test]
+fn choosing_a_keyed_topic_introduces_its_record_key_on_every_producer() {
+    let checkout = postgres_and_kafka_checkout();
+
+    let open = ProfileDir::new(&["postgres@16", "kafka@3.7", "sqs@2012.11.05"]);
+    let chosen = ProfileDir::new(&["postgres@16", "kafka@3.7", "sqs@2012.11.05"]);
+
+    chosen.put(
+        "choices/topic_runtime/topic.order_events.yaml",
+        "format: 1\ndeclaration: topic_runtime topic.order_events\nentry: kafka.keyed-topic@1\n",
+    );
+
+    let (document, realization) = realization_diff((&checkout, &open), (&checkout, &chosen));
+
+    let record_keys: Vec<String> = realization
+        .requirements
+        .introduced
+        .iter()
+        .filter_map(|fact| match fact {
+            Fact::Realization {
+                declaration,
+                requirement,
+                ..
+            } if requirement == "record-key" => Some(declaration.to_string()),
+            _ => None,
+        })
+        .collect();
+
+    assert_eq!(
+        record_keys,
+        [
+            "effect_site operation.cancel_order/effect.cancel_order.publish_cancelled",
+            "effect_site operation.charge_payment/effect.charge_payment.publish_captured",
+            "effect_site operation.charge_payment/effect.charge_payment.publish_failed",
+            "effect_site operation.create_order/effect.create_order.publish_created",
+            "effect_site operation.reserve_inventory/effect.reserve_inventory.publish_reserved",
+            "transition machine.order_lifecycle/transition.order.mark_paid",
+        ]
+    );
+    assert!(realization.requirements.withdrawn.is_empty());
+    assert!(
+        document
+            .failed_gates(&[Gate::Ambiguous, Gate::Infeasible])
+            .is_empty()
+    );
+
+    let text = render::render(&document);
+
+    assert!(
+        text.contains(
+            "  ~ topic_runtime topic.order_events  ambiguous -> chosen kafka.keyed-topic@1"
+        ),
+        "{text}"
+    );
+    assert!(text.contains("  + requires realization("), "{text}");
+
+    // The document reads back as itself.
+    let json = serde_json::to_string_pretty(&document).unwrap();
+    let read: DiffDocument = serde_json::from_str(&json).unwrap();
+
+    assert_eq!(serde_json::to_string_pretty(&read).unwrap(), json);
+}
+
+#[test]
+fn without_a_stack_a_diff_has_no_realization_section_and_no_gate_fails() {
+    let checkout = postgres_and_kafka_checkout();
+
+    let document = diff(
+        &side(SideName::Base, workspace(&checkout), None),
+        &side(SideName::Head, workspace(&checkout), None),
+    );
+
+    assert_eq!(document.realization, None);
+    assert!(
+        document
+            .failed_gates(&[Gate::Infeasible, Gate::Ambiguous])
+            .is_empty()
+    );
+    assert!(
+        !serde_json::to_string(&document)
+            .unwrap()
+            .contains("\"realization\"")
+    );
+}
+
+fn texts<T: ToString>(values: &[T]) -> Vec<String> {
+    values.iter().map(ToString::to_string).collect()
 }

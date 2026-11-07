@@ -35,6 +35,7 @@ use crate::design::change::side::{self, Side, SideName, Source};
 use crate::design::graph::EdgeKind;
 use crate::design::symbol::SymbolKey;
 use crate::design::workspace::WorkspaceState;
+use crate::realization::choice::Profile;
 
 use super::completeness;
 use super::state::{
@@ -94,6 +95,11 @@ pub enum Priority {
     /// An orphaned key, or facts no proof needs any longer: optional
     /// work.
     Cleanup,
+
+    /// The project's stack cannot realize it (Part VI §18, item 7): the
+    /// remedy is a decision about the spec or the stack, not code, so
+    /// its work waits for that decision.
+    Parked,
 }
 
 impl Plan {
@@ -261,6 +267,10 @@ pub fn plan(derivation: &Derivation) -> Plan {
 /// `missing_facts` and `incomplete` always block what relies on them,
 /// so they read as structure only for completeness' sake.
 pub(crate) fn priority(state: &DeclarationState, blocks: &[ObligationKey]) -> Priority {
+    if state.has(ConditionKind::Unrealizable) {
+        return Priority::Parked;
+    }
+
     if !blocks.is_empty() {
         return Priority::Correctness;
     }
@@ -279,6 +289,8 @@ pub(crate) fn priority(state: &DeclarationState, blocks: &[ObligationKey]) -> Pr
             ConditionKind::Unreviewed | ConditionKind::Disputed => Priority::Review,
 
             ConditionKind::Orphaned | ConditionKind::Surplus => Priority::Cleanup,
+
+            ConditionKind::Unrealizable => Priority::Parked,
         })
         .min()
         .unwrap_or(Priority::Cleanup)
@@ -716,6 +728,7 @@ impl Scope {
             commit: None,
             merge_base: false,
             workspace: Some(head.clone()),
+            realization: Profile::read(project_dir).map_err(|error| error.to_string())?,
         };
 
         let base = if merge_base {
