@@ -2462,7 +2462,11 @@ impl Packet {
                 }
             );
 
-            let _ = writeln!(out, "  relied on by:");
+            if required.obligations.is_empty() {
+                let _ = writeln!(out, "  relied on by no proof");
+            } else {
+                let _ = writeln!(out, "  relied on by:");
+            }
 
             for relying in &required.obligations {
                 let _ = writeln!(out, "  - {}: {}", relying.display, relying.summary);
