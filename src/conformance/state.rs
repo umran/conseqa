@@ -31,6 +31,14 @@
 //!
 //! Reviews and disputes are conditions of their own, gated apart: they
 //! say who else checked a record, not what it records.
+//!
+//! With a stack profile, what the code must provide also includes what
+//! each chosen realization demands of it (Part VI §11): every
+//! `realization` fact is required of the declaration it is on, whether
+//! or not a proof relies on it. Every declaration a catalogue entry
+//! realizes must then be bound, its record names the realization its
+//! code was checked against, and a declaration the stack cannot realize
+//! is `unrealizable` (Part VI §18).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -49,6 +57,9 @@ use crate::design::graph::SymbolGraph;
 use crate::design::graph_build;
 use crate::design::graph_query::{self, GraphQuery, QueryRow};
 use crate::design::workspace::WorkspaceState;
+use crate::realization::capability::{self as capability, Spec};
+use crate::realization::choice::{Profile, Status as RealizationStatus};
+use crate::realization::requirements::{self, Placed};
 use crate::spec::{Id, TransactionStep};
 
 use super::completeness::{self, LISTED_MATCHES, Match, Matcher, RequiredScope};
@@ -56,7 +67,7 @@ use super::markers::{self, Region, Scan, ScanError};
 use super::policy::{Policy, ReviewRule};
 use super::record::{
     ClaimScope, CompletenessClaim, Party, PartyKind, Record, RecordContent, RecordFile,
-    RecordedRegion, Records, Review, ReviewTarget, Verdict,
+    RecordedRealization, RecordedRegion, Records, Review, ReviewTarget, Verdict,
 };
 use super::{ConformanceError, Digest, bindable};
 
@@ -176,6 +187,11 @@ pub enum Condition {
     /// Reviews at the current digests disputing the record, or items of
     /// it.
     Disputed { reviews: Vec<Dispute> },
+
+    /// With a stack profile, the declaration is ambiguous, has an
+    /// invalid choice, or is infeasible (Part VI §10.3): a decision
+    /// about the spec or the stack, not code, is owed.
+    Unrealizable { state: String },
 }
 
 impl Condition {
@@ -190,6 +206,7 @@ impl Condition {
             Self::Surplus { .. } => ConditionKind::Surplus,
             Self::Unreviewed { .. } => ConditionKind::Unreviewed,
             Self::Disputed { .. } => ConditionKind::Disputed,
+            Self::Unrealizable { .. } => ConditionKind::Unrealizable,
         }
     }
 }
@@ -209,11 +226,12 @@ pub enum ConditionKind {
     Surplus,
     Unreviewed,
     Disputed,
+    Unrealizable,
 }
 
 impl ConditionKind {
     /// Every condition, in §10.1's order.
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 11] = [
         Self::Unbound,
         Self::Orphaned,
         Self::Unattested,
@@ -224,6 +242,7 @@ impl ConditionKind {
         Self::Surplus,
         Self::Unreviewed,
         Self::Disputed,
+        Self::Unrealizable,
     ];
 }
 
@@ -240,6 +259,7 @@ impl fmt::Display for ConditionKind {
             Self::Surplus => "surplus",
             Self::Unreviewed => "unreviewed",
             Self::Disputed => "disputed",
+            Self::Unrealizable => "unrealizable",
         })
     }
 }
@@ -375,6 +395,44 @@ pub struct Derivation<'a> {
 
     /// The anchors of each fact of the reliance, by canonical form.
     pub anchors: BTreeMap<String, BTreeSet<DeclarationKey>>,
+
+    /// The realization profile and what it puts in force, when the
+    /// project has a stack profile (Part VI).
+    pub realization: Option<Realization>,
+}
+
+/// A project's realization profile, as one derivation read it, with each
+/// declaration's state and every requirement in force (Part VI §10,
+/// §11).
+pub struct Realization {
+    pub profile: Profile,
+    pub status: RealizationStatus,
+    pub placed: Vec<Placed>,
+}
+
+impl Realization {
+    /// The realization a realized declaration's record must name: its
+    /// chosen or automatic entry, with its options.
+    pub fn of(&self, declaration: &TextualKey) -> Option<RecordedRealization> {
+        self.status
+            .declarations
+            .iter()
+            .find(|realized| &realized.declaration == declaration)
+            .and_then(|realized| realized.state.realization())
+            .map(|(entry, options)| RecordedRealization {
+                entry: entry.clone(),
+                options: options.to_vec(),
+            })
+    }
+
+    /// The state of a realizable declaration, if it is one.
+    pub fn state(&self, declaration: &TextualKey) -> Option<&crate::realization::choice::State> {
+        self.status
+            .declarations
+            .iter()
+            .find(|realized| &realized.declaration == declaration)
+            .map(|realized| &realized.state)
+    }
 }
 
 impl<'a> Derivation<'a> {
@@ -408,8 +466,39 @@ impl<'a> Derivation<'a> {
         let records = Records::of_project(project_dir).read_all()?;
         let policy = Policy::read(project_dir)?;
 
+        let realization = Profile::read(project_dir)?.map(|profile| {
+            let status = RealizationStatus::with_needs(
+                &profile,
+                capability::needs_of(&Spec::of_workspace(workspace)),
+            );
+            let placed = requirements::placed(&status, &profile.catalogue, workspace, &graph);
+
+            Realization {
+                profile,
+                status,
+                placed,
+            }
+        });
+
         let reliance = reliance(proven.values().copied());
-        let required = required_facts(&reliance, workspace, &graph);
+        let mut required = required_facts(&reliance, workspace, &graph);
+
+        // What the chosen realizations demand of each declaration, which
+        // no proof relies on.
+        for placed in realization
+            .iter()
+            .flat_map(|realization| &realization.placed)
+        {
+            required
+                .entry(placed.declaration().key().clone())
+                .or_default()
+                .entry(placed.fact.canonical())
+                .or_insert_with(|| RequiredFact {
+                    fact: placed.fact.clone(),
+                    class: ConformanceClass::Attestable,
+                    relied_on_by: Vec::new(),
+                });
+        }
         let scopes =
             completeness::required(reliance.values().map(|relied| &relied.fact), workspace);
 
@@ -515,6 +604,7 @@ impl<'a> Derivation<'a> {
             required: &required,
             scopes: &scopes,
             failures: &failures,
+            realization: realization.as_ref(),
         };
 
         let declarations: Vec<DeclarationState> = partition
@@ -556,6 +646,7 @@ impl<'a> Derivation<'a> {
             scan,
             named,
             anchors,
+            realization,
         };
 
         Ok((derivation, extra))
@@ -770,6 +861,7 @@ struct Inputs<'a> {
     required: &'a BTreeMap<DeclarationKey, BTreeMap<String, RequiredFact>>,
     scopes: &'a [RequiredScope],
     failures: &'a BTreeMap<(&'a TextualKey, ClaimScope), ScopeFailure>,
+    realization: Option<&'a Realization>,
 }
 
 impl Inputs<'_> {
@@ -801,7 +893,14 @@ impl Inputs<'_> {
 
         let mut conditions = Vec::new();
 
-        if regions.is_empty() && self.policy.requires_binding(key.kind()) {
+        // The realization the record must name, when a catalogue entry
+        // realizes the declaration: which also brings it under binding,
+        // whatever the policy lists (Part VI §18, item 4).
+        let realized = self
+            .realization
+            .and_then(|realization| realization.of(&declaration));
+
+        if regions.is_empty() && (self.policy.requires_binding(key.kind()) || realized.is_some()) {
             conditions.push(Condition::Unbound);
         }
 
@@ -819,7 +918,8 @@ impl Inputs<'_> {
         }
 
         if let Some(record) = record
-            && Some(&record.residual) != self.partition.members.get(key)
+            && (Some(&record.residual) != self.partition.members.get(key)
+                || record.realization != realized)
         {
             conditions.push(Condition::Stale);
         }
@@ -943,6 +1043,16 @@ impl Inputs<'_> {
             if !disputes.is_empty() {
                 conditions.push(Condition::Disputed { reviews: disputes });
             }
+        }
+
+        if let Some(state) = self
+            .realization
+            .and_then(|realization| realization.state(&declaration))
+            .filter(|state| state.fails())
+        {
+            conditions.push(Condition::Unrealizable {
+                state: state.name().to_string(),
+            });
         }
 
         DeclarationState {

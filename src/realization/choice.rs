@@ -575,8 +575,11 @@ impl Status {
 
     /// The status of a model under a profile.
     pub fn of(profile: &Profile, model: &Model) -> Self {
-        let needs = capability::needs(model);
+        Self::with_needs(profile, capability::needs(model))
+    }
 
+    /// The status of a spec's needs under a profile.
+    pub fn with_needs(profile: &Profile, needs: BTreeMap<TextualKey, Vec<Need>>) -> Self {
         let orphaned = profile
             .choices
             .iter()

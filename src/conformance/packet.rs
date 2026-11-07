@@ -1350,6 +1350,12 @@ fn done_when(state: &DeclarationState, record: Option<&Record>) -> Vec<Step> {
 /// A condition in a sentence.
 fn sentence(condition: &Condition, key: &TextualKey, record: Option<&Record>) -> String {
     match condition {
+        Condition::Unrealizable { state } => format!(
+            "The project's stack cannot realize it: it is {state}, and `conseqa realize explain \
+             {key}` says why. The remedy is a decision about the spec or the stack, not code, so \
+             its work is parked until then."
+        ),
+
         Condition::Unbound => format!(
             "It has no region, and the policy requires every `{}` bound. Mark its code with \
              `conseqa:begin {key}` and `conseqa:end {key}` comment lines.",

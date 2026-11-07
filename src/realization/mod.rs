@@ -24,6 +24,9 @@
 //! - [`choice`] judges each declaration's candidates against its needs:
 //!   chosen by the architect, automatic when exactly one fits,
 //!   ambiguous, an invalid choice, infeasible, or unneeded (§10);
+//! - [`requirements`] resolves what each chosen entry demands, of the
+//!   declaration it realizes and of that declaration's neighbours, into
+//!   the `realization` facts Part IV requires of the code (§11);
 //! - [`document`] is the JSON each `conseqa realize` subcommand prints,
 //!   and each realization tool of the design MCP server returns.
 //!
@@ -42,6 +45,7 @@ pub mod capability;
 pub mod catalogue;
 pub mod choice;
 pub mod document;
+pub mod requirements;
 pub mod stack;
 
 /// The realization format (§14): of the stack profile, choice files,

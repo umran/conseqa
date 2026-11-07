@@ -26,10 +26,12 @@ use serde::ser::SerializeMap;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::analyzer::basis::{DeclarationKey, TextualKey};
+use crate::design::workspace::WorkspaceState;
 use crate::spec::{
-    DeliverySemantics, FieldPath, Id, LockMode, MemberAssignment, MemberConcurrency, Model,
-    ObjectSelector, OrderingSemantics, OutboxOrdering, OutboxPartitioning, SelectorPredicate,
-    SelectorValue, Transaction, TransactionIsolation, TransactionStep, ValueSource,
+    DataModel, DeliverySemantics, FieldPath, Id, LockMode, MemberAssignment, MemberConcurrency,
+    Model, ObjectSelector, OperationBlock, OrderingSemantics, OutboxOrdering, OutboxPartitioning,
+    RuntimeModel, SelectorPredicate, SelectorValue, StateMachine, Topic, Transaction,
+    TransactionIsolation, TransactionStep, ValueSource,
 };
 
 /// One capability (§6.2), in the table's order, which is the order
@@ -403,13 +405,61 @@ impl fmt::Display for Source {
     }
 }
 
+/// What needs are derived from: the parts of a spec that declare what a
+/// realization must provide. It is read from an assembled model, or
+/// from a workspace whose operations need not all have programs yet, as
+/// a side of a diff may not (Part I §13.4): an operation without a
+/// program asks nothing of its data models.
+pub struct Spec<'a> {
+    data_models: &'a BTreeMap<Id, DataModel>,
+    topics: &'a BTreeMap<Id, Topic>,
+    state_machines: &'a BTreeMap<Id, StateMachine>,
+    programs: Vec<(&'a Id, &'a OperationBlock)>,
+    runtime: Option<&'a RuntimeModel>,
+}
+
+impl<'a> Spec<'a> {
+    pub fn of_model(model: &'a Model) -> Self {
+        Self {
+            data_models: &model.data_models,
+            topics: &model.topics,
+            state_machines: &model.state_machines,
+            programs: model
+                .operations
+                .iter()
+                .map(|(id, operation)| (id, &operation.program))
+                .collect(),
+            runtime: model.runtime.as_ref(),
+        }
+    }
+
+    pub fn of_workspace(workspace: &'a WorkspaceState) -> Self {
+        Self {
+            data_models: &workspace.data_models,
+            topics: &workspace.topics,
+            state_machines: &workspace.state_machines,
+            programs: workspace
+                .operations
+                .iter()
+                .filter_map(|(id, draft)| Some((id, draft.program.as_ref()?)))
+                .collect(),
+            runtime: Some(&workspace.runtime),
+        }
+    }
+}
+
 /// Every realizable declaration of the model, in the partition's order,
 /// with what it needs (§6.3) in the vocabulary's order. A declaration
 /// needing nothing is listed with no needs.
 pub fn needs(model: &Model) -> BTreeMap<TextualKey, Vec<Need>> {
+    needs_of(&Spec::of_model(model))
+}
+
+/// The needs of a spec, read as [`needs`] reads a model's.
+pub fn needs_of(spec: &Spec<'_>) -> BTreeMap<TextualKey, Vec<Need>> {
     let mut needs = Needs::default();
 
-    for (data_model, declaration) in &model.data_models {
+    for (data_model, declaration) in spec.data_models {
         let key = textual(DeclarationKey::DataModel(data_model.clone()));
 
         needs.add(
@@ -429,31 +479,31 @@ pub fn needs(model: &Model) -> BTreeMap<TextualKey, Vec<Need>> {
         }
     }
 
-    for topic in model.topics.keys() {
+    for topic in spec.topics.keys() {
         let key = textual(DeclarationKey::Topic(topic.clone()));
 
         needs.add(&key, Capability::ChannelFanout, &key, Because::Fanout);
     }
 
-    for (operation, declaration) in &model.operations {
-        for (_, transaction) in declaration.program.transactions() {
+    for (operation, program) in &spec.programs {
+        for (_, transaction) in program.transactions() {
             let Some(data_model) = &transaction.data_model else {
                 continue;
             };
 
             let data_model = textual(DeclarationKey::DataModel(data_model.clone()));
             let source = textual(DeclarationKey::Transaction {
-                operation: operation.clone(),
+                operation: (*operation).clone(),
                 transaction: transaction.id.clone(),
             });
 
-            for (capability, because) in transaction_needs(model, transaction) {
+            for (capability, because) in transaction_needs(spec, transaction) {
                 needs.add(&data_model, capability, &source, because);
             }
         }
     }
 
-    if let Some(runtime) = &model.runtime {
+    if let Some(runtime) = spec.runtime {
         for (topic, declaration) in &runtime.topics {
             let key = textual(DeclarationKey::TopicRuntime(topic.clone()));
 
@@ -648,7 +698,7 @@ fn assignment(assignment: MemberAssignment) -> Capability {
 }
 
 /// What one transaction asks of its data model's store (§6.3).
-fn transaction_needs(model: &Model, transaction: &Transaction) -> Vec<(Capability, Because)> {
+fn transaction_needs(spec: &Spec<'_>, transaction: &Transaction) -> Vec<(Capability, Because)> {
     let mut needs = Vec::new();
 
     let isolation = match transaction.isolation {
@@ -718,14 +768,14 @@ fn transaction_needs(model: &Model, transaction: &Transaction) -> Vec<(Capabilit
             TransactionStep::Update(update) => {
                 writes.push((
                     at(&update.target.object),
-                    written(model, transaction, &update.target),
+                    written(spec, transaction, &update.target),
                 ));
             }
 
             TransactionStep::Delete(delete) => {
                 writes.push((
                     at(&delete.target.object),
-                    written(model, transaction, &delete.target),
+                    written(spec, transaction, &delete.target),
                 ));
             }
 
@@ -738,7 +788,7 @@ fn transaction_needs(model: &Model, transaction: &Transaction) -> Vec<(Capabilit
                 ));
                 writes.push((
                     at(&cas.target.object),
-                    written(model, transaction, &cas.target),
+                    written(spec, transaction, &cas.target),
                 ));
             }
 
@@ -751,7 +801,7 @@ fn transaction_needs(model: &Model, transaction: &Transaction) -> Vec<(Capabilit
                 ));
                 writes.push((
                     at(&advance.target.object),
-                    written(model, transaction, &advance.target),
+                    written(spec, transaction, &advance.target),
                 ));
             }
 
@@ -764,7 +814,7 @@ fn transaction_needs(model: &Model, transaction: &Transaction) -> Vec<(Capabilit
                 ));
                 writes.push((
                     at(&fence.target.object),
-                    written(model, transaction, &fence.target),
+                    written(spec, transaction, &fence.target),
                 ));
             }
 
@@ -777,13 +827,13 @@ fn transaction_needs(model: &Model, transaction: &Transaction) -> Vec<(Capabilit
                 ));
                 writes.push((
                     at(&transition.subject.object),
-                    written(model, transaction, &transition.subject),
+                    written(spec, transaction, &transition.subject),
                 ));
 
                 // Each transition-scoped admission is an outbox write
                 // committed with the transition (§22 of the semantics
                 // contract).
-                let declared = model
+                let declared = spec
                     .state_machines
                     .get(&transition.machine)
                     .and_then(|machine| machine.transitions.get(&transition.transition));
@@ -812,7 +862,7 @@ fn transaction_needs(model: &Model, transaction: &Transaction) -> Vec<(Capabilit
                     Capability::UniquenessIdentity,
                     Because::Step { step: step.clone() },
                 ));
-                writes.push((step, written(model, transaction, &upsert.target)));
+                writes.push((step, written(spec, transaction, &upsert.target)));
             }
 
             TransactionStep::Insert(insert) => {
@@ -898,14 +948,14 @@ fn instances(writes: &[(Step, Written<'_>)]) -> usize {
 
 /// What a selector of the transaction's data model writes.
 fn written<'a>(
-    model: &'a Model,
+    spec: &Spec<'a>,
     transaction: &Transaction,
     selector: &'a ObjectSelector,
 ) -> Written<'a> {
     let identity = transaction
         .data_model
         .as_ref()
-        .and_then(|data_model| model.data_models.get(data_model))
+        .and_then(|data_model| spec.data_models.get(data_model))
         .and_then(|data_model| data_model.objects.get(&selector.object))
         .map(|object| object.identity.as_slice())
         .unwrap_or_default();

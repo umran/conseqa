@@ -2045,3 +2045,358 @@ fn the_person_running_a_checkout_is_its_git_user_name() {
 
     let _ = ConformanceError::NoPerson { path: dir };
 }
+
+// ---------------------------------------------------------------------
+// §18.12 Realization requirements (Part VI §20.4, §20.5, §20.7)
+// ---------------------------------------------------------------------
+
+/// A project entry for the worker runtime a stack names: the only thing
+/// in it that bounds a pool member's concurrency.
+const NOMAD: &str = "format: 1
+id: nomad.job
+version: VERSION
+technology: { name: nomad, versions: \">=1.6\" }
+realizes: { kind: execution_pool }
+provides:
+  - concurrency: bounded
+requirements:
+  - id: task-concurrency
+    of: self
+    statement: Each task group runs the pool's bound of invocations at once, and no more.
+evidence:
+  task-concurrency: { look_for: the job's task group }
+";
+
+/// The stack a project directory names, with its worker runtime's entry
+/// at `nomad`.
+fn stack(dir: &Path, technologies: &[&str], nomad: u32) {
+    put(
+        dir,
+        ".conseqa/realization/stack.yaml",
+        format!(
+            "format: 1\ncatalogue: conseqa-standard@1\ntechnologies: [{}]\n",
+            technologies.join(", ")
+        ),
+    );
+
+    put(
+        dir,
+        ".conseqa/realization/catalogue/nomad.job.yaml",
+        NOMAD.replace("VERSION", &nomad.to_string()),
+    );
+}
+
+const STACK: [&str; 4] = ["postgres@16", "kafka@3.7", "envoy@1.30", "nomad@1.8"];
+
+fn checkout() -> WorkspaceState {
+    spec(&fs::read_to_string("tests/fixtures/flash_checkout.yaml").unwrap())
+}
+
+/// The wallet behind a router hashing the debit's account, as the
+/// charge requests it.
+fn routed_wallet() -> WorkspaceState {
+    let debit = OPERATION.replace("ISOLATION", "serializable");
+    let charge = OPERATION
+        .replace("ISOLATION", "read_committed")
+        .replace("debit", "charge")
+        .replacen(
+            "      steps:\n      - kind: transaction\n",
+            &format!("      steps:\n{REQUEST_DEBIT}      - kind: transaction\n"),
+            1,
+        );
+
+    spec(&format!(
+        "{HEAD}{charge}{debit}runtime:
+  execution_pools:
+    pool.wallet_api:
+      member_concurrency:
+        kind: unbounded
+  routers:
+    router.debit:
+      boundary:
+        operation: operation.debit
+        input: input.debit.request
+      pool: pool.wallet_api
+      routing:
+        key:
+        - account_id
+        member_assignment:
+          kind: consistent_hash
+"
+    ))
+}
+
+/// The declarations a requirement is on, by key.
+fn placed_on(derivation: &Derivation, requirement: &str) -> Vec<String> {
+    let placed: BTreeSet<String> = derivation
+        .realization
+        .as_ref()
+        .expect("a stack profile")
+        .placed
+        .iter()
+        .filter(|placed| placed.requirement() == requirement)
+        .map(|placed| placed.declaration().to_string())
+        .collect();
+
+    placed.into_iter().collect()
+}
+
+/// The realization facts required of a declaration, by requirement.
+fn realization_facts(state: &State, text: &str) -> Vec<String> {
+    required(state, text, ConformanceClass::Attestable)
+        .into_iter()
+        .filter_map(|fact| match fact {
+            Fact::Realization { requirement, .. } => Some(requirement),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn realization_requirements_land_on_exactly_their_neighbours() {
+    let dir = temp_dir("neighbours");
+    stack(&dir, &STACK, 1);
+
+    let checkout = checkout();
+    let derivation = derive(&dir, &checkout);
+
+    // Kafka's record key lands on every site publishing to the topic,
+    // the transition whose side effect publishes included.
+    let producers = [
+        "effect_site operation.cancel_order/effect.cancel_order.publish_cancelled",
+        "effect_site operation.charge_payment/effect.charge_payment.publish_captured",
+        "effect_site operation.charge_payment/effect.charge_payment.publish_failed",
+        "effect_site operation.create_order/effect.create_order.publish_created",
+        "effect_site operation.reserve_inventory/effect.reserve_inventory.publish_reserved",
+        "transition machine.order_lifecycle/transition.order.mark_paid",
+    ];
+
+    assert_eq!(placed_on(&derivation, "record-key"), producers);
+    assert_eq!(placed_on(&derivation, "idempotent-producer"), producers);
+    assert_eq!(
+        placed_on(&derivation, "stable-partitions"),
+        ["topic_runtime topic.order_events"]
+    );
+
+    for producer in producers {
+        assert_eq!(
+            realization_facts(&derivation.state, producer),
+            ["idempotent-producer", "record-key"],
+            "{producer}"
+        );
+    }
+
+    // Envoy's header lands on the router's one caller, and PostgreSQL's
+    // retry on the one serializable transaction.
+    let dir = temp_dir("callers");
+    stack(&dir, &["postgres@16", "envoy@1.30"], 1);
+
+    let wallet = routed_wallet();
+    let derivation = derive(&dir, &wallet);
+
+    assert_eq!(placed_on(&derivation, "routing-header"), [CHARGE_SITE]);
+    assert_eq!(placed_on(&derivation, "serialization-retry"), [DEBIT]);
+    assert_eq!(placed_on(&derivation, "guarded-update"), [CHARGE, DEBIT]);
+    assert_eq!(
+        realization_facts(&derivation.state, CHARGE_SITE),
+        ["routing-header"]
+    );
+
+    // Each requirement is required of its declaration, relied on by no
+    // proof.
+    let site = derivation.state.declaration(&key(CHARGE_SITE)).unwrap();
+
+    assert!(
+        site.required
+            .iter()
+            .all(|required| required.relied_on_by.is_empty())
+    );
+    assert!(kinds(&derivation.state, CHARGE_SITE).contains(&ConditionKind::MissingFacts));
+}
+
+#[test]
+fn every_realized_declaration_is_required_bound() {
+    let realized = [
+        "router router.create_order",
+        "execution_pool pool.order_workers",
+        "storage_layout layout.order",
+        "topic_runtime topic.order_events",
+    ];
+
+    let dir = temp_dir("bound");
+    stack(&dir, &STACK, 1);
+
+    let checkout = checkout();
+    let state = derive(&dir, &checkout).state;
+
+    for declaration in realized {
+        assert!(
+            kinds(&state, declaration).contains(&ConditionKind::Unbound),
+            "{declaration}"
+        );
+    }
+
+    // An unneeded router is realized by nothing, so nothing binds it.
+    assert!(!kinds(&state, "router router.cancel_order").contains(&ConditionKind::Unbound));
+
+    // Without a stack the policy alone decides, and lists none of them.
+    let state = state::derive(&temp_dir("unbound"), &checkout).unwrap();
+
+    for declaration in realized {
+        assert!(
+            !kinds(&state, declaration).contains(&ConditionKind::Unbound),
+            "{declaration}"
+        );
+    }
+}
+
+#[test]
+fn a_record_names_the_realization_its_code_was_checked_against() {
+    const POOL: &str = "execution_pool pool.order_workers";
+    const TOPIC: &str = "topic_runtime topic.order_events";
+
+    let dir = temp_dir("realized-record");
+    stack(&dir, &STACK, 1);
+
+    put(
+        &dir,
+        "deploy/order-workers.nomad",
+        "# conseqa:begin execution_pool pool.order_workers\n\
+         group \"order-workers\" {\n\
+         \x20 count = 1\n\
+         }\n\
+         # conseqa:end execution_pool pool.order_workers\n",
+    );
+
+    put(
+        &dir,
+        "infra/topics.tf",
+        "# conseqa:begin topic_runtime topic.order_events\n\
+         resource \"kafka_topic\" \"order_events\" {\n\
+         \x20 name       = \"order-events\"\n\
+         \x20 partitions = 12\n\
+         }\n\
+         # conseqa:end topic_runtime topic.order_events\n",
+    );
+
+    let checkout = checkout();
+
+    for declaration in [POOL, TOPIC] {
+        let state = state::derive(&dir, &checkout).unwrap();
+        let facts = required(&state, declaration, ConformanceClass::Attestable);
+
+        attest_as(
+            &dir,
+            &checkout,
+            &input(&dir, declaration, &facts),
+            attester(),
+        )
+        .unwrap();
+    }
+
+    let realization = |declaration: &str| {
+        record_of(&dir, declaration)
+            .realization
+            .map(|realization| (realization.entry.to_string(), realization.options))
+    };
+
+    assert_eq!(
+        realization(POOL),
+        Some(("nomad.job@1".to_string(), Vec::new()))
+    );
+    assert_eq!(
+        realization(TOPIC),
+        Some(("kafka.keyed-topic@1".to_string(), Vec::new()))
+    );
+
+    let state = state::derive(&dir, &checkout).unwrap();
+
+    for declaration in [POOL, TOPIC] {
+        assert_eq!(
+            kinds(&state, declaration),
+            [ConditionKind::Unreviewed],
+            "{declaration}"
+        );
+    }
+
+    // A new version of the pool's entry: the claims its record was
+    // checked against may have changed.
+    stack(&dir, &STACK, 2);
+
+    let state = state::derive(&dir, &checkout).unwrap();
+
+    assert_eq!(
+        kinds(&state, POOL),
+        [
+            ConditionKind::Stale,
+            ConditionKind::MissingFacts,
+            ConditionKind::Surplus,
+            ConditionKind::Unreviewed
+        ]
+    );
+
+    // Another entry chosen for the topic runtime.
+    stack(&dir, &STACK, 1);
+
+    let mut technologies = STACK.to_vec();
+    technologies.push("sqs@2012.11.05");
+    stack(&dir, &technologies, 1);
+
+    put(
+        &dir,
+        ".conseqa/realization/choices/topic_runtime/topic.order_events.yaml",
+        "format: 1\ndeclaration: topic_runtime topic.order_events\nentry: sqs.fifo@1\n",
+    );
+
+    let state = state::derive(&dir, &checkout).unwrap();
+
+    assert!(kinds(&state, TOPIC).contains(&ConditionKind::Stale));
+    assert!(!kinds(&state, POOL).contains(&ConditionKind::Stale));
+}
+
+#[test]
+fn an_unrealizable_declarations_item_is_parked() {
+    const TOPIC: &str = "topic_runtime topic.order_events";
+
+    let dir = temp_dir("parked");
+
+    let mut technologies = STACK.to_vec();
+    technologies.push("sqs@2012.11.05");
+    stack(&dir, &technologies, 1);
+
+    let checkout = checkout();
+    let derivation = derive(&dir, &checkout);
+
+    let condition = derivation
+        .state
+        .declaration(&key(TOPIC))
+        .unwrap()
+        .conditions
+        .last()
+        .cloned()
+        .unwrap();
+
+    assert_eq!(
+        serde_json::to_value(&condition).unwrap(),
+        json!({ "condition": "unrealizable", "state": "ambiguous" })
+    );
+
+    let work = plan::plan(&derivation);
+
+    assert_eq!(item(&work, TOPIC).priority, Priority::Parked);
+    assert_eq!(
+        work.items.last().map(|item| item.key.to_string()),
+        Some(TOPIC.to_string()),
+        "parked work comes last"
+    );
+
+    let packet = packet_of(&derivation, TOPIC);
+
+    assert!(
+        serde_json::to_string(&packet)
+            .unwrap()
+            .contains("its work is parked until then"),
+        "{}",
+        packet.render()
+    );
+}

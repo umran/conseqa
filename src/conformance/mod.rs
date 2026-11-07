@@ -221,6 +221,11 @@ pub enum ConformanceError {
     #[error("the spec cannot be verified: {reason}")]
     Unverifiable { reason: String },
 
+    /// The realization profile does not load (Part VI §8.2), so what
+    /// it requires of the code cannot be derived.
+    #[error(transparent)]
+    Realization(#[from] crate::realization::RealizationError),
+
     /// The CLI or a coordinator's surface stamps who attests or reviews
     /// with the person running it, and git names no one (§14.5).
     #[error(
